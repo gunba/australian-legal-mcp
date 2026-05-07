@@ -16,6 +16,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from typing import Iterable
+from urllib.parse import parse_qs, unquote, urlparse
 
 from markdownify import markdownify
 from selectolax.parser import HTMLParser, Node
@@ -211,6 +212,12 @@ _MD_COLLAPSE = re.compile(r"\n{3,}")
 _MD_TRAIL_WS = re.compile(r"[ \t]+\n")
 _MD_NUMERIC_RANGE = re.compile(r"(?<=\d)\s+-\s+(?=\d)")
 _MD_SPACED_QUOTE = re.compile(r'"\s+([^"\n]*?)\s+"')
+_HISTORY_LINK_LINE = re.compile(r'^\[View history reference\]\([^)]+\)\s*$', re.IGNORECASE)
+_HISTORY_TOGGLE_LINE = re.compile(
+    r'!\[[^\]]*\]\([^)]*(?:"(?:View|Hide) history note"[^)]*)?\)\s*(?:View|Hide) history note',
+    re.IGNORECASE,
+)
+_MARKDOWN_LINK_START = re.compile(r"\[[^\]\n]{0,300}\]\(")
 
 
 def _is_structural_markdown_line(line: str) -> bool:
@@ -250,10 +257,157 @@ def _unwrap_prose_lines(md: str) -> str:
 
 
 def _tidy_markdown(md: str) -> str:
+    md = _rewrite_internal_links(md)
+    md = _rewrite_formula_tables(md)
+    md = _strip_history_noise(md)
     md = _unwrap_prose_lines(md)
     md = _MD_TRAIL_WS.sub("\n", md)
     md = _MD_COLLAPSE.sub("\n\n", md)
     return md.strip() + "\n"
+
+
+def _doc_id_from_ato_link(target: str) -> str | None:
+    target = target.strip()
+    if target.startswith("<") and target.endswith(">"):
+        target = target[1:-1]
+    if " " in target:
+        target = target.split(" ", 1)[0]
+    if not ("/law/view/document" in target or "ato.gov.au/law/view/document" in target):
+        return None
+    parsed = urlparse(target)
+    query = parse_qs(parsed.query)
+    raw = (query.get("docid") or query.get("DocID") or query.get("LocID") or query.get("locid"))
+    if not raw:
+        return None
+    doc_id = unquote(raw[0]).strip().strip('"')
+    return doc_id or None
+
+
+def _rewrite_internal_links(md: str) -> str:
+    """Replace noisy ATO markdown URLs with compact doc_id references."""
+
+    out: list[str] = []
+    i = 0
+    while i < len(md):
+        start = md.find("[", i)
+        if start < 0:
+            out.append(md[i:])
+            break
+        out.append(md[i:start])
+        label_end = md.find("](", start)
+        if label_end < 0:
+            out.append(md[start:])
+            break
+        label = md[start + 1:label_end]
+        target_start = label_end + 2
+        depth = 1
+        j = target_start
+        while j < len(md):
+            if md[j] == "(":
+                depth += 1
+            elif md[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if j >= len(md):
+            out.append(md[start:])
+            break
+        target = md[target_start:j]
+        doc_id = _doc_id_from_ato_link(target)
+        if doc_id is None:
+            out.append(md[start:j + 1])
+        elif label.strip().lower() == "view history reference":
+            out.append("")
+        else:
+            clean_label = " ".join(label.split()) or doc_id
+            if clean_label == doc_id or clean_label.endswith(f"docid={doc_id}"):
+                out.append(f"[doc_id: {doc_id}]")
+            else:
+                out.append(f"{clean_label} [doc_id: {doc_id}]")
+        i = j + 1
+    return "".join(out)
+
+
+def _table_cells(line: str) -> list[str]:
+    stripped = line.strip()
+    if not stripped.startswith("|") or not stripped.endswith("|"):
+        return []
+    cells = [c.strip() for c in stripped.strip("|").split("|")]
+    return [c for c in cells if c]
+
+
+def _is_table_separator(line: str) -> bool:
+    cells = _table_cells(line)
+    return bool(cells) and all(set(c.replace(" ", "")) <= {"-", ":"} for c in cells)
+
+
+def _formula_from_table(lines: list[str]) -> str | None:
+    data_rows = [_table_cells(line) for line in lines if not _is_table_separator(line)]
+    data_rows = [row for row in data_rows if row]
+    if len(data_rows) < 2:
+        return None
+    numerator = data_rows[0]
+    denominator = data_rows[1]
+    if len(denominator) != 1:
+        return None
+    if not any(cell in {"×", "x", "X", "*"} for cell in numerator) and len(numerator) < 2:
+        return None
+    numerator_text = " ".join("x" if cell == "×" else cell for cell in numerator)
+    denominator_text = denominator[0]
+    return f"Formula: ({numerator_text}) / {denominator_text}"
+
+
+def _rewrite_formula_tables(md: str) -> str:
+    lines = md.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        if not lines[i].lstrip().startswith("|"):
+            out.append(lines[i])
+            i += 1
+            continue
+        start = i
+        while i < len(lines) and lines[i].lstrip().startswith("|"):
+            i += 1
+        block = lines[start:i]
+        formula = _formula_from_table(block)
+        if formula:
+            out.append(formula)
+        else:
+            out.extend(block)
+    return "\n".join(out)
+
+
+def _is_history_boundary(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    return (
+        stripped.startswith("#")
+        or stripped.startswith("***")
+        or stripped.startswith("**")
+        or bool(_MARKDOWN_LINK_START.match(stripped))
+    )
+
+
+def _strip_history_noise(md: str) -> str:
+    lines = md.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if _HISTORY_LINK_LINE.match(stripped) or _HISTORY_TOGGLE_LINE.search(stripped):
+            i += 1
+            continue
+        if stripped == "History":
+            i += 1
+            while i < len(lines) and not _is_history_boundary(lines[i]):
+                i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
 
 
 def _collect_anchors(node: Node) -> list[tuple[str, str]]:

@@ -19,6 +19,13 @@ INSERT_CHUNK_FTS = """
 INSERT INTO chunks_fts (rowid, text, heading_path) VALUES (?, ?, ?)
 """
 
+INSERT_DEFINITION = """
+INSERT OR REPLACE INTO definitions
+    (definition_id, term, norm_term, doc_id, source_title, source_type, scope,
+     heading_path, anchor, ord, body)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
 INSERT_TITLE_FTS = """
 INSERT INTO title_fts (doc_id, title, headings) VALUES (?, ?, ?)
 """

@@ -63,6 +63,25 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id);
 
+-- Additive definition index. Older v6 corpora may not have rows here; the
+-- runtime reports that explicitly for get_definition instead of weakening
+-- normal search/document retrieval.
+CREATE TABLE IF NOT EXISTS definitions (
+    definition_id TEXT PRIMARY KEY,
+    term          TEXT NOT NULL,
+    norm_term     TEXT NOT NULL,
+    doc_id        TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+    source_title  TEXT NOT NULL,
+    source_type   TEXT NOT NULL,
+    scope         TEXT,
+    heading_path  TEXT,
+    anchor        TEXT,
+    ord           INTEGER NOT NULL,
+    body          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_definitions_norm_term ON definitions(norm_term);
+CREATE INDEX IF NOT EXISTS idx_definitions_doc ON definitions(doc_id);
+
 -- [SL-04] FTS5 with Porter stemming + unicode61 + diacritic-insensitive — tuned for English legal text in both title_fts and chunks_fts.
 -- Title-level FTS — just the title plus per-doc heading text. Citations
 -- like "TR 2024/3" live inside ``title`` so title_fts finds them.

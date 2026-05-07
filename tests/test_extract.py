@@ -105,6 +105,44 @@ def test_extract_unwraps_source_wrapped_inline_fragments() -> None:
     ) in doc.markdown
 
 
+def test_extract_removes_history_noise_and_rewrites_internal_links() -> None:
+    html = """
+    <div id="LawContent">
+        <h1>Income Tax Assessment Act 1997 s 203-50</h1>
+        <a href="/law/view/document?LocID=PAC%2F19970038%2F203-50&amp;db=HISTFT">View history reference</a>
+        <img src="x.gif" title="View history note">View history note
+        <img src="y.gif" title="Hide history note">Hide history note
+        <p>History</p>
+        <p>S 203-50 inserted by No 48 of 2002.</p>
+        <h2>Operative provisions</h2>
+        <p>See <a href="/law/view/document?LocID=%22PAC%2F19970038%2F203-55(1)%22">203-55(1)</a>.</p>
+    </div>
+    """
+    doc = extract(html)
+    assert "View history" not in doc.markdown
+    assert "Hide history" not in doc.markdown
+    assert "inserted by No 48" not in doc.markdown
+    assert "203-55(1) [doc_id: PAC/19970038/203-55(1)]" in doc.markdown
+    assert "/law/view/document" not in doc.markdown
+
+
+def test_extract_rewrites_simple_formula_table() -> None:
+    html = """
+    <div id="LawContent">
+        <p>Use the following formula:</p>
+        <table>
+          <tr><td></td><td>Amount of the frankable distribution</td><td>×</td><td>Franking % differential</td></tr>
+          <tr><td></td><td>Applicable gross-up rate</td></tr>
+        </table>
+    </div>
+    """
+    doc = extract(html)
+    assert (
+        "Formula: (Amount of the frankable distribution x Franking % differential) / "
+        "Applicable gross-up rate"
+    ) in doc.markdown
+
+
 # ---------------------------------------------------------------------------
 # W2.2 — currency / supersession extraction
 

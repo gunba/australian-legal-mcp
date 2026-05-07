@@ -19,10 +19,12 @@ external URL recorded in the release manifest.
 | `search_titles` | Fast citation/title lookup, for example `TR 2024/3` or `Income Tax Assessment Act 1997 s 8-1`. |
 | `get_document` | Fetch an outline, a full document, a section, or an ordinal range. |
 | `get_chunks` | Fetch exact chunks returned by `search`, with optional neighbor context. |
+| `get_definition` | Fetch compact statutory definitions for a term, with an optional labelled ordinary-meaning fallback when a licensed dictionary source is configured. |
 | `whats_new` | Recent documents by corpus date. |
 | `stats` | Index version, counts, and default search policy. |
 
-Every result includes the ATO `canonical_url`.
+JSON results include the ATO `canonical_url`; markdown output prefers compact
+`doc_id` references for follow-up calls.
 
 ## Install
 
@@ -109,12 +111,18 @@ Default search is tuned for current public tax-law work:
   `include_old=true`.
 - Legislation is not excluded by the old-content rule because current Acts
   often have old commencement dates.
+- `get_definition` returns statutory definitions from the corpus definition
+  index. Ordinary-meaning fallback is labelled non-statutory and only runs
+  when `ATO_MCP_DICTIONARY_PATH` points to an approved JSON/JSONL/TSV
+  dictionary source.
 
 Examples:
 
 ```bash
 ato-mcp search "R&D tax incentive eligibility" --k 5
 ato-mcp search-titles "TR 2024 3"
+ato-mcp search-titles "s 203-50 ITAA97"
+ato-mcp get-definition "corporate tax gross-up rate" --context-act ITAA97
 ato-mcp search "section 8-1 repairs" --mode keyword
 ato-mcp search "royalties withholding old cases" --include-old --types Cases
 ```

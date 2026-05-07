@@ -42,6 +42,7 @@ from ..store.manifest import (
 from ..store.queries import (
     INSERT_CHUNK,
     INSERT_CHUNK_FTS,
+    INSERT_DEFINITION,
     INSERT_DOCUMENT,
     INSERT_EMPTY_SHELL,
     INSERT_TITLE_FTS,
@@ -49,6 +50,7 @@ from ..store.queries import (
 )
 from ..util.log import get_logger
 from . import chunk as chunk_mod
+from . import definitions as definition_mod
 from . import extract as extract_mod
 from . import metadata as meta_mod
 from . import rules as rules_mod
@@ -139,6 +141,7 @@ class PreparedDoc:
     headings_text: str
     anchors: list[tuple[str, str]]
     chunks: list[PreparedChunk]
+    definitions: list[definition_mod.Definition]
     # W2.2 currency markers — None when the source page carries no marker.
     withdrawn_date: str | None = None
     superseded_by: str | None = None
@@ -540,6 +543,16 @@ def build(args: BuildArgs) -> Manifest:
             chunks = (
                 chunk_mod.chunk_markdown(markdown, root_title=title) if has_content and markdown else []
             )
+            prepared_chunks = [
+                PreparedChunk(c.ord, c.heading_path, c.anchor, c.text)
+                for c in chunks
+            ]
+            definitions = _extract_definitions_for_doc(
+                doc_id=doc_id,
+                title=derived_title,
+                category=category,
+                chunks=prepared_chunks,
+            )
             if chunks:
                 # [W2.1] Heading-aware embedder input — see fresh-build path.
                 texts = [_embedding_input(title, c.heading_path, c.text) for c in chunks]
@@ -573,6 +586,8 @@ def build(args: BuildArgs) -> Manifest:
                 chunk_rowid = cur.lastrowid
                 conn.execute(INSERT_CHUNK_FTS, (chunk_rowid, c.text, c.heading_path))
                 conn.execute(INSERT_VEC, (chunk_rowid, vec_to_bytes(vectors_i8[i])))
+            if definitions:
+                conn.executemany(INSERT_DEFINITION, _definition_rows(definitions))
 
             # Build a pack record. pack_sha8 + offset/length filled after pack close.
             record = {
@@ -589,6 +604,7 @@ def build(args: BuildArgs) -> Manifest:
                 "withdrawn_date": currency.withdrawn_date,
                 "superseded_by": currency.superseded_by,
                 "replaces": currency.replaces,
+                "definitions": [d.__dict__ for d in definitions],
                 "chunks": [
                     {
                         "ord": c.ord,
@@ -840,6 +856,12 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
     # body prose + history table). Cheap relative to the extract+chunk pass
     # already done; runs from the same parse if selectolax cached anything.
     currency = extract_mod.extract_currency(html or "")
+    definitions = _extract_definitions_for_doc(
+        doc_id=doc_id,
+        title=derived_title,
+        category=category,
+        chunks=chunks,
+    )
     return PreparedDoc(
         doc_id=doc_id,
         category=category,
@@ -850,10 +872,48 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
         headings_text=" ".join(headings),
         anchors=anchors,
         chunks=chunks,
+        definitions=definitions,
         withdrawn_date=currency.withdrawn_date,
         superseded_by=currency.superseded_by,
         replaces=currency.replaces,
     )
+
+
+def _extract_definitions_for_doc(
+    *,
+    doc_id: str,
+    title: str,
+    category: str,
+    chunks: list[PreparedChunk],
+) -> list[definition_mod.Definition]:
+    return definition_mod.extract_definitions(
+        doc_id=doc_id,
+        source_title=title,
+        source_type=category,
+        chunks=[
+            definition_mod.DefinitionChunk(c.ord, c.heading_path, c.anchor, c.text)
+            for c in chunks
+        ],
+    )
+
+
+def _definition_rows(definitions: list[definition_mod.Definition]) -> list[tuple]:
+    return [
+        (
+            d.definition_id,
+            d.term,
+            d.norm_term,
+            d.doc_id,
+            d.source_title,
+            d.source_type,
+            d.scope,
+            d.heading_path,
+            d.anchor,
+            d.ord,
+            d.body,
+        )
+        for d in definitions
+    ]
 
 
 def _encode_length_bucketed(
@@ -978,6 +1038,7 @@ def _write_window(
     chunk_rows = []
     chunk_fts_rows = []
     vec_rows = []
+    definition_rows = []
     zstd_compressor = zstd.ZstdCompressor(level=zstd_level)
 
     for doc, start, end in doc_chunk_ranges:
@@ -1023,6 +1084,7 @@ def _write_window(
             "withdrawn_date": doc.withdrawn_date,
             "superseded_by": doc.superseded_by,
             "replaces": doc.replaces,
+            "definitions": [d.__dict__ for d in doc.definitions],
             "chunks": record_chunks,
         }
         pack_builder.add(doc.doc_id, record)
@@ -1038,11 +1100,14 @@ def _write_window(
                 has_content=True,
             )
         )
+        definition_rows.extend(_definition_rows(doc.definitions))
 
     if chunk_rows:
         conn.executemany(INSERT_CHUNK_WITH_ID, chunk_rows)
         conn.executemany(INSERT_CHUNK_FTS, chunk_fts_rows)
         conn.executemany(INSERT_VEC, vec_rows)
+    if definition_rows:
+        conn.executemany(INSERT_DEFINITION, definition_rows)
 
 
 def _next_chunk_id(conn) -> int:
@@ -1122,6 +1187,46 @@ def _insert_from_previous(
         conn.execute(INSERT_CHUNK_FTS, (chunk_rowid, c["text"], c.get("heading_path") or ""))
         from .pack import decode_embedding as _dec
         conn.execute(INSERT_VEC, (chunk_rowid, _dec(c["embedding_b64"])))
+    definitions = record.get("definitions")
+    if not definitions:
+        chunks = [
+            PreparedChunk(
+                int(c["ord"]),
+                c.get("heading_path") or "",
+                c.get("anchor"),
+                c["text"],
+            )
+            for c in record.get("chunks", [])
+        ]
+        definitions = [
+            d.__dict__
+            for d in _extract_definitions_for_doc(
+                doc_id=record["doc_id"],
+                title=record["title"],
+                category=record.get("type") or record.get("category") or "",
+                chunks=chunks,
+            )
+        ]
+    if definitions:
+        conn.executemany(
+            INSERT_DEFINITION,
+            [
+                (
+                    d["definition_id"],
+                    d["term"],
+                    d["norm_term"],
+                    d["doc_id"],
+                    d["source_title"],
+                    d["source_type"],
+                    d.get("scope"),
+                    d.get("heading_path") or "",
+                    d.get("anchor"),
+                    d["ord"],
+                    d["body"],
+                )
+                for d in definitions
+            ],
+        )
 
 
 def _iter_index(pages_dir: Path) -> Iterator[dict]:

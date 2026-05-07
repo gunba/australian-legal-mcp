@@ -97,8 +97,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     column migrations are no longer supported; pre-v5 DBs should be rebuilt
     from source.
 
-    Additive tables introduced in v5 (``empty_shells``) are created here
-    if absent so older v6 DBs that pre-date the additive table land safely.
+    Additive tables introduced without a schema bump are created here if
+    absent so older v6 DBs that pre-date the additive table land safely.
     """
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
     if not cols:
@@ -135,6 +135,21 @@ def _migrate(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_shells_last_checked
           ON empty_shells(last_checked_at);
+        CREATE TABLE IF NOT EXISTS definitions (
+            definition_id TEXT PRIMARY KEY,
+            term          TEXT NOT NULL,
+            norm_term     TEXT NOT NULL,
+            doc_id        TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+            source_title  TEXT NOT NULL,
+            source_type   TEXT NOT NULL,
+            scope         TEXT,
+            heading_path  TEXT,
+            anchor        TEXT,
+            ord           INTEGER NOT NULL,
+            body          TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_definitions_norm_term ON definitions(norm_term);
+        CREATE INDEX IF NOT EXISTS idx_definitions_doc ON definitions(doc_id);
         """
     )
 

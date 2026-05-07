@@ -179,6 +179,20 @@ enum Command {
         #[arg(long)]
         max_chars: Option<usize>,
     },
+    /// Fetch compact statutory definitions for a term.
+    GetDefinition {
+        term: String,
+        #[arg(long)]
+        context_doc_id: Option<String>,
+        #[arg(long)]
+        context_act: Option<String>,
+        #[arg(long, default_value_t = 5)]
+        max_defs: usize,
+        #[arg(long)]
+        ordinary_meaning_fallback: bool,
+        #[arg(long, default_value = "markdown")]
+        format: OutputFormat,
+    },
     /// Documents most recently published by the corpus date field.
     WhatsNew {
         #[arg(long)]
@@ -360,6 +374,29 @@ fn main() -> Result<()> {
                         include_children,
                         count,
                         max_chars,
+                    },
+                )?
+            );
+            Ok(())
+        }
+        Command::GetDefinition {
+            term,
+            context_doc_id,
+            context_act,
+            max_defs,
+            ordinary_meaning_fallback,
+            format,
+        } => {
+            println!(
+                "{}",
+                get_definition(
+                    &term,
+                    GetDefinitionOptions {
+                        context_doc_id: context_doc_id.as_deref(),
+                        context_act: context_act.as_deref(),
+                        max_defs,
+                        ordinary_meaning_fallback,
+                        format,
                     },
                 )?
             );
@@ -589,6 +626,22 @@ fn init_db(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id);
         CREATE INDEX IF NOT EXISTS idx_chunks_doc_ord ON chunks(doc_id, ord);
+
+        CREATE TABLE IF NOT EXISTS definitions (
+            definition_id TEXT PRIMARY KEY,
+            term          TEXT NOT NULL,
+            norm_term     TEXT NOT NULL,
+            doc_id        TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+            source_title  TEXT NOT NULL,
+            source_type   TEXT NOT NULL,
+            scope         TEXT,
+            heading_path  TEXT,
+            anchor        TEXT,
+            ord           INTEGER NOT NULL,
+            body          TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_definitions_norm_term ON definitions(norm_term);
+        CREATE INDEX IF NOT EXISTS idx_definitions_doc ON definitions(doc_id);
 
         CREATE TABLE IF NOT EXISTS chunk_embeddings (
             chunk_id   INTEGER PRIMARY KEY REFERENCES chunks(chunk_id) ON DELETE CASCADE,
@@ -2102,16 +2155,15 @@ fn format_hits_markdown(hits: &[Hit]) -> String {
         } else {
             escape_md(&hit.title)
         };
-        // [OF-03] Hit rows link titles to canonical_url and show doc_id for follow-up retrieval.
+        // [OF-03] Markdown hit rows prefer compact doc_id references; JSON keeps canonical_url.
         out.push_str(&format!(
-            "| {} | {} | {} | `{}` | {} | [{}]({})<br><small>`{}`</small> | {} | {} |\n",
+            "| {} | {} | {} | `{}` | {} | {}<br><small>`{}`</small> | {} | {} |\n",
             idx + 1,
             chunk,
             ord,
             escape_md(&hit.doc_type),
             hit.date.as_deref().unwrap_or(""),
             title_display,
-            hit.canonical_url,
             escape_md(&hit.doc_id),
             escape_md(&hit.heading_path),
             escape_md(&hit.snippet)
@@ -2123,6 +2175,175 @@ fn format_hits_markdown(hits: &[Hit]) -> String {
 fn escape_md(value: &str) -> String {
     // [OF-04] Table cells escape pipes and flatten newlines so snippets cannot break the grid.
     value.replace('|', "\\|").replace('\n', " ")
+}
+
+fn ato_doc_id_from_link(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_matches('<').trim_matches('>');
+    let parsed = Url::parse(trimmed)
+        .or_else(|_| Url::parse("https://www.ato.gov.au").and_then(|base| base.join(trimmed)))
+        .ok()?;
+    if parsed.domain() != Some("www.ato.gov.au") && parsed.domain() != Some("ato.gov.au") {
+        return None;
+    }
+    if parsed.path() != "/law/view/document" {
+        return None;
+    }
+    for (key, value) in parsed.query_pairs() {
+        if key.eq_ignore_ascii_case("docid") || key.eq_ignore_ascii_case("locid") {
+            let doc_id = value.trim().trim_matches('"').to_string();
+            if !doc_id.is_empty() {
+                return Some(doc_id);
+            }
+        }
+    }
+    None
+}
+
+fn direct_doc_id_from_query(query: &str) -> Option<String> {
+    if let Some(doc_id) = ato_doc_id_from_link(query) {
+        return Some(doc_id);
+    }
+    let re = Regex::new(r"\b[A-Z]{2,}/[A-Za-z0-9_.()/-]+").expect("valid regex");
+    re.find(query)
+        .map(|m| m.as_str().trim_end_matches('.').to_string())
+}
+
+fn act_prefix_for_query(query: &str) -> Option<&'static str> {
+    let compact: String = query
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect();
+    if compact.contains("itaa1997") || compact.contains("itaa97") {
+        Some("PAC/19970038")
+    } else if compact.contains("itaa1936") || compact.contains("itaa36") {
+        Some("PAC/19360027")
+    } else if compact.contains("fbtaa") || compact.contains("fringebenefitstaxassessmentact1986") {
+        Some("PAC/19860039")
+    } else if compact.contains("gstact")
+        || compact.contains("antsagst")
+        || compact.contains("newtaxsystemgoodsandservicestaxact1999")
+    {
+        Some("PAC/19990055")
+    } else if compact.contains("tasa") || compact.contains("taxagentservicesact2009") {
+        Some("PAC/20090013")
+    } else {
+        None
+    }
+}
+
+fn section_from_query(query: &str) -> Option<String> {
+    let re = Regex::new(
+        r"(?i)\b(?:s|sec|section)?\.?\s*([0-9]{1,4}[A-Z]?(?:-[0-9]{1,4}[A-Z]?)?(?:\([0-9A-Za-z]+\))?)\b",
+    )
+    .expect("valid regex");
+    let has_section_word = Regex::new(r"(?i)\b(s|sec|section)\b")
+        .expect("valid regex")
+        .is_match(query);
+    for cap in re.captures_iter(query) {
+        let value = cap.get(1)?.as_str();
+        if value.contains('-') || has_section_word || act_prefix_for_query(query).is_some() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn exact_title_hits(
+    conn: &Connection,
+    query: &str,
+    k: usize,
+    filter: &SqlFilter,
+) -> Result<Vec<Hit>> {
+    let mut doc_ids = Vec::new();
+    if let Some(doc_id) = direct_doc_id_from_query(query) {
+        doc_ids.push(doc_id);
+    }
+    if let Some(section) = section_from_query(query) {
+        if let Some(prefix) = act_prefix_for_query(query) {
+            doc_ids.push(format!("{prefix}/{section}"));
+        } else {
+            let where_filter = if filter.sql.is_empty() {
+                String::new()
+            } else {
+                format!(" AND {}", filter.sql)
+            };
+            let sql = format!(
+                "SELECT d.doc_id FROM documents d WHERE d.doc_id LIKE ? ESCAPE '\\' {where_filter} ORDER BY d.doc_id LIMIT ?"
+            );
+            let mut params_vec = vec![Value::Text(format!("%/{}", glob_to_like(&section)))];
+            params_vec.extend(filter.params.clone());
+            params_vec.push(Value::Integer(k as i64));
+            let mut stmt = conn.prepare(&sql)?;
+            for row in
+                stmt.query_map(params_from_iter(params_vec), |row| row.get::<_, String>(0))?
+            {
+                doc_ids.push(row?);
+            }
+        }
+    }
+
+    let mut hits = Vec::new();
+    let mut seen = HashSet::new();
+    for doc_id in doc_ids {
+        if !seen.insert(doc_id.clone()) {
+            continue;
+        }
+        if let Some(hit) = load_title_hit(conn, &doc_id, filter)? {
+            hits.push(hit);
+        }
+        if hits.len() >= k {
+            break;
+        }
+    }
+    Ok(hits)
+}
+
+fn load_title_hit(conn: &Connection, doc_id: &str, filter: &SqlFilter) -> Result<Option<Hit>> {
+    let where_filter = if filter.sql.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", filter.sql)
+    };
+    let sql = format!(
+        r#"
+        SELECT d.doc_id, d.type, d.title, d.date,
+               d.withdrawn_date, d.superseded_by, d.replaces
+        FROM documents d
+        WHERE d.doc_id = ? {where_filter}
+        "#
+    );
+    let mut params_vec = vec![Value::Text(doc_id.to_string())];
+    params_vec.extend(filter.params.clone());
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params_from_iter(params_vec))?;
+    if let Some(row) = rows.next()? {
+        let doc_id: String = row.get("doc_id")?;
+        let title: String = row.get("title")?;
+        Ok(Some(Hit {
+            canonical_url: canonical_url(&doc_id),
+            doc_id: doc_id.clone(),
+            title: title.clone(),
+            doc_type: row.get("type")?,
+            date: row.get("date")?,
+            heading_path: String::new(),
+            anchor: None,
+            snippet: title,
+            score: Some(-2000.0),
+            chunk_id: None,
+            ord: None,
+            next_call: Some(format!(
+                "get_document(doc_id=\"{doc_id}\", format=\"card\")"
+            )),
+            ranking: None,
+            withdrawn_date: row.get("withdrawn_date")?,
+            superseded_by: row.get("superseded_by")?,
+            replaces: row.get("replaces")?,
+            reranker_score: None,
+        }))
+    } else {
+        Ok(None)
+    }
 }
 
 fn search_titles(
@@ -2137,6 +2358,7 @@ fn search_titles(
     let conn = open_read()?;
     let k = k.clamp(1, 100);
     let filter = build_doc_filter("d", types, None, None, None, include_old, current_only);
+    let exact_hits = exact_title_hits(&conn, query, k, &filter)?;
     let where_filter = if filter.sql.is_empty() {
         String::new()
     } else {
@@ -2192,11 +2414,14 @@ fn search_titles(
         Err(rusqlite::Error::SqliteFailure(_, _)) => Vec::new(),
         Err(err) => return Err(err.into()),
     };
+    let exact_doc_ids: HashSet<String> = exact_hits.iter().map(|hit| hit.doc_id.clone()).collect();
+    rows.retain(|hit| !exact_doc_ids.contains(&hit.doc_id));
     rows.sort_by(|a, b| {
         a.score
             .partial_cmp(&b.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    rows.splice(0..0, exact_hits);
     let truncated = rows.len() > k;
     rows.truncate(k);
     match format {
@@ -2600,6 +2825,268 @@ fn format_document_markdown(
     out
 }
 
+struct GetDefinitionOptions<'a> {
+    context_doc_id: Option<&'a str>,
+    context_act: Option<&'a str>,
+    max_defs: usize,
+    ordinary_meaning_fallback: bool,
+    format: OutputFormat,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct DefinitionSource {
+    doc_id: String,
+    title: String,
+    #[serde(rename = "type")]
+    source_type: String,
+    scope: Option<String>,
+    heading_path: String,
+    anchor: Option<String>,
+    ord: i64,
+    canonical_url: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct DefinitionHit {
+    definition_id: String,
+    term: String,
+    kind: String,
+    body: String,
+    source: DefinitionSource,
+}
+
+#[derive(Debug, Serialize)]
+struct OrdinaryMeaningHit {
+    term: String,
+    definition: String,
+    source: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DictionaryEntry {
+    term: String,
+    definition: String,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+fn normalize_definition_term(term: &str) -> String {
+    let cleaned = term
+        .replace("\\*", "*")
+        .trim_matches(|ch: char| ch.is_whitespace() || ch == ':' || ch == '*')
+        .to_string();
+    cleaned
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn context_prefix(context_doc_id: Option<&str>, context_act: Option<&str>) -> Option<String> {
+    if let Some(act) = context_act.and_then(act_prefix_for_query) {
+        return Some(act.to_string());
+    }
+    let doc_id = context_doc_id?;
+    let mut parts = doc_id.split('/');
+    let first = parts.next()?;
+    let second = parts.next()?;
+    if first == "PAC" {
+        Some(format!("{first}/{second}"))
+    } else {
+        None
+    }
+}
+
+fn definition_rank(hit: &DefinitionHit, opts: &GetDefinitionOptions<'_>) -> usize {
+    if opts
+        .context_doc_id
+        .is_some_and(|doc_id| hit.source.doc_id == doc_id)
+    {
+        return 0;
+    }
+    if let Some(prefix) = context_prefix(opts.context_doc_id, opts.context_act) {
+        if hit.source.doc_id.starts_with(&(prefix + "/")) {
+            return 1;
+        }
+    }
+    2
+}
+
+fn get_definition(term: &str, opts: GetDefinitionOptions<'_>) -> Result<String> {
+    let conn = open_read()?;
+    if !table_exists(&conn, "definitions")? {
+        return format_definition_response(
+            term,
+            &[],
+            None,
+            false,
+            opts.ordinary_meaning_fallback,
+            opts.format,
+        );
+    }
+    let norm = normalize_definition_term(term);
+    let max_defs = opts.max_defs.clamp(1, 20);
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT definition_id, term, doc_id, source_title, source_type, scope,
+               heading_path, anchor, ord, body
+        FROM definitions
+        WHERE norm_term = ?
+        ORDER BY doc_id, ord, term
+        LIMIT 100
+        "#,
+    )?;
+    let mut hits = stmt
+        .query_map([norm], |row| {
+            let doc_id: String = row.get("doc_id")?;
+            Ok(DefinitionHit {
+                definition_id: row.get("definition_id")?,
+                term: row.get("term")?,
+                kind: "statutory".to_string(),
+                body: row.get("body")?,
+                source: DefinitionSource {
+                    canonical_url: canonical_url(&doc_id),
+                    doc_id,
+                    title: row.get("source_title")?,
+                    source_type: row.get("source_type")?,
+                    scope: row.get("scope")?,
+                    heading_path: row
+                        .get::<_, Option<String>>("heading_path")?
+                        .unwrap_or_default(),
+                    anchor: row.get("anchor")?,
+                    ord: row.get("ord")?,
+                },
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut seen = HashSet::new();
+    hits.retain(|hit| seen.insert((hit.source.doc_id.clone(), hit.body.clone())));
+    hits.sort_by_key(|hit| definition_rank(hit, &opts));
+    hits.truncate(max_defs);
+    let ordinary = if hits.is_empty() && opts.ordinary_meaning_fallback {
+        lookup_ordinary_meaning(term)?
+    } else {
+        None
+    };
+    format_definition_response(
+        term,
+        &hits,
+        ordinary,
+        true,
+        opts.ordinary_meaning_fallback,
+        opts.format,
+    )
+}
+
+fn lookup_ordinary_meaning(term: &str) -> Result<Option<OrdinaryMeaningHit>> {
+    let Some(path) = std::env::var_os("ATO_MCP_DICTIONARY_PATH") else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("reading ordinary-meaning dictionary {}", path.display()))?;
+    let wanted = normalize_definition_term(term);
+    if let Ok(entries) = serde_json::from_str::<Vec<DictionaryEntry>>(&raw) {
+        for entry in entries {
+            if normalize_definition_term(&entry.term) == wanted {
+                return Ok(Some(OrdinaryMeaningHit {
+                    term: entry.term,
+                    definition: entry.definition,
+                    source: entry.source.unwrap_or_else(|| path.display().to_string()),
+                }));
+            }
+        }
+        return Ok(None);
+    }
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<DictionaryEntry>(line) {
+            if normalize_definition_term(&entry.term) == wanted {
+                return Ok(Some(OrdinaryMeaningHit {
+                    term: entry.term,
+                    definition: entry.definition,
+                    source: entry.source.unwrap_or_else(|| path.display().to_string()),
+                }));
+            }
+        } else {
+            let parts: Vec<&str> = line.splitn(3, '\t').collect();
+            if parts.len() >= 2 && normalize_definition_term(parts[0]) == wanted {
+                return Ok(Some(OrdinaryMeaningHit {
+                    term: parts[0].to_string(),
+                    definition: parts[1].to_string(),
+                    source: parts
+                        .get(2)
+                        .map(|s| (*s).to_string())
+                        .unwrap_or_else(|| path.display().to_string()),
+                }));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn format_definition_response(
+    term: &str,
+    hits: &[DefinitionHit],
+    ordinary: Option<OrdinaryMeaningHit>,
+    definition_index_available: bool,
+    ordinary_meaning_requested: bool,
+    format: OutputFormat,
+) -> Result<String> {
+    let statutory_found = !hits.is_empty();
+    match format {
+        OutputFormat::Json => Ok(serde_json::to_string_pretty(&json!({
+            "term": term,
+            "statutory_definition_found": statutory_found,
+            "definitions": hits,
+            "ordinary_meaning": ordinary,
+            "meta": {
+                "definition_index_available": definition_index_available,
+                "ordinary_meaning_requested": ordinary_meaning_requested,
+                "ordinary_meaning_source_configured": std::env::var_os("ATO_MCP_DICTIONARY_PATH").is_some(),
+            }
+        }))?),
+        OutputFormat::Markdown => {
+            if statutory_found {
+                let mut out = String::new();
+                for hit in hits {
+                    out.push_str(&format!(
+                        "**{}**\n\n{}\n\n`definition_id: {}` | `{}` | ord `{}`\n\n",
+                        escape_md(&hit.term),
+                        hit.body,
+                        hit.definition_id,
+                        hit.source.doc_id,
+                        hit.source.ord
+                    ));
+                }
+                return Ok(out.trim_end().to_string());
+            }
+            if !definition_index_available {
+                return Ok(
+                    "_Definition index unavailable in this corpus; rebuild or update the corpus to use get_definition._"
+                        .to_string(),
+                );
+            }
+            if let Some(hit) = ordinary {
+                return Ok(format!(
+                    "**{}** (ordinary meaning; non-statutory)\n\n{}\n\nSource: {}",
+                    escape_md(&hit.term),
+                    hit.definition,
+                    escape_md(&hit.source)
+                ));
+            }
+            if ordinary_meaning_requested && std::env::var_os("ATO_MCP_DICTIONARY_PATH").is_none() {
+                Ok("_No statutory definition found. Ordinary-meaning fallback requested, but ATO_MCP_DICTIONARY_PATH is not configured._".to_string())
+            } else {
+                Ok("_No statutory definition found._".to_string())
+            }
+        }
+    }
+}
+
 fn whats_new(
     since: Option<&str>,
     before: Option<&str>,
@@ -2749,6 +3236,11 @@ fn stats(format: OutputFormat) -> Result<String> {
     } else {
         0
     };
+    let definitions: i64 = if table_exists(&conn, "definitions")? {
+        conn.query_row("SELECT COUNT(*) FROM definitions", [], |r| r.get(0))?
+    } else {
+        0
+    };
     let mut types = BTreeMap::new();
     let mut stmt =
         conn.prepare("SELECT type, COUNT(*) AS n FROM documents GROUP BY type ORDER BY n DESC")?;
@@ -2769,6 +3261,7 @@ fn stats(format: OutputFormat) -> Result<String> {
         "documents": docs,
         "chunks": chunks,
         "chunk_embeddings": embeddings,
+        "definitions": definitions,
         "types": types,
         "default_search_policy": {
             "excluded_types": DEFAULT_EXCLUDED_TYPES,
@@ -2797,6 +3290,7 @@ fn stats(format: OutputFormat) -> Result<String> {
             out.push_str(&format!("documents: `{}`\n", docs));
             out.push_str(&format!("chunks: `{}`\n", chunks));
             out.push_str(&format!("chunk_embeddings: `{}`\n", embeddings));
+            out.push_str(&format!("definitions: `{}`\n", definitions));
             out.push_str("default_search_mode: `hybrid`\n");
             out.push_str(&format!(
                 "default_search: excludes `{}` and dates before `{}` except `{}`\n",
@@ -4006,7 +4500,27 @@ struct PackRecord {
     #[serde(default)]
     replaces: Option<String>,
     #[serde(default)]
+    definitions: Vec<PackDefinition>,
+    #[serde(default)]
     chunks: Vec<PackChunk>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackDefinition {
+    definition_id: String,
+    term: String,
+    norm_term: String,
+    doc_id: String,
+    source_title: String,
+    source_type: String,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    heading_path: Option<String>,
+    #[serde(default)]
+    anchor: Option<String>,
+    ord: i64,
+    body: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4105,6 +4619,29 @@ fn insert_record(conn: &Connection, record: &PackRecord, doc_ref: &DocRef) -> Re
                 rowid,
                 chunk.text,
                 chunk.heading_path.as_deref().unwrap_or("")
+            ],
+        )?;
+    }
+    for definition in &record.definitions {
+        conn.execute(
+            r#"
+            INSERT OR REPLACE INTO definitions
+                (definition_id, term, norm_term, doc_id, source_title, source_type,
+                 scope, heading_path, anchor, ord, body)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                definition.definition_id,
+                definition.term,
+                definition.norm_term,
+                definition.doc_id,
+                definition.source_title,
+                definition.source_type,
+                definition.scope,
+                definition.heading_path,
+                definition.anchor,
+                definition.ord,
+                definition.body,
             ],
         )?;
     }
@@ -4320,6 +4857,20 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
             )?
         }
         "get_chunks" => get_chunks_mcp(&args)?,
+        "get_definition" => {
+            let term = required_str(&args, "term")?;
+            get_definition(
+                term,
+                GetDefinitionOptions {
+                    context_doc_id: args.get("context_doc_id").and_then(|v| v.as_str()),
+                    context_act: args.get("context_act").and_then(|v| v.as_str()),
+                    max_defs: optional_usize(&args, "max_defs").unwrap_or(5),
+                    ordinary_meaning_fallback: optional_bool(&args, "ordinary_meaning_fallback")
+                        .unwrap_or(false),
+                    format: output_format_arg(&args),
+                },
+            )?
+        }
         "verify_quote" => verify_quote_mcp(&args)?,
         "whats_new" => {
             let types = optional_string_array(&args, "types")?;
@@ -4948,7 +5499,7 @@ fn format_verify_quote_markdown(matches: &[QuoteMatch], found: bool, truncated: 
 }
 
 fn tool_descriptors() -> JsonValue {
-    // [SW-01] Tool surface is deliberately limited to six explicit MCP tools.
+    // [SW-01] Tool surface is deliberately limited to seven explicit MCP tools.
     json!([
         {
             "name": "search",
@@ -5018,6 +5569,22 @@ fn tool_descriptors() -> JsonValue {
                     "format": {"type": "string", "enum": ["markdown", "json"]}
                 },
                 "required": ["chunk_ids"]
+            }
+        },
+        {
+            "name": "get_definition",
+            "description": "Fetch compact statutory definitions for a term. Returns only matching definition entries, not whole dictionary provisions. Optional ordinary-meaning fallback is non-statutory and requires ATO_MCP_DICTIONARY_PATH.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "term": {"type": "string"},
+                    "context_doc_id": {"type": "string"},
+                    "context_act": {"type": "string"},
+                    "max_defs": {"type": "integer", "minimum": 1, "maximum": 20},
+                    "ordinary_meaning_fallback": {"type": "boolean"},
+                    "format": {"type": "string", "enum": ["markdown", "json"]}
+                },
+                "required": ["term"]
             }
         },
         {
@@ -5297,6 +5864,30 @@ mod tests {
         conn.execute(
             "INSERT INTO chunks(chunk_id, doc_id, ord, heading_path, anchor, text) VALUES (?, ?, ?, ?, NULL, ?)",
             params![chunk_id, doc_id, ord, "Section A", compress_text(text)?],
+        )?;
+        Ok(())
+    }
+
+    fn insert_definition(
+        conn: &Connection,
+        definition_id: &str,
+        term: &str,
+        doc_id: &str,
+        body: &str,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT INTO definitions(definition_id, term, norm_term, doc_id, source_title, \
+             source_type, scope, heading_path, anchor, ord, body) \
+             VALUES (?, ?, ?, ?, ?, 'Legislation_and_supporting_material', ?, '', NULL, 0, ?)",
+            params![
+                definition_id,
+                term,
+                normalize_definition_term(term),
+                doc_id,
+                format!("{doc_id} title"),
+                format!("{doc_id} title"),
+                body,
+            ],
         )?;
         Ok(())
     }
@@ -6165,6 +6756,115 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn search_titles_resolves_section_citation_alias() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        insert_doc_full(
+            &conn,
+            "PAC/19970038/203-50",
+            Some("1997-01-01"),
+            None,
+            None,
+            None,
+        )?;
+        conn.execute(
+            "UPDATE documents SET type = 'Legislation_and_supporting_material', title = ? WHERE doc_id = ?",
+            params!["Income Tax Assessment Act 1997 s 203-50", "PAC/19970038/203-50"],
+        )?;
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            let json_str =
+                search_titles("s 203-50 ITAA97", 5, None, false, true, OutputFormat::Json)?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            assert_eq!(parsed["hits"][0]["doc_id"], json!("PAC/19970038/203-50"));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn get_definition_returns_matching_entry_only() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        insert_doc_full(
+            &conn,
+            "PAC/19970038/995-1",
+            Some("1997-01-01"),
+            None,
+            None,
+            None,
+        )?;
+        insert_definition(
+            &conn,
+            "def-corporate-gross-up",
+            "corporate tax gross-up rate",
+            "PAC/19970038/995-1",
+            ", of an entity for an income year, means the amount worked out using the formula.",
+        )?;
+        insert_definition(
+            &conn,
+            "def-other",
+            "corporate tax rate",
+            "PAC/19970038/995-1",
+            "means the rate of tax.",
+        )?;
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            let json_str = get_definition(
+                "corporate tax gross-up rate",
+                GetDefinitionOptions {
+                    context_doc_id: Some("PAC/19970038/203-50"),
+                    context_act: None,
+                    max_defs: 5,
+                    ordinary_meaning_fallback: false,
+                    format: OutputFormat::Json,
+                },
+            )?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            assert_eq!(parsed["statutory_definition_found"], json!(true));
+            assert_eq!(parsed["definitions"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                parsed["definitions"][0]["definition_id"],
+                json!("def-corporate-gross-up")
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn get_definition_reports_unconfigured_ordinary_meaning() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let prev = std::env::var_os("ATO_MCP_DICTIONARY_PATH");
+        std::env::remove_var("ATO_MCP_DICTIONARY_PATH");
+
+        let result = with_data_dir(dir.path(), || -> Result<String> {
+            get_definition(
+                "not a statutory term",
+                GetDefinitionOptions {
+                    context_doc_id: None,
+                    context_act: None,
+                    max_defs: 5,
+                    ordinary_meaning_fallback: true,
+                    format: OutputFormat::Markdown,
+                },
+            )
+        });
+
+        if let Some(value) = prev {
+            std::env::set_var("ATO_MCP_DICTIONARY_PATH", value);
+        }
+        let md = result?;
+        assert!(md.contains("ATO_MCP_DICTIONARY_PATH is not configured"));
+        Ok(())
+    }
+
     // ----- W2.4 integration: whats_new also honours current_only ---------
     //
     // `whats_new` builds its WHERE clause inline rather than going through
@@ -6323,6 +7023,7 @@ mod tests {
             withdrawn_date: Some("2024-06-15".to_string()),
             superseded_by: Some("TR 2024/1".to_string()),
             replaces: None,
+            definitions: Vec::new(),
             chunks: vec![PackChunk {
                 ord: 0,
                 heading_path: Some("Section A".to_string()),
@@ -6341,6 +7042,7 @@ mod tests {
             withdrawn_date: None,
             superseded_by: None,
             replaces: Some("TR 2018/X".to_string()),
+            definitions: Vec::new(),
             chunks: vec![PackChunk {
                 ord: 0,
                 heading_path: Some("Section A".to_string()),
