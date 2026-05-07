@@ -9,8 +9,9 @@ Orchestrates:
 6. Write document into a sqlite ``ato.db`` and a release pack.
 7. Emit a ``manifest.json`` suitable for clients.
 
-Supports ``incremental`` rebuilds: if a prior manifest is supplied and a
-document's ``content_hash`` is unchanged, the existing pack slot is reused.
+Supports ``incremental`` rebuilds: if a prior manifest is supplied, a
+document's ``content_hash`` is unchanged, and its previous pack record is
+compatible with the current extracted fields, the existing pack slot is reused.
 """
 from __future__ import annotations
 
@@ -61,6 +62,7 @@ from .pack import (
     PackWriter,
     PackedDocRef,
     encode_embedding,
+    read_record,
 )
 
 LOGGER = get_logger(__name__)
@@ -194,7 +196,7 @@ class EncodedWindow:
 
 
 def _build_fresh_windowed(args: BuildArgs) -> Manifest:
-    # [IB-12] Fresh-build path (no previous_manifest): full re-embed. Incremental build() is a separate path that reuses pack slots when content_hash is unchanged.
+    # [IB-12] Fresh builds fully re-embed; incremental builds reuse pack slots only when content_hash is unchanged and the prior pack record is compatible with current extracted fields.
     if args.embedder != "embeddinggemma":
         raise ValueError("build-index requires --embedder embeddinggemma")
     _reset_fresh_outputs(args.out_dir, args.db_path)
@@ -527,7 +529,14 @@ def build(args: BuildArgs) -> Manifest:
             ch = meta_mod.content_hash(markdown, meta_fields)
 
             prev_ref = prev_docs.get(doc_id)
-            if prev_ref and prev_ref.content_hash == ch and prev_ref.pack_sha8 in prev_pack_info:
+            if (
+                prev_ref
+                and prev_ref.content_hash == ch
+                and prev_ref.pack_sha8 in prev_pack_info
+                and _previous_pack_record_has_current_definitions(
+                    prev_ref, args.previous_manifest, prev_pack_info
+                )
+            ):
                 # Reuse prior pack slot; skip re-embedding.
                 doc_refs.append(prev_ref)
                 reused_pack_shas.add(prev_ref.pack_sha8)
@@ -604,6 +613,7 @@ def build(args: BuildArgs) -> Manifest:
                 "withdrawn_date": currency.withdrawn_date,
                 "superseded_by": currency.superseded_by,
                 "replaces": currency.replaces,
+                "definitions_format_version": definition_mod.DEFINITIONS_FORMAT_VERSION,
                 "definitions": [d.__dict__ for d in definitions],
                 "chunks": [
                     {
@@ -916,6 +926,35 @@ def _definition_rows(definitions: list[definition_mod.Definition]) -> list[tuple
     ]
 
 
+def _previous_pack_record_has_current_definitions(
+    prev_ref: DocRef,
+    prev_manifest_path: Path | None,
+    prev_packs: dict[str, PackInfo],
+) -> bool:
+    """Return true only when a reusable old pack carries current definitions.
+
+    Reusing a content-stable pack from an older extractor would make the new
+    manifest point at records that cannot hydrate current definition IDs on
+    user installs.
+    """
+
+    if prev_manifest_path is None:
+        return False
+    prev_root = Path(prev_manifest_path).parent
+    pack_path = prev_root / "packs" / f"pack-{prev_ref.pack_sha8}.bin.zst"
+    if not pack_path.exists():
+        info = prev_packs.get(prev_ref.pack_sha8)
+        if info:
+            pack_path = prev_root / info.url
+    if not pack_path.exists():
+        return False
+    record = read_record(pack_path, prev_ref.offset, prev_ref.length)
+    return (
+        record.get("definitions_format_version") == definition_mod.DEFINITIONS_FORMAT_VERSION
+        and "definitions" in record
+    )
+
+
 def _encode_length_bucketed(
     model: EmbeddingModel,
     texts: list[str],
@@ -1084,6 +1123,7 @@ def _write_window(
             "withdrawn_date": doc.withdrawn_date,
             "superseded_by": doc.superseded_by,
             "replaces": doc.replaces,
+            "definitions_format_version": definition_mod.DEFINITIONS_FORMAT_VERSION,
             "definitions": [d.__dict__ for d in doc.definitions],
             "chunks": record_chunks,
         }
@@ -1138,8 +1178,6 @@ def _insert_from_previous(
     We read the document record out of the previous pack file (next to the
     previous manifest) and replay the inserts.
     """
-    from .pack import read_record
-
     if prev_manifest_path is None:
         raise RuntimeError("cannot reuse document without previous manifest path")
     prev_root = Path(prev_manifest_path).parent
@@ -1187,8 +1225,11 @@ def _insert_from_previous(
         conn.execute(INSERT_CHUNK_FTS, (chunk_rowid, c["text"], c.get("heading_path") or ""))
         from .pack import decode_embedding as _dec
         conn.execute(INSERT_VEC, (chunk_rowid, _dec(c["embedding_b64"])))
-    definitions = record.get("definitions")
-    if not definitions:
+    if record.get("definitions_format_version") == definition_mod.DEFINITIONS_FORMAT_VERSION:
+        definitions = record.get("definitions", [])
+    else:
+        definitions = None
+    if definitions is None:
         chunks = [
             PreparedChunk(
                 int(c["ord"]),

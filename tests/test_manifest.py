@@ -16,6 +16,7 @@ from ato_mcp.store.manifest import (
     PackInfo,
     diff_manifests,
     load_manifest,
+    manifest_fingerprint,
     save_manifest,
     save_update_summary,
     update_summary_from_manifest,
@@ -59,6 +60,19 @@ def test_diff_added_changed_removed() -> None:
     added, changed, removed = diff_manifests(old, new)
     assert [r.doc_id for r in added] == ["c"]
     assert [r.doc_id for r in changed] == ["b"]
+    assert removed == []
+
+
+def test_diff_marks_same_content_repack_changed() -> None:
+    old_doc = _doc("a", "same")
+    new_doc = _doc("a", "same")
+    new_doc.pack_sha8 = "feedface"
+    new_doc.length = 12
+
+    added, changed, removed = diff_manifests(_m([old_doc]), _m([new_doc]))
+
+    assert added == []
+    assert [r.doc_id for r in changed] == ["a"]
     assert removed == []
 
 
@@ -157,6 +171,7 @@ def test_update_summary_keeps_fast_check_fields(tmp_path: Path) -> None:
     assert summary.index_version == "2026.05.03"
     assert summary.document_count == 2
     assert summary.pack_count == 1
+    assert summary.manifest_fingerprint == manifest_fingerprint(m)
     assert summary.reranker is not None
     assert summary.reranker.tokenizer_sha256 == "c" * 64
 
@@ -165,6 +180,7 @@ def test_update_summary_keeps_fast_check_fields(tmp_path: Path) -> None:
     raw = json.loads(path.read_text())
     assert "documents" not in raw
     assert raw["document_count"] == 2
+    assert raw["manifest_fingerprint"] == manifest_fingerprint(m)
     assert raw["reranker"]["id"] == "gte-reranker-modernbert-base-quantized"
 
 

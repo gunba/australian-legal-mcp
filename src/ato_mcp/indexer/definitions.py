@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass
 
 
+DEFINITIONS_FORMAT_VERSION = 2
+
 _TERM_RE = re.compile(r"\*\*\*\s*([^*\n][^*]{0,180}?)\s*\*\*\*", re.MULTILINE)
 _WS_RE = re.compile(r"\s+")
 _CUE_RE = re.compile(
@@ -54,15 +56,17 @@ def _clean_body(body: str) -> str:
     return body
 
 
-def _definition_id(doc_id: str, ord: int, term: str, body: str) -> str:
+def _definition_id(doc_id: str, ord: int, term: str, body: str, offset: int) -> str:
     h = hashlib.sha256()
     h.update(doc_id.encode("utf-8"))
     h.update(b"\0")
     h.update(str(ord).encode("ascii"))
     h.update(b"\0")
+    h.update(str(offset).encode("ascii"))
+    h.update(b"\0")
     h.update(normalize_term(term).encode("utf-8"))
     h.update(b"\0")
-    h.update(body[:256].encode("utf-8"))
+    h.update(body.encode("utf-8"))
     return h.hexdigest()[:20]
 
 
@@ -115,7 +119,7 @@ def extract_definitions(
             seen.add(key)
             out.append(
                 Definition(
-                    definition_id=_definition_id(doc_id, chunk.ord, term, body),
+                    definition_id=_definition_id(doc_id, chunk.ord, term, body, match.start()),
                     term=term,
                     norm_term=norm,
                     doc_id=doc_id,

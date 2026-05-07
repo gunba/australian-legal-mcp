@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ato_mcp.indexer import definitions as definition_mod
 from ato_mcp.indexer.pack import (
     PackBuilder,
     PackWriter,
@@ -10,6 +11,8 @@ from ato_mcp.indexer.pack import (
     read_record,
     read_record_from_bytes,
 )
+from ato_mcp.indexer.build import _previous_pack_record_has_current_definitions
+from ato_mcp.store.manifest import DocRef, PackInfo
 
 
 def _record(doc_id: str) -> dict:
@@ -76,3 +79,99 @@ def test_read_record_from_bytes_matches_disk(tmp_path: Path) -> None:
         fh.seek(r.offset)
         blob = fh.read(r.length)
     assert read_record_from_bytes(blob) == disk
+
+
+def test_previous_pack_reuse_requires_current_definition_format(tmp_path: Path) -> None:
+    packs_dir = tmp_path / "packs"
+    packs_dir.mkdir()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+
+    old_path = packs_dir / "pack-old.bin.zst"
+    with PackWriter(path=old_path) as writer:
+        writer.add("old", _record("old"))
+        old_ref = list(writer.refs)[0]
+
+    old_format_record = _record("old-format")
+    old_format_record["definitions"] = [
+        {
+            "definition_id": "old-id",
+            "term": "test term",
+            "norm_term": "test term",
+            "doc_id": "old-format",
+            "source_title": "Document old-format",
+            "source_type": "Cases",
+            "scope": "Document old-format",
+            "heading_path": "Root",
+            "anchor": None,
+            "ord": 0,
+            "body": "means an old-format definition.",
+        }
+    ]
+    old_format_path = packs_dir / "pack-old-format.bin.zst"
+    with PackWriter(path=old_format_path) as writer:
+        writer.add("old-format", old_format_record)
+        old_format_ref = list(writer.refs)[0]
+
+    new_record = _record("new")
+    new_record["definitions_format_version"] = definition_mod.DEFINITIONS_FORMAT_VERSION
+    new_record["definitions"] = []
+    new_path = packs_dir / "pack-new.bin.zst"
+    with PackWriter(path=new_path) as writer:
+        writer.add("new", new_record)
+        new_ref = list(writer.refs)[0]
+
+    assert not _previous_pack_record_has_current_definitions(
+        DocRef(
+            doc_id="old",
+            content_hash="same",
+            pack_sha8="old",
+            offset=old_ref.offset,
+            length=old_ref.length,
+        ),
+        manifest_path,
+        {
+            "old": PackInfo(
+                sha8="old",
+                sha256="0" * 64,
+                size=old_path.stat().st_size,
+                url="packs/pack-old.bin.zst",
+            )
+        },
+    )
+    assert not _previous_pack_record_has_current_definitions(
+        DocRef(
+            doc_id="old-format",
+            content_hash="same",
+            pack_sha8="old-format",
+            offset=old_format_ref.offset,
+            length=old_format_ref.length,
+        ),
+        manifest_path,
+        {
+            "old-format": PackInfo(
+                sha8="old-format",
+                sha256="0" * 64,
+                size=old_format_path.stat().st_size,
+                url="packs/pack-old-format.bin.zst",
+            )
+        },
+    )
+    assert _previous_pack_record_has_current_definitions(
+        DocRef(
+            doc_id="new",
+            content_hash="same",
+            pack_sha8="new",
+            offset=new_ref.offset,
+            length=new_ref.length,
+        ),
+        manifest_path,
+        {
+            "new": PackInfo(
+                sha8="new",
+                sha256="0" * 64,
+                size=new_path.stat().st_size,
+                url="packs/pack-new.bin.zst",
+            )
+        },
+    )

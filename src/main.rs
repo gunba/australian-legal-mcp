@@ -2216,7 +2216,11 @@ fn act_prefix_for_query(query: &str) -> Option<&'static str> {
         .collect();
     if compact.contains("itaa1997") || compact.contains("itaa97") {
         Some("PAC/19970038")
+    } else if compact.contains("incometaxassessmentact1997") {
+        Some("PAC/19970038")
     } else if compact.contains("itaa1936") || compact.contains("itaa36") {
+        Some("PAC/19360027")
+    } else if compact.contains("incometaxassessmentact1936") {
         Some("PAC/19360027")
     } else if compact.contains("fbtaa") || compact.contains("fringebenefitstaxassessmentact1986") {
         Some("PAC/19860039")
@@ -2233,20 +2237,17 @@ fn act_prefix_for_query(query: &str) -> Option<&'static str> {
 }
 
 fn section_from_query(query: &str) -> Option<String> {
-    let re = Regex::new(
-        r"(?i)\b(?:s|sec|section)?\.?\s*([0-9]{1,4}[A-Z]?(?:-[0-9]{1,4}[A-Z]?)?(?:\([0-9A-Za-z]+\))?)\b",
+    let explicit = Regex::new(
+        r"(?i)\b(?:s|sec|section)\.?\s*([0-9]{1,4}[A-Z]?(?:-[0-9]{1,4}[A-Z]?)?(?:\([0-9A-Za-z]+\))?)\b",
     )
     .expect("valid regex");
-    let has_section_word = Regex::new(r"(?i)\b(s|sec|section)\b")
-        .expect("valid regex")
-        .is_match(query);
-    for cap in re.captures_iter(query) {
-        let value = cap.get(1)?.as_str();
-        if value.contains('-') || has_section_word || act_prefix_for_query(query).is_some() {
-            return Some(value.to_string());
-        }
+    if let Some(cap) = explicit.captures(query) {
+        return Some(cap.get(1)?.as_str().to_string());
     }
-    None
+    let bare = Regex::new(r"(?i)\b([0-9]{1,4}[A-Z]?-[0-9]{1,4}[A-Z]?(?:\([0-9A-Za-z]+\))?)\b")
+        .expect("valid regex");
+    bare.captures(query)
+        .and_then(|cap| cap.get(1).map(|m| m.as_str().to_string()))
 }
 
 fn exact_title_hits(
@@ -3379,6 +3380,8 @@ struct UpdateSummary {
     reranker: Option<ModelInfo>,
     document_count: usize,
     pack_count: usize,
+    #[serde(default)]
+    manifest_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -3928,11 +3931,15 @@ fn enforce_update_summary_compatibility(summary: &UpdateSummary) -> Result<()> {
 }
 
 fn installed_matches_update_summary(installed: &Manifest, summary: &UpdateSummary) -> Result<bool> {
+    let Some(summary_fingerprint) = summary.manifest_fingerprint.as_deref() else {
+        return Ok(false);
+    };
     if installed.schema_version != summary.schema_version
         || installed.index_version != summary.index_version
         || installed.min_client_version != summary.min_client_version
         || installed.documents.len() != summary.document_count
         || installed.packs.len() != summary.pack_count
+        || manifest_fingerprint(installed)? != summary_fingerprint
         || !model_info_matches(&installed.model, &summary.model)
         || !optional_model_info_matches(installed.reranker.as_ref(), summary.reranker.as_ref())
     {
@@ -3956,6 +3963,30 @@ fn installed_matches_update_summary(installed: &Manifest, summary: &UpdateSummar
         &conn,
         &summary.model.id,
     )?)
+}
+
+fn manifest_fingerprint(manifest: &Manifest) -> Result<String> {
+    let mut documents = manifest.documents.clone();
+    documents.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
+    let mut packs = manifest.packs.clone();
+    packs.sort_by(|a, b| a.sha8.cmp(&b.sha8));
+    let payload = json!({
+        "documents": documents.iter().map(|d| json!({
+            "doc_id": d.doc_id,
+            "content_hash": d.content_hash,
+            "pack_sha8": d.pack_sha8,
+            "offset": d.offset,
+            "length": d.length,
+        })).collect::<Vec<_>>(),
+        "packs": packs.iter().map(|p| json!({
+            "sha8": p.sha8,
+            "sha256": p.sha256,
+            "size": p.size,
+            "url": p.url,
+        })).collect::<Vec<_>>(),
+    });
+    let bytes = serde_json::to_vec(&payload)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 fn model_info_matches(left: &ModelInfo, right: &ModelInfo) -> bool {
@@ -4022,7 +4053,7 @@ fn diff_manifests(
     for doc in &new.documents {
         match old_docs.get(doc.doc_id.as_str()) {
             None => added.push(doc.clone()),
-            Some(old_doc) if old_doc.content_hash != doc.content_hash => changed.push(doc.clone()),
+            Some(old_doc) if !doc_ref_matches(old_doc, doc) => changed.push(doc.clone()),
             _ => {}
         }
     }
@@ -4032,6 +4063,13 @@ fn diff_manifests(
         .map(|doc_id| (*doc_id).to_string())
         .collect();
     (added, changed, removed)
+}
+
+fn doc_ref_matches(old: &DocRef, new: &DocRef) -> bool {
+    old.content_hash == new.content_hash
+        && old.pack_sha8 == new.pack_sha8
+        && old.offset == new.offset
+        && old.length == new.length
 }
 
 #[derive(Clone)]
@@ -6147,6 +6185,36 @@ mod tests {
     }
 
     #[test]
+    fn diff_manifests_marks_pack_slot_change_as_changed() {
+        let old = Manifest {
+            documents: vec![DocRef {
+                doc_id: "DOC".to_string(),
+                content_hash: "same-content".to_string(),
+                pack_sha8: "oldpack".to_string(),
+                offset: 0,
+                length: 10,
+            }],
+            ..sample_manifest(MAX_SUPPORTED_MANIFEST_VERSION as i64, "")
+        };
+        let new = Manifest {
+            documents: vec![DocRef {
+                doc_id: "DOC".to_string(),
+                content_hash: "same-content".to_string(),
+                pack_sha8: "newpack".to_string(),
+                offset: 0,
+                length: 11,
+            }],
+            ..sample_manifest(MAX_SUPPORTED_MANIFEST_VERSION as i64, "")
+        };
+
+        let (added, changed, removed) = diff_manifests(Some(&old), &new);
+        assert!(added.is_empty());
+        assert!(removed.is_empty());
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].doc_id, "DOC");
+    }
+
+    #[test]
     fn cmp_dotted_version_basics() {
         use std::cmp::Ordering;
         assert_eq!(cmp_dotted_version("1.2.3", "1.2.3"), Ordering::Equal);
@@ -6773,6 +6841,18 @@ mod tests {
             "UPDATE documents SET type = 'Legislation_and_supporting_material', title = ? WHERE doc_id = ?",
             params!["Income Tax Assessment Act 1997 s 203-50", "PAC/19970038/203-50"],
         )?;
+        insert_doc_full(
+            &conn,
+            "PAC/19970038/8-1",
+            Some("1997-01-01"),
+            None,
+            None,
+            None,
+        )?;
+        conn.execute(
+            "UPDATE documents SET type = 'Legislation_and_supporting_material', title = ? WHERE doc_id = ?",
+            params!["Income Tax Assessment Act 1997 s 8-1", "PAC/19970038/8-1"],
+        )?;
         drop(conn);
 
         with_data_dir(dir.path(), || -> Result<()> {
@@ -6780,6 +6860,16 @@ mod tests {
                 search_titles("s 203-50 ITAA97", 5, None, false, true, OutputFormat::Json)?;
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
             assert_eq!(parsed["hits"][0]["doc_id"], json!("PAC/19970038/203-50"));
+            let json_str = search_titles(
+                "Income Tax Assessment Act 1997 s 8-1",
+                5,
+                None,
+                false,
+                true,
+                OutputFormat::Json,
+            )?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            assert_eq!(parsed["hits"][0]["doc_id"], json!("PAC/19970038/8-1"));
             Ok(())
         })?;
         Ok(())
@@ -7279,6 +7369,137 @@ mod tests {
     }
 
     #[test]
+    fn apply_update_locked_ingests_repacked_definitions_with_same_content_hash() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let data = tempdir()?;
+        let release = tempdir()?;
+        let release_dir = release.path();
+        let packs_dir = release_dir.join("packs");
+        fs::create_dir_all(&packs_dir)?;
+
+        let model_bundle = release_dir.join("model-bundle.tar.zst");
+        write_test_tar_zst(
+            &model_bundle,
+            &[
+                ("model_quantized.onnx", b"dummy onnx bytes"),
+                ("tokenizer.json", br#"{"version":"1.0","truncation":null}"#),
+            ],
+        )?;
+        let model_bundle_bytes = fs::read(&model_bundle)?;
+        let embedding_b64 =
+            base64::engine::general_purpose::STANDARD.encode(vec![0u8; EMBEDDING_DIM]);
+
+        let base_record = json!({
+            "doc_id": "DOC_DEF_REPACK",
+            "type": "Public_ruling",
+            "title": "Definition repack",
+            "date": "2026-05-01",
+            "downloaded_at": "2026-05-01T00:00:00Z",
+            "content_hash": "same-content-hash",
+            "chunks": [{
+                "ord": 0,
+                "heading_path": "Ruling",
+                "anchor": "ruling",
+                "text": "***test term*** means the first definition.",
+                "embedding_b64": embedding_b64
+            }]
+        });
+        let old_pack_bytes = encode_test_pack_record(&base_record)?;
+        fs::write(packs_dir.join("pack-olddefs.bin.zst"), &old_pack_bytes)?;
+
+        let old_manifest = Manifest {
+            schema_version: MAX_SUPPORTED_MANIFEST_VERSION as i64,
+            index_version: "defs-v1".to_string(),
+            created_at: "2026-05-01T00:00:00Z".to_string(),
+            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
+            model: ModelInfo {
+                id: "embeddinggemma-test".to_string(),
+                sha256: sha256_hex(&model_bundle_bytes),
+                size: model_bundle_bytes.len() as u64,
+                url: "model-bundle.tar.zst".to_string(),
+                tokenizer_sha256: None,
+            },
+            reranker: None,
+            documents: vec![DocRef {
+                doc_id: "DOC_DEF_REPACK".to_string(),
+                content_hash: "same-content-hash".to_string(),
+                pack_sha8: "olddefs".to_string(),
+                offset: 0,
+                length: old_pack_bytes.len() as u64,
+            }],
+            packs: vec![PackInfo {
+                sha8: "olddefs".to_string(),
+                sha256: sha256_hex(&old_pack_bytes),
+                size: old_pack_bytes.len() as u64,
+                url: "packs/pack-olddefs.bin.zst".to_string(),
+            }],
+        };
+        let manifest_path = release_dir.join("manifest.json");
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&old_manifest)?)?;
+
+        with_data_dir(data.path(), || -> Result<()> {
+            let stats = apply_update_locked(manifest_path.to_str().expect("utf-8 path"))?;
+            assert_eq!(stats.added, 1);
+            let conn = open_read()?;
+            let definitions: i64 =
+                conn.query_row("SELECT COUNT(*) FROM definitions", [], |row| row.get(0))?;
+            assert_eq!(definitions, 0);
+            drop(conn);
+
+            let mut new_record = base_record;
+            new_record["definitions"] = json!([{
+                "definition_id": "def-test-term",
+                "term": "test term",
+                "norm_term": "test term",
+                "doc_id": "DOC_DEF_REPACK",
+                "source_title": "Definition repack",
+                "source_type": "Public_ruling",
+                "scope": "Definition repack",
+                "heading_path": "Ruling",
+                "anchor": "ruling",
+                "ord": 0,
+                "body": "means the first definition."
+            }]);
+            let new_pack_bytes = encode_test_pack_record(&new_record)?;
+            fs::write(packs_dir.join("pack-newdefs.bin.zst"), &new_pack_bytes)?;
+            let mut new_manifest = old_manifest;
+            new_manifest.documents[0].pack_sha8 = "newdefs".to_string();
+            new_manifest.documents[0].length = new_pack_bytes.len() as u64;
+            new_manifest.packs = vec![PackInfo {
+                sha8: "newdefs".to_string(),
+                sha256: sha256_hex(&new_pack_bytes),
+                size: new_pack_bytes.len() as u64,
+                url: "packs/pack-newdefs.bin.zst".to_string(),
+            }];
+            fs::write(&manifest_path, serde_json::to_vec_pretty(&new_manifest)?)?;
+            let summary = UpdateSummary {
+                schema_version: new_manifest.schema_version,
+                index_version: new_manifest.index_version.clone(),
+                min_client_version: new_manifest.min_client_version.clone(),
+                model: new_manifest.model.clone(),
+                reranker: new_manifest.reranker.clone(),
+                document_count: new_manifest.documents.len(),
+                pack_count: new_manifest.packs.len(),
+                manifest_fingerprint: Some(manifest_fingerprint(&new_manifest)?),
+            };
+            fs::write(
+                release_dir.join("update.json"),
+                serde_json::to_vec_pretty(&summary)?,
+            )?;
+
+            let stats = apply_update_locked(manifest_path.to_str().expect("utf-8 path"))?;
+            assert_eq!(stats.added, 0);
+            assert_eq!(stats.changed, 1);
+            let conn = open_read()?;
+            let definitions: i64 =
+                conn.query_row("SELECT COUNT(*) FROM definitions", [], |row| row.get(0))?;
+            assert_eq!(definitions, 1);
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
     fn apply_update_locked_skips_full_manifest_when_update_summary_matches() -> Result<()> {
         let _lock = TEST_DB_LOCK.lock().unwrap();
         let data = tempdir()?;
@@ -7310,6 +7531,7 @@ mod tests {
             reranker: None,
             document_count: 0,
             pack_count: 0,
+            manifest_fingerprint: Some(manifest_fingerprint(&manifest)?),
         };
         fs::write(
             release_dir.join("update.json"),

@@ -1,7 +1,8 @@
 """Manifest schema + signature verification (minisign).
 
 A manifest enumerates every document in a release and the pack-file byte range
-it lives in. Clients diff content_hash to produce the delta work list.
+it lives in. Clients diff the document content hash and pack byte range to
+produce the delta work list.
 """
 from __future__ import annotations
 
@@ -98,9 +99,35 @@ class UpdateSummary(BaseModel):
     reranker: Optional[ModelInfo] = None
     document_count: int
     pack_count: int
+    manifest_fingerprint: str
 
     def to_bytes(self) -> bytes:
         return orjson.dumps(self.model_dump(), option=orjson.OPT_SORT_KEYS | orjson.OPT_INDENT_2)
+
+
+def manifest_fingerprint(manifest: Manifest) -> str:
+    payload = {
+        "documents": [
+            {
+                "doc_id": d.doc_id,
+                "content_hash": d.content_hash,
+                "pack_sha8": d.pack_sha8,
+                "offset": d.offset,
+                "length": d.length,
+            }
+            for d in sorted(manifest.documents, key=lambda d: d.doc_id)
+        ],
+        "packs": [
+            {
+                "sha8": p.sha8,
+                "sha256": p.sha256,
+                "size": p.size,
+                "url": p.url,
+            }
+            for p in sorted(manifest.packs, key=lambda p: p.sha8)
+        ],
+    }
+    return hashlib.sha256(orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)).hexdigest()
 
 
 def update_summary_from_manifest(manifest: Manifest) -> UpdateSummary:
@@ -112,6 +139,7 @@ def update_summary_from_manifest(manifest: Manifest) -> UpdateSummary:
         reranker=manifest.reranker,
         document_count=len(manifest.documents),
         pack_count=len(manifest.packs),
+        manifest_fingerprint=manifest_fingerprint(manifest),
     )
 
 
@@ -164,7 +192,7 @@ def diff_manifests(
     old: Manifest | None, new: Manifest
 ) -> tuple[list[DocRef], list[DocRef], list[str]]:
     """Return (added, changed, removed_doc_ids)."""
-    # [SL-08] content_hash is the only diff signal — a chunk-only edit that doesn't bump content_hash is invisible to delta installs (intentional simplification).
+    # [SL-08] Doc refs diff by content_hash plus pack slot so same-content repacks still hydrate updated pack-side fields.
     old_ix: dict[str, DocRef] = old.doc_index() if old else {}
     new_ix = new.doc_index()
     added: list[DocRef] = []
@@ -172,10 +200,19 @@ def diff_manifests(
     for doc_id, ref in new_ix.items():
         if doc_id not in old_ix:
             added.append(ref)
-        elif old_ix[doc_id].content_hash != ref.content_hash:
+        elif not doc_ref_matches(old_ix[doc_id], ref):
             changed.append(ref)
     removed = [doc_id for doc_id in old_ix if doc_id not in new_ix]
     return added, changed, removed
+
+
+def doc_ref_matches(old: DocRef, new: DocRef) -> bool:
+    return (
+        old.content_hash == new.content_hash
+        and old.pack_sha8 == new.pack_sha8
+        and old.offset == new.offset
+        and old.length == new.length
+    )
 
 
 def canonical_json(obj: Any) -> bytes:
