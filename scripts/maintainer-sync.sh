@@ -4,8 +4,9 @@
 # Expects these env vars (set in the systemd unit or your shell):
 #   ATO_MCP_REPO_DIR   absolute path to this repo checkout
 #   ATO_MCP_PAGES_DIR  absolute path to ato_pages/ (default: $ATO_MCP_REPO_DIR/../ato_pages)
-#   ATO_MCP_MODEL_DIR  absolute path to a dir holding model_quantized.onnx,
-#                      model_quantized.onnx_data, tokenizer.json
+#   ATO_MCP_MODEL_DIR  absolute path to the EmbeddingGemma dir holding
+#                      tokenizer.json and either model_quantized.onnx or
+#                      onnx/model_quantized.onnx
 #   ATO_MCP_MODEL_URL  optional approved model mirror URL
 #   ATO_MCP_RERANKER_BUNDLE optional dir holding reranker ONNX + tokenizer.json
 #   ATO_MCP_RERANKER_URL optional pinned hf:// source for the reranker
@@ -16,10 +17,12 @@
 #   ATO_MCP_MODE       incremental | catch_up | full (default: incremental)
 #
 # Flow:
-#   1. refresh-source in the requested mode (incremental by default)
-#   2. If ato_pages/index.jsonl actually grew (or catch-up wrote new rows),
-#      re-run build-index --incremental against the previous release manifest.
-#   3. Publish a new release under tag $ATO_MCP_RELEASE_TAG-YYYY.MM.DD and
+#   1. Run the requested source refresh mode when it is catch_up or full.
+#   2. Always run refresh-source --mode incremental as the final pre-build
+#      source step, so the release includes the live ATO What's New feed.
+#   3. If ato_pages/index.jsonl actually changed, rebuild against the previous
+#      release manifest when one is available.
+#   4. Publish a new release under tag $ATO_MCP_RELEASE_TAG-YYYY.MM.DD and
 #      mark it latest. GitHub's "download latest" URL then points at it,
 #      so end-users' `ato-mcp update` picks it up on their next run.
 
@@ -28,6 +31,19 @@ set -euo pipefail
 REPO_DIR="${ATO_MCP_REPO_DIR:?set ATO_MCP_REPO_DIR}"
 PAGES_DIR="${ATO_MCP_PAGES_DIR:-$REPO_DIR/../ato_pages}"
 MODEL_DIR="${ATO_MCP_MODEL_DIR:?set ATO_MCP_MODEL_DIR}"
+if [[ -f "$MODEL_DIR/model_quantized.onnx" ]]; then
+    MODEL_ONNX="$MODEL_DIR/model_quantized.onnx"
+elif [[ -f "$MODEL_DIR/onnx/model_quantized.onnx" ]]; then
+    MODEL_ONNX="$MODEL_DIR/onnx/model_quantized.onnx"
+else
+    echo "model_quantized.onnx not found under $MODEL_DIR or $MODEL_DIR/onnx" >&2
+    exit 2
+fi
+TOKENIZER="$MODEL_DIR/tokenizer.json"
+if [[ ! -f "$TOKENIZER" ]]; then
+    echo "tokenizer.json not found under $MODEL_DIR" >&2
+    exit 2
+fi
 MODEL_URL="${ATO_MCP_MODEL_URL:-}"
 MODEL_URL_ARG=()
 if [ -n "$MODEL_URL" ]; then
@@ -109,7 +125,6 @@ BEFORE_HASH=$(index_hash)
 
 case "$MODE" in
     incremental)
-        "$ATO_MCP" refresh-source --mode incremental --output-dir "$PAGES_DIR"
         ;;
     catch_up)
         "$ATO_MCP" catch-up --output-dir "$PAGES_DIR"
@@ -122,6 +137,9 @@ case "$MODE" in
         exit 2
         ;;
 esac
+
+echo "== final What's New refresh =="
+"$ATO_MCP" refresh-source --mode incremental --output-dir "$PAGES_DIR"
 
 AFTER_COUNT=$(wc -l < "$PAGES_DIR/index.jsonl" 2>/dev/null || echo 0)
 AFTER_HASH=$(index_hash)
@@ -152,8 +170,8 @@ fi
     --pages-dir "$PAGES_DIR" \
     --out-dir "$RELEASE_DIR" \
     --db-path "$RELEASE_DIR/ato.db" \
-    --model-path "$MODEL_DIR/model_quantized.onnx" \
-    --tokenizer-path "$MODEL_DIR/tokenizer.json" \
+    --model-path "$MODEL_ONNX" \
+    --tokenizer-path "$TOKENIZER" \
     --gpu \
     "${PREV_ARG[@]}" \
     "${RERANKER_BUILD_ARGS[@]}"

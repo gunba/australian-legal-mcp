@@ -661,17 +661,15 @@ def build(args: BuildArgs) -> Manifest:
     doc_refs_final = _load_doc_refs_from_db(conn, pack_search_dirs)
     new_packs = _scan_packs_dir(packs_dir)
     have = {p.sha8 for p in new_packs}
-    # Any pack referenced by a doc_ref but not in our new packs dir must be
-    # a reused pack — pull its PackInfo from the previous manifest.
     referenced = {r.pack_sha8 for r in doc_refs_final}
     for sha8 in referenced - have:
-        if sha8 in prev_pack_info:
-            new_packs.append(prev_pack_info[sha8])
-        else:
+        if sha8 not in prev_pack_info:
             raise RuntimeError(
                 f"doc references pack {sha8} but it's neither in {packs_dir} "
                 f"nor in the previous manifest"
             )
+        _materialize_reused_pack(packs_dir, prev_packs_dir, prev_pack_info[sha8])
+    new_packs = _scan_packs_dir(packs_dir)
 
     manifest = Manifest(
         index_version=_today_version(),
@@ -1387,6 +1385,37 @@ def _populate_offsets_from_packs(refs: list[DocRef], pack_search_dirs: list[Path
             if hit is None:
                 raise RuntimeError(f"doc {ref.doc_id} missing from pack {sha8}")
             ref.offset, ref.length = hit
+
+
+def _materialize_reused_pack(
+    packs_dir: Path,
+    prev_packs_dir: Path | None,
+    pack: PackInfo,
+) -> Path:
+    """Make a reused pack part of the new release output directory."""
+    if prev_packs_dir is None:
+        raise RuntimeError(f"cannot materialize reused pack {pack.sha8} without previous packs dir")
+
+    filename = f"pack-{pack.sha8}.bin.zst"
+    src = prev_packs_dir / filename
+    if not src.exists():
+        fallback = prev_packs_dir / Path(pack.url).name
+        if fallback.exists():
+            src = fallback
+    if not src.exists():
+        raise RuntimeError(f"reused pack {pack.sha8} not found under {prev_packs_dir}")
+
+    dest = packs_dir / filename
+    if dest.exists():
+        if dest.stat().st_size != src.stat().st_size:
+            raise RuntimeError(f"existing pack {dest} does not match reused pack {src}")
+        return dest
+
+    try:
+        os.link(src, dest)
+    except OSError:
+        shutil.copy2(src, dest)
+    return dest
 
 
 def _scan_packs_dir(packs_dir: Path) -> list[PackInfo]:

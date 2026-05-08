@@ -18,7 +18,8 @@ Three modes:
   missing** docs. Each new doc inherits its category from the reducer's
   ``representative_path``, so they land in the correct
   ``payloads/<Category>/...`` subfolder automatically. Use this after long
-  gaps where the What's New feed has rolled past the last scrape.
+  gaps where the What's New feed has rolled past the last scrape. It is not
+  an empty-shell retry mechanism.
 """
 from __future__ import annotations
 

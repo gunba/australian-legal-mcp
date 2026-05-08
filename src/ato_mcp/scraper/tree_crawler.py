@@ -99,7 +99,7 @@ class AtoTreeCrawler:
 			nodes.append(node)
 			progress.update(1)
 			if uid_counter % 1000 == 0:
-				progress.set_postfix_str(f"queue={len(queue)}")
+				progress.set_postfix_str(f"crawl_frontier={len(queue)}")
 
 			if max_nodes and len(nodes) >= max_nodes:
 				self.logger.warning("Reached max_nodes=%s before finishing crawl", max_nodes)

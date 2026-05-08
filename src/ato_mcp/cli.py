@@ -93,9 +93,15 @@ def catch_up(
     missing documents. Each new doc is placed into its proper category folder
     automatically via the reducer's representative_path.
 
+    The progress postfix ``crawl_frontier`` is the number of pending browse-tree
+    nodes discovered by the crawler. It is not a missing/new document count; that
+    count is printed only after the crawl is reduced and diffed.
+
     Defaults are polite (1 worker, 1.0 s between requests = ~1 req/sec).
     A full-tree catch-up takes hours at these rates — scope with
     ``--root-query`` + ``--path-prefix`` when you only need recent docs.
+    This command is for missing canonical documents, not for retrying
+    empty-shell documents that the ATO served without body content.
 
     Full catch-up:
         ato-mcp catch-up --output-dir ./ato_pages
@@ -488,7 +494,7 @@ def shells_list(
     ),
     db_path: Optional[Path] = typer.Option(None),
 ) -> None:
-    """Show the N oldest-unchecked shells (re-probe candidates)."""
+    """Show the N oldest-unchecked shells for diagnostics."""
     from .store import db as store_db
     target = db_path or paths.db_path()
     conn = store_db.connect(target, mode="ro")

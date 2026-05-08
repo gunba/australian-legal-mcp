@@ -11,7 +11,10 @@ from ato_mcp.indexer.pack import (
     read_record,
     read_record_from_bytes,
 )
-from ato_mcp.indexer.build import _previous_pack_record_has_current_definitions
+from ato_mcp.indexer.build import (
+    _materialize_reused_pack,
+    _previous_pack_record_has_current_definitions,
+)
 from ato_mcp.store.manifest import DocRef, PackInfo
 
 
@@ -79,6 +82,30 @@ def test_read_record_from_bytes_matches_disk(tmp_path: Path) -> None:
         fh.seek(r.offset)
         blob = fh.read(r.length)
     assert read_record_from_bytes(blob) == disk
+
+
+def test_materialize_reused_pack_hardlinks_or_copies_previous_pack(tmp_path: Path) -> None:
+    prev_packs = tmp_path / "previous" / "packs"
+    new_packs = tmp_path / "new" / "packs"
+    prev_packs.mkdir(parents=True)
+    new_packs.mkdir(parents=True)
+
+    src = prev_packs / "pack-deadbeef.bin.zst"
+    src.write_bytes(b"previous pack bytes")
+
+    dest = _materialize_reused_pack(
+        new_packs,
+        prev_packs,
+        PackInfo(
+            sha8="deadbeef",
+            sha256="0" * 64,
+            size=src.stat().st_size,
+            url="https://github.com/gunba/ato-mcp/releases/download/v0.6.5/pack-deadbeef.bin.zst",
+        ),
+    )
+
+    assert dest == new_packs / "pack-deadbeef.bin.zst"
+    assert dest.read_bytes() == src.read_bytes()
 
 
 def test_previous_pack_reuse_requires_current_definition_format(tmp_path: Path) -> None:

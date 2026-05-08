@@ -187,6 +187,10 @@ Local GPU release build:
 python -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 
+.venv/bin/ato-mcp refresh-source \
+  --mode incremental \
+  --output-dir /path/to/ato_pages
+
 LD_LIBRARY_PATH="$(find .venv/lib*/python3.*/site-packages/nvidia/ -maxdepth 2 -name lib -type d | tr '\n' ':')$LD_LIBRARY_PATH" \
   .venv/bin/ato-mcp build-index \
   --pages-dir /path/to/ato_pages \
@@ -203,6 +207,10 @@ LD_LIBRARY_PATH="$(find .venv/lib*/python3.*/site-packages/nvidia/ -maxdepth 2 -
   --model-dir ./models/embeddinggemma \
   --overwrite
 ```
+
+Run the incremental What's New refresh immediately before every release build.
+If it changes `ato_pages/index.jsonl`, rebuild from that refreshed source before
+publishing.
 
 Release builds use EmbeddingGemma vectors. The model is not uploaded to
 GitHub Releases; by default the manifest points at pinned Hugging Face

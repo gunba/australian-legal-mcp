@@ -30,7 +30,7 @@ python -m venv .venv
 .venv/bin/pip uninstall -y onnxruntime
 .venv/bin/pip install -e '.[gpu]'
 
-ATO_MCP_MODE=catch_up \
+ATO_MCP_MODE=incremental \
 ATO_MCP_REPO_DIR="$PWD" \
 ATO_MCP_PAGES_DIR="/path/to/ato_pages" \
 ATO_MCP_MODEL_DIR="$PWD/models/embeddinggemma" \
@@ -42,7 +42,8 @@ scripts/maintainer-sync.sh
 
 `scripts/maintainer-sync.sh` will:
 
-1. Refresh `ato_pages` in the requested mode.
+1. Refresh `ato_pages` in the requested mode, then always run the
+   incremental What's New refresh as the final pre-build source step.
 2. Build `release/<tag>/ato.db`, packs, and `manifest.json`.
 3. Write the pinned Hugging Face EmbeddingGemma source into the manifest,
    unless `ATO_MCP_MODEL_URL` points at an approved mirror.
@@ -50,6 +51,12 @@ scripts/maintainer-sync.sh
    or the explicit `ATO_MCP_RERANKER_*` env vars are set.
 5. Upload the corpus assets with `.venv/bin/ato-mcp release`.
 6. Mark the release latest.
+
+Weekly release runs should use `ATO_MCP_MODE=incremental`. The full-tree
+`catch_up` mode is for proving genuinely missing canonical IDs after a
+long outage; it is not an empty-shell retry queue. Empty shells are pages the
+ATO served without extractable body content and should be treated as
+diagnostics unless a live document URL is known to have gained content.
 
 The script skips rebuilds when the refreshed `index.jsonl` hash is unchanged,
 except in `ATO_MCP_MODE=full`. Set `ATO_MCP_FORCE_REBUILD=1` for schema,
@@ -215,7 +222,8 @@ cargo test --locked
 
 Watch for:
 
-- Zero new rows for several weekly catch-up runs.
+- Zero new rows for several weekly incremental runs while the live What's New
+  feed has changed.
 - Growing failed rows in `ato_pages/index.jsonl`.
 - `ato-mcp doctor` failures after update.
 - Missing `CUDAExecutionProvider` before a release build.
