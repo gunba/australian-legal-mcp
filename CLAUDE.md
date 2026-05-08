@@ -6,6 +6,36 @@ The user is not expected to have a GPU and may be using a low performance enterp
 
 IMPORTANT: We should be looking to simplify the MCP surface and minimise extraneous context at all times.
 
+# Design Philosophy
+
+ATO-MCP should expose clean, source-grounded retrieval primitives and let agents
+do the reasoning. Prefer fewer tools, fewer parameters, and less context over
+feature breadth.
+
+Good features are deterministic and derived from stable, ubiquitous source
+structure. Examples: parsing an ATO document URL into its exact `doc_id`,
+constructing titles from HTML headings, removing repeated history/navigation
+metadata that appears across the corpus, and preserving exact chunk/document
+references.
+
+Do not add features built on hacky string substitutions, guessed citation
+aliases, hand-maintained act maps, or fragile interpretations of user prose.
+If logic would need ongoing maintenance against new ATO document shapes, it is
+not a good runtime feature. If it relies on an ephemeral ATO structure, add an
+audit/telemetry step first or leave it out.
+
+Do not add backwards-compatibility shims for users or installs that do not
+exist. Prefer one current deterministic layout, one environment variable, and
+one source-derived code path. If a breaking change is needed before there is a
+real installed user base, make the break cleanly and remove the old surface.
+
+No arbitrary timers, sleeps, or polling loops as control flow. Use deterministic
+completion signals or do not implement the behavior.
+
+Do not expose date-sensitive law resolution, historical-version selection, or
+similar legal interpretation helpers unless the corpus contains broad,
+source-derived version/effective-date data that can support the feature safely.
+
 # Workflow
 
 Use `/r`, `/j`, `/b`, `/c`, and `/rj` from this repo root.

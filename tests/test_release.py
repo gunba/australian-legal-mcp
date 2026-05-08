@@ -11,7 +11,7 @@ from ato_mcp.indexer.release import (
     EMBEDDINGGEMMA_HF_FINGERPRINT,
     EMBEDDINGGEMMA_HF_SIZE,
     EMBEDDINGGEMMA_HF_URL,
-    RERANKER_MODEL_CANDIDATES,
+    RERANKER_MODEL_PATH,
     ReleaseArgs,
     ReleaseError,
     _resolve_reranker_info,
@@ -84,9 +84,9 @@ def test_bundle_model_round_trip(tmp_path: Path) -> None:
     from ato_mcp.indexer.release import bundle_model
 
     model_dir = tmp_path / "model"
-    model_dir.mkdir()
-    (model_dir / "model_quantized.onnx").write_bytes(b"ONNX\x00" * 50)
-    (model_dir / "model_quantized.onnx_data").write_bytes(b"\x01\x02\x03" * 200)
+    (model_dir / "onnx").mkdir(parents=True)
+    (model_dir / "onnx" / "model_quantized.onnx").write_bytes(b"ONNX\x00" * 50)
+    (model_dir / "onnx" / "model_quantized.onnx_data").write_bytes(b"\x01\x02\x03" * 200)
     (model_dir / "tokenizer.json").write_text('{"tok":"json"}')
 
     bundle = tmp_path / "bundle.tar.zst"
@@ -101,8 +101,13 @@ def test_bundle_model_round_trip(tmp_path: Path) -> None:
         with dctx.stream_reader(fh) as reader, tarfile.open(fileobj=reader, mode="r|") as tar:
             tar.extractall(extract_dir, filter="data")
 
-    for name in ("model_quantized.onnx", "model_quantized.onnx_data", "tokenizer.json"):
-        assert (extract_dir / name).read_bytes() == (model_dir / name).read_bytes()
+    expected_sources = {
+        "model_quantized.onnx": model_dir / "onnx" / "model_quantized.onnx",
+        "model_quantized.onnx_data": model_dir / "onnx" / "model_quantized.onnx_data",
+        "tokenizer.json": model_dir / "tokenizer.json",
+    }
+    for name, source in expected_sources.items():
+        assert (extract_dir / name).read_bytes() == source.read_bytes()
 
 
 def test_publish_uses_external_model_url_without_uploading_bundle(
@@ -130,9 +135,9 @@ def test_publish_uses_external_model_url_without_uploading_bundle(
         out_dir / "manifest.json",
     )
     model_dir = tmp_path / "model"
-    model_dir.mkdir()
-    (model_dir / "model_quantized.onnx").write_bytes(b"ONNX\x00" * 50)
-    (model_dir / "model_quantized.onnx_data").write_bytes(b"\x01\x02\x03" * 200)
+    (model_dir / "onnx").mkdir(parents=True)
+    (model_dir / "onnx" / "model_quantized.onnx").write_bytes(b"ONNX\x00" * 50)
+    (model_dir / "onnx" / "model_quantized.onnx_data").write_bytes(b"\x01\x02\x03" * 200)
     (model_dir / "tokenizer.json").write_text('{"tok":"json"}')
 
     commands: list[list[str]] = []
@@ -291,7 +296,7 @@ def test_release_cli_accepts_reranker_bundle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Passing `--reranker-bundle` populates the manifest's `reranker` field
-    with a sha256/size derived from the bundle's `model_quantized.onnx`.
+    with a sha256/size derived from the bundle's `onnx/model_quantized.onnx`.
 
     The bundle itself is NOT uploaded to GitHub (only its fingerprint goes
     into the manifest), and the reranker URL records the external HF mirror
@@ -300,9 +305,9 @@ def test_release_cli_accepts_reranker_bundle(
     out_dir, manifest_path = _seed_release_dir(tmp_path)
 
     bundle = tmp_path / "reranker_bundle"
-    bundle.mkdir()
+    (bundle / Path(RERANKER_MODEL_PATH).parent).mkdir(parents=True)
     onnx_bytes = b"ONNX" + b"\x00" * 1024
-    (bundle / "model_quantized.onnx").write_bytes(onnx_bytes)
+    (bundle / RERANKER_MODEL_PATH).write_bytes(onnx_bytes)
     (bundle / "tokenizer.json").write_text('{"tok":"json"}')
     (bundle / "config.json").write_text('{"model_type":"bert"}')
 
@@ -327,7 +332,7 @@ def test_release_cli_accepts_reranker_bundle(
 
     out = load_manifest(manifest_path)
     assert out.reranker is not None
-    # Bundle sha256 + size were computed from model_quantized.onnx.
+    # Bundle sha256 + size were computed from onnx/model_quantized.onnx.
     import hashlib as _hashlib
     expected_sha = _hashlib.sha256(onnx_bytes).hexdigest()
     assert out.reranker.sha256 == expected_sha
@@ -382,7 +387,8 @@ def test_release_cli_rejects_github_reranker_url(
 
     bundle = tmp_path / "reranker_bundle"
     bundle.mkdir()
-    (bundle / "model_quantized.onnx").write_bytes(b"ONNX")
+    (bundle / Path(RERANKER_MODEL_PATH).parent).mkdir(parents=True)
+    (bundle / RERANKER_MODEL_PATH).write_bytes(b"ONNX")
 
     def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
         return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -401,35 +407,16 @@ def test_release_cli_rejects_github_reranker_url(
         )
 
 
-# ----- C2: filename-fallback matrix --------------------------------------
-#
-# Background: Python computes the manifest sha against `model_quantized.onnx`.
-# Rust originally only tried `onnx/model.onnx` and `model.onnx` on HF — meaning
-# the maintainer had to either rename the file at upload time or the runtime
-# would fail sha verification. C2 widens the candidate list on both sides.
-#
-# These tests pin both halves of the contract:
-#   - the Python helper picks whichever filename is in the bundle
-#   - the candidate list is shared with Rust via RERANKER_MODEL_CANDIDATES
-#     (Rust mirrors the same order in `install_hf_reranker`)
-
-
-@pytest.mark.parametrize("filename", list(RERANKER_MODEL_CANDIDATES))
-def test_resolve_reranker_info_finds_each_candidate_filename(
+def test_resolve_reranker_info_uses_canonical_model_filename(
     tmp_path: Path,
-    filename: str,
 ) -> None:
-    """The Python helper computes sha against whichever recognised ONNX
-    filename actually exists in the bundle. Critically: the resulting
-    sha256 must match the file the Rust runtime will end up downloading
-    when it walks the same candidate list — otherwise the first-time
-    install breaks for every user."""
+    """The release helper hashes the same canonical ONNX file that Rust downloads."""
     import hashlib as _hashlib
 
     bundle = tmp_path / "bundle"
-    (bundle / Path(filename).parent).mkdir(parents=True, exist_ok=True)
-    onnx_bytes = b"ONNX-" + filename.encode() + b"-payload"
-    onnx_file = bundle / filename
+    (bundle / Path(RERANKER_MODEL_PATH).parent).mkdir(parents=True, exist_ok=True)
+    onnx_bytes = b"ONNX-canonical-payload"
+    onnx_file = bundle / RERANKER_MODEL_PATH
     onnx_file.write_bytes(onnx_bytes)
     # Tokenizer is part of the C4 path; populate it so the auto-derived
     # sha lights up in the same call.
@@ -445,10 +432,7 @@ def test_resolve_reranker_info_finds_each_candidate_filename(
     info = _resolve_reranker_info(args, current_reranker=None)
     assert info is not None
     expected_sha = _hashlib.sha256(onnx_bytes).hexdigest()
-    assert info.sha256 == expected_sha, (
-        f"helper hashed wrong file for filename={filename}: "
-        f"expected sha256 of {filename}, got {info.sha256}"
-    )
+    assert info.sha256 == expected_sha
     assert info.size == len(onnx_bytes)
     # C4: tokenizer sha auto-populates from the bundle.
     assert info.tokenizer_sha256 == _hashlib.sha256(tokenizer_bytes).hexdigest()
@@ -457,9 +441,7 @@ def test_resolve_reranker_info_finds_each_candidate_filename(
 def test_resolve_reranker_info_rejects_bundle_without_recognised_onnx(
     tmp_path: Path,
 ) -> None:
-    """A bundle that contains no recognised ONNX filename surfaces a clear
-    error rather than silently producing a manifest the Rust runtime will
-    later fail to install."""
+    """A bundle without the canonical ONNX path surfaces a clear error."""
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     (bundle / "tokenizer.json").write_bytes(b"{}")
@@ -471,7 +453,7 @@ def test_resolve_reranker_info_rejects_bundle_without_recognised_onnx(
         reranker_bundle=bundle,
         reranker_url="hf://test/test@abc",
     )
-    with pytest.raises(ReleaseError, match="missing a recognised ONNX model"):
+    with pytest.raises(ReleaseError, match="missing onnx/model_quantized.onnx"):
         _resolve_reranker_info(args, current_reranker=None)
 
 
@@ -482,8 +464,8 @@ def test_resolve_reranker_info_threads_explicit_tokenizer_sha(
     import hashlib as _hashlib
 
     bundle = tmp_path / "bundle"
-    bundle.mkdir()
-    (bundle / "model_quantized.onnx").write_bytes(b"ONNX")
+    (bundle / Path(RERANKER_MODEL_PATH).parent).mkdir(parents=True)
+    (bundle / RERANKER_MODEL_PATH).write_bytes(b"ONNX")
     (bundle / "tokenizer.json").write_bytes(b'{"tok":"json"}')
 
     explicit = "f" * 64

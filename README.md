@@ -16,11 +16,10 @@ external URL recorded in the release manifest.
 | Tool | Purpose |
 |---|---|
 | `search` | Hybrid semantic-plus-lexical search over the GPU-built corpus. Defaults exclude Edited Private Advice and very old non-legislation content. |
-| `search_titles` | Fast citation/title lookup, for example `TR 2024/3` or `Income Tax Assessment Act 1997 s 8-1`. |
+| `search_titles` | Fast title lookup, plus exact `doc_id` and ATO document-link lookup. |
 | `get_document` | Fetch an outline, a full document, a section, or an ordinal range. |
 | `get_chunks` | Fetch exact chunks returned by `search`, with optional neighbor context. |
-| `get_definition` | Fetch compact statutory definitions for a term, with an optional labelled ordinary-meaning fallback when a licensed dictionary source is configured. |
-| `whats_new` | Recent documents by corpus date. |
+| `get_definition` | Fetch compact statutory definitions for a term, with labelled ordinary-meaning fallback when no statutory definition is found. |
 | `stats` | Index version, counts, and default search policy. |
 
 JSON results include the ATO `canonical_url`; markdown output prefers compact
@@ -112,17 +111,19 @@ Default search is tuned for current public tax-law work:
 - Legislation is not excluded by the old-content rule because current Acts
   often have old commencement dates.
 - `get_definition` returns statutory definitions from the corpus definition
-  index. Ordinary-meaning fallback is labelled non-statutory and only runs
-  when `ATO_MCP_DICTIONARY_PATH` points to an approved JSON/JSONL/TSV
-  dictionary source.
+  index. If no statutory definition is found, it falls back to a labelled
+  non-statutory ordinary meaning. By default the Rust client downloads and
+  indexes Open English WordNet 2024 (CC-BY 4.0) into the local data directory
+  on first use. Set `ATO_MCP_DICTIONARY_PATH` to a licensed JSON/JSONL/TSV
+  dictionary export to use that source instead.
 
 Examples:
 
 ```bash
 ato-mcp search "R&D tax incentive eligibility" --k 5
 ato-mcp search-titles "TR 2024 3"
-ato-mcp search-titles "s 203-50 ITAA97"
-ato-mcp get-definition "corporate tax gross-up rate" --context-act ITAA97
+ato-mcp search-titles "PAC/19970038/203-50"
+ato-mcp get-definition "corporate tax gross-up rate" --context-doc-id PAC/19970038/203-50
 ato-mcp search "section 8-1 repairs" --mode keyword
 ato-mcp search "royalties withholding old cases" --include-old --types Cases
 ```
@@ -165,7 +166,6 @@ Layout:
 ato-mcp/
 ├── live/
 │   ├── ato.db
-│   ├── model.onnx -> model_quantized.onnx
 │   ├── model_quantized.onnx
 │   ├── model_quantized.onnx_data
 │   └── tokenizer.json

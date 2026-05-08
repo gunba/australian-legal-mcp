@@ -255,7 +255,7 @@ def release(
     model_size: Optional[int] = typer.Option(None, help="Size in bytes of an externally hosted model bundle."),
     reranker_bundle: Optional[Path] = typer.Option(
         None,
-        help="Directory containing model_quantized.onnx + tokenizer.json (+ optional config.json) "
+        help="Directory containing onnx/model_quantized.onnx + tokenizer.json (+ optional config.json) "
              "for the cross-encoder reranker. The bundle is NOT uploaded to GitHub; only its "
              "sha256/size are recorded in the manifest's `reranker` ModelInfo. The Rust runtime "
              "fetches the actual ONNX from --reranker-url (default: pinned Hugging Face revision).",

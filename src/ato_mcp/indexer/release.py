@@ -38,16 +38,16 @@ EMBEDDINGGEMMA_HF_FINGERPRINT = (
 EMBEDDINGGEMMA_HF_SIZE = 329_781_810
 
 # Default cross-encoder reranker source: gte-reranker-modernbert-base quantized
-# ONNX. The Rust client downloads `model_quantized.onnx` + `tokenizer.json`
-# from this Hugging Face revision and renames them to `live/reranker.onnx` +
-# `live/reranker_tokenizer.json` for runtime use.
+# ONNX. The Rust client downloads `onnx/model_quantized.onnx` +
+# `tokenizer.json` from this Hugging Face revision and renames them to
+# `live/reranker.onnx` + `live/reranker_tokenizer.json` for runtime use.
 #
 # When publishing a release with `--reranker-bundle`, the maintainer is
 # expected to either:
 #   1. Override `--reranker-url` with their pinned HF revision, OR
 #   2. Accept this default URL and supply their own sha256/size from
 #      `--reranker-sha256`/`--reranker-size` (the bundle's own
-#      `model_quantized.onnx` is hashed automatically).
+#      `onnx/model_quantized.onnx` is hashed automatically).
 #
 # We do not bake a default fingerprint here because the release helper derives
 # the ONNX and tokenizer hashes from the maintainer's local bundle.
@@ -79,7 +79,7 @@ class ReleaseArgs:
     model_bundle_name: str = "embeddinggemma-bundle.tar.zst"
     # ---- Optional cross-encoder reranker (Wave 3) -------------------------
     # Same shape as the embedding bundle: pass `--reranker-bundle` pointing
-    # at a directory containing `model_quantized.onnx` + `tokenizer.json`
+    # at a directory containing `onnx/model_quantized.onnx` + `tokenizer.json`
     # (and optionally `config.json`), and the release CLI will hash the ONNX
     # file and write a `reranker: ModelInfo` entry into the manifest. The
     # bundle is NOT uploaded to GitHub — `reranker_url` records the external
@@ -120,15 +120,14 @@ def bundle_model(
     tar_buffer = io.BytesIO()
     with tarfile.open(fileobj=tar_buffer, mode="w") as tar:
         for name in include:
-            # Search both model_dir and model_dir/onnx (onnx-community models
-            # ship the weights in an onnx/ subdir while the tokenizer sits at
-            # the top level).
-            for candidate in (model_dir / name, model_dir / "onnx" / name):
-                if candidate.exists():
-                    tar.add(str(candidate), arcname=name)
-                    break
-            else:
-                raise FileNotFoundError(f"model bundle missing {name} under {model_dir}")
+            candidate = (
+                model_dir / "onnx" / name
+                if name.startswith("model_quantized.onnx")
+                else model_dir / name
+            )
+            if not candidate.exists():
+                raise FileNotFoundError(f"model bundle missing {candidate}")
+            tar.add(str(candidate), arcname=name)
     tar_buffer.seek(0)
     cctx = zstd.ZstdCompressor(level=level)
     with open(out_path, "wb") as fh:
@@ -196,16 +195,14 @@ def _resolve_reranker_info(args: ReleaseArgs, current_reranker: ModelInfo | None
     Returns ``None`` if no reranker info was provided in any form (CLI flags
     or pre-existing manifest entry). Bundle metadata wins over per-flag
     overrides: when ``--reranker-bundle`` points at a directory containing
-    one of the recognised ONNX exports (``model_quantized.onnx``,
-    ``model.onnx``, ``onnx/model_quantized.onnx``, ``onnx/model.onnx``),
-    that file's own sha256 + size are computed and used unless
-    ``--reranker-sha256`` / ``--reranker-size`` were passed explicitly.
+    ``onnx/model_quantized.onnx``, that file's own sha256 + size are computed
+    and used unless ``--reranker-sha256`` / ``--reranker-size`` were passed
+    explicitly.
 
     The bundle is NOT uploaded to GitHub — only its fingerprint goes into
     the manifest. The Rust runtime fetches the actual ONNX from the URL
     recorded in ``ModelInfo.url`` (default: pinned Hugging Face revision)
-    and tries each of the same filename candidates in order, accepting the
-    first one whose sha256 matches.
+    at the same canonical path.
     """
     bundle_provided = args.reranker_bundle is not None
     flags_provided = (
@@ -229,12 +226,10 @@ def _resolve_reranker_info(args: ReleaseArgs, current_reranker: ModelInfo | None
         onnx = _find_reranker_model_in_bundle(bundle)
         if onnx is None:
             raise ReleaseError(
-                f"reranker bundle {bundle} is missing a recognised ONNX model "
-                f"(looked for: {', '.join(RERANKER_MODEL_CANDIDATES)})"
+                f"reranker bundle {bundle} is missing {RERANKER_MODEL_PATH}"
             )
-        # bundle defaults: hash + size of whichever ONNX file we found (the
-        # runtime treats this as the wire-level integrity check on the
-        # primary weight file, regardless of which filename it ships under).
+        # Bundle defaults: hash + size of the canonical ONNX file the runtime
+        # downloads from Hugging Face.
         if sha256 is None:
             sha256 = _file_sha256(onnx)
         if size is None:
@@ -275,27 +270,13 @@ def _resolve_reranker_info(args: ReleaseArgs, current_reranker: ModelInfo | None
     )
 
 
-# Filename candidates for the int8 reranker ONNX export. Different
-# `optimum-cli` revisions emit different filenames (`model_quantized.onnx`
-# is the most common int8 output; `model.onnx` is what huggingface-pinned
-# repos serve once a quantized variant has been promoted to the canonical
-# name). The Rust runtime walks the same list when downloading from HF —
-# the maintainer recipe in MAINTENANCE.md must keep them in sync.
-RERANKER_MODEL_CANDIDATES = (
-    "onnx/model_quantized.onnx",
-    "model_quantized.onnx",
-    "onnx/model.onnx",
-    "model.onnx",
-)
+RERANKER_MODEL_PATH = "onnx/model_quantized.onnx"
 
 
 def _find_reranker_model_in_bundle(bundle: Path) -> Path | None:
-    """Return the first recognised ONNX file under ``bundle`` or None."""
-    for name in RERANKER_MODEL_CANDIDATES:
-        candidate = bundle / name
-        if candidate.exists():
-            return candidate
-    return None
+    """Return the canonical reranker ONNX file under ``bundle`` or None."""
+    candidate = bundle / RERANKER_MODEL_PATH
+    return candidate if candidate.exists() else None
 
 
 def sign_manifest(manifest_path: Path, sign_key: Path) -> Path:

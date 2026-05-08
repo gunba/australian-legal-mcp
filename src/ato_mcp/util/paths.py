@@ -34,7 +34,7 @@ def db_path() -> Path:
 
 
 def model_path() -> Path:
-    return live_dir() / "model.onnx"
+    return live_dir() / "model_quantized.onnx"
 
 
 def tokenizer_path() -> Path:

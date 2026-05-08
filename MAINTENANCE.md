@@ -155,21 +155,11 @@ records this URL via `--reranker-url`. Format:
 hf://Alibaba-NLP/gte-reranker-modernbert-base@<revision-sha>
 ```
 
-The Rust client tries the following filenames in order under that revision
-(first one whose download matches the manifest's `reranker.sha256` wins):
-
-1. `onnx/model_quantized.onnx` (preferred quantized output path)
-2. `model_quantized.onnx` (root-level quantized alias)
-3. `onnx/model.onnx` (canonical optimum-cli output path)
-4. `model.onnx` (root-level alias)
-
-This means you can host the bundle's `model_quantized.onnx` under any of
-those names — the Python `_resolve_reranker_info` helper hashes whichever
-one exists in your local bundle, and the Rust runtime walks the same list
-on download. **Critical:** if you re-quantize with a different optimum-cli
-version that produces a different filename, just upload it under one of
-the recognised names and re-run `ato-mcp release`. Do **not** rename the
-file — the sha will diverge from the manifest.
+The Rust client fetches exactly `onnx/model_quantized.onnx` under that
+revision and verifies it against `reranker.sha256`. Do not add alternate
+filename fallbacks or aliases. If a future exporter produces a different
+path, normalize the hosted artifact to this path before release and keep the
+manifest hash tied to the bytes at that path.
 
 The Rust client also downloads `tokenizer.json` from the same revision and
 renames the pair to `live/reranker.onnx` and `live/reranker_tokenizer.json`
@@ -196,10 +186,9 @@ ato-mcp release \
 ```
 
 The `--reranker-bundle` flag computes sha256 + size from
-`reranker_bundle/model_quantized.onnx` (or any of the recognised filenames
-listed above) automatically; pass `--reranker-sha256` / `--reranker-size`
-only to override the auto-computed values (rare — used when re-packaging
-the bundle).
+`reranker_bundle/onnx/model_quantized.onnx` automatically; pass
+`--reranker-sha256` / `--reranker-size` only to override the auto-computed
+values.
 
 If your bundle includes `tokenizer.json`, its sha256 is also auto-derived
 and embedded into `reranker.tokenizer_sha256`. Pass

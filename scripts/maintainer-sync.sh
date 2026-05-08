@@ -5,8 +5,7 @@
 #   ATO_MCP_REPO_DIR   absolute path to this repo checkout
 #   ATO_MCP_PAGES_DIR  absolute path to ato_pages/ (default: $ATO_MCP_REPO_DIR/../ato_pages)
 #   ATO_MCP_MODEL_DIR  absolute path to the EmbeddingGemma dir holding
-#                      tokenizer.json and either model_quantized.onnx or
-#                      onnx/model_quantized.onnx
+#                      tokenizer.json and onnx/model_quantized.onnx
 #   ATO_MCP_MODEL_URL  optional approved model mirror URL
 #   ATO_MCP_RERANKER_BUNDLE optional dir holding reranker ONNX + tokenizer.json
 #   ATO_MCP_RERANKER_URL optional pinned hf:// source for the reranker
@@ -31,12 +30,10 @@ set -euo pipefail
 REPO_DIR="${ATO_MCP_REPO_DIR:?set ATO_MCP_REPO_DIR}"
 PAGES_DIR="${ATO_MCP_PAGES_DIR:-$REPO_DIR/../ato_pages}"
 MODEL_DIR="${ATO_MCP_MODEL_DIR:?set ATO_MCP_MODEL_DIR}"
-if [[ -f "$MODEL_DIR/model_quantized.onnx" ]]; then
-    MODEL_ONNX="$MODEL_DIR/model_quantized.onnx"
-elif [[ -f "$MODEL_DIR/onnx/model_quantized.onnx" ]]; then
+if [[ -f "$MODEL_DIR/onnx/model_quantized.onnx" ]]; then
     MODEL_ONNX="$MODEL_DIR/onnx/model_quantized.onnx"
 else
-    echo "model_quantized.onnx not found under $MODEL_DIR or $MODEL_DIR/onnx" >&2
+    echo "onnx/model_quantized.onnx not found under $MODEL_DIR" >&2
     exit 2
 fi
 TOKENIZER="$MODEL_DIR/tokenizer.json"

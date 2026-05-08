@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
 use url::Url;
+use zip::ZipArchive;
 
 const APP_NAME: &str = "ato-mcp";
 const DEFAULT_RELEASES_URL: &str = "https://github.com/gunba/ato-mcp/releases/latest/download";
@@ -38,6 +39,9 @@ const EMBEDDINGGEMMA_HF_FINGERPRINT: &str =
 const OLD_CONTENT_CUTOFF: &str = "2000-01-01";
 const DEFAULT_EXCLUDED_TYPES: &[&str] = &["Edited_private_advice"];
 const LEGISLATION_TYPE: &str = "Legislation_and_supporting_material";
+const OEWN_2024_URL: &str = "https://en-word.net/static/english-wordnet-2024.zip";
+const OEWN_2024_SOURCE: &str = "Open English WordNet 2024 (CC-BY 4.0)";
+const ORDINARY_DICTIONARY_PATH_ENV: &str = "ATO_MCP_DICTIONARY_PATH";
 /// On-disk schema version this binary supports. Bump when introducing
 /// schema changes; older binaries reject newer corpora via [`open_read`]
 /// / [`open_write`] / [`apply_update_locked`] guards.
@@ -65,12 +69,7 @@ const RERANK_QUERY_MAX_TOKENS: usize = 64;
 const RERANK_PAIR_MAX_TOKENS: usize = 512;
 const DEFAULT_MAX_PER_DOC: usize = 2;
 const HARD_MAX_PER_DOC: usize = 3;
-const RERANKER_MODEL_CANDIDATES: &[&str] = &[
-    "onnx/model_quantized.onnx",
-    "model_quantized.onnx",
-    "onnx/model.onnx",
-    "model.onnx",
-];
+const RERANKER_HF_MODEL_PATH: &str = "onnx/model_quantized.onnx";
 
 // SimSIMD's Rust 5.x trait wires `i8::dot` through `simsimd_cos_i8`
 // (cosine distance), which is not what the ranking pipeline expects.
@@ -143,7 +142,7 @@ enum Command {
         #[arg(long, default_value = "markdown")]
         format: OutputFormat,
     },
-    /// Search document titles and citations only.
+    /// Search document titles, plus exact doc_id / ATO document links.
     SearchTitles {
         query: String,
         #[arg(short, long, default_value_t = 20)]
@@ -181,28 +180,8 @@ enum Command {
         term: String,
         #[arg(long)]
         context_doc_id: Option<String>,
-        #[arg(long)]
-        context_act: Option<String>,
         #[arg(long, default_value_t = 5)]
         max_defs: usize,
-        #[arg(long)]
-        ordinary_meaning_fallback: bool,
-        #[arg(long, default_value = "markdown")]
-        format: OutputFormat,
-    },
-    /// Documents most recently published by the corpus date field.
-    WhatsNew {
-        #[arg(long)]
-        since: Option<String>,
-        #[arg(long)]
-        before: Option<String>,
-        #[arg(long, default_value_t = 50)]
-        limit: usize,
-        #[arg(long, value_delimiter = ',')]
-        types: Vec<String>,
-        /// Include withdrawn / superseded rulings (default excludes them).
-        #[arg(long)]
-        include_withdrawn: bool,
         #[arg(long, default_value = "markdown")]
         format: OutputFormat,
     },
@@ -376,9 +355,7 @@ fn main() -> Result<()> {
         Command::GetDefinition {
             term,
             context_doc_id,
-            context_act,
             max_defs,
-            ordinary_meaning_fallback,
             format,
         } => {
             println!(
@@ -387,33 +364,9 @@ fn main() -> Result<()> {
                     &term,
                     GetDefinitionOptions {
                         context_doc_id: context_doc_id.as_deref(),
-                        context_act: context_act.as_deref(),
                         max_defs,
-                        ordinary_meaning_fallback,
                         format,
                     },
-                )?
-            );
-            Ok(())
-        }
-        Command::WhatsNew {
-            since,
-            before,
-            limit,
-            types,
-            include_withdrawn,
-            format,
-        } => {
-            let types = empty_vec_as_none(types);
-            println!(
-                "{}",
-                whats_new(
-                    since.as_deref(),
-                    before.as_deref(),
-                    limit,
-                    types.as_deref(),
-                    !include_withdrawn,
-                    format
                 )?
             );
             Ok(())
@@ -490,7 +443,7 @@ fn lock_path() -> Result<PathBuf> {
 }
 
 fn model_path() -> Result<PathBuf> {
-    Ok(live_dir()?.join("model.onnx"))
+    Ok(live_dir()?.join("model_quantized.onnx"))
 }
 
 fn tokenizer_path() -> Result<PathBuf> {
@@ -2202,51 +2155,7 @@ fn direct_doc_id_from_query(query: &str) -> Option<String> {
         .map(|m| m.as_str().trim_end_matches('.').to_string())
 }
 
-fn act_prefix_for_query(query: &str) -> Option<&'static str> {
-    let compact: String = query
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .collect();
-    if compact.contains("itaa1997")
-        || compact.contains("itaa97")
-        || compact.contains("incometaxassessmentact1997")
-    {
-        Some("PAC/19970038")
-    } else if compact.contains("itaa1936")
-        || compact.contains("itaa36")
-        || compact.contains("incometaxassessmentact1936")
-    {
-        Some("PAC/19360027")
-    } else if compact.contains("fbtaa") || compact.contains("fringebenefitstaxassessmentact1986") {
-        Some("PAC/19860039")
-    } else if compact.contains("gstact")
-        || compact.contains("antsagst")
-        || compact.contains("newtaxsystemgoodsandservicestaxact1999")
-    {
-        Some("PAC/19990055")
-    } else if compact.contains("tasa") || compact.contains("taxagentservicesact2009") {
-        Some("PAC/20090013")
-    } else {
-        None
-    }
-}
-
-fn section_from_query(query: &str) -> Option<String> {
-    let explicit = Regex::new(
-        r"(?i)\b(?:s|sec|section)\.?\s*([0-9]{1,4}[A-Z]?(?:-[0-9]{1,4}[A-Z]?)?(?:\([0-9A-Za-z]+\))?)\b",
-    )
-    .expect("valid regex");
-    if let Some(cap) = explicit.captures(query) {
-        return Some(cap.get(1)?.as_str().to_string());
-    }
-    let bare = Regex::new(r"(?i)\b([0-9]{1,4}[A-Z]?-[0-9]{1,4}[A-Z]?(?:\([0-9A-Za-z]+\))?)\b")
-        .expect("valid regex");
-    bare.captures(query)
-        .and_then(|cap| cap.get(1).map(|m| m.as_str().to_string()))
-}
-
-fn exact_title_hits(
+fn direct_title_hits(
     conn: &Connection,
     query: &str,
     k: usize,
@@ -2255,29 +2164,6 @@ fn exact_title_hits(
     let mut doc_ids = Vec::new();
     if let Some(doc_id) = direct_doc_id_from_query(query) {
         doc_ids.push(doc_id);
-    }
-    if let Some(section) = section_from_query(query) {
-        if let Some(prefix) = act_prefix_for_query(query) {
-            doc_ids.push(format!("{prefix}/{section}"));
-        } else {
-            let where_filter = if filter.sql.is_empty() {
-                String::new()
-            } else {
-                format!(" AND {}", filter.sql)
-            };
-            let sql = format!(
-                "SELECT d.doc_id FROM documents d WHERE d.doc_id LIKE ? ESCAPE '\\' {where_filter} ORDER BY d.doc_id LIMIT ?"
-            );
-            let mut params_vec = vec![Value::Text(format!("%/{}", glob_to_like(&section)))];
-            params_vec.extend(filter.params.clone());
-            params_vec.push(Value::Integer(k as i64));
-            let mut stmt = conn.prepare(&sql)?;
-            for row in
-                stmt.query_map(params_from_iter(params_vec), |row| row.get::<_, String>(0))?
-            {
-                doc_ids.push(row?);
-            }
-        }
     }
 
     let mut hits = Vec::new();
@@ -2355,7 +2241,7 @@ fn search_titles(
     let conn = open_read()?;
     let k = k.clamp(1, 100);
     let filter = build_doc_filter("d", types, None, None, None, include_old, current_only);
-    let exact_hits = exact_title_hits(&conn, query, k, &filter)?;
+    let direct_hits = direct_title_hits(&conn, query, k, &filter)?;
     let where_filter = if filter.sql.is_empty() {
         String::new()
     } else {
@@ -2381,10 +2267,6 @@ fn search_titles(
     let mut rows = match stmt.query_map(params_from_iter(params_vec), |row| {
         let doc_id: String = row.get("doc_id")?;
         let title: String = row.get("title")?;
-        let mut score = row.get::<_, f64>("score").ok();
-        if title_matches_normalized_query(&title, query) {
-            score = score.map(|s| s - 1000.0);
-        }
         Ok(Hit {
             canonical_url: canonical_url(&doc_id),
             doc_id: doc_id.clone(),
@@ -2394,7 +2276,7 @@ fn search_titles(
             heading_path: String::new(),
             anchor: None,
             snippet: title,
-            score,
+            score: row.get::<_, f64>("score").ok(),
             chunk_id: None,
             ord: None,
             next_call: Some(format!(
@@ -2411,14 +2293,15 @@ fn search_titles(
         Err(rusqlite::Error::SqliteFailure(_, _)) => Vec::new(),
         Err(err) => return Err(err.into()),
     };
-    let exact_doc_ids: HashSet<String> = exact_hits.iter().map(|hit| hit.doc_id.clone()).collect();
-    rows.retain(|hit| !exact_doc_ids.contains(&hit.doc_id));
+    let direct_doc_ids: HashSet<String> =
+        direct_hits.iter().map(|hit| hit.doc_id.clone()).collect();
+    rows.retain(|hit| !direct_doc_ids.contains(&hit.doc_id));
     rows.sort_by(|a, b| {
         a.score
             .partial_cmp(&b.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    rows.splice(0..0, exact_hits);
+    rows.splice(0..0, direct_hits);
     let truncated = rows.len() > k;
     rows.truncate(k);
     match format {
@@ -2437,19 +2320,6 @@ fn search_titles(
         }))?),
         OutputFormat::Markdown => Ok(format_hits_markdown(&rows)),
     }
-}
-
-fn title_matches_normalized_query(title: &str, query: &str) -> bool {
-    let q = normalize_alnum(query);
-    q.len() >= 4 && normalize_alnum(title).contains(&q)
-}
-
-fn normalize_alnum(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .flat_map(|ch| ch.to_lowercase())
-        .collect()
 }
 
 #[derive(Serialize)]
@@ -2824,9 +2694,7 @@ fn format_document_markdown(
 
 struct GetDefinitionOptions<'a> {
     context_doc_id: Option<&'a str>,
-    context_act: Option<&'a str>,
     max_defs: usize,
-    ordinary_meaning_fallback: bool,
     format: OutputFormat,
 }
 
@@ -2852,11 +2720,18 @@ struct DefinitionHit {
     source: DefinitionSource,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
+struct OrdinaryDefinition {
+    part_of_speech: Option<String>,
+    definition: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
 struct OrdinaryMeaningHit {
     term: String,
-    definition: String,
+    kind: String,
     source: String,
+    definitions: Vec<OrdinaryDefinition>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2865,6 +2740,8 @@ struct DictionaryEntry {
     definition: String,
     #[serde(default)]
     source: Option<String>,
+    #[serde(default)]
+    part_of_speech: Option<String>,
 }
 
 fn normalize_definition_term(term: &str) -> String {
@@ -2879,10 +2756,7 @@ fn normalize_definition_term(term: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn context_prefix(context_doc_id: Option<&str>, context_act: Option<&str>) -> Option<String> {
-    if let Some(act) = context_act.and_then(act_prefix_for_query) {
-        return Some(act.to_string());
-    }
+fn context_prefix(context_doc_id: Option<&str>) -> Option<String> {
     let doc_id = context_doc_id?;
     let mut parts = doc_id.split('/');
     let first = parts.next()?;
@@ -2901,7 +2775,7 @@ fn definition_rank(hit: &DefinitionHit, opts: &GetDefinitionOptions<'_>) -> usiz
     {
         return 0;
     }
-    if let Some(prefix) = context_prefix(opts.context_doc_id, opts.context_act) {
+    if let Some(prefix) = context_prefix(opts.context_doc_id) {
         if hit.source.doc_id.starts_with(&(prefix + "/")) {
             return 1;
         }
@@ -2912,14 +2786,8 @@ fn definition_rank(hit: &DefinitionHit, opts: &GetDefinitionOptions<'_>) -> usiz
 fn get_definition(term: &str, opts: GetDefinitionOptions<'_>) -> Result<String> {
     let conn = open_read()?;
     if !table_exists(&conn, "definitions")? {
-        return format_definition_response(
-            term,
-            &[],
-            None,
-            false,
-            opts.ordinary_meaning_fallback,
-            opts.format,
-        );
+        let (ordinary, ordinary_error) = ordinary_meaning_or_error(term);
+        return format_definition_response(term, &[], ordinary, ordinary_error, false, opts.format);
     }
     let norm = normalize_definition_term(term);
     let max_defs = opts.max_defs.clamp(1, 20);
@@ -2960,77 +2828,253 @@ fn get_definition(term: &str, opts: GetDefinitionOptions<'_>) -> Result<String> 
     hits.retain(|hit| seen.insert((hit.source.doc_id.clone(), hit.body.clone())));
     hits.sort_by_key(|hit| definition_rank(hit, &opts));
     hits.truncate(max_defs);
-    let ordinary = if hits.is_empty() && opts.ordinary_meaning_fallback {
-        lookup_ordinary_meaning(term)?
+    let (ordinary, ordinary_error) = if hits.is_empty() {
+        ordinary_meaning_or_error(term)
     } else {
-        None
+        (None, None)
     };
-    format_definition_response(
-        term,
-        &hits,
-        ordinary,
-        true,
-        opts.ordinary_meaning_fallback,
-        opts.format,
-    )
+    format_definition_response(term, &hits, ordinary, ordinary_error, true, opts.format)
+}
+
+fn ordinary_meaning_or_error(term: &str) -> (Option<OrdinaryMeaningHit>, Option<String>) {
+    match lookup_ordinary_meaning(term) {
+        Ok(hit) => (hit, None),
+        Err(err) => (None, Some(err.to_string())),
+    }
+}
+
+fn ordinary_dictionary_dir() -> Result<PathBuf> {
+    let path = data_dir()?.join("ordinary-meaning");
+    fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
+fn ordinary_dictionary_index_path() -> Result<PathBuf> {
+    Ok(ordinary_dictionary_dir()?.join("open-english-wordnet-2024.tsv"))
 }
 
 fn lookup_ordinary_meaning(term: &str) -> Result<Option<OrdinaryMeaningHit>> {
-    let Some(path) = std::env::var_os("ATO_MCP_DICTIONARY_PATH") else {
-        return Ok(None);
+    if let Some(path) = std::env::var_os(ORDINARY_DICTIONARY_PATH_ENV) {
+        let path = PathBuf::from(path);
+        let source = path.display().to_string();
+        return lookup_ordinary_meaning_file(&path, &source, term);
+    }
+    let path = ensure_oewn_ordinary_dictionary()?;
+    lookup_ordinary_meaning_file(&path, OEWN_2024_SOURCE, term)
+}
+
+fn ensure_oewn_ordinary_dictionary() -> Result<PathBuf> {
+    let index_path = ordinary_dictionary_index_path()?;
+    if index_path.exists() {
+        return Ok(index_path);
+    }
+    let context = UrlContext {
+        manifest_dir: None,
+        manifest_base_url: None,
     };
-    let path = PathBuf::from(path);
-    let raw = fs::read_to_string(&path)
+    let zip_bytes = fetch_bytes(OEWN_2024_URL, &context)
+        .with_context(|| format!("fetching ordinary-meaning source from {OEWN_2024_URL}"))?;
+    let index = build_oewn_dictionary_index(&zip_bytes)?;
+    let tmp_path = index_path.with_extension("tsv.tmp");
+    fs::write(&tmp_path, index)?;
+    fs::rename(&tmp_path, &index_path)?;
+    Ok(index_path)
+}
+
+fn build_oewn_dictionary_index(zip_bytes: &[u8]) -> Result<String> {
+    let mut archive = ZipArchive::new(Cursor::new(zip_bytes))?;
+    let mut rows = Vec::new();
+    for (suffix, part_of_speech) in [
+        ("data.noun", "noun"),
+        ("data.verb", "verb"),
+        ("data.adj", "adjective"),
+        ("data.adv", "adverb"),
+    ] {
+        let content = read_zip_member_by_suffix(&mut archive, suffix)?;
+        parse_oewn_data_file(&content, part_of_speech, &mut rows);
+    }
+    rows.sort();
+    rows.dedup();
+    Ok(rows.join("\n") + "\n")
+}
+
+fn read_zip_member_by_suffix(
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    suffix: &str,
+) -> Result<String> {
+    for idx in 0..archive.len() {
+        let mut file = archive.by_index(idx)?;
+        if file.name().ends_with(suffix) {
+            let mut content = String::new();
+            file.read_to_string(&mut content)?;
+            return Ok(content);
+        }
+    }
+    bail!("ordinary-meaning source is missing {suffix}")
+}
+
+fn parse_oewn_data_file(content: &str, part_of_speech: &str, rows: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    for line in content.lines() {
+        if !line
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_digit())
+        {
+            continue;
+        }
+        let Some((record, gloss)) = line.split_once('|') else {
+            continue;
+        };
+        let mut fields = record.split_whitespace();
+        let _offset = fields.next();
+        let _lex_filenum = fields.next();
+        let _ss_type = fields.next();
+        let Some(word_count_hex) = fields.next() else {
+            continue;
+        };
+        let Ok(word_count) = usize::from_str_radix(word_count_hex, 16) else {
+            continue;
+        };
+        let definition = clean_ordinary_field(gloss);
+        if definition.is_empty() {
+            continue;
+        }
+        for _ in 0..word_count {
+            let Some(raw_word) = fields.next() else {
+                break;
+            };
+            let _lex_id = fields.next();
+            let term = raw_word.replace('_', " ");
+            let norm = normalize_definition_term(&term);
+            if norm.is_empty() || !seen.insert((norm.clone(), definition.clone())) {
+                continue;
+            }
+            rows.push(format!(
+                "{}\t{}\t{}\t{}",
+                clean_ordinary_field(&norm),
+                clean_ordinary_field(&term),
+                part_of_speech,
+                definition
+            ));
+        }
+    }
+}
+
+fn clean_ordinary_field(value: &str) -> String {
+    value
+        .replace(['\t', '\r', '\n'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches('"')
+        .to_string()
+}
+
+fn lookup_ordinary_meaning_file(
+    path: &Path,
+    source: &str,
+    term: &str,
+) -> Result<Option<OrdinaryMeaningHit>> {
+    let raw = fs::read_to_string(path)
         .with_context(|| format!("reading ordinary-meaning dictionary {}", path.display()))?;
     let wanted = normalize_definition_term(term);
     if let Ok(entries) = serde_json::from_str::<Vec<DictionaryEntry>>(&raw) {
-        for entry in entries {
-            if normalize_definition_term(&entry.term) == wanted {
-                return Ok(Some(OrdinaryMeaningHit {
-                    term: entry.term,
-                    definition: entry.definition,
-                    source: entry.source.unwrap_or_else(|| path.display().to_string()),
-                }));
-            }
-        }
-        return Ok(None);
+        return Ok(ordinary_from_dictionary_entries(entries, &wanted, source));
     }
+    let mut jsonl_entries = Vec::new();
+    let mut saw_jsonl = false;
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
         if let Ok(entry) = serde_json::from_str::<DictionaryEntry>(line) {
-            if normalize_definition_term(&entry.term) == wanted {
-                return Ok(Some(OrdinaryMeaningHit {
-                    term: entry.term,
-                    definition: entry.definition,
-                    source: entry.source.unwrap_or_else(|| path.display().to_string()),
-                }));
-            }
-        } else {
-            let parts: Vec<&str> = line.splitn(3, '\t').collect();
-            if parts.len() >= 2 && normalize_definition_term(parts[0]) == wanted {
-                return Ok(Some(OrdinaryMeaningHit {
-                    term: parts[0].to_string(),
-                    definition: parts[1].to_string(),
-                    source: parts
-                        .get(2)
-                        .map(|s| (*s).to_string())
-                        .unwrap_or_else(|| path.display().to_string()),
-                }));
-            }
+            saw_jsonl = true;
+            jsonl_entries.push(entry);
         }
     }
-    Ok(None)
+    if saw_jsonl {
+        return Ok(ordinary_from_dictionary_entries(
+            jsonl_entries,
+            &wanted,
+            source,
+        ));
+    }
+    ordinary_from_tsv(&raw, &wanted, source)
+}
+
+fn ordinary_from_dictionary_entries(
+    entries: Vec<DictionaryEntry>,
+    wanted: &str,
+    default_source: &str,
+) -> Option<OrdinaryMeaningHit> {
+    let mut definitions = Vec::new();
+    let mut source = default_source.to_string();
+    for entry in entries {
+        if normalize_definition_term(&entry.term) != wanted {
+            continue;
+        }
+        if let Some(entry_source) = entry.source {
+            source = entry_source;
+        }
+        definitions.push(OrdinaryDefinition {
+            part_of_speech: entry.part_of_speech,
+            definition: entry.definition,
+        });
+        if definitions.len() >= 5 {
+            break;
+        }
+    }
+    if definitions.is_empty() {
+        None
+    } else {
+        Some(OrdinaryMeaningHit {
+            term: wanted.to_string(),
+            kind: "ordinary".to_string(),
+            source,
+            definitions,
+        })
+    }
+}
+
+fn ordinary_from_tsv(raw: &str, wanted: &str, source: &str) -> Result<Option<OrdinaryMeaningHit>> {
+    let mut definitions = Vec::new();
+    for line in raw.lines() {
+        let parts: Vec<&str> = line.splitn(4, '\t').collect();
+        if parts.len() == 4 && parts[0] == wanted {
+            definitions.push(OrdinaryDefinition {
+                part_of_speech: Some(parts[2].to_string()),
+                definition: parts[3].to_string(),
+            });
+        } else if parts.len() >= 2 && normalize_definition_term(parts[0]) == wanted {
+            definitions.push(OrdinaryDefinition {
+                part_of_speech: None,
+                definition: parts[1].to_string(),
+            });
+        }
+        if definitions.len() >= 5 {
+            break;
+        }
+    }
+    if definitions.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(OrdinaryMeaningHit {
+            term: wanted.to_string(),
+            kind: "ordinary".to_string(),
+            source: source.to_string(),
+            definitions,
+        }))
+    }
 }
 
 fn format_definition_response(
     term: &str,
     hits: &[DefinitionHit],
     ordinary: Option<OrdinaryMeaningHit>,
+    ordinary_error: Option<String>,
     definition_index_available: bool,
-    ordinary_meaning_requested: bool,
     format: OutputFormat,
 ) -> Result<String> {
     let statutory_found = !hits.is_empty();
@@ -3042,8 +3086,7 @@ fn format_definition_response(
             "ordinary_meaning": ordinary,
             "meta": {
                 "definition_index_available": definition_index_available,
-                "ordinary_meaning_requested": ordinary_meaning_requested,
-                "ordinary_meaning_source_configured": std::env::var_os("ATO_MCP_DICTIONARY_PATH").is_some(),
+                "ordinary_meaning_error": ordinary_error,
             }
         }))?),
         OutputFormat::Markdown => {
@@ -3068,159 +3111,32 @@ fn format_definition_response(
                 );
             }
             if let Some(hit) = ordinary {
+                let mut out = format!(
+                    "**{}** (ordinary meaning; non-statutory)\n\n",
+                    escape_md(&hit.term)
+                );
+                for definition in hit.definitions {
+                    let prefix = definition
+                        .part_of_speech
+                        .map(|pos| format!("{}: ", escape_md(&pos)))
+                        .unwrap_or_default();
+                    out.push_str(&format!(
+                        "- {}{}\n",
+                        prefix,
+                        escape_md(&definition.definition)
+                    ));
+                }
+                out.push_str(&format!("\nSource: {}", escape_md(&hit.source)));
+                return Ok(out);
+            }
+            if let Some(err) = ordinary_error {
                 return Ok(format!(
-                    "**{}** (ordinary meaning; non-statutory)\n\n{}\n\nSource: {}",
-                    escape_md(&hit.term),
-                    hit.definition,
-                    escape_md(&hit.source)
+                    "_No statutory definition found. Ordinary-meaning source unavailable: {}_",
+                    escape_md(&err)
                 ));
             }
-            if ordinary_meaning_requested && std::env::var_os("ATO_MCP_DICTIONARY_PATH").is_none() {
-                Ok("_No statutory definition found. Ordinary-meaning fallback requested, but ATO_MCP_DICTIONARY_PATH is not configured._".to_string())
-            } else {
-                Ok("_No statutory definition found._".to_string())
-            }
+            Ok("_No statutory definition found._".to_string())
         }
-    }
-}
-
-fn whats_new(
-    since: Option<&str>,
-    before: Option<&str>,
-    limit: usize,
-    types: Option<&[String]>,
-    current_only: bool,
-    format: OutputFormat,
-) -> Result<String> {
-    // [MT-15] whats_new sorts by COALESCE(date, downloaded_at) and labels published vs ingested.
-    let conn = open_read()?;
-    let mut clauses = Vec::new();
-    let mut params_out = Vec::new();
-    let sort_expr = "COALESCE(date, downloaded_at)";
-    if let Some(since) = since {
-        clauses.push(format!("{sort_expr} >= ?"));
-        params_out.push(Value::Text(since.to_string()));
-    }
-    if let Some(before) = before {
-        clauses.push(format!("{sort_expr} < ?"));
-        params_out.push(Value::Text(before.to_string()));
-    }
-    if let Some(types) = types {
-        if !types.is_empty() {
-            let mut ors = Vec::new();
-            for t in types {
-                if t.contains('*') {
-                    ors.push("type LIKE ? ESCAPE '\\'".to_string());
-                    params_out.push(Value::Text(glob_to_like(t)));
-                } else {
-                    ors.push("type = ?".to_string());
-                    params_out.push(Value::Text(t.clone()));
-                }
-            }
-            clauses.push(format!("({})", ors.join(" OR ")));
-        }
-    } else {
-        let placeholders = vec!["?"; DEFAULT_EXCLUDED_TYPES.len()].join(",");
-        clauses.push(format!("type NOT IN ({placeholders})"));
-        for t in DEFAULT_EXCLUDED_TYPES {
-            params_out.push(Value::Text((*t).to_string()));
-        }
-    }
-    if current_only {
-        // W2.4: drop withdrawn rulings by default — see SearchOptions.
-        clauses.push("withdrawn_date IS NULL".to_string());
-    }
-    let where_sql = if clauses.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", clauses.join(" AND "))
-    };
-    let limit = limit.clamp(1, 500);
-    params_out.push(Value::Integer(limit as i64 + 1));
-    let sql = format!(
-        "SELECT doc_id, type, title, date, downloaded_at, \
-                withdrawn_date, superseded_by, replaces \
-         FROM documents {where_sql} ORDER BY {sort_expr} DESC LIMIT ?"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let mut hits = stmt
-        .query_map(params_from_iter(params_out), |row| {
-            let doc_id: String = row.get("doc_id")?;
-            let date: Option<String> = row.get("date")?;
-            let downloaded_at: String = row.get("downloaded_at")?;
-            Ok(Hit {
-                canonical_url: canonical_url(&doc_id),
-                doc_id: doc_id.clone(),
-                title: row.get("title")?,
-                doc_type: row.get("type")?,
-                date: date.clone(),
-                heading_path: String::new(),
-                anchor: None,
-                snippet: if let Some(date) = date {
-                    format!("published {}", date)
-                } else {
-                    format!("ingested {}", downloaded_at)
-                },
-                score: None,
-                chunk_id: None,
-                ord: None,
-                next_call: Some(format!(
-                    "get_document(doc_id=\"{doc_id}\", format=\"card\")"
-                )),
-                ranking: None,
-                withdrawn_date: row.get("withdrawn_date")?,
-                superseded_by: row.get("superseded_by")?,
-                replaces: row.get("replaces")?,
-                reranker_score: None,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let truncated = hits.len() > limit;
-    if truncated {
-        hits.truncate(limit);
-    }
-    let next_before = hits
-        .last()
-        .and_then(|hit| hit.date.as_deref())
-        .map(|date| date.to_string());
-    let next_call = if truncated {
-        next_before.as_ref().map(|date| {
-            let mut args = vec![
-                format!("before={}", mcp_string(date)),
-                format!("limit={limit}"),
-            ];
-            if let Some(since) = since {
-                args.push(format!("since={}", mcp_string(since)));
-            }
-            if let Some(types) = types {
-                let rendered = types
-                    .iter()
-                    .map(|value| mcp_string(value))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                args.push(format!("types=[{rendered}]"));
-            }
-            if !current_only {
-                args.push("current_only=false".to_string());
-            }
-            format!("whats_new({})", args.join(", "))
-        })
-    } else {
-        None
-    };
-    match format {
-        OutputFormat::Json => Ok(serde_json::to_string_pretty(&json!({
-            "since": since,
-            "before": before,
-            "hits": hits,
-            "meta": {
-                "returned": hits.len(),
-                "truncated": truncated,
-                "returned_chars": hits.iter().map(|hit| hit.snippet.len()).sum::<usize>(),
-                "next_call": next_call,
-            },
-        }))?),
-        OutputFormat::Markdown => Ok(format_hits_markdown(&hits)),
     }
 }
 
@@ -4275,7 +4191,6 @@ fn ensure_model(manifest: &Manifest, context: &UrlContext, staging: &Path) -> Re
             fs::rename(entry.path(), live_dir()?.join(entry.file_name()))?;
         }
     }
-    ensure_model_alias()?;
     fs::write(marker, marker_value)?;
     let _ = fs::remove_file(bundle);
     let _ = fs::remove_dir_all(extract_dir);
@@ -4306,22 +4221,6 @@ fn install_hf_embedding_model(repo: &str, revision: &str, staging: &Path) -> Res
         }
         fs::rename(&part, dest)?;
     }
-    ensure_model_alias()
-}
-
-fn ensure_model_alias() -> Result<()> {
-    let model_link = live_dir()?.join("model.onnx");
-    let quantized = live_dir()?.join("model_quantized.onnx");
-    if !quantized.exists() {
-        bail!("model_quantized.onnx missing after model install");
-    }
-    if model_link.exists() {
-        fs::remove_file(&model_link)?;
-    }
-    #[cfg(unix)]
-    std::os::unix::fs::symlink("model_quantized.onnx", &model_link)?;
-    #[cfg(not(unix))]
-    fs::copy(&quantized, &model_link)?;
     Ok(())
 }
 
@@ -4331,8 +4230,8 @@ fn ensure_model_alias() -> Result<()> {
 /// if the local files match the manifest's sha256 we skip the download.
 ///
 /// Two download shapes are accepted:
-///   1. `hf://owner/repo[@revision]` — fetch `model.onnx` + `tokenizer.json`
-///      from the Hugging Face mirror, sha-verify the model.
+///   1. `hf://owner/repo[@revision]` — fetch `onnx/model_quantized.onnx` +
+///      `tokenizer.json` from the Hugging Face mirror, sha-verify the model.
 ///   2. Any other URL — treated as a tar.zst bundle (the EmbeddingGemma
 ///      pattern). The bundle MUST contain `reranker.onnx` AND
 ///      `reranker_tokenizer.json` at the archive root. The bundle's
@@ -4404,14 +4303,6 @@ fn ensure_reranker(manifest: &Manifest, context: &UrlContext, staging: &Path) ->
 
 fn install_hf_reranker(repo: &str, revision: &str, info: &ModelInfo, staging: &Path) -> Result<()> {
     fs::create_dir_all(staging)?;
-    // Different `optimum-cli` revisions emit different filenames for the
-    // int8 export (`onnx/model.onnx`, `onnx/model_quantized.onnx`,
-    // `model_quantized.onnx`, `model.onnx`). Try each in order; the first
-    // candidate that downloads AND matches the manifest's sha256 wins.
-    // Without sha-mismatch as a retry signal, a successful download of the
-    // wrong file would fail fatally even though the right file exists at a
-    // sibling URL — that would have broken every first-time reranker
-    // install on launch day.
     let model_part = download_hf_reranker_model(repo, revision, info, staging)?;
     let tokenizer_part = staging.join("reranker_tokenizer.json.part");
     let tokenizer_url = hf_resolve_url(repo, revision, "tokenizer.json");
@@ -4461,36 +4352,16 @@ where
 {
     fs::create_dir_all(staging)?;
     let model_part = staging.join("reranker.onnx.part");
-    let mut downloaded = false;
-    let mut errors: Vec<String> = Vec::new();
-    for candidate in RERANKER_MODEL_CANDIDATES {
-        let url = hf_resolve_url(repo, revision, candidate);
-        match fetch(&url, &model_part) {
-            Ok(_) => {
-                if info.sha256.is_empty() {
-                    // Bundle-style reranker manifests may verify the archive
-                    // rather than the extracted ONNX; accept the first model
-                    // candidate in that case.
-                    downloaded = true;
-                    break;
-                }
-                match verify_sha256_file(&model_part, &info.sha256) {
-                    Ok(_) => {
-                        downloaded = true;
-                        break;
-                    }
-                    Err(err) => errors.push(format!("{candidate}: {err}")),
-                }
-            }
-            Err(err) => errors.push(format!("{candidate}: {err}")),
-        }
-    }
-    if !downloaded {
+    let url = hf_resolve_url(repo, revision, RERANKER_HF_MODEL_PATH);
+    if let Err(err) = fetch(&url, &model_part) {
         let _ = fs::remove_file(&model_part);
-        bail!(
-            "no reranker model variant matched manifest sha256 for {repo}; tried: {}",
-            errors.join("; ")
-        );
+        bail!("downloading reranker model {RERANKER_HF_MODEL_PATH} from {repo}: {err}");
+    }
+    if !info.sha256.is_empty() {
+        if let Err(err) = verify_sha256_file(&model_part, &info.sha256) {
+            let _ = fs::remove_file(&model_part);
+            bail!("verifying reranker model {RERANKER_HF_MODEL_PATH} from {repo}: {err}");
+        }
     }
     Ok(model_part)
 }
@@ -4880,26 +4751,12 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
                 term,
                 GetDefinitionOptions {
                     context_doc_id: args.get("context_doc_id").and_then(|v| v.as_str()),
-                    context_act: args.get("context_act").and_then(|v| v.as_str()),
                     max_defs: optional_usize(&args, "max_defs").unwrap_or(5),
-                    ordinary_meaning_fallback: optional_bool(&args, "ordinary_meaning_fallback")
-                        .unwrap_or(false),
                     format: output_format_arg(&args),
                 },
             )?
         }
         "verify_quote" => verify_quote_mcp(&args)?,
-        "whats_new" => {
-            let types = optional_string_array(&args, "types")?;
-            whats_new(
-                args.get("since").and_then(|v| v.as_str()),
-                args.get("before").and_then(|v| v.as_str()),
-                optional_usize(&args, "limit").unwrap_or(50),
-                types.as_deref(),
-                optional_bool(&args, "current_only").unwrap_or(true),
-                output_format_arg(&args),
-            )?
-        }
         "stats" => stats(output_format_arg(&args))?,
         _ => bail!("unknown tool: {name}"),
     };
@@ -5516,7 +5373,7 @@ fn format_verify_quote_markdown(matches: &[QuoteMatch], found: bool, truncated: 
 }
 
 fn tool_descriptors() -> JsonValue {
-    // [SW-01] Tool surface is deliberately limited to eight explicit MCP tools.
+    // [SW-01] Tool surface is deliberately limited to six explicit MCP tools.
     json!([
         {
             "name": "search",
@@ -5541,7 +5398,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "search_titles",
-            "description": "Fast title-only search for citations, section numbers, and case names.",
+            "description": "Fast title-only search, with exact doc_id and ATO document-link lookup.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5590,15 +5447,13 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_definition",
-            "description": "Fetch compact statutory definitions for a term. Returns only matching definition entries, not whole dictionary provisions. Optional ordinary-meaning fallback is non-statutory and requires ATO_MCP_DICTIONARY_PATH.",
+            "description": "Fetch compact statutory definitions for a term. Returns only matching definition entries, not whole dictionary provisions. If no statutory definition is found, returns a labelled non-statutory ordinary meaning from the configured dictionary source or Open English WordNet.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "term": {"type": "string"},
                     "context_doc_id": {"type": "string"},
-                    "context_act": {"type": "string"},
                     "max_defs": {"type": "integer", "minimum": 1, "maximum": 20},
-                    "ordinary_meaning_fallback": {"type": "boolean"},
                     "format": {"type": "string", "enum": ["markdown", "json"]}
                 },
                 "required": ["term"]
@@ -5616,21 +5471,6 @@ fn tool_descriptors() -> JsonValue {
                     "format": {"type": "string", "enum": ["markdown", "json"]}
                 },
                 "required": ["doc_id", "quote"]
-            }
-        },
-        {
-            "name": "whats_new",
-            "description": "Most recently published documents by corpus date.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "since": {"type": "string"},
-                    "before": {"type": "string"},
-                    "limit": {"type": "integer"},
-                    "types": {"type": "array", "items": {"type": "string"}},
-                    "current_only": {"type": "boolean", "description": "When true (default), excludes withdrawn rulings. Set false to include withdrawn material with a visible marker."},
-                    "format": {"type": "string", "enum": ["markdown", "json"]}
-                }
             }
         },
         {
@@ -6803,7 +6643,7 @@ mod tests {
     }
 
     #[test]
-    fn search_titles_resolves_section_citation_alias() -> Result<()> {
+    fn search_titles_prefers_direct_doc_id_hits() -> Result<()> {
         let _lock = TEST_DB_LOCK.lock().unwrap();
         let (dir, _db) = make_test_db()?;
         let conn = open_write_at(&dir.path().join("live/ato.db"))?;
@@ -6819,6 +6659,13 @@ mod tests {
             "UPDATE documents SET type = 'Legislation_and_supporting_material', title = ? WHERE doc_id = ?",
             params!["Income Tax Assessment Act 1997 s 203-50", "PAC/19970038/203-50"],
         )?;
+        conn.execute(
+            "INSERT INTO title_fts(doc_id, title, headings) VALUES (?, ?, '')",
+            params![
+                "PAC/19970038/203-50",
+                "Income Tax Assessment Act 1997 s 203-50"
+            ],
+        )?;
         insert_doc_full(
             &conn,
             "PAC/19970038/8-1",
@@ -6831,11 +6678,21 @@ mod tests {
             "UPDATE documents SET type = 'Legislation_and_supporting_material', title = ? WHERE doc_id = ?",
             params!["Income Tax Assessment Act 1997 s 8-1", "PAC/19970038/8-1"],
         )?;
+        conn.execute(
+            "INSERT INTO title_fts(doc_id, title, headings) VALUES (?, ?, '')",
+            params!["PAC/19970038/8-1", "Income Tax Assessment Act 1997 s 8-1"],
+        )?;
         drop(conn);
 
         with_data_dir(dir.path(), || -> Result<()> {
-            let json_str =
-                search_titles("s 203-50 ITAA97", 5, None, false, true, OutputFormat::Json)?;
+            let json_str = search_titles(
+                "PAC/19970038/203-50",
+                5,
+                None,
+                false,
+                true,
+                OutputFormat::Json,
+            )?;
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
             assert_eq!(parsed["hits"][0]["doc_id"], json!("PAC/19970038/203-50"));
             let json_str = search_titles(
@@ -6887,9 +6744,7 @@ mod tests {
                 "corporate tax gross-up rate",
                 GetDefinitionOptions {
                     context_doc_id: Some("PAC/19970038/203-50"),
-                    context_act: None,
                     max_defs: 5,
-                    ordinary_meaning_fallback: false,
                     format: OutputFormat::Json,
                 },
             )?;
@@ -6906,163 +6761,60 @@ mod tests {
     }
 
     #[test]
-    fn get_definition_reports_unconfigured_ordinary_meaning() -> Result<()> {
+    fn get_definition_falls_back_to_configured_ordinary_dictionary() -> Result<()> {
         let _lock = TEST_DB_LOCK.lock().unwrap();
         let (dir, _db) = make_test_db()?;
-        let prev = std::env::var_os("ATO_MCP_DICTIONARY_PATH");
-        std::env::remove_var("ATO_MCP_DICTIONARY_PATH");
+        let dictionary_path = dir.path().join("ordinary.tsv");
+        fs::write(
+            &dictionary_path,
+            "car\tcar\tnoun\ta road vehicle powered by an engine\n",
+        )?;
+        let prev = std::env::var_os(ORDINARY_DICTIONARY_PATH_ENV);
+        std::env::set_var(ORDINARY_DICTIONARY_PATH_ENV, &dictionary_path);
 
         let result = with_data_dir(dir.path(), || -> Result<String> {
             get_definition(
-                "not a statutory term",
+                "car",
                 GetDefinitionOptions {
                     context_doc_id: None,
-                    context_act: None,
                     max_defs: 5,
-                    ordinary_meaning_fallback: true,
-                    format: OutputFormat::Markdown,
+                    format: OutputFormat::Json,
                 },
             )
         });
 
         if let Some(value) = prev {
-            std::env::set_var("ATO_MCP_DICTIONARY_PATH", value);
+            std::env::set_var(ORDINARY_DICTIONARY_PATH_ENV, value);
+        } else {
+            std::env::remove_var(ORDINARY_DICTIONARY_PATH_ENV);
         }
-        let md = result?;
-        assert!(md.contains("ATO_MCP_DICTIONARY_PATH is not configured"));
-        Ok(())
-    }
-
-    // ----- W2.4 integration: whats_new also honours current_only ---------
-    //
-    // `whats_new` builds its WHERE clause inline rather than going through
-    // `build_doc_filter` (its sort key and pagination shape are different),
-    // so the `withdrawn_date IS NULL` clause is duplicated. This test makes
-    // sure the duplication doesn't drift.
-
-    #[test]
-    fn whats_new_excludes_withdrawn_by_default_and_surfaces_them_when_off() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
-        // Two docs published in the same recent window. Only one is current.
-        insert_doc_full(
-            &conn,
-            "DOC_NEW_CURRENT",
-            Some("2026-04-01"),
-            None,
-            None,
-            None,
-        )?;
-        insert_doc_full(
-            &conn,
-            "DOC_NEW_WITHDRAWN",
-            Some("2026-04-15"),
-            Some("2026-04-20"),
-            Some("TR 2026/X"),
-            None,
-        )?;
-        drop(conn);
-
-        with_data_dir(dir.path(), || -> Result<()> {
-            // Default: current_only=true → withdrawn doc dropped.
-            let json_str = whats_new(
-                Some("2026-01-01"),
-                None,
-                10,
-                None,
-                true, // current_only
-                OutputFormat::Json,
-            )?;
-            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-            let doc_ids: Vec<&str> = parsed["hits"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|h| h["doc_id"].as_str().unwrap())
-                .collect();
-            assert!(
-                doc_ids.contains(&"DOC_NEW_CURRENT"),
-                "current doc should appear; got: {doc_ids:?}"
-            );
-            assert!(
-                !doc_ids.contains(&"DOC_NEW_WITHDRAWN"),
-                "withdrawn doc must be filtered out by default; got: {doc_ids:?}"
-            );
-
-            // current_only=false → both docs returned, withdrawn one carries
-            // its withdrawn_date marker through the JSON shape.
-            let json_str = whats_new(
-                Some("2026-01-01"),
-                None,
-                10,
-                None,
-                false, // current_only off
-                OutputFormat::Json,
-            )?;
-            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-            let hits = parsed["hits"].as_array().unwrap();
-            let doc_ids: Vec<&str> = hits.iter().map(|h| h["doc_id"].as_str().unwrap()).collect();
-            assert!(
-                doc_ids.contains(&"DOC_NEW_CURRENT"),
-                "current doc should still appear; got: {doc_ids:?}"
-            );
-            let withdrawn_hit = hits
-                .iter()
-                .find(|h| h["doc_id"].as_str() == Some("DOC_NEW_WITHDRAWN"))
-                .expect("withdrawn doc should appear when current_only=false");
-            assert_eq!(
-                withdrawn_hit["withdrawn_date"],
-                json!("2026-04-20"),
-                "withdrawn_date must surface in the Hit JSON when filter is off"
-            );
-            assert_eq!(withdrawn_hit["superseded_by"], json!("TR 2026/X"));
-            Ok(())
-        })?;
+        let parsed: serde_json::Value = serde_json::from_str(&result?)?;
+        assert_eq!(parsed["statutory_definition_found"], json!(false));
+        assert_eq!(parsed["ordinary_meaning"]["kind"], json!("ordinary"));
+        assert_eq!(
+            parsed["ordinary_meaning"]["definitions"][0]["definition"],
+            json!("a road vehicle powered by an engine")
+        );
         Ok(())
     }
 
     #[test]
-    fn whats_new_next_call_preserves_current_only_false() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
-        insert_doc_full(
-            &conn,
-            "DOC_PAGE_1",
-            Some("2026-04-20"),
-            Some("2026-04-25"),
-            None,
-            None,
-        )?;
-        insert_doc_full(
-            &conn,
-            "DOC_PAGE_2",
-            Some("2026-04-19"),
-            Some("2026-04-24"),
-            None,
-            None,
-        )?;
-        drop(conn);
-
-        with_data_dir(dir.path(), || -> Result<()> {
-            let json_str = whats_new(Some("2026-01-01"), None, 1, None, false, OutputFormat::Json)?;
-            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-            let next_call = parsed["meta"]["next_call"]
-                .as_str()
-                .expect("truncated whats_new should emit next_call");
-            assert!(
-                next_call.contains("current_only=false"),
-                "continuation must preserve withdrawn-doc inclusion; got: {next_call}"
-            );
-            Ok(())
-        })?;
-        Ok(())
+    fn parse_oewn_data_file_builds_ordinary_rows() {
+        let mut rows = Vec::new();
+        parse_oewn_data_file(
+            "00001740 03 n 02 car 0 motor_vehicle 0 001 @ 00001930 n 0000 | a road vehicle powered by an engine\n",
+            "noun",
+            &mut rows,
+        );
+        assert!(rows.contains(&"car\tcar\tnoun\ta road vehicle powered by an engine".to_string()));
+        assert!(rows.contains(
+            &"motor vehicle\tmotor vehicle\tnoun\ta road vehicle powered by an engine".to_string()
+        ));
     }
 
     // ----- C1 regression: currency fields survive insert_record -------------
     //
-    // The Wave 2 currency-filter tests (search_titles + whats_new) used the
+    // Earlier currency-filter tests used the
     // manual `insert_doc_full` seeder, which writes `withdrawn_date` /
     // `superseded_by` / `replaces` directly. The production code path is
     // `apply_update_locked → insert_docs_from_packs → read_record_from_pack_bytes
@@ -7319,7 +7071,7 @@ mod tests {
             assert_eq!(stats.added, 1);
             assert_eq!(stats.changed, 0);
             assert_eq!(stats.removed, 0);
-            assert!(model_path()?.exists(), "model alias should be installed");
+            assert!(model_path()?.exists(), "model should be installed");
             assert!(tokenizer_path()?.exists(), "tokenizer should be installed");
             assert!(
                 installed_manifest_path()?.exists(),
@@ -7526,7 +7278,6 @@ mod tests {
             )?;
             fs::write(live_dir()?.join("model_quantized.onnx"), b"model")?;
             fs::write(live_dir()?.join("tokenizer.json"), br#"{"version":"1.0"}"#)?;
-            ensure_model_alias()?;
             fs::write(live_dir()?.join(".model.sha256"), model_sha)?;
 
             let stats = apply_update_locked(manifest_path.to_str().expect("utf-8 path"))?;
@@ -7884,7 +7635,7 @@ mod tests {
     }
 
     #[test]
-    fn hf_reranker_download_reports_all_candidate_failures() -> Result<()> {
+    fn hf_reranker_download_reports_model_path_failure() -> Result<()> {
         let dir = tempdir()?;
         let info = ModelInfo {
             id: "rerank-id".to_string(),
@@ -7900,23 +7651,21 @@ mod tests {
             dir.path(),
             |url, _dest| Err(anyhow!("404 for {url}")),
         )
-        .expect_err("all candidates should fail");
+        .expect_err("download should fail");
         let msg = err.to_string();
-        for candidate in RERANKER_MODEL_CANDIDATES {
-            assert!(
-                msg.contains(candidate),
-                "error should include failed candidate {candidate}; got: {msg}"
-            );
-        }
+        assert!(
+            msg.contains(RERANKER_HF_MODEL_PATH),
+            "error should include canonical model path; got: {msg}"
+        );
         assert!(
             !dir.path().join("reranker.onnx.part").exists(),
-            "failed candidate loop should clean partial model file"
+            "failed download should clean partial model file"
         );
         Ok(())
     }
 
     #[test]
-    fn hf_reranker_download_falls_through_sha_mismatch() -> Result<()> {
+    fn hf_reranker_download_rejects_sha_mismatch() -> Result<()> {
         let dir = tempdir()?;
         let expected = b"correct model bytes";
         let info = ModelInfo {
@@ -7927,29 +7676,24 @@ mod tests {
             tokenizer_sha256: None,
         };
         let mut calls = Vec::new();
-        let model_part = download_hf_reranker_model_with(
+        let err = download_hf_reranker_model_with(
             "example/repo",
             "rev",
             &info,
             dir.path(),
             |url, dest| {
                 calls.push(url.to_string());
-                if url.ends_with(RERANKER_MODEL_CANDIDATES[0]) {
-                    fs::write(dest, b"wrong model bytes")?;
-                } else if url.ends_with(RERANKER_MODEL_CANDIDATES[1]) {
-                    fs::write(dest, expected)?;
-                } else {
-                    bail!("unexpected candidate after successful sha match: {url}");
-                }
+                fs::write(dest, b"wrong model bytes")?;
                 Ok(fs::metadata(dest)?.len())
             },
-        )?;
-        assert_eq!(
-            calls.len(),
-            2,
-            "first candidate should sha-mismatch, second should win"
+        )
+        .expect_err("sha mismatch must be fatal");
+        assert_eq!(calls.len(), 1, "only the canonical model path is tried");
+        assert!(err.to_string().contains("sha256 mismatch"));
+        assert!(
+            !dir.path().join("reranker.onnx.part").exists(),
+            "failed sha verification should clean partial model file"
         );
-        assert_eq!(fs::read(model_part)?, expected);
         Ok(())
     }
 
