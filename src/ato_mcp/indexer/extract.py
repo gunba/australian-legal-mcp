@@ -13,6 +13,7 @@ metadata/chunking steps.
 """
 from __future__ import annotations
 
+import html as html_lib
 import re
 from dataclasses import dataclass, field
 from typing import Iterable
@@ -65,6 +66,14 @@ class CurrencyInfo:
     replaces: str | None = None
 
 
+@dataclass(frozen=True)
+class _FormulaCell:
+    index: int
+    parts: list[str]
+    has_break: bool
+    has_underline: bool
+
+
 def extract(html: str) -> ExtractedDoc:
     if not html or not html.strip():
         return ExtractedDoc(markdown="", title=None, html_title=None)
@@ -84,6 +93,7 @@ def extract(html: str) -> ExtractedDoc:
     lead_headings = _leading_headings(container)
     title = _compose_title(lead_headings) or html_title
 
+    _rewrite_formula_html_tables(container)
     _inject_anchor_suffixes(container)
 
     headings = [
@@ -208,6 +218,88 @@ def _inject_anchor_suffixes(node: Node) -> None:
             heading.insert_child(f" {{#{anchor}}}")
 
 
+def _clean_formula_part(value: str) -> str:
+    return " ".join(value.replace("\xa0", " ").split())
+
+
+def _formula_cell_parts(cell: Node) -> list[str]:
+    raw = cell.text(deep=True, separator="\n", strip=True) or ""
+    parts = [_clean_formula_part(part) for part in raw.splitlines()]
+    parts = [part for part in parts if part]
+    if len(parts) > 1:
+        parts = [part for part in parts if part != "*"]
+    return [part.removeprefix("*").strip() if part.startswith("* ") else part for part in parts]
+
+
+def _formula_cells(row: Node) -> list[_FormulaCell]:
+    cells: list[_FormulaCell] = []
+    for index, cell in enumerate(row.css("td,th")):
+        parts = _formula_cell_parts(cell)
+        if not parts:
+            continue
+        html = (cell.html or "").lower()
+        cells.append(
+            _FormulaCell(
+                index=index,
+                parts=parts,
+                has_break="<br" in html,
+                has_underline="<u" in html,
+            )
+        )
+    return cells
+
+
+def _formula_text(parts: list[str]) -> str:
+    text = " ".join(parts).replace("×", "x")
+    return " ".join(text.split())
+
+
+def _looks_like_formula_numerator(text: str) -> bool:
+    padded = f" {text} "
+    return bool(re.search(r"\d\s*%|\s[+\-/]\s|[×*]|\b[xX]\b", padded))
+
+
+def _formula_from_html_table(table: Node) -> str | None:
+    rows = [_formula_cells(row) for row in table.css("tr")]
+    rows = [row for row in rows if row]
+    if len(rows) == 1 and len(rows[0]) == 1:
+        cell = rows[0][0]
+        if cell.has_break and cell.has_underline and len(cell.parts) == 2:
+            return f"Formula: {_formula_text([cell.parts[0]])} / {_formula_text([cell.parts[1]])}"
+        return None
+
+    if len(rows) != 2:
+        return None
+    numerator = rows[0]
+    denominator = rows[1]
+    if len(denominator) != 1:
+        return None
+    denominator_col = denominator[0].index
+    numerator_cols = [cell.index for cell in numerator]
+    if len(numerator) == 1 and numerator[0].index != denominator_col:
+        return None
+    if len(numerator) > 1 and denominator_col not in numerator_cols:
+        return None
+
+    numerator_text = " ".join(_formula_text(cell.parts) for cell in numerator)
+    denominator_text = _formula_text(denominator[0].parts)
+    if not numerator_text or not denominator_text:
+        return None
+    if not _looks_like_formula_numerator(numerator_text):
+        return None
+    return f"Formula: ({numerator_text}) / {denominator_text}"
+
+
+def _rewrite_formula_html_tables(node: Node) -> None:
+    for table in node.css("table"):
+        formula = _formula_from_html_table(table)
+        if formula is None:
+            continue
+        replacement = HTMLParser(f"<p>{html_lib.escape(formula)}</p>").css_first("p")
+        if replacement is not None:
+            table.replace_with(replacement)
+
+
 _MD_COLLAPSE = re.compile(r"\n{3,}")
 _MD_TRAIL_WS = re.compile(r"[ \t]+\n")
 _MD_NUMERIC_RANGE = re.compile(r"(?<=\d)\s+-\s+(?=\d)")
@@ -258,7 +350,6 @@ def _unwrap_prose_lines(md: str) -> str:
 
 def _tidy_markdown(md: str) -> str:
     md = _rewrite_internal_links(md)
-    md = _rewrite_formula_tables(md)
     md = _strip_history_noise(md)
     md = _unwrap_prose_lines(md)
     md = _MD_TRAIL_WS.sub("\n", md)
@@ -327,56 +418,6 @@ def _rewrite_internal_links(md: str) -> str:
                 out.append(f"{clean_label} [doc_id: {doc_id}]")
         i = j + 1
     return "".join(out)
-
-
-def _table_cells(line: str) -> list[str]:
-    stripped = line.strip()
-    if not stripped.startswith("|") or not stripped.endswith("|"):
-        return []
-    cells = [c.strip() for c in stripped.strip("|").split("|")]
-    return [c for c in cells if c]
-
-
-def _is_table_separator(line: str) -> bool:
-    cells = _table_cells(line)
-    return bool(cells) and all(set(c.replace(" ", "")) <= {"-", ":"} for c in cells)
-
-
-def _formula_from_table(lines: list[str]) -> str | None:
-    data_rows = [_table_cells(line) for line in lines if not _is_table_separator(line)]
-    data_rows = [row for row in data_rows if row]
-    if len(data_rows) < 2:
-        return None
-    numerator = data_rows[0]
-    denominator = data_rows[1]
-    if len(denominator) != 1:
-        return None
-    if not any(cell in {"×", "x", "X", "*"} for cell in numerator) and len(numerator) < 2:
-        return None
-    numerator_text = " ".join("x" if cell == "×" else cell for cell in numerator)
-    denominator_text = denominator[0]
-    return f"Formula: ({numerator_text}) / {denominator_text}"
-
-
-def _rewrite_formula_tables(md: str) -> str:
-    lines = md.splitlines()
-    out: list[str] = []
-    i = 0
-    while i < len(lines):
-        if not lines[i].lstrip().startswith("|"):
-            out.append(lines[i])
-            i += 1
-            continue
-        start = i
-        while i < len(lines) and lines[i].lstrip().startswith("|"):
-            i += 1
-        block = lines[start:i]
-        formula = _formula_from_table(block)
-        if formula:
-            out.append(formula)
-        else:
-            out.extend(block)
-    return "\n".join(out)
 
 
 def _is_history_boundary(line: str) -> bool:

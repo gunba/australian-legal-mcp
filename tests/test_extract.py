@@ -143,6 +143,76 @@ def test_extract_rewrites_simple_formula_table() -> None:
     ) in doc.markdown
 
 
+def test_extract_rewrites_underlined_single_cell_fraction_table() -> None:
+    html = """
+    <div id="LawContent">
+        <p>Multiply by:</p>
+        <table class="table">
+          <tr>
+            <td></td>
+            <td><u>365</u><br>Number of days in reference period</td>
+            <td></td>
+          </tr>
+        </table>
+    </div>
+    """
+    doc = extract(html)
+    assert "Formula: 365 / Number of days in reference period" in doc.markdown
+    assert "| 365" not in doc.markdown
+
+
+def test_extract_rewrites_two_row_defined_term_fraction_table() -> None:
+    html = """
+    <div id="LawContent">
+        <table class="table">
+          <tr>
+            <td></td>
+            <td>100% - <br>*<br>Corporate tax rate for imputation purposes</td>
+            <td></td>
+          </tr>
+          <tr>
+            <td></td>
+            <td>*<br>Corporate tax rate for imputation purposes</td>
+            <td></td>
+          </tr>
+        </table>
+    </div>
+    """
+    doc = extract(html)
+    assert (
+        "Formula: (100% - Corporate tax rate for imputation purposes) / "
+        "Corporate tax rate for imputation purposes"
+    ) in doc.markdown
+
+
+def test_extract_leaves_ambiguous_two_row_table_as_table() -> None:
+    html = """
+    <div id="LawContent">
+        <table>
+          <tr><td>Label</td></tr>
+          <tr><td>Value</td></tr>
+        </table>
+    </div>
+    """
+    doc = extract(html)
+    assert "Formula:" not in doc.markdown
+    assert "| Label |" in doc.markdown
+
+
+def test_extract_leaves_multi_cell_table_without_operator_as_table() -> None:
+    html = """
+    <div id="LawContent">
+        <table>
+          <tr><td>Label</td><td>Value</td></tr>
+          <tr><td>Total</td></tr>
+        </table>
+    </div>
+    """
+    doc = extract(html)
+    assert "Formula:" not in doc.markdown
+    assert "| Label | Value |" in doc.markdown
+
+
 # ---------------------------------------------------------------------------
 # W2.2 — currency / supersession extraction
 

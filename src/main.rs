@@ -2796,13 +2796,13 @@ fn get_definition(term: &str, opts: GetDefinitionOptions<'_>) -> Result<String> 
         SELECT definition_id, term, doc_id, source_title, source_type, scope,
                heading_path, anchor, ord, body
         FROM definitions
-        WHERE norm_term = ?
+        WHERE norm_term = ? AND source_type = ?
         ORDER BY doc_id, ord, term
         LIMIT 100
         "#,
     )?;
     let mut hits = stmt
-        .query_map([norm], |row| {
+        .query_map(params![norm, LEGISLATION_TYPE], |row| {
             let doc_id: String = row.get("doc_id")?;
             Ok(DefinitionHit {
                 definition_id: row.get("definition_id")?,
@@ -5732,16 +5732,28 @@ mod tests {
         doc_id: &str,
         body: &str,
     ) -> Result<()> {
+        insert_definition_with_source(conn, definition_id, term, doc_id, body, LEGISLATION_TYPE)
+    }
+
+    fn insert_definition_with_source(
+        conn: &Connection,
+        definition_id: &str,
+        term: &str,
+        doc_id: &str,
+        body: &str,
+        source_type: &str,
+    ) -> Result<()> {
         conn.execute(
             "INSERT INTO definitions(definition_id, term, norm_term, doc_id, source_title, \
              source_type, scope, heading_path, anchor, ord, body) \
-             VALUES (?, ?, ?, ?, ?, 'Legislation_and_supporting_material', ?, '', NULL, 0, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, '', NULL, 0, ?)",
             params![
                 definition_id,
                 term,
                 normalize_definition_term(term),
                 doc_id,
                 format!("{doc_id} title"),
+                source_type,
                 format!("{doc_id} title"),
                 body,
             ],
@@ -6755,6 +6767,75 @@ mod tests {
                 parsed["definitions"][0]["definition_id"],
                 json!("def-corporate-gross-up")
             );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn get_definition_ignores_non_legislation_sources() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        insert_doc_full(
+            &conn,
+            "PAC/19860039/136",
+            Some("1986-01-01"),
+            None,
+            None,
+            None,
+        )?;
+        insert_doc_full(&conn, "EV/123456", Some("2024-01-01"), None, None, None)?;
+        insert_doc_full(
+            &conn,
+            "AID/AID20021000",
+            Some("2002-01-01"),
+            None,
+            None,
+            None,
+        )?;
+        insert_definition(
+            &conn,
+            "def-car-legislation",
+            "car",
+            "PAC/19860039/136",
+            "has the meaning given by section 995-1.",
+        )?;
+        insert_definition_with_source(
+            &conn,
+            "def-car-epa",
+            "car",
+            "EV/123456",
+            "A private advice glossary entry.",
+            "Edited_private_advice",
+        )?;
+        insert_definition_with_source(
+            &conn,
+            "def-car-aid",
+            "car",
+            "AID/AID20021000",
+            "An interpretative decision glossary entry.",
+            "ATO_interpretative_decisions",
+        )?;
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            let json_str = get_definition(
+                "car",
+                GetDefinitionOptions {
+                    context_doc_id: Some("PAC/19860039/136"),
+                    max_defs: 10,
+                    format: OutputFormat::Json,
+                },
+            )?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            let definitions = parsed["definitions"].as_array().unwrap();
+            assert_eq!(definitions.len(), 1);
+            assert_eq!(
+                definitions[0]["definition_id"],
+                json!("def-car-legislation")
+            );
+            assert_eq!(definitions[0]["source"]["type"], json!(LEGISLATION_TYPE));
             Ok(())
         })?;
         Ok(())
