@@ -121,25 +121,18 @@ class DedupedLinkIndex:
 		return len(self._by_canonical)
 
 
-def build_pending_record(entry: WhatsNewEntry, pending_folder: str) -> Dict[str, Any]:
+def build_pending_record(entry: WhatsNewEntry) -> Dict[str, Any]:
 	"""Produce a deduped-link record for a new What's New entry.
 
 	The representative_path is derived from the docid prefix via
 	``ato_mcp.indexer.metadata.representative_path_from_docid`` so the file
 	lands under the correct ``payloads/<category>/`` bucket. The legacy
-	``pending_folder`` argument is kept for backwards compatibility but only
-	used when docid-based classification fails.
+	``payloads/whats_new`` bucket is intentionally not used.
 	"""
-	try:
-		from ..indexer.metadata import representative_path_from_docid
-		segments = representative_path_from_docid(
-			entry.href, title=entry.title, heading=entry.heading,
-		)
-	except Exception:  # noqa: BLE001 — defensive: import/classify failure must not break scraping
-		segments = [pending_folder]
-		if entry.heading:
-			segments.append(entry.heading)
-		segments.append(entry.title or entry.href)
+	from ..indexer.metadata import representative_path_from_docid
+	segments = representative_path_from_docid(
+		entry.href, title=entry.title, heading=entry.heading,
+	)
 	return {
 		"canonical_id": entry.href,
 		"href": entry.href,

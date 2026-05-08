@@ -1043,9 +1043,3 @@ def _year_from_docid(ins: RuleInputs) -> int | None:
 def template_of(inputs: RuleInputs) -> Template:
     """Expose the classification decision (used by tests and for debugging)."""
     return classify(inputs)
-
-
-# Backwards-compat shim so the old v1 call site keeps working.
-def human_code_for_doc_id(doc_id: str) -> str | None:
-    code, _year = _extract_from_docid(RuleInputs(doc_id=doc_id))
-    return code

@@ -37,12 +37,9 @@ class ModelInfo(BaseModel):
     sha256: str
     size: int
     url: str
-    # C4: optional sha256 of the companion `tokenizer.json`. The Rust HF
-    # download path uses this to harden tokenizer.json to the same
-    # checksum-pinned standard the model file enjoys. Optional for
-    # back-compat: v3 manifests built before this field landed (and the
-    # tar.zst bundle path that hashes the whole archive) leave it as
-    # ``None`` and the runtime logs a one-line warning rather than failing.
+    # Optional sha256 of the companion `tokenizer.json`. Reranker manifests
+    # must set this so the Rust HF download path verifies tokenizer.json to
+    # the same checksum-pinned standard as the model file.
     tokenizer_sha256: str | None = None
 
 

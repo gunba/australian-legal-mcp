@@ -1,5 +1,5 @@
 [Unit]
-Description=ato-mcp: maintainer weekly catch-up
+Description=ato-mcp: maintainer weekly incremental release
 
 [Timer]
 OnCalendar=Sun *-*-* 03:43:00

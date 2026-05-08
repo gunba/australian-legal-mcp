@@ -55,7 +55,7 @@ def test_build_pending_record_uses_docid_classifier() -> None:
         title="CR 2026/12",
         heading="Rulings",
     )
-    record = build_pending_record(entry, pending_folder="whats_new")
+    record = build_pending_record(entry)
     rep = record["representative_path"]
     # First segment must be the real category, NOT 'whats_new'.
     assert rep[0] == "Public_rulings"

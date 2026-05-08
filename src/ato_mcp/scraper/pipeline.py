@@ -8,8 +8,8 @@ point. Produces (or updates) the ``output_dir/index.jsonl`` +
 Three modes:
 
 - ``incremental`` — pulls the ATO ``What's new`` feed, refreshes matching
-  payloads, and drops any new/pending documents under
-  ``payloads/<pending_folder>/``. Covers the rolling 2-3 week window the
+  payloads, and writes any new documents under their classified
+  ``payloads/<Category>/`` path. Covers the rolling 2-3 week window the
   feed exposes.
 - ``full`` — runs the whole crawl + reduce + download pipeline. Takes hours;
   intended for monthly full rebuilds.
@@ -85,7 +85,6 @@ def refresh_source(
     snapshot_dir: Path | str | None = None,
     base_url: str = "https://www.ato.gov.au",
     whats_new_url: str = "https://www.ato.gov.au/law/view/whatsnew.htm?fid=whatsnew",
-    pending_folder: str = "whats_new",
     parser_run_date: str | None = None,
     max_workers: int = 1,
     request_interval: float = 0.5,
@@ -114,7 +113,6 @@ def refresh_source(
             whats_new_url=whats_new_url,
             base_url=base_url,
             parser_run_date=parser_run_date,
-            pending_folder=pending_folder,
             max_workers=max_workers,
             request_interval=request_interval,
             verbose_progress=verbose_progress,
@@ -175,7 +173,6 @@ def refresh_source(
         whats_new_url=whats_new_url,
         base_url=base_url,
         parser_run_date=parser_run_date,
-        pending_folder=pending_folder,
         max_workers=max_workers,
         request_interval=request_interval,
         verbose_progress=verbose_progress,
@@ -327,7 +324,6 @@ def _run_whats_new(
     whats_new_url: str,
     base_url: str,
     parser_run_date: str,
-    pending_folder: str,
     max_workers: int,
     request_interval: float,
     verbose_progress: bool,
@@ -346,7 +342,7 @@ def _run_whats_new(
         if match:
             known.append(match)
         else:
-            pending.append(build_pending_record(entry, pending_folder))
+            pending.append(build_pending_record(entry))
 
     summary = {
         "whats_new_url": whats_new_url,
@@ -371,7 +367,7 @@ def _run_whats_new(
             asset_fetcher=asset_fetcher,
         )
     if pending:
-        LOGGER.info("Writing %s pending document(s) under payloads/%s", len(pending), pending_folder)
+        LOGGER.info("Writing %s pending What's New document(s)", len(pending))
         _download_records(
             records=pending,
             output_dir=output_dir,

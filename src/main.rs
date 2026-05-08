@@ -94,9 +94,6 @@ struct Cli {
 enum Command {
     /// Run the MCP stdio server.
     Serve {
-        /// Deprecated no-op: serve skips update checks by default.
-        #[arg(long)]
-        no_update: bool,
         /// Check for corpus updates before starting the MCP stdio loop.
         #[arg(long)]
         check_update: bool,
@@ -250,11 +247,8 @@ enum DocumentFormat {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve {
-            no_update,
-            check_update,
-        } => {
-            if serve_should_check_update(no_update, check_update) {
+        Command::Serve { check_update } => {
+            if serve_should_check_update(check_update) {
                 update_before_serve()?;
             } else {
                 ensure_installed_db()?;
@@ -2214,13 +2208,15 @@ fn act_prefix_for_query(query: &str) -> Option<&'static str> {
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
         .collect();
-    if compact.contains("itaa1997") || compact.contains("itaa97") {
+    if compact.contains("itaa1997")
+        || compact.contains("itaa97")
+        || compact.contains("incometaxassessmentact1997")
+    {
         Some("PAC/19970038")
-    } else if compact.contains("incometaxassessmentact1997") {
-        Some("PAC/19970038")
-    } else if compact.contains("itaa1936") || compact.contains("itaa36") {
-        Some("PAC/19360027")
-    } else if compact.contains("incometaxassessmentact1936") {
+    } else if compact.contains("itaa1936")
+        || compact.contains("itaa36")
+        || compact.contains("incometaxassessmentact1936")
+    {
         Some("PAC/19360027")
     } else if compact.contains("fbtaa") || compact.contains("fringebenefitstaxassessmentact1986") {
         Some("PAC/19860039")
@@ -3358,13 +3354,9 @@ struct ModelInfo {
     sha256: String,
     size: u64,
     url: String,
-    /// Optional sha256 of the companion tokenizer file. Currently used by
-    /// the HF reranker download path to harden `tokenizer.json` to the
-    /// same standard the model file enjoys (C4). When `None` or empty the
-    /// runtime logs a one-line warning and skips verification — back-compat
-    /// for v3 manifests built before this field existed. Tar.zst bundles
-    /// (the EmbeddingGemma path) verify the bundle as a whole and ignore
-    /// this field.
+    /// Optional sha256 of the companion tokenizer file. Reranker manifests
+    /// must set it; tar.zst model bundles verify the bundle as a whole and
+    /// ignore this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tokenizer_sha256: Option<String>,
 }
@@ -3481,10 +3473,8 @@ fn env_truthy(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn serve_should_check_update(no_update: bool, check_update: bool) -> bool {
-    !no_update
-        && !env_truthy("ATO_MCP_OFFLINE")
-        && (check_update || env_truthy("ATO_MCP_AUTO_UPDATE"))
+fn serve_should_check_update(check_update: bool) -> bool {
+    !env_truthy("ATO_MCP_OFFLINE") && (check_update || env_truthy("ATO_MCP_AUTO_UPDATE"))
 }
 
 fn ensure_installed_db() -> Result<()> {
@@ -3780,11 +3770,10 @@ fn replace_live_db(staged_db: &Path) -> Result<()> {
     if db.exists() {
         fs::remove_file(&db)?;
     }
-    fs::rename(staged_db, &db).or_else(|err| {
+    fs::rename(staged_db, &db).inspect_err(|_err| {
         if backup.exists() {
             let _ = fs::copy(&backup, &db);
         }
-        Err(err)
     })?;
     Ok(())
 }
@@ -4428,23 +4417,13 @@ fn install_hf_reranker(repo: &str, revision: &str, info: &ModelInfo, staging: &P
     let tokenizer_url = hf_resolve_url(repo, revision, "tokenizer.json");
     fetch_http_to_file(&tokenizer_url, &tokenizer_part)
         .with_context(|| format!("downloading reranker tokenizer from {repo}"))?;
-    // C4: verify tokenizer sha256 when the maintainer pinned one.
-    // tokenizer_sha256 is optional on ModelInfo for back-compat with v3
-    // manifests built before the field existed; when absent we log a single
-    // warning rather than fail (matches the back-compat policy on the model
-    // sha when empty).
-    match info.tokenizer_sha256.as_deref() {
-        Some(expected) if !expected.is_empty() => {
-            verify_sha256_file(&tokenizer_part, expected)
-                .with_context(|| format!("verifying reranker tokenizer from {repo}"))?;
-        }
-        _ => {
-            eprintln!(
-                "ato-mcp: reranker tokenizer sha256 not pinned in manifest for {repo}; \
-                 skipping verification (set ModelInfo.tokenizer_sha256 to enable)"
-            );
-        }
-    }
+    let expected_tokenizer_sha = info
+        .tokenizer_sha256
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("reranker manifest is missing tokenizer_sha256 for {repo}"))?;
+    verify_sha256_file(&tokenizer_part, expected_tokenizer_sha)
+        .with_context(|| format!("verifying reranker tokenizer from {repo}"))?;
 
     let live_model = reranker_model_path()?;
     let live_tokenizer = reranker_tokenizer_path()?;
@@ -4489,9 +4468,9 @@ where
         match fetch(&url, &model_part) {
             Ok(_) => {
                 if info.sha256.is_empty() {
-                    // No checksum to verify — accept the first successful
-                    // download. This is the back-compat path for manifests
-                    // built before sha pinning.
+                    // Bundle-style reranker manifests may verify the archive
+                    // rather than the extracted ONNX; accept the first model
+                    // candidate in that case.
                     downloaded = true;
                     break;
                 }
@@ -5537,7 +5516,7 @@ fn format_verify_quote_markdown(matches: &[QuoteMatch], found: bool, truncated: 
 }
 
 fn tool_descriptors() -> JsonValue {
-    // [SW-01] Tool surface is deliberately limited to seven explicit MCP tools.
+    // [SW-01] Tool surface is deliberately limited to eight explicit MCP tools.
     json!([
         {
             "name": "search",
@@ -5950,15 +5929,14 @@ mod tests {
         std::env::remove_var("ATO_MCP_OFFLINE");
         std::env::remove_var("ATO_MCP_AUTO_UPDATE");
 
-        assert!(!serve_should_check_update(false, false));
-        assert!(serve_should_check_update(false, true));
-        assert!(!serve_should_check_update(true, true));
+        assert!(!serve_should_check_update(false));
+        assert!(serve_should_check_update(true));
 
         std::env::set_var("ATO_MCP_AUTO_UPDATE", "1");
-        assert!(serve_should_check_update(false, false));
+        assert!(serve_should_check_update(false));
 
         std::env::set_var("ATO_MCP_OFFLINE", "1");
-        assert!(!serve_should_check_update(false, true));
+        assert!(!serve_should_check_update(true));
 
         if let Some(value) = offline_prev {
             std::env::set_var("ATO_MCP_OFFLINE", value);
@@ -8262,36 +8240,6 @@ mod tests {
         assert!(parsed.reranker.is_some());
         let rr = parsed.reranker.as_ref().unwrap();
         assert_eq!(rr.tokenizer_sha256.as_deref(), Some("cafef00d"));
-        Ok(())
-    }
-
-    #[test]
-    fn manifest_round_trips_reranker_field_without_tokenizer_sha256() -> Result<()> {
-        // Back-compat: a v3 manifest emitted before the C4 fix omits
-        // tokenizer_sha256 entirely. Old binaries already accept it (they
-        // ignore unknown fields); new binaries must still accept manifests
-        // without the field.
-        let raw = r#"{
-            "schema_version": 3,
-            "index_version": "test",
-            "created_at": "2026-01-01T00:00:00Z",
-            "min_client_version": "0.6.0",
-            "model": {"id": "m", "sha256": "0", "size": 0, "url": "https://x"},
-            "reranker": {"id": "rerank-id", "sha256": "abc", "size": 1, "url": "https://y"},
-            "documents": [],
-            "packs": []
-        }"#;
-        let parsed: Manifest = serde_json::from_str(raw)?;
-        let rr = parsed.reranker.as_ref().expect("reranker present");
-        assert_eq!(rr.tokenizer_sha256, None);
-        // And the JSON we re-emit omits the missing field rather than
-        // serialising a `null` (back-compat for older binaries that only
-        // tolerate the original shape).
-        let re_emit = serde_json::to_string(&parsed)?;
-        assert!(
-            !re_emit.contains("tokenizer_sha256"),
-            "tokenizer_sha256 must be omitted when None; got: {re_emit}"
-        );
         Ok(())
     }
 

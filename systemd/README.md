@@ -20,10 +20,11 @@ Keep the user manager alive between logins:
 loginctl enable-linger "$USER"
 ```
 
-## Maintainer install (weekly catch-up + publish)
+## Maintainer Install (Weekly Incremental Publish)
 
 Only install these on the machine you publish releases from. They
-scrape the ATO, rebuild the search index, and push a new GitHub release.
+refresh the ATO What's New feed, incrementally rebuild the corpus when the
+source changed, and push a new GitHub release.
 
 ```bash
 cp ato-mcp-maintainer-*.service ato-mcp-maintainer-*.timer \
