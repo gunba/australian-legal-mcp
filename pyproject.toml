@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ato-mcp"
-version = "0.6.5"
+version = "0.6.6"
 description = "Local MCP server for the Australian Taxation Office legal database"
 readme = "README.md"
 requires-python = ">=3.11"
