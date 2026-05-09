@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from ato_mcp.indexer.metadata import (
     category_for_docid,
+    category_for_record,
     representative_path_from_docid,
     year_for_docid,
 )
@@ -20,6 +21,16 @@ def test_class_ruling_goes_to_public_rulings() -> None:
 
 def test_legislative_instrument_goes_to_legislation() -> None:
     href = "/law/view/document?docid=OPS/LI202615/00001"
+    assert category_for_docid(href) == "Legislation_and_supporting_material"
+
+
+def test_principal_act_section_goes_to_legislation() -> None:
+    href = "/law/view/document?docid=PAC/19970038/8-1"
+    assert category_for_docid(href) == "Legislation_and_supporting_material"
+
+
+def test_new_explanatory_memorandum_goes_to_legislation() -> None:
+    href = "/law/view/document?docid=NEM/200615/NAT/ATO/00001"
     assert category_for_docid(href) == "Legislation_and_supporting_material"
 
 
@@ -60,3 +71,12 @@ def test_build_pending_record_uses_docid_classifier() -> None:
     # First segment must be the real category, NOT 'whats_new'.
     assert rep[0] == "Public_rulings"
     assert "whats_new" not in rep
+
+
+def test_whats_new_payload_path_does_not_become_category() -> None:
+    href = "/law/view/document?docid=TPA/TA20253/NAT/ATO/00001"
+    category = category_for_record(
+        href,
+        "payloads/whats_new/Taxpayer_alerts/TA_2025_3/law_view_document_docid_TPA_TA20253_NAT_ATO_00001.html",
+    )
+    assert category == "Taxpayer_alerts"

@@ -1,7 +1,7 @@
 """DB schema + basic insert / search sanity tests.
 
-These exercise the schema without the embedding model — we stub chunks_vec
-entries with all-zero vectors so sqlite-vec accepts them, but never query it.
+These exercise the schema without the embedding model; vector rows are stubbed
+with all-zero int8 embeddings and never queried.
 """
 from __future__ import annotations
 
@@ -35,6 +35,7 @@ def _seed_doc(
             doc_id, "Public_rulings", title, "2024-07-01",
             "2026-04-18T00:00:00Z",
             "sha256:" + "0" * 64, "deadbeef",
+            zstd.ZstdCompressor(level=3).compress(b"<div></div>"),
             withdrawn_date, superseded_by, replaces,
         ),
     )
@@ -95,31 +96,5 @@ def test_schema_inserts_and_queries(tmp_path: Path) -> None:
     assert row["withdrawn_date"] is None
 
     assert store_db.get_meta(conn, "schema_version") == store_db.SCHEMA_VERSION
-    assert store_db.SCHEMA_VERSION == "6"
+    assert store_db.SCHEMA_VERSION == "7"
     conn.close()
-
-
-def test_migrate_rejects_pre_v6(tmp_path: Path) -> None:
-    """W2.3: a v5 DB (missing currency columns) must be rejected with a
-    rebuild-prompt rather than silently upgraded.
-    """
-    import sqlite3
-    db_path = tmp_path / "ato.db"
-    # Build a minimal v5-shaped documents table by hand and stamp meta.
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute(
-        "CREATE TABLE documents ("
-        "doc_id TEXT PRIMARY KEY, type TEXT NOT NULL, title TEXT NOT NULL, date TEXT, "
-        "downloaded_at TEXT NOT NULL, content_hash TEXT NOT NULL, pack_sha8 TEXT NOT NULL)"
-    )
-    conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-    conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', '5')")
-    conn.commit()
-    conn.close()
-
-    import pytest
-    with pytest.raises(RuntimeError) as excinfo:
-        store_db.init_db(db_path)
-    msg = str(excinfo.value)
-    assert "rebuild" in msg.lower() or "v6" in msg.lower(), f"expected rebuild/v6 in error, got: {msg}"

@@ -8,6 +8,7 @@ Maintainer commands:
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -21,6 +22,27 @@ LOGGER = get_logger("ato_mcp.cli")
 app = typer.Typer(no_args_is_help=True, add_completion=False, help=__doc__)
 # [CC-01] Rust owns the installed MCP runtime. This Python CLI is maintainer tooling.
 # [CC-06] no_args_is_help=True + add_completion=False — small intentional CLI, no shell-completion magic.
+
+
+def _maybe_reexec_with_nvidia_libs() -> None:
+    if os.environ.get("ATO_MCP_NVIDIA_LIBS_READY"):
+        return
+    lib_dirs = [
+        path
+        for path in Path(sys.prefix).glob("lib*/python*/site-packages/nvidia/*/lib")
+        if path.is_dir()
+    ]
+    if not lib_dirs:
+        return
+    current = [part for part in os.environ.get("LD_LIBRARY_PATH", "").split(":") if part]
+    missing = [str(path) for path in lib_dirs if str(path) not in current]
+    if not missing:
+        os.environ["ATO_MCP_NVIDIA_LIBS_READY"] = "1"
+        return
+    env = os.environ.copy()
+    env["LD_LIBRARY_PATH"] = ":".join([*missing, *current])
+    env["ATO_MCP_NVIDIA_LIBS_READY"] = "1"
+    os.execvpe(sys.executable, [sys.executable, *sys.argv], env)
 
 
 @app.command("refresh-source")
@@ -143,40 +165,23 @@ def build_index(
     model_path: Optional[Path] = typer.Option(None, help="Path to embeddinggemma ONNX file."),
     tokenizer_path: Optional[Path] = typer.Option(None, help="Path to tokenizer.json."),
     model_id: str = typer.Option("embeddinggemma-300m-int8-256d"),
-    model_url: Optional[str] = typer.Option(None),
-    reranker_id: Optional[str] = typer.Option(
-        None,
-        help="Optional reranker model id; combined with --reranker-url to populate "
-             "the manifest's `reranker` ModelInfo. Leave unset to publish a manifest "
-             "without a reranker entry (Rust runtime falls back to un-reranked).",
-    ),
-    reranker_url: Optional[str] = typer.Option(
-        None,
-        help="Optional reranker source URL (e.g. hf://Alibaba-NLP/gte-reranker-modernbert-base@<sha>).",
-    ),
-    reranker_sha256: Optional[str] = typer.Option(
-        None, help="sha256 of the externally hosted reranker ONNX file."
-    ),
-    reranker_size: Optional[int] = typer.Option(
-        None, help="Size in bytes of the externally hosted reranker ONNX file."
-    ),
-    reranker_tokenizer_sha256: Optional[str] = typer.Option(
-        None,
-        help="Optional sha256 of the externally hosted reranker tokenizer.json. "
-             "When provided, the Rust runtime verifies the downloaded tokenizer "
-             "byte-for-byte; otherwise it logs a one-line warning and skips.",
-    ),
     previous_manifest: Optional[Path] = typer.Option(None, help="Previous manifest for incremental reuse."),
     limit: Optional[int] = typer.Option(None, help="Cap documents processed (for testing)."),
     embedder: str = typer.Option(
         "embeddinggemma",
         help="Vectorizer: embeddinggemma.",
     ),
-    encode_batch_size: int = typer.Option(64, help="Embedding batch size. Bump for GPU."),
-    max_batch_tokens: int = typer.Option(8192, help="Approx padded tokens allowed in one inference call."),
+    encode_batch_size: Optional[int] = typer.Option(None, help="Embedding batch size. Default: 64 CPU, 128 GPU."),
+    max_batch_tokens: Optional[int] = typer.Option(
+        None,
+        help="Approx padded tokens allowed in one inference call. Default: 8192 CPU, 12288 GPU.",
+    ),
     workers: int = typer.Option(max(1, (os.cpu_count() or 2) - 1), help="HTML extraction workers."),
     window_docs: int = typer.Option(20_000, help="Documents prepared per build window."),
-    checkpoint_every: int = typer.Option(1_000_000_000, help="Prepared records per transaction checkpoint."),
+    checkpoint_every: int = typer.Option(
+        20_000,
+        help="Prepared records per resumable transaction checkpoint.",
+    ),
     unsafe_fast_sqlite: bool = typer.Option(
         False,
         help="Use scratch-build SQLite pragmas that favor speed over crash recovery.",
@@ -189,17 +194,28 @@ def build_index(
     from .indexer.build import BuildArgs
     from .indexer.build import build as run_build
     from .store.manifest import sha256_file
+    from .util.power import maybe_reexec_with_sleep_inhibitor
+
+    maybe_reexec_with_sleep_inhibitor("ato-mcp corpus rebuild")
+    if gpu:
+        _maybe_reexec_with_nvidia_libs()
 
     if embedder != "embeddinggemma":
         raise typer.BadParameter("embedder must be embeddinggemma")
     if model_path is None or tokenizer_path is None:
         raise typer.BadParameter("--model-path and --tokenizer-path are required for embeddinggemma")
+    if encode_batch_size is not None and encode_batch_size <= 0:
+        raise typer.BadParameter("--encode-batch-size must be positive")
+    if max_batch_tokens is not None and max_batch_tokens <= 0:
+        raise typer.BadParameter("--max-batch-tokens must be positive")
 
     model_sha = sha256_file(model_path) if model_path is not None else ""
     model_size = model_path.stat().st_size if model_path is not None else 0
     providers: tuple[str, ...] | None = None
     if gpu:
         providers = ("CUDAExecutionProvider", "CPUExecutionProvider")
+    effective_encode_batch_size = encode_batch_size or (128 if gpu else 64)
+    effective_max_batch_tokens = max_batch_tokens or (12_288 if gpu else 8_192)
     args = BuildArgs(
         pages_dir=pages_dir,
         out_dir=out_dir,
@@ -207,19 +223,13 @@ def build_index(
         model_id=model_id,
         model_path=model_path,
         tokenizer_path=tokenizer_path,
-        model_url=model_url,
         model_sha256=model_sha,
         model_size=model_size,
-        reranker_id=reranker_id,
-        reranker_url=reranker_url,
-        reranker_sha256=reranker_sha256,
-        reranker_size=reranker_size,
-        reranker_tokenizer_sha256=reranker_tokenizer_sha256,
         previous_manifest=previous_manifest,
         limit=limit,
         embedder=embedder,  # type: ignore[arg-type]
-        encode_batch_size=encode_batch_size,
-        max_batch_tokens=max_batch_tokens,
+        encode_batch_size=effective_encode_batch_size,
+        max_batch_tokens=effective_max_batch_tokens,
         providers=providers,
         workers=workers,
         window_docs=window_docs,

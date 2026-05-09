@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 # older binaries decoding a v3 manifest still parse fine (Rust's `Manifest`
 # struct uses `#[serde(default)]` on all the new fields), but their separate
 # `schema_version > MAX_SUPPORTED_SCHEMA_VERSION` check catches them earlier.
-MANIFEST_SCHEMA_VERSION = 3
+MANIFEST_SCHEMA_VERSION = 4
 
 # Default `min_client_version` for newly-built manifests. The Rust binary
 # rejects any manifest whose `min_client_version` is greater than
@@ -29,7 +29,7 @@ MANIFEST_SCHEMA_VERSION = 3
 # binary from ingesting a newer corpus. Bump in lockstep with binary
 # releases that introduce schema or model changes (Wave 3: 0.6.x introduces
 # the optional cross-encoder reranker bundle).
-DEFAULT_MIN_CLIENT_VERSION = "0.6.1"
+DEFAULT_MIN_CLIENT_VERSION = "0.6.9"
 
 
 class ModelInfo(BaseModel):

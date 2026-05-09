@@ -85,12 +85,12 @@ def extract_definitions(
     source_type: str,
     chunks: list[DefinitionChunk],
 ) -> list[Definition]:
-    """Extract simple markdown definition entries.
+    """Extract simple source-marked definition entries.
 
-    The ATO corpus consistently marks defined terms as bold-italic
-    ``***term***``. This extractor does not infer legal meaning; it only cuts
-    the text from one marked term to the next when the following text looks
-    like a definition clause.
+    The HTML chunker marks ATO bold-italic defined terms as ``***term***`` in
+    a build-only definition text. This extractor does not infer legal meaning;
+    it only cuts the text from one marked term to the next when the following
+    text looks like a definition clause.
     """
 
     out: list[Definition] = []

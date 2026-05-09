@@ -1,7 +1,6 @@
--- ato-mcp SQLite schema v6
+-- ato-mcp SQLite schema v7
 -- Minimal field set: doc_id PK, type, title, date + 3 build-time columns +
 -- 3 currency columns (W2.2) — withdrawn_date, superseded_by, replaces.
--- [SL-01] Pre-v6 DBs are rejected with a migration prompt rather than transparently upgraded — schema is intentionally narrow.
 --
 -- Design notes:
 --   doc_id   The full ATO docid path, slashes included. The canonical URL
@@ -35,6 +34,7 @@ CREATE TABLE IF NOT EXISTS documents (
     downloaded_at    TEXT NOT NULL,
     content_hash     TEXT NOT NULL,
     pack_sha8        TEXT NOT NULL,
+    html             BLOB NOT NULL,
     -- currency markers (W2.2):
     withdrawn_date   TEXT,
     superseded_by    TEXT,
@@ -63,9 +63,8 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id);
 
--- Additive definition index. Older v6 corpora may not have rows here; the
--- runtime reports that explicitly for get_definition instead of weakening
--- normal search/document retrieval.
+-- Definition index. The runtime reports empty definition coverage explicitly
+-- instead of weakening normal search/document retrieval.
 CREATE TABLE IF NOT EXISTS definitions (
     definition_id TEXT PRIMARY KEY,
     term          TEXT NOT NULL,
@@ -81,6 +80,24 @@ CREATE TABLE IF NOT EXISTS definitions (
 );
 CREATE INDEX IF NOT EXISTS idx_definitions_norm_term ON definitions(norm_term);
 CREATE INDEX IF NOT EXISTS idx_definitions_doc ON definitions(doc_id);
+
+CREATE TABLE IF NOT EXISTS document_assets (
+    asset_ref     TEXT PRIMARY KEY,
+    doc_id        TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+    source_path   TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    media_type    TEXT,
+    alt           TEXT,
+    title         TEXT,
+    sha256        TEXT NOT NULL,
+    bytes         INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_assets_doc ON document_assets(doc_id);
+
+CREATE TABLE IF NOT EXISTS chunk_embeddings (
+    chunk_id   INTEGER PRIMARY KEY REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+    embedding  BLOB NOT NULL CHECK(length(embedding) = 256)
+);
 
 -- [SL-04] FTS5 with Porter stemming + unicode61 + diacritic-insensitive — tuned for English legal text in both title_fts and chunks_fts.
 -- Title-level FTS — just the title plus per-doc heading text. Citations
@@ -107,8 +124,8 @@ CREATE TABLE IF NOT EXISTS meta (
 -- extractable content. Kept so a later retry run can re-probe them without
 -- losing the list of "known empties" between sessions.
 --
---   source: where the row came from — 'migration' (v4→v5 sweep),
---           'scrape' (seen empty during build), 'retry' (probed and still
+--   source: where the row came from — 'scrape' (seen empty during build),
+--           'retry' (probed and still
 --           empty). Free-form text beyond those is fine.
 CREATE TABLE IF NOT EXISTS empty_shells (
     doc_id          TEXT PRIMARY KEY,
@@ -118,6 +135,3 @@ CREATE TABLE IF NOT EXISTS empty_shells (
     source          TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_shells_last_checked ON empty_shells(last_checked_at);
-
--- chunks_vec is created at runtime by store/db.py after sqlite-vec is loaded.
--- [SL-02] chunks_vec lives outside this file — vec0 virtual table needs the sqlite-vec extension loaded first; DDL is in db.py:_VEC_TABLE_DDL.

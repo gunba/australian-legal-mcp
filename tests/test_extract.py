@@ -1,5 +1,7 @@
-"""HTML -> markdown extraction edge cases."""
+"""HTML extraction edge cases."""
 from __future__ import annotations
+
+from pathlib import Path
 
 from ato_mcp.indexer.extract import CurrencyInfo, extract, extract_currency
 
@@ -17,13 +19,13 @@ def test_extract_law_contents_div() -> None:
     </body></html>
     """
     doc = extract(html)
-    assert "Taxation Ruling TR 2024/3" in doc.markdown
+    assert "Taxation Ruling TR 2024/3" in doc.text
     assert doc.title == "Taxation Ruling TR 2024/3"
     # Anchor captured on heading
     assert ("Taxation Ruling TR 2024/3", "top") in doc.anchors
     assert ("Background", "background") in doc.anchors
     # Header nav was stripped
-    assert "skip me" not in doc.markdown
+    assert "skip me" not in doc.text
 
 
 def test_extract_missing_lawcontents_uses_article() -> None:
@@ -36,13 +38,13 @@ def test_extract_missing_lawcontents_uses_article() -> None:
     </body></html>
     """
     doc = extract(html)
-    assert "Court Decision" in doc.markdown
-    assert "Judgment text." in doc.markdown
+    assert "Court Decision" in doc.text
+    assert "Judgment text." in doc.text
 
 
-def test_extract_empty_returns_empty_markdown() -> None:
+def test_extract_empty_returns_empty_text() -> None:
     doc = extract("")
-    assert doc.markdown == ""
+    assert doc.text == ""
     assert doc.title is None
 
 
@@ -55,8 +57,8 @@ def test_extract_strips_scripts() -> None:
     </div>
     """
     doc = extract(html)
-    assert "alert" not in doc.markdown
-    assert "Hello." in doc.markdown
+    assert "alert" not in doc.text
+    assert "Hello." in doc.text
 
 
 def test_compose_title_from_leading_headings() -> None:
@@ -102,7 +104,29 @@ def test_extract_unwraps_source_wrapped_inline_fragments() -> None:
         'S 355-210(1) amended by No 15 of 2017, s 3 and Sch 4 items 61-65, '
         'by omitting "or an external Territory" after "within Australia" '
         "from para (a) and (e)(i),"
-    ) in doc.markdown
+    ) in doc.text
+
+
+def test_extract_keeps_literal_asterisks_unescaped() -> None:
+    html = """
+    <div id="LawContent">
+        <p>You are entitled to a * tax offset for * foreign income tax.</p>
+    </div>
+    """
+    doc = extract(html)
+    assert r"\*" not in doc.text
+    assert "a * tax offset for * foreign income tax" in doc.text
+
+
+def test_extract_ignores_malformed_source_attribute_names() -> None:
+    html = """
+    <div id="LawContent">
+        <p PAC/19010002/Pt8>Malformed source attribute should not break extraction.</p>
+    </div>
+    """
+    doc = extract(html)
+    assert "Malformed source attribute should not break extraction." in doc.text
+    assert "PAC/19010002/Pt8" not in doc.html
 
 
 def test_extract_removes_history_noise_and_rewrites_internal_links() -> None:
@@ -119,11 +143,80 @@ def test_extract_removes_history_noise_and_rewrites_internal_links() -> None:
     </div>
     """
     doc = extract(html)
-    assert "View history" not in doc.markdown
-    assert "Hide history" not in doc.markdown
-    assert "inserted by No 48" not in doc.markdown
-    assert "203-55(1) [doc_id: PAC/19970038/203-55(1)]" in doc.markdown
-    assert "/law/view/document" not in doc.markdown
+    assert "View history" not in doc.text
+    assert "Hide history" not in doc.text
+    assert "inserted by No 48" not in doc.text
+    assert "203-55(1)" in doc.text
+    assert 'data-doc-id="PAC/19970038/203-55(1)"' in doc.html
+    assert "/law/view/document" not in doc.html
+
+
+def test_extract_removes_ato_mini_menu_navigation() -> None:
+    html = """
+    <div id="lawContents">
+      <div id="LawMiniMenuHeader">
+        <a href="/law/view/pdf?DocId=TPA%2FTA20253">Download</a>
+        <a href="/single-page-applications/legaldatabase/#Law/table-of-contents?docid=TPA/TA20253">Back to browse</a>
+      </div>
+      <h1>Taxpayer alert</h1>
+      <p>Substantive alert text.</p>
+    </div>
+    """
+    doc = extract(html)
+    assert "LawMiniMenuHeader" not in doc.html
+    assert "Back to browse" not in doc.text
+    assert "Substantive alert text." in doc.text
+
+
+def test_extract_preserves_legislation_inline_text_after_many_doc_links() -> None:
+    links = "\n".join(
+        f'<a href="/law/view/document?LocID=%22REG%2F20150033%2F91(3)%22">91(3)</a> {idx}'
+        for idx in range(70)
+    )
+    html = f"""
+    <div id="lawContents">
+      <div id="LawMiniMenuHeader"><a href="/law/view/print">Print</a></div>
+      <div id="LawContents">
+        <div id="lawBody">
+          <strong>SECTION 154</strong>
+          <br>A document is taken to continue under this instrument.
+          {links}
+          <br>Tail text after repeated internal links must survive.
+        </div>
+      </div>
+    </div>
+    """
+    doc = extract(html)
+    assert "Print" not in doc.text
+    assert "A document is taken to continue under this instrument." in doc.text
+    assert "Tail text after repeated internal links must survive." in doc.text
+    assert 'data-doc-id="REG/20150033/91(3)"' in doc.html
+    assert "/law/view/document" not in doc.html
+
+
+def test_extract_rewrites_images_to_asset_refs(tmp_path: Path) -> None:
+    payload = tmp_path / "doc.html"
+    asset = tmp_path / "assets" / "formula.gif"
+    asset.parent.mkdir()
+    asset.write_bytes(b"GIF89a-test")
+    payload.write_text(
+        """
+        <div id="LawContent">
+            <p>Formula <img src="assets/formula.gif" title="Annual amount formula"></p>
+            <p><img src="assets/history.gif" title="View history note">View history note</p>
+        </div>
+        """,
+        encoding="utf-8",
+    )
+
+    doc = extract(payload.read_text(encoding="utf-8"), doc_id="A/B/C", source_path=payload)
+
+    assert len(doc.assets) == 1
+    assert doc.assets[0].asset_ref == "ato-image://A%2FB%2FC/0"
+    assert 'data-asset-ref="ato-image://A%2FB%2FC/0"' in doc.html
+    assert "[image: Annual amount formula]" in doc.text
+    assert "![" not in doc.text
+    assert "View history note" not in doc.html
 
 
 def test_extract_rewrites_simple_formula_table() -> None:
@@ -140,7 +233,7 @@ def test_extract_rewrites_simple_formula_table() -> None:
     assert (
         "Formula: (Amount of the frankable distribution x Franking % differential) / "
         "Applicable gross-up rate"
-    ) in doc.markdown
+    ) in doc.text
 
 
 def test_extract_rewrites_underlined_single_cell_fraction_table() -> None:
@@ -157,8 +250,8 @@ def test_extract_rewrites_underlined_single_cell_fraction_table() -> None:
     </div>
     """
     doc = extract(html)
-    assert "Formula: 365 / Number of days in reference period" in doc.markdown
-    assert "| 365" not in doc.markdown
+    assert "Formula: 365 / Number of days in reference period" in doc.text
+    assert "| 365" not in doc.text
 
 
 def test_extract_rewrites_two_row_defined_term_fraction_table() -> None:
@@ -182,7 +275,7 @@ def test_extract_rewrites_two_row_defined_term_fraction_table() -> None:
     assert (
         "Formula: (100% - Corporate tax rate for imputation purposes) / "
         "Corporate tax rate for imputation purposes"
-    ) in doc.markdown
+    ) in doc.text
 
 
 def test_extract_leaves_ambiguous_two_row_table_as_table() -> None:
@@ -195,8 +288,8 @@ def test_extract_leaves_ambiguous_two_row_table_as_table() -> None:
     </div>
     """
     doc = extract(html)
-    assert "Formula:" not in doc.markdown
-    assert "| Label |" in doc.markdown
+    assert "Formula:" not in doc.text
+    assert "Label\nValue" in doc.text
 
 
 def test_extract_leaves_multi_cell_table_without_operator_as_table() -> None:
@@ -209,8 +302,8 @@ def test_extract_leaves_multi_cell_table_without_operator_as_table() -> None:
     </div>
     """
     doc = extract(html)
-    assert "Formula:" not in doc.markdown
-    assert "| Label | Value |" in doc.markdown
+    assert "Formula:" not in doc.text
+    assert "Label | Value\nTotal" in doc.text
 
 
 # ---------------------------------------------------------------------------

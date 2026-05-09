@@ -17,13 +17,18 @@ external URL recorded in the release manifest.
 |---|---|
 | `search` | Hybrid semantic-plus-lexical search over the GPU-built corpus. Defaults exclude Edited Private Advice and very old non-legislation content. |
 | `search_titles` | Fast title lookup, plus exact `doc_id` and ATO document-link lookup. |
-| `get_document` | Fetch an outline, a full document, a section, or an ordinal range. |
+| `get_document` | Fetch cleaned source HTML for a document. Internal ATO document links are `data-doc-id` attributes. |
+| `get_elements` | Select headings, paragraphs, tables, links, or asset references from cleaned HTML by tag and optional attribute. |
+| `get_asset` | Resolve a retained image `data-asset-ref` to a local file path and source metadata. |
 | `get_chunks` | Fetch exact chunks returned by `search`, with optional neighbor context. |
 | `get_definition` | Fetch compact statutory definitions for a term, with labelled ordinary-meaning fallback when no statutory definition is found. |
 | `stats` | Index version, counts, and default search policy. |
 
-JSON results include the ATO `canonical_url`; markdown output prefers compact
-`doc_id` references for follow-up calls.
+JSON results include the ATO `canonical_url`. Document bodies are exposed as
+cleaned HTML fragments so agents can navigate source structure directly without
+Markdown escaping or rendered-host assumptions. Search chunks are plain
+semantic text derived from the cleaned HTML; heading paths are metadata, and
+internal links/images contribute only useful visible text to search.
 
 ## Install
 
@@ -123,6 +128,7 @@ Examples:
 ato-mcp search "R&D tax incentive eligibility" --k 5
 ato-mcp search-titles "TR 2024 3"
 ato-mcp search-titles "PAC/19970038/203-50"
+ato-mcp get-document PAC/19970038/203-50 --format html --max-chars 20000
 ato-mcp get-definition "corporate tax gross-up rate" --context-doc-id PAC/19970038/203-50
 ato-mcp search "section 8-1 repairs" --mode keyword
 ato-mcp search "royalties withholding old cases" --include-old --types Cases
@@ -166,6 +172,7 @@ Layout:
 ato-mcp/
 ├── live/
 │   ├── ato.db
+│   ├── assets/
 │   ├── model_quantized.onnx
 │   ├── model_quantized.onnx_data
 │   └── tokenizer.json
@@ -185,7 +192,7 @@ Local GPU release build:
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install -e '.[dev]'
+.venv/bin/pip install -e '.[dev,gpu]'
 
 .venv/bin/ato-mcp refresh-source \
   --mode incremental \
@@ -212,7 +219,34 @@ Run the incremental What's New refresh immediately before every release build.
 If it changes `ato_pages/index.jsonl`, rebuild from that refreshed source before
 publishing.
 
-Release builds use EmbeddingGemma vectors. The model is not uploaded to
+`build-index` consumes local model files only to embed the corpus. Hosted model
+and reranker distribution metadata is resolved in the `release` step, not in the
+corpus build step.
+
+For faster local rebuilds while tuning extraction/chunking, use a smaller
+`--limit` smoke corpus first. `scripts/maintainer-sync.sh` also accepts
+`ATO_MCP_BUILD_WORKERS`, `ATO_MCP_WINDOW_DOCS`, `ATO_MCP_ENCODE_BATCH_SIZE`,
+`ATO_MCP_MAX_BATCH_TOKENS`, `ATO_MCP_CHECKPOINT_EVERY`,
+`ATO_MCP_PACK_TARGET_MB`, and
+`ATO_MCP_UNSAFE_FAST_SQLITE=1` for maintainer scratch builds. `--gpu` defaults
+to larger embedding batches than CPU, with a conservative padded-token cap for
+12 GB CUDA cards. Both fresh and previous-manifest builds
+use windowed, length-bucketed embedding batches; unchanged documents still reuse
+prior pack records. By default, full builds commit a resumable checkpoint every
+20,000 prepared records, so a later extractor or embed failure loses only the
+current window and a rerun skips already sealed documents. The build log prints
+per-window prepare/embed/write timing, token throughput, batch size, and
+approximate padded-token pressure so you can tune those values from evidence.
+
+Long maintainer runs automatically inhibit system sleep when the host provides
+`systemd-inhibit` or macOS `caffeinate`. `build-index` protects direct corpus
+rebuilds, and `scripts/maintainer-sync.sh` protects the full scrape, rebuild,
+and release flow. Set `ATO_MCP_ALLOW_SLEEP=1` only for short local checks where
+sleep prevention is unwanted.
+
+Release builds use EmbeddingGemma vectors and should run on the maintainer GPU.
+The Rust end-user runtime does not require a GPU; query embedding and reranking
+must continue to work on ordinary CPU-only laptops. The model is not uploaded to
 GitHub Releases; by default the manifest points at pinned Hugging Face
 EmbeddingGemma files, and the Rust client downloads and verifies them during
 `init`, `update`, or an opted-in `serve --check-update` startup check. Pass

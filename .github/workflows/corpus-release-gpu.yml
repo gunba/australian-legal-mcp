@@ -35,11 +35,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m venv .venv
-          .venv/bin/pip install -e '.[dev]'
-          .venv/bin/pip uninstall -y onnxruntime
-          .venv/bin/pip install -e '.[gpu]'
+          .venv/bin/pip install -e '.[dev,gpu]'
       - name: Require CUDA execution provider
         run: |
+          LIBS=$(find .venv/lib*/python*/site-packages/nvidia/ -maxdepth 2 -name lib -type d 2>/dev/null | tr '\n' ':' | sed 's/:$//')
+          export LD_LIBRARY_PATH="${LIBS:-}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           .venv/bin/python - <<'PY'
           import onnxruntime as ort
           providers = ort.get_available_providers()

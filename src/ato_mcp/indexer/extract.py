@@ -1,26 +1,34 @@
-"""HTML -> structured markdown for ATO documents.
+"""HTML -> cleaned agent-facing content for ATO documents.
 
 Strategy:
 1. Parse with selectolax (lexbor) for speed.
 2. Find the content container (``lawContents`` div, falling back to ``<article>``
    or ``<main>`` / ``<body>`` with nav stripped).
-3. Walk headings and collect anchor IDs onto a ``{#anchor}`` suffix.
-4. Convert to markdown via ``markdownify`` with a tight tag whitelist.
-5. Emit a bare markdown string; the chunker handles heading-based splits.
+3. Strip ubiquitous ATO history/navigation noise and unsafe/presentational
+   attributes.
+4. Rewrite internal ATO document links to ``data-doc-id`` attributes and
+   rewrite retained images to compact asset references.
+5. Emit cleaned HTML plus the plain semantic text used by metadata checks.
 
-Output also includes a plain-text ``outline`` (heading-path tuples) used by the
-metadata/chunking steps.
+Output also includes source headings, anchors, and image asset metadata used by
+the build pipeline.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import html as html_lib
+import mimetypes
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Iterable
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
-from markdownify import markdownify
+from bs4 import BeautifulSoup
 from selectolax.parser import HTMLParser, Node
+
+from . import chunk as chunk_mod
 
 _HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
 _NAV_LIKE_CLASSES = (
@@ -28,20 +36,45 @@ _NAV_LIKE_CLASSES = (
     "global-header",
     "breadcrumb",
     "breadcrumbs",
+    "minimenu",
+    "minimenu-bar",
     "site-footer",
     "page-footer",
     "navigation",
     "skip-links",
 )
+_NAV_LIKE_IDS = {"LawMiniMenuHeader"}
+_HISTORY_LABELS = {
+    "view history reference",
+    "view history note",
+    "hide history note",
+}
+_STRUCTURAL_ATTRS = {"id", "href", "data-doc-id", "data-asset-ref", "data-media-type"}
+_TABLE_ATTRS = {"colspan", "rowspan", "scope", "headers"}
+
+
+@dataclass(frozen=True)
+class ExtractedAsset:
+    asset_ref: str
+    source_path: str
+    relative_path: str
+    media_type: str | None
+    alt: str | None
+    title: str | None
+    sha256: str
+    size: int
+    data_b64: str
 
 
 @dataclass
 class ExtractedDoc:
-    markdown: str
+    html: str
+    text: str
     title: str | None
     html_title: str | None = None  # raw <title> (browser tab text)
     headings: list[str] = field(default_factory=list)
     anchors: list[tuple[str, str]] = field(default_factory=list)  # (heading_text, anchor_id)
+    assets: list[ExtractedAsset] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -74,43 +107,51 @@ class _FormulaCell:
     has_underline: bool
 
 
-def extract(html: str) -> ExtractedDoc:
+def extract(
+    html: str,
+    *,
+    doc_id: str | None = None,
+    source_path: Path | None = None,
+) -> ExtractedDoc:
     if not html or not html.strip():
-        return ExtractedDoc(markdown="", title=None, html_title=None)
+        return ExtractedDoc(html="", text="", title=None, html_title=None)
 
     tree = HTMLParser(html)
     html_title = _first_text(tree, "title")
 
     container = _pick_container(tree)
     if container is None:
-        return ExtractedDoc(markdown="", title=None, html_title=html_title)
+        return ExtractedDoc(html="", text="", title=None, html_title=html_title)
 
     _strip_noise(container)
-    anchors = _collect_anchors(container)
 
     # Capture "title headings" — consecutive leading headings before any body
     # content. On ATO rulings that gives h1=doc_type, h2=code, h3=subject.
     lead_headings = _leading_headings(container)
     title = _compose_title(lead_headings) or html_title
 
+    _strip_history_html(container)
     _rewrite_formula_html_tables(container)
-    _inject_anchor_suffixes(container)
+    _normalise_named_anchors(container)
+    container = _rewrite_links_html(container)
+    assets = _rewrite_images_html(container, doc_id=doc_id, source_path=source_path)
+    _strip_attributes(container)
+    anchors = _collect_anchors(container)
 
     headings = [
         (h.text(deep=True, separator=" ", strip=True) or "")
         for h in container.css(",".join(_HEADING_TAGS))
     ]
     html_fragment = container.html or ""
-    markdown = markdownify(
-        html_fragment,
-        heading_style="ATX",
-        bullets="-",
-        strip=["script", "style", "iframe"],
-    )
-    markdown = _tidy_markdown(markdown)
+    text = chunk_mod.html_to_text(html_fragment)
     return ExtractedDoc(
-        markdown=markdown, title=title, html_title=html_title,
-        headings=headings, anchors=anchors,
+        html=html_fragment.strip(),
+        text=text,
+        title=title,
+        html_title=html_title,
+        headings=headings,
+        anchors=anchors,
+        assets=assets,
     )
 
 
@@ -188,6 +229,9 @@ def _strip_noise(node: Node) -> None:
     for selector in ("script", "style", "noscript", "template"):
         for el in node.css(selector):
             el.decompose()
+    for ident in _NAV_LIKE_IDS:
+        for el in node.css(f"#{ident}"):
+            el.decompose()
     for cls in _NAV_LIKE_CLASSES:
         for el in node.css(f".{cls}"):
             el.decompose()
@@ -195,27 +239,228 @@ def _strip_noise(node: Node) -> None:
         el.decompose()
 
 
-def _inject_anchor_suffixes(node: Node) -> None:
-    """Rewrite ``<h* id="foo">Title</h*>`` to append ``{#foo}`` inside the heading.
+def _text_norm(value: str | None) -> str:
+    return " ".join((value or "").split()).strip()
 
-    markdownify preserves the text; we append the anchor so chunks can reference
-    it directly. Same rule applied to ``<a name="foo">`` siblings.
-    """
-    # [IB-08] Inject heading id as ' {#anchor}' suffix so the chunker can reference sections; markdownify runs with heading_style=ATX, bullets='-', and script/style/iframe stripped.
-    for tag in _HEADING_TAGS:
-        for heading in node.css(tag):
-            anchor = heading.attributes.get("id")
-            if not anchor:
-                # Look for a child <a name="...">
-                for a in heading.css("a"):
-                    name = a.attributes.get("name") or a.attributes.get("id")
-                    if name:
-                        anchor = name
-                        break
-            if not anchor:
+
+def _text_lc(value: str | None) -> str:
+    return _text_norm(value).lower()
+
+
+def _node_text_lc(node: Node) -> str:
+    return _text_lc(node.text(deep=True, separator=" ", strip=True))
+
+
+def _node_has_history_id(node: Node) -> bool:
+    ident = _text_lc(node.attributes.get("id"))
+    return ident.startswith("history_")
+
+
+def _node_has_history_label(node: Node) -> bool:
+    title = _text_lc(node.attributes.get("title"))
+    label = _node_text_lc(node)
+    return title in _HISTORY_LABELS or label in _HISTORY_LABELS
+
+
+def _strip_history_section_from(parent: Node, marker: Node) -> None:
+    children = list(parent.iter(include_text=False))
+    try:
+        start = children.index(marker)
+    except ValueError:
+        marker.decompose()
+        return
+    for child in children[start:]:
+        tag = (child.tag or "").lower()
+        if child is not marker and tag in _HEADING_TAGS:
+            break
+        child.decompose()
+
+
+def _strip_history_html(node: Node) -> None:
+    """Remove ATO version-history controls and blocks before HTML is exposed."""
+
+    for el in list(node.traverse()):
+        if _node_has_history_id(el):
+            el.decompose()
+
+    for el in list(node.traverse()):
+        tag = (el.tag or "").lower()
+        if tag in {"a", "button", "img"} and _node_has_history_label(el):
+            el.decompose()
+
+    for text_node in list(node.traverse(include_text=True)):
+        if (text_node.tag or "").lower() == "-text" and _text_lc(text_node.text()) in _HISTORY_LABELS:
+            text_node.decompose()
+
+    for el in list(node.traverse()):
+        tag = (el.tag or "").lower()
+        if tag not in {"p", "div", *_HEADING_TAGS}:
+            continue
+        if _node_text_lc(el) != "history":
+            continue
+        parent = el.parent
+        if parent is None:
+            el.decompose()
+        else:
+            _strip_history_section_from(parent, el)
+
+
+def _normalise_named_anchors(node: Node) -> None:
+    for el in node.css("a"):
+        name = el.attributes.get("name")
+        if name and not el.attributes.get("id"):
+            el.attrs["id"] = name
+        _drop_attr(el, "name")
+
+
+def _rewrite_links_html(node: Node) -> Node:
+    original_id = node.attributes.get("id")
+    soup = BeautifulSoup(node.html or "", "html.parser")
+    for el in soup.find_all("a"):
+        href = el.get("href")
+        if not href:
+            continue
+        doc_id = _doc_id_from_ato_link(href)
+        if doc_id:
+            el["data-doc-id"] = doc_id
+            del el["href"]
+            continue
+        clean = _safe_href(href)
+        if clean:
+            el["href"] = clean
+        else:
+            del el["href"]
+    tree = HTMLParser(str(soup))
+    if original_id:
+        replacement = tree.css_first(f"#{original_id}")
+        if replacement is not None:
+            return replacement
+    return tree.body or tree.root
+
+
+def _safe_href(href: str) -> str | None:
+    value = html_lib.unescape(href).strip()
+    if not value:
+        return None
+    if re.match(r"(?is)^\s*(?:javascript|data):", value):
+        return None
+    return value
+
+
+def _asset_ref(doc_id: str, ordinal: int) -> str:
+    return f"ato-image://{quote(doc_id, safe='')}/{ordinal}"
+
+
+def _asset_relative_path(data: bytes, source: str) -> tuple[str, str]:
+    sha = hashlib.sha256(data).hexdigest()
+    suffix = Path(urlparse(source).path).suffix.lower()
+    if not suffix or len(suffix) > 10:
+        suffix = mimetypes.guess_extension(mimetypes.guess_type(source)[0] or "") or ".bin"
+    return f"assets/{sha[:2]}/{sha}{suffix}", sha
+
+
+def _asset_path_for(source_path: Path | None, src: str) -> Path | None:
+    if source_path is None or not src:
+        return None
+    parsed = urlparse(src)
+    if parsed.scheme or src.startswith("/"):
+        return None
+    return (source_path.parent / src).resolve()
+
+
+def _image_label(img: Node) -> tuple[str | None, str | None, str]:
+    alt = _text_norm(img.attributes.get("alt")) or None
+    title = _text_norm(img.attributes.get("title")) or None
+    label = alt or title or ""
+    return alt, title, label
+
+
+def _rewrite_images_html(
+    node: Node,
+    *,
+    doc_id: str | None,
+    source_path: Path | None,
+) -> list[ExtractedAsset]:
+    assets: list[ExtractedAsset] = []
+    image_ord = 0
+    for img in list(node.css("img")):
+        alt, title, label = _image_label(img)
+        if _text_lc(label) == "exclamation":
+            img.decompose()
+            continue
+
+        src = _text_norm(img.attributes.get("src"))
+        data: bytes | None = None
+        asset_path = _asset_path_for(source_path, src)
+        if asset_path is not None and asset_path.exists():
+            data = asset_path.read_bytes()
+
+        asset_ref: str | None = None
+        relative_path: str | None = None
+        media_type = mimetypes.guess_type(src)[0]
+        if data is not None and doc_id:
+            asset_ref = _asset_ref(doc_id, image_ord)
+            relative_path, sha = _asset_relative_path(data, src)
+            assets.append(
+                ExtractedAsset(
+                    asset_ref=asset_ref,
+                    source_path=src,
+                    relative_path=relative_path,
+                    media_type=media_type,
+                    alt=alt,
+                    title=title,
+                    sha256=sha,
+                    size=len(data),
+                    data_b64=base64.b64encode(data).decode("ascii"),
+                )
+            )
+            image_ord += 1
+
+        if asset_ref is None and not label:
+            img.decompose()
+            continue
+
+        attrs = []
+        if asset_ref:
+            attrs.append(f'data-asset-ref="{html_lib.escape(asset_ref, quote=True)}"')
+        if media_type:
+            attrs.append(f'data-media-type="{html_lib.escape(media_type, quote=True)}"')
+        text = f"[image: {label}]" if label else "[image]"
+        replacement = HTMLParser(
+            f"<span {' '.join(attrs)}>{html_lib.escape(text)}</span>"
+        ).css_first("span")
+        if replacement is not None:
+            img.replace_with(replacement)
+        else:
+            img.decompose()
+    return assets
+
+
+def _strip_attributes(node: Node) -> None:
+    for el in node.traverse():
+        tag = (el.tag or "").lower()
+        allowed = set(_STRUCTURAL_ATTRS)
+        if tag in {"td", "th"}:
+            allowed |= _TABLE_ATTRS
+        for attr in list(el.attributes):
+            attr_lc = attr.lower()
+            if attr_lc.startswith("data-") and attr_lc in _STRUCTURAL_ATTRS:
                 continue
-            # Append ' {#anchor}' to the heading text
-            heading.insert_child(f" {{#{anchor}}}")
+            if attr_lc in allowed:
+                if attr_lc != attr:
+                    value = el.attributes.get(attr)
+                    if value is not None:
+                        el.attrs[attr_lc] = value
+                    _drop_attr(el, attr)
+                continue
+            _drop_attr(el, attr)
+
+
+def _drop_attr(node: Node, attr: str) -> None:
+    try:
+        del node.attrs[attr]
+    except KeyError:
+        pass
 
 
 def _clean_formula_part(value: str) -> str:
@@ -300,63 +545,6 @@ def _rewrite_formula_html_tables(node: Node) -> None:
             table.replace_with(replacement)
 
 
-_MD_COLLAPSE = re.compile(r"\n{3,}")
-_MD_TRAIL_WS = re.compile(r"[ \t]+\n")
-_MD_NUMERIC_RANGE = re.compile(r"(?<=\d)\s+-\s+(?=\d)")
-_MD_SPACED_QUOTE = re.compile(r'"\s+([^"\n]*?)\s+"')
-_HISTORY_LINK_LINE = re.compile(r'^\[View history reference\]\([^)]+\)\s*$', re.IGNORECASE)
-_HISTORY_TOGGLE_LINE = re.compile(
-    r'!\[[^\]]*\]\([^)]*(?:"(?:View|Hide) history note"[^)]*)?\)\s*(?:View|Hide) history note',
-    re.IGNORECASE,
-)
-_MARKDOWN_LINK_START = re.compile(r"\[[^\]\n]{0,300}\]\(")
-
-
-def _is_structural_markdown_line(line: str) -> bool:
-    stripped = line.lstrip()
-    return (
-        not stripped
-        or stripped.startswith(("#", ">", "|", "```", "---"))
-        or bool(re.match(r"([-*+]|\d+[.)])\s+", stripped))
-    )
-
-
-def _unwrap_prose_lines(md: str) -> str:
-    """Join source-wrapped inline fragments inside plain prose blocks.
-
-    ATO legislation pages sometimes split inline spans, quotes, and hyphenated
-    amendment ranges across physical HTML source lines. markdownify preserves
-    those newlines, which turns inline phrases into broken markdown. Keep
-    structural markdown blocks intact and unwrap only plain prose paragraphs.
-    """
-
-    # [IE-03] Plain prose blocks are unwrapped after markdownify so source line breaks inside inline spans/quotes don't shatter amendment notes.
-    blocks = re.split(r"(\n\s*\n)", md)
-    out: list[str] = []
-    for block in blocks:
-        if not block or block.isspace():
-            out.append(block)
-            continue
-        lines = block.splitlines()
-        if len(lines) <= 1 or any(_is_structural_markdown_line(line) for line in lines):
-            out.append(block)
-            continue
-        joined = " ".join(line.strip() for line in lines if line.strip())
-        joined = _MD_NUMERIC_RANGE.sub("-", joined)
-        joined = _MD_SPACED_QUOTE.sub(r'"\1"', joined)
-        out.append(joined)
-    return "".join(out)
-
-
-def _tidy_markdown(md: str) -> str:
-    md = _rewrite_internal_links(md)
-    md = _strip_history_noise(md)
-    md = _unwrap_prose_lines(md)
-    md = _MD_TRAIL_WS.sub("\n", md)
-    md = _MD_COLLAPSE.sub("\n\n", md)
-    return md.strip() + "\n"
-
-
 def _doc_id_from_ato_link(target: str) -> str | None:
     target = target.strip()
     if target.startswith("<") and target.endswith(">"):
@@ -372,83 +560,6 @@ def _doc_id_from_ato_link(target: str) -> str | None:
         return None
     doc_id = unquote(raw[0]).strip().strip('"')
     return doc_id or None
-
-
-def _rewrite_internal_links(md: str) -> str:
-    """Replace noisy ATO markdown URLs with compact doc_id references."""
-
-    out: list[str] = []
-    i = 0
-    while i < len(md):
-        start = md.find("[", i)
-        if start < 0:
-            out.append(md[i:])
-            break
-        out.append(md[i:start])
-        label_end = md.find("](", start)
-        if label_end < 0:
-            out.append(md[start:])
-            break
-        label = md[start + 1:label_end]
-        target_start = label_end + 2
-        depth = 1
-        j = target_start
-        while j < len(md):
-            if md[j] == "(":
-                depth += 1
-            elif md[j] == ")":
-                depth -= 1
-                if depth == 0:
-                    break
-            j += 1
-        if j >= len(md):
-            out.append(md[start:])
-            break
-        target = md[target_start:j]
-        doc_id = _doc_id_from_ato_link(target)
-        if doc_id is None:
-            out.append(md[start:j + 1])
-        elif label.strip().lower() == "view history reference":
-            out.append("")
-        else:
-            clean_label = " ".join(label.split()) or doc_id
-            if clean_label == doc_id or clean_label.endswith(f"docid={doc_id}"):
-                out.append(f"[doc_id: {doc_id}]")
-            else:
-                out.append(f"{clean_label} [doc_id: {doc_id}]")
-        i = j + 1
-    return "".join(out)
-
-
-def _is_history_boundary(line: str) -> bool:
-    stripped = line.strip()
-    if not stripped:
-        return False
-    return (
-        stripped.startswith("#")
-        or stripped.startswith("***")
-        or stripped.startswith("**")
-        or bool(_MARKDOWN_LINK_START.match(stripped))
-    )
-
-
-def _strip_history_noise(md: str) -> str:
-    lines = md.splitlines()
-    out: list[str] = []
-    i = 0
-    while i < len(lines):
-        stripped = lines[i].strip()
-        if _HISTORY_LINK_LINE.match(stripped) or _HISTORY_TOGGLE_LINE.search(stripped):
-            i += 1
-            continue
-        if stripped == "History":
-            i += 1
-            while i < len(lines) and not _is_history_boundary(lines[i]):
-                i += 1
-            continue
-        out.append(lines[i])
-        i += 1
-    return "\n".join(out)
 
 
 def _collect_anchors(node: Node) -> list[tuple[str, str]]:

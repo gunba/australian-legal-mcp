@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ato-mcp"
-version = "0.6.8"
+version = "0.6.9"
 description = "Local MCP server for the Australian Taxation Office legal database"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,9 +21,6 @@ classifiers = [
 dependencies = [
     "typer>=0.12",
     "selectolax>=0.3.21",
-    "markdownify>=0.11",
-    "sqlite-vec>=0.1.6",
-    "onnxruntime>=1.20",
     "tokenizers>=0.20",
     "orjson>=3.10",
     "zstandard>=0.22",
@@ -47,26 +44,21 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.5",
 ]
-# Maintainer-only: GPU-backed corpus build. End users run the Rust binary
-# and never load this Python package, so pinning the heavier onnxruntime-gpu
-# wheel here doesn't reach them.
-#
-# onnxruntime and onnxruntime-gpu both ship a module named ``onnxruntime``
-# and clobber each other if installed in the same environment — pip can't
-# detect the conflict because the package names are different. Install
-# this group with ``pip uninstall -y onnxruntime`` first so the GPU build
-# wins:
-#
-#     pip install -e '.[dev]'
-#     pip uninstall -y onnxruntime
-#     pip install -e '.[gpu]'
-#
-# After install, ``ort.get_available_providers()`` should list
-# ``CUDAExecutionProvider``. If it doesn't, ``LD_LIBRARY_PATH`` is missing
-# the venv's ``nvidia/*/lib`` paths — see scripts/maintainer-sync.sh for
-# how to set it.
+# Maintainer-only embedding runtimes. End users run the Rust binary and never
+# load this Python package. Keep CPU and GPU extras separate: onnxruntime and
+# onnxruntime-gpu both ship the same ``onnxruntime`` module and clobber each
+# other when installed together.
+cpu = [
+    "onnxruntime>=1.20,<2",
+]
 gpu = [
     "onnxruntime-gpu>=1.25,<2",
+    "nvidia-cublas-cu12>=12,<13",
+    "nvidia-cuda-nvrtc-cu12>=12,<13",
+    "nvidia-cuda-runtime-cu12>=12,<13",
+    "nvidia-cudnn-cu12>=9,<10",
+    "nvidia-cufft-cu12>=11,<12",
+    "nvidia-curand-cu12>=10,<11",
 ]
 
 [project.scripts]

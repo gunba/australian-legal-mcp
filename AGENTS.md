@@ -15,6 +15,18 @@ constructing titles from HTML headings, removing repeated history/navigation
 metadata that appears across the corpus, and preserving exact chunk/document
 references.
 
+The document surface is cleaned source HTML, not Markdown. Preserve stable
+HTML structure so agents can navigate tags and attributes directly. Internal
+ATO document links should become deterministic `data-doc-id` attributes rather
+than retained `href` URLs, and retained images should be compact
+`data-asset-ref` references resolvable through the asset tool. Do not inline
+image bytes or carry decorative/history icons into context.
+
+The semantic search/index path should use plain, source-derived text from the
+cleaned HTML. Do not introduce HTML-to-Markdown conversion, Markdown escaping,
+or host-rendering assumptions into stored chunks. Headings belong in metadata;
+links and images should contribute only useful visible text to search.
+
 Do not add features built on hacky string substitutions, guessed citation
 aliases, hand-maintained act maps, or fragile interpretations of user prose.
 If logic would need ongoing maintenance against new ATO document shapes, it is
@@ -120,6 +132,19 @@ Default search is intentionally current-guidance-first:
 
 Python is maintainer tooling only. Use it only on a machine that has the
 source corpus, model files, and a GPU-backed ONNX Runtime setup.
+Use `pip install -e '.[dev,gpu]'` for release builds; install the `cpu` and
+`gpu` extras separately because their ONNX Runtime wheels conflict.
+Maintainer corpus builds should pass `--gpu` and fail fast if CUDA is not
+available. The Rust end-user runtime must remain CPU-safe; do not make ordinary
+install, update, search, or serve require a GPU.
+Maintainer corpus rebuilds should run with sleep prevention active. `build-index`
+and `scripts/maintainer-sync.sh` do this automatically through `systemd-inhibit`
+or `caffeinate` when available.
+
+`build-index` consumes local embedding model files and writes corpus artifacts.
+Do not thread hosted model URLs, reranker URLs, or other distribution metadata
+through corpus building. The `release` step owns model/reranker distribution
+metadata and final manifest publication.
 
 Do not run `refresh-source`, `catch-up`, `build-index`, or `release` on a
 user install. Those commands require the maintainer checkout and model

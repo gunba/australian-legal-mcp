@@ -4,9 +4,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
-from ato_mcp.indexer.build import BuildArgs, _reranker_model_info
 from ato_mcp.store.manifest import (
     DEFAULT_MIN_CLIENT_VERSION,
     DocRef,
@@ -76,28 +73,25 @@ def test_diff_marks_same_content_repack_changed() -> None:
     assert removed == []
 
 
-def test_manifest_schema_version_bumped_to_3() -> None:
-    """Wave 3 (0.6.0) bumps the manifest schema version to 3 so older Rust
-    binaries refuse to ingest a v3 corpus.
+def test_manifest_schema_version_bumped_to_4() -> None:
+    """Cleaned HTML/assets bump the manifest schema version to 4 so older
+    Rust binaries refuse to ingest packs with the new required body surface.
 
     The Rust side's `MAX_SUPPORTED_MANIFEST_VERSION` advances in lockstep;
     this constant is the gate the build pipeline writes into freshly-built
     manifests.
     """
-    assert MANIFEST_SCHEMA_VERSION == 3
+    assert MANIFEST_SCHEMA_VERSION == 4
     fresh = _m([])
-    assert fresh.schema_version == 3
+    assert fresh.schema_version == 4
 
 
-def test_min_client_version_pins_to_0_6_1() -> None:
-    """Wave 3 bumps the minimum client version to 0.6.1. Older binaries
-    decoding the v3 manifest would parse fine (the new `reranker` field is
-    optional), but the runtime's `min_client_version > CARGO_PKG_VERSION`
-    check rejects them earlier with a friendlier "upgrade required" error.
+def test_min_client_version_pins_to_0_6_9() -> None:
+    """The HTML/assets corpus requires the matching Rust binary.
     """
-    assert DEFAULT_MIN_CLIENT_VERSION == "0.6.1"
+    assert DEFAULT_MIN_CLIENT_VERSION == "0.6.9"
     fresh = _m([])
-    assert fresh.min_client_version == "0.6.1"
+    assert fresh.min_client_version == "0.6.9"
 
 
 def test_manifest_with_reranker_serializes_and_deserializes(tmp_path: Path) -> None:
@@ -182,41 +176,3 @@ def test_update_summary_keeps_fast_check_fields(tmp_path: Path) -> None:
     assert raw["document_count"] == 2
     assert raw["manifest_fingerprint"] == manifest_fingerprint(m)
     assert raw["reranker"]["id"] == "gte-reranker-modernbert-base-quantized"
-
-
-def test_build_reranker_manifest_requires_integrity_fields(tmp_path: Path) -> None:
-    args = BuildArgs(
-        pages_dir=tmp_path,
-        out_dir=tmp_path,
-        db_path=tmp_path / "ato.db",
-        model_id="embeddinggemma-300m-int8-256d",
-        model_path=tmp_path / "model_quantized.onnx",
-        tokenizer_path=tmp_path / "tokenizer.json",
-        reranker_id="ms-marco-minilm-l6-v2-int8",
-        reranker_url="hf://example/repo@abc",
-    )
-
-    with pytest.raises(ValueError, match="sha256.*size"):
-        _reranker_model_info(args)
-
-
-def test_build_reranker_manifest_accepts_complete_metadata(tmp_path: Path) -> None:
-    args = BuildArgs(
-        pages_dir=tmp_path,
-        out_dir=tmp_path,
-        db_path=tmp_path / "ato.db",
-        model_id="embeddinggemma-300m-int8-256d",
-        model_path=tmp_path / "model_quantized.onnx",
-        tokenizer_path=tmp_path / "tokenizer.json",
-        reranker_id="ms-marco-minilm-l6-v2-int8",
-        reranker_url="hf://example/repo@abc",
-        reranker_sha256="a" * 64,
-        reranker_size=123,
-        reranker_tokenizer_sha256="b" * 64,
-    )
-
-    info = _reranker_model_info(args)
-    assert info is not None
-    assert info.sha256 == "a" * 64
-    assert info.size == 123
-    assert info.tokenizer_sha256 == "b" * 64

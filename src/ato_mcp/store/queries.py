@@ -1,11 +1,11 @@
-"""Prepared SQL queries used by maintainer build and migration paths."""
+"""Prepared SQL queries used by maintainer build paths."""
 from __future__ import annotations
 
 INSERT_DOCUMENT = """
 INSERT OR REPLACE INTO documents
     (doc_id, type, title, date, downloaded_at, content_hash, pack_sha8,
-     withdrawn_date, superseded_by, replaces)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     html, withdrawn_date, superseded_by, replaces)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 DELETE_DOCUMENT = "DELETE FROM documents WHERE doc_id = ?"
@@ -26,6 +26,12 @@ INSERT OR REPLACE INTO definitions
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
+INSERT_ASSET = """
+INSERT OR REPLACE INTO document_assets
+    (asset_ref, doc_id, source_path, relative_path, media_type, alt, title, sha256, bytes)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
 INSERT_TITLE_FTS = """
 INSERT INTO title_fts (doc_id, title, headings) VALUES (?, ?, ?)
 """
@@ -35,7 +41,7 @@ INSERT INTO title_fts (title_fts, doc_id, title, headings)
   SELECT 'delete', doc_id, title, headings FROM title_fts WHERE doc_id = ?
 """
 
-INSERT_VEC = "INSERT INTO chunks_vec(chunk_id, embedding) VALUES (?, vec_int8(?))"
+INSERT_VEC = "INSERT INTO chunk_embeddings(chunk_id, embedding) VALUES (?, ?)"
 
 SELECT_CHUNKS_FOR_DOC = """
 SELECT chunk_id, ord, heading_path, anchor, text

@@ -10,6 +10,7 @@
 #   - model at models/embeddinggemma/
 #   - optional ATO_MCP_MODEL_URL for an approved model mirror
 #   - optional ATO_MCP_RERANKER_BUNDLE / ATO_MCP_RERANKER_URL for the reranker
+#     (defaults to models/reranker when present)
 #   - gh authenticated for the maintainer account
 #
 # Usage:
@@ -28,7 +29,11 @@ MODEL_URL_ARG=()
 if [ -n "$MODEL_URL" ]; then
   MODEL_URL_ARG=(--model-url "$MODEL_URL")
 fi
+DEFAULT_RERANKER_BUNDLE="$REPO_DIR/models/reranker"
 RERANKER_BUNDLE="${ATO_MCP_RERANKER_BUNDLE:-}"
+if [[ -z "$RERANKER_BUNDLE" && -d "$DEFAULT_RERANKER_BUNDLE" ]]; then
+  RERANKER_BUNDLE="$DEFAULT_RERANKER_BUNDLE"
+fi
 RERANKER_ID="${ATO_MCP_RERANKER_ID:-}"
 RERANKER_URL="${ATO_MCP_RERANKER_URL:-}"
 RERANKER_SHA256="${ATO_MCP_RERANKER_SHA256:-}"

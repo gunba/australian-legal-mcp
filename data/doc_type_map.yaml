@@ -72,6 +72,9 @@ EM:
 ACT:
   name: "Act"
   category: "Legislation_and_supporting_material"
+PAC:
+  name: "Principal Act"
+  category: "Legislation_and_supporting_material"
 REG:
   name: "Regulation"
   category: "Legislation_and_supporting_material"
@@ -94,6 +97,9 @@ EV:
   name: "Edited Private Advice"
   category: "Edited_private_advice"
 EXM:
+  name: "Explanatory Memorandum"
+  category: "Legislation_and_supporting_material"
+NEM:
   name: "Explanatory Memorandum"
   category: "Legislation_and_supporting_material"
 EXR:

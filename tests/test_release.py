@@ -32,11 +32,11 @@ from ato_mcp.store.manifest import (
 
 def test_freshly_built_manifest_pins_min_client_version() -> None:
     """A freshly-constructed Manifest must default `min_client_version` to
-    "0.6.1" so older binaries refuse to ingest this corpus.
+    "0.6.9" so older binaries refuse to ingest this corpus.
 
     The Rust enforce_manifest_compatibility check compares this field to
     `CARGO_PKG_VERSION`; without this default the gate is dormant and a
-    pre-Wave-3 binary would silently download a v3 corpus and only fail
+    pre-HTML-surface binary would silently download a v4 corpus and only fail
     AFTER the install via the schema-version DB check.
     """
     manifest = Manifest(
@@ -44,11 +44,11 @@ def test_freshly_built_manifest_pins_min_client_version() -> None:
         created_at="2026-05-03T00:00:00+00:00",
         model=ModelInfo(id="m", sha256="0" * 64, size=1, url="model/m.onnx.zst"),
     )
-    assert manifest.min_client_version == "0.6.1"
-    assert DEFAULT_MIN_CLIENT_VERSION == "0.6.1"
-    # And the manifest format version is bumped to v3 (Wave 3 boundary).
+    assert manifest.min_client_version == "0.6.9"
+    assert DEFAULT_MIN_CLIENT_VERSION == "0.6.9"
+    # And the manifest format version is bumped to v4 (HTML/assets boundary).
     assert manifest.schema_version == MANIFEST_SCHEMA_VERSION
-    assert MANIFEST_SCHEMA_VERSION == 3
+    assert MANIFEST_SCHEMA_VERSION == 4
 
 
 def test_rewrite_manifest_urls_flattens_asset_names(tmp_path: Path) -> None:

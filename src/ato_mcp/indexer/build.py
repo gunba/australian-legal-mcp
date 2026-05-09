@@ -3,8 +3,8 @@
 Orchestrates:
 1. Enumerate ``index.jsonl`` records from a scraped ``ato_pages/`` directory.
 2. Load each payload HTML.
-3. Extract markdown, metadata, status.
-4. Chunk.
+3. Extract cleaned HTML, metadata, status.
+4. Chunk cleaned HTML into plain semantic search text.
 5. Embed chunks (int8 via EmbeddingGemma ONNX).
 6. Write document into a sqlite ``ato.db`` and a release pack.
 7. Emit a ``manifest.json`` suitable for clients.
@@ -15,6 +15,7 @@ compatible with the current extracted fields, the existing pack slot is reused.
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -41,6 +42,7 @@ from ..store.manifest import (
     save_update_summary,
 )
 from ..store.queries import (
+    INSERT_ASSET,
     INSERT_CHUNK,
     INSERT_CHUNK_FTS,
     INSERT_DEFINITION,
@@ -69,11 +71,11 @@ LOGGER = get_logger(__name__)
 
 BASE_URL = "https://www.ato.gov.au"
 
-# [IB-13] CHECKPOINT_EVERY=1000 docs commits the in-progress SQLite txn AND flushes the in-flight pack — a kill mid-run loses at most this many docs of work.
+# [IB-13] CHECKPOINT_EVERY=20000 docs commits the in-progress SQLite txn AND flushes the in-flight pack — a failure loses at most the current build window.
 # Commit the in-progress transaction every N newly-processed docs so a kill
 # mid-run only loses at most this many docs of work. Packs sealed at each
 # checkpoint become immutable on disk and are picked up on restart.
-CHECKPOINT_EVERY = 1000
+CHECKPOINT_EVERY = 20_000
 
 INSERT_CHUNK_WITH_ID = """
 INSERT INTO chunks (chunk_id, doc_id, ord, heading_path, anchor, text)
@@ -89,24 +91,8 @@ class BuildArgs:
     model_id: str
     model_path: Path | None
     tokenizer_path: Path | None
-    model_url: str | None = None
     model_sha256: str | None = None
     model_size: int | None = None
-    # Optional reranker bundle metadata. When all four are set, the build
-    # writes a `reranker: ModelInfo` field into the manifest so the Rust
-    # runtime knows where to fetch the cross-encoder ONNX + tokenizer from.
-    # Leave None to publish a manifest without a reranker entry; the runtime
-    # falls back to the un-reranked hybrid score in that case.
-    reranker_id: str | None = None
-    reranker_url: str | None = None
-    reranker_sha256: str | None = None
-    reranker_size: int | None = None
-    # C4: optional sha256 of the reranker tokenizer file. Threaded from the
-    # release CLI when known; embedded into the manifest's
-    # ``reranker.tokenizer_sha256`` so the Rust runtime can verify the
-    # downloaded ``tokenizer.json`` byte-for-byte. Older v3 manifests omit
-    # this field; the runtime degrades to a one-line warning.
-    reranker_tokenizer_sha256: str | None = None
     previous_manifest: Path | None = None
     limit: int | None = None  # optional cap for testing
     # [IB-17] Production build-index exposes only EmbeddingGemma.
@@ -130,6 +116,20 @@ class PreparedChunk:
     heading_path: str
     anchor: str | None
     text: str
+    definition_text: str | None = None
+
+
+@dataclass
+class PreparedAsset:
+    asset_ref: str
+    source_path: str
+    relative_path: str
+    media_type: str | None
+    alt: str | None
+    title: str | None
+    sha256: str
+    size: int
+    data_b64: str
 
 
 @dataclass
@@ -142,6 +142,8 @@ class PreparedDoc:
     content_hash: str
     headings_text: str
     anchors: list[tuple[str, str]]
+    html: str
+    assets: list[PreparedAsset]
     chunks: list[PreparedChunk]
     definitions: list[definition_mod.Definition]
     # W2.2 currency markers — None when the source page carries no marker.
@@ -195,11 +197,21 @@ class EncodedWindow:
     approx_padded_tokens: int
 
 
+@dataclass
+class BatchEncodeStats:
+    tokens_seen: int = 0
+    encode_calls: int = 0
+    max_batch_size: int = 0
+    max_padded_tokens: int = 0
+    approx_padded_tokens: int = 0
+
+
 def _build_fresh_windowed(args: BuildArgs) -> Manifest:
     # [IB-12] Fresh builds fully re-embed; incremental builds reuse pack slots only when content_hash is unchanged and the prior pack record is compatible with current extracted fields.
     if args.embedder != "embeddinggemma":
         raise ValueError("build-index requires --embedder embeddinggemma")
     _reset_fresh_outputs(args.out_dir, args.db_path)
+    asset_root = args.db_path.parent
     packs_dir = args.out_dir / "packs"
     packs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -301,6 +313,7 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
                 empties=empties,
                 vectors_i8=vectors_i8,
                 zstd_level=args.zstd_level,
+                asset_root=asset_root,
             )
             write_s = time.monotonic() - phase
             timings.write += write_s
@@ -353,9 +366,8 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
             id=model_id,
             sha256=args.model_sha256 or "",
             size=args.model_size or 0,
-            url=args.model_url or f"model/{model_id}.onnx.zst",
+            url=f"model/{model_id}.onnx.zst",
         ),
-        reranker=_reranker_model_info(args),
         documents=doc_refs_final,
         packs=packs,
     )
@@ -399,6 +411,7 @@ def build(args: BuildArgs) -> Manifest:
         raise ValueError("--model-path and --tokenizer-path are required for embeddinggemma builds")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    asset_root = args.db_path.parent
     packs_dir = args.out_dir / "packs"
     packs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -418,6 +431,8 @@ def build(args: BuildArgs) -> Manifest:
         LOGGER.info("Loaded previous manifest with %d documents", len(prev_docs))
 
     conn = store_db.init_db(args.db_path)
+    if args.unsafe_fast_sqlite:
+        _apply_unsafe_fast_sqlite_pragmas(conn)
     store_db.set_meta(conn, "embedding_model_id", args.model_id)
     store_db.set_meta(conn, "index_version", _today_version())
 
@@ -438,214 +453,160 @@ def build(args: BuildArgs) -> Manifest:
         tokenizer_path=args.tokenizer_path,
         providers=args.providers,
     )
-    pack_builder = PackBuilder(out_dir=packs_dir, target_size=args.pack_target_size)
+    pack_builder = FastPackBuilder(
+        out_dir=packs_dir,
+        target_size=args.pack_target_size,
+        zstd_level=args.zstd_level,
+    )
 
     doc_refs: list[DocRef] = []
-    reused_pack_shas: set[str] = set()
-    processed = 0
-    reused = 0
+    timings = WindowTimings()
+    seen = processed = reused = changed = empty_shells = chunks_count = windows = 0
+    tokens_seen = encode_calls = approx_padded_tokens = 0
     since_checkpoint = 0
     t0 = time.monotonic()
 
     conn.execute("BEGIN")
     try:
-        for rec in index_records:
-            canonical_id = rec["canonical_id"]
-            doc_id = meta_mod.doc_id_for(canonical_id)
-            if doc_id in resume_done:
-                continue
-            category = meta_mod.category_from_path(rec.get("payload_path"))
-            if category == "Unknown":
-                # Payload path didn't resolve (missing or outside the
-                # expected bucket tree) — fall back to the docid-prefix map
-                # so EV/... stays "Edited_private_advice", JUD/... stays
-                # "Cases" etc. Avoids a bucket of "Unknown" docs whose type
-                # is still knowable from the URL.
-                category = meta_mod.category_for_docid(canonical_id)
-            status = rec.get("status")
-            has_content = status == "success"
-
-            markdown = ""
-            headings: list[str] = []
-            anchors: list[tuple[str, str]] = []
-            html: str | None = None
-            if has_content and rec.get("payload_path"):
-                payload_path = args.pages_dir / rec["payload_path"]
-                if payload_path.exists():
-                    html = payload_path.read_text(encoding="utf-8", errors="replace")
-                    extracted = extract_mod.extract(html)
-                    markdown = extracted.markdown
-                    headings = extracted.headings
-                    anchors = extracted.anchors
-                    title = extracted.title
-                else:
-                    has_content = False
-                    title = None
-            else:
-                title = None
-
-            # A payload with status=success but no extractable content (EPA
-            # empty shells, broken pages) should still surface by title, but
-            # shouldn't generate empty chunks.
-            if has_content and not markdown.strip():
-                has_content = False
-
-            # [IB-15] Empty shells (status=success but no extractable body — broken pages, EPA stubs) go to empty_shells, NOT documents/title_fts/chunks_fts; later retry runs can re-probe by URL.
-            # Empty shell: scraper succeeded but extracted no body. Log it
-            # to empty_shells so a later retry run can re-probe the URL,
-            # then skip inserting into ``documents``.
-            if not has_content:
-                now = datetime.now(timezone.utc).isoformat()
-                conn.execute(INSERT_EMPTY_SHELL, (doc_id, now, now, "scrape"))
-                processed += 1
-                since_checkpoint += 1
-                if since_checkpoint >= CHECKPOINT_EVERY:
-                    _checkpoint(conn, pack_builder, doc_refs)
-                    since_checkpoint = 0
-                continue
-
-            if not title:
-                title = (rec.get("title") or canonical_id).strip() or canonical_id
-
-            prefix, _ = meta_mod.parse_docid(canonical_id)
-            pub_date = meta_mod.extract_pub_date(markdown) if markdown else None
-            derived = rules_mod.derive_metadata(rules_mod.RuleInputs(
-                doc_id=doc_id,
-                title=title,
-                headings=tuple(headings),
-                body_head=markdown[:3000] if markdown else "",
-                category=category,
-                pub_date=pub_date,
-            ))
-            derived_title = derived.title or title
-            derived_date = derived.date
-            downloaded_at = rec.get("downloaded_at") or datetime.now(timezone.utc).isoformat()
-
-            meta_fields = {
-                "title": derived_title,
-                "type": category,
-                "date": derived_date,
-            }
-            ch = meta_mod.content_hash(markdown, meta_fields)
-
-            prev_ref = prev_docs.get(doc_id)
-            if (
-                prev_ref
-                and prev_ref.content_hash == ch
-                and prev_ref.pack_sha8 in prev_pack_info
-                and _previous_pack_record_has_current_definitions(
-                    prev_ref, args.previous_manifest, prev_pack_info
-                )
-            ):
-                # Reuse prior pack slot; skip re-embedding.
-                doc_refs.append(prev_ref)
-                reused_pack_shas.add(prev_ref.pack_sha8)
-                reused += 1
-                processed += 1
-                since_checkpoint += 1
-                _insert_from_previous(conn, rec, prev_ref, args.previous_manifest, prev_pack_info)
-                if since_checkpoint >= CHECKPOINT_EVERY:
-                    _checkpoint(conn, pack_builder, doc_refs)
-                    since_checkpoint = 0
-                continue
-
-            chunks = (
-                chunk_mod.chunk_markdown(markdown, root_title=title) if has_content and markdown else []
-            )
-            prepared_chunks = [
-                PreparedChunk(c.ord, c.heading_path, c.anchor, c.text)
-                for c in chunks
+        for raw_window in _windowed(index_records, args.window_docs):
+            active_records = [
+                rec
+                for rec in raw_window
+                if meta_mod.doc_id_for(rec["canonical_id"]) not in resume_done
             ]
-            definitions = _extract_definitions_for_doc(
-                doc_id=doc_id,
-                title=derived_title,
-                category=category,
-                chunks=prepared_chunks,
-            )
-            if chunks:
-                # [W2.1] Heading-aware embedder input — see fresh-build path.
-                texts = [_embedding_input(title, c.heading_path, c.text) for c in chunks]
-                encoded = model.encode(texts, is_query=False, batch_size=args.encode_batch_size)
+            if not active_records:
+                continue
+
+            windows += 1
+            seen += len(active_records)
+            phase = time.monotonic()
+            prepared = _prepare_window(args.pages_dir, active_records, args.workers)
+            prepare_s = time.monotonic() - phase
+            timings.prepare += prepare_s
+
+            empties: list[EmptyShell] = []
+            texts: list[str] = []
+            doc_chunk_ranges: list[tuple[PreparedDoc, int, int]] = []
+            window_reused = 0
+
+            phase = time.monotonic()
+            for rec, item in zip(active_records, prepared, strict=True):
+                if item is None:
+                    continue
+                if isinstance(item, EmptyShell):
+                    empties.append(item)
+                    continue
+
+                prev_ref = prev_docs.get(item.doc_id)
+                if (
+                    prev_ref
+                    and prev_ref.content_hash == item.content_hash
+                    and prev_ref.pack_sha8 in prev_pack_info
+                    and _previous_pack_record_has_current_definitions(
+                        prev_ref, args.previous_manifest, prev_pack_info, item.category
+                    )
+                ):
+                    doc_refs.append(prev_ref)
+                    _insert_from_previous(
+                        conn,
+                        rec,
+                        prev_ref,
+                        args.previous_manifest,
+                        prev_pack_info,
+                        asset_root,
+                    )
+                    window_reused += 1
+                    continue
+
+                start = len(texts)
+                texts.extend(
+                    _embedding_input(item.title, c.heading_path, c.text)
+                    for c in item.chunks
+                )
+                doc_chunk_ranges.append((item, start, len(texts)))
+            reuse_write_s = time.monotonic() - phase
+
+            phase = time.monotonic()
+            window_tokens = 0
+            window_encode_calls = 0
+            window_max_batch_size = 0
+            window_max_padded_tokens = 0
+            window_approx_padded_tokens = 0
+            if texts:
+                encoded = _encode_length_bucketed(
+                    model,
+                    texts,
+                    batch_size=args.encode_batch_size,
+                    max_batch_tokens=args.max_batch_tokens,
+                )
                 vectors_i8 = encoded.vectors_int8
+                window_tokens = encoded.tokens_seen
+                window_encode_calls = encoded.encode_calls
+                window_max_batch_size = encoded.max_batch_size
+                window_max_padded_tokens = encoded.max_padded_tokens
+                window_approx_padded_tokens = encoded.approx_padded_tokens
+                tokens_seen += window_tokens
+                encode_calls += window_encode_calls
+                approx_padded_tokens += window_approx_padded_tokens
             else:
                 vectors_i8 = np.empty((0, store_db.EMBEDDING_DIM), dtype=np.int8)
+            embed_s = time.monotonic() - phase
+            timings.embed += embed_s
 
-            # Insert document row — v6 columns include currency markers (W2.2).
-            currency = extract_mod.extract_currency(html or "")
-            conn.execute(
-                INSERT_DOCUMENT,
-                (
-                    doc_id, category, derived_title, derived_date,
-                    downloaded_at, ch, "PENDING",  # pack_sha8 backfilled below
-                    currency.withdrawn_date,
-                    currency.superseded_by,
-                    currency.replaces,
-                ),
+            phase = time.monotonic()
+            _write_window(
+                conn=conn,
+                pack_builder=pack_builder,
+                doc_refs=doc_refs,
+                doc_chunk_ranges=doc_chunk_ranges,
+                empties=empties,
+                vectors_i8=vectors_i8,
+                zstd_level=args.zstd_level,
+                asset_root=asset_root,
             )
-            conn.execute(
-                INSERT_TITLE_FTS,
-                (doc_id, derived_title, " ".join(headings)),
-            )
-            for i, c in enumerate(chunks):
-                compressed_text = zstd.ZstdCompressor(level=3).compress(c.text.encode("utf-8"))
-                cur = conn.execute(
-                    INSERT_CHUNK,
-                    (doc_id, c.ord, c.heading_path, c.anchor, compressed_text),
-                )
-                chunk_rowid = cur.lastrowid
-                conn.execute(INSERT_CHUNK_FTS, (chunk_rowid, c.text, c.heading_path))
-                conn.execute(INSERT_VEC, (chunk_rowid, vec_to_bytes(vectors_i8[i])))
-            if definitions:
-                conn.executemany(INSERT_DEFINITION, _definition_rows(definitions))
+            write_s = reuse_write_s + (time.monotonic() - phase)
+            timings.write += write_s
 
-            # Build a pack record. pack_sha8 + offset/length filled after pack close.
-            record = {
-                "doc_id": doc_id,
-                "type": category,
-                "title": derived_title,
-                "date": derived_date,
-                "downloaded_at": downloaded_at,
-                "content_hash": ch,
-                "anchors": anchors,
-                # W2.2 currency markers are persisted into the pack record so a
-                # later incremental build that reuses this doc can replay the
-                # withdrawn/superseded state without re-extracting from HTML.
-                "withdrawn_date": currency.withdrawn_date,
-                "superseded_by": currency.superseded_by,
-                "replaces": currency.replaces,
-                "definitions_format_version": definition_mod.DEFINITIONS_FORMAT_VERSION,
-                "definitions": [d.__dict__ for d in definitions],
-                "chunks": [
-                    {
-                        "ord": c.ord,
-                        "heading_path": c.heading_path,
-                        "anchor": c.anchor,
-                        "text": c.text,
-                        "embedding_b64": encode_embedding(vec_to_bytes(vectors_i8[i])),
-                    }
-                    for i, c in enumerate(chunks)
-                ],
-            }
-            pack_builder.add(doc_id, record)
-            doc_refs.append(
-                DocRef(
-                    doc_id=doc_id,
-                    content_hash=ch,
-                    pack_sha8="PENDING",
-                    offset=0,
-                    length=0,
-                    type=category,
-                    title=derived_title,
-                    has_content=has_content,
-                )
-            )
-            processed += 1
-            since_checkpoint += 1
-            if processed % 500 == 0:
-                LOGGER.info("processed=%d reused=%d", processed, reused)
-            if since_checkpoint >= CHECKPOINT_EVERY:
+            window_changed = len(doc_chunk_ranges)
+            window_empty = len(empties)
+            reused += window_reused
+            changed += window_changed
+            empty_shells += window_empty
+            chunks_count += len(texts)
+            processed += window_reused + window_changed + window_empty
+            since_checkpoint += window_reused + window_changed + window_empty
+            if since_checkpoint >= args.checkpoint_every:
                 _checkpoint(conn, pack_builder, doc_refs)
                 since_checkpoint = 0
+
+            elapsed = time.monotonic() - t0
+            LOGGER.info(
+                "window=%d seen=%d processed=%d reused=%d changed=%d empty_shells=%d "
+                "chunks=%d elapsed=%.1fs prepare=%.1fs embed=%.1fs write=%.1fs "
+                "embed_calls=%d tokens=%d tokens/s=%.1f chunks/s=%.1f "
+                "max_batch=%d max_padded_tokens=%d approx_padded_tokens=%d "
+                "encode_batch_size=%d max_batch_tokens=%d",
+                windows,
+                seen,
+                processed,
+                reused,
+                changed,
+                empty_shells,
+                chunks_count,
+                elapsed,
+                prepare_s,
+                embed_s,
+                write_s,
+                window_encode_calls,
+                window_tokens,
+                window_tokens / embed_s if embed_s else 0.0,
+                len(texts) / embed_s if embed_s else 0.0,
+                window_max_batch_size,
+                window_max_padded_tokens,
+                window_approx_padded_tokens,
+                args.encode_batch_size,
+                args.max_batch_tokens,
+            )
 
         # Final checkpoint seals the last pack and commits leftover docs.
         _checkpoint(conn, pack_builder, doc_refs)
@@ -678,9 +639,8 @@ def build(args: BuildArgs) -> Manifest:
             id=args.model_id,
             sha256=args.model_sha256 or "",
             size=args.model_size or 0,
-            url=args.model_url or f"model/{args.model_id}.onnx.zst",
+            url=f"model/{args.model_id}.onnx.zst",
         ),
-        reranker=_reranker_model_info(args),
         documents=doc_refs_final,
         packs=new_packs,
     )
@@ -688,8 +648,27 @@ def build(args: BuildArgs) -> Manifest:
     save_update_summary(manifest, args.out_dir / "update.json")
     dt = time.monotonic() - t0
     LOGGER.info(
-        "Indexed %d docs this session (%d reused); manifest has %d total in %.1fs",
-        processed, reused, len(doc_refs_final), dt,
+        "Indexed %d records this session (%d changed, %d reused, %d empty shells); "
+        "manifest has %d docs total in %.1fs "
+        "(prepare=%.1fs embed=%.1fs write=%.1fs tokens=%d embed_calls=%d "
+        "tokens/s=%.1f chunks/s=%.1f approx_padded_tokens=%d "
+        "encode_batch_size=%d max_batch_tokens=%d)",
+        processed,
+        changed,
+        reused,
+        empty_shells,
+        len(doc_refs_final),
+        dt,
+        timings.prepare,
+        timings.embed,
+        timings.write,
+        tokens_seen,
+        encode_calls,
+        tokens_seen / timings.embed if timings.embed else 0.0,
+        chunks_count / timings.embed if timings.embed else 0.0,
+        approx_padded_tokens,
+        args.encode_batch_size,
+        args.max_batch_tokens,
     )
     _log_currency_summary(conn)
     return manifest
@@ -731,52 +710,13 @@ def _reset_fresh_outputs(out_dir: Path, db_path: Path) -> None:
     build_dir = out_dir / ".build"
     if build_dir.exists():
         shutil.rmtree(build_dir)
+    asset_dir = db_path.parent / "assets"
+    if asset_dir.exists():
+        shutil.rmtree(asset_dir)
 
 
 def _effective_model_id(args: BuildArgs) -> str:
     return args.model_id
-
-
-def _reranker_model_info(args: BuildArgs) -> ModelInfo | None:
-    """Build the manifest's optional ``reranker`` field from BuildArgs.
-
-    Returns ``None`` unless an explicit reranker id + URL were threaded
-    through. The release CLI is responsible for populating these from a
-    bundle directory or for forwarding them from upstream maintainer
-    flags. A build that doesn't pass them yields ``reranker = None``,
-    which the Rust runtime treats as "no reranker available, fall back
-    to the un-reranked hybrid score".
-    """
-    provided = [
-        args.reranker_id,
-        args.reranker_url,
-        args.reranker_sha256,
-        args.reranker_size,
-        args.reranker_tokenizer_sha256,
-    ]
-    if not any(value for value in provided):
-        return None
-    missing = []
-    if not args.reranker_id:
-        missing.append("reranker_id")
-    if not args.reranker_url:
-        missing.append("reranker_url")
-    if not args.reranker_sha256:
-        missing.append("reranker_sha256")
-    if not args.reranker_size:
-        missing.append("reranker_size")
-    if missing:
-        raise ValueError(
-            "reranker manifest requires id, url, sha256, and size; missing "
-            + ", ".join(missing)
-        )
-    return ModelInfo(
-        id=args.reranker_id,
-        sha256=args.reranker_sha256,
-        size=args.reranker_size,
-        url=args.reranker_url,
-        tokenizer_sha256=args.reranker_tokenizer_sha256,
-    )
 
 
 def _apply_unsafe_fast_sqlite_pragmas(conn) -> None:
@@ -804,46 +744,65 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
     pages_dir, rec = item
     canonical_id = rec["canonical_id"]
     doc_id = meta_mod.doc_id_for(canonical_id)
-    category = meta_mod.category_from_path(rec.get("payload_path"))
-    if category == "Unknown":
-        category = meta_mod.category_for_docid(canonical_id)
+    category = meta_mod.category_for_record(canonical_id, rec.get("payload_path"))
 
     status = rec.get("status")
     has_content = status == "success"
-    markdown = ""
     headings: list[str] = []
     anchors: list[tuple[str, str]] = []
     title: str | None = None
     html: str | None = None
+    clean_html = ""
+    assets: list[PreparedAsset] = []
 
     if has_content and rec.get("payload_path"):
         payload_path = pages_dir / rec["payload_path"]
         if payload_path.exists():
             html = payload_path.read_text(encoding="utf-8", errors="replace")
-            extracted = extract_mod.extract(html)
-            markdown = extracted.markdown
+            extracted = extract_mod.extract(html, doc_id=doc_id, source_path=payload_path)
+            clean_html = extracted.html
             headings = extracted.headings
             anchors = extracted.anchors
+            assets = [
+                PreparedAsset(
+                    asset_ref=a.asset_ref,
+                    source_path=a.source_path,
+                    relative_path=a.relative_path,
+                    media_type=a.media_type,
+                    alt=a.alt,
+                    title=a.title,
+                    sha256=a.sha256,
+                    size=a.size,
+                    data_b64=a.data_b64,
+                )
+                for a in extracted.assets
+            ]
             title = extracted.title
         else:
             has_content = False
 
-    if has_content and not markdown.strip():
+    if not title:
+        title = (rec.get("title") or canonical_id).strip() or canonical_id
+
+    chunks = [
+        PreparedChunk(c.ord, c.heading_path, c.anchor, c.text, c.definition_text)
+        for c in chunk_mod.chunk_html(clean_html, root_title=title)
+    ] if has_content and clean_html else []
+
+    if has_content and not chunks:
         has_content = False
 
     if not has_content:
         return EmptyShell(doc_id=doc_id)
 
-    if not title:
-        title = (rec.get("title") or canonical_id).strip() or canonical_id
-
-    pub_date = meta_mod.extract_pub_date(markdown) if markdown else None
+    body_text = "\n\n".join(c.text for c in chunks)
+    pub_date = meta_mod.extract_pub_date(body_text) if body_text else None
     derived = rules_mod.derive_metadata(
         rules_mod.RuleInputs(
             doc_id=doc_id,
             title=title,
             headings=tuple(headings),
-            body_head=markdown[:3000] if markdown else "",
+            body_head=body_text[:3000] if body_text else "",
             category=category,
             pub_date=pub_date,
         )
@@ -855,11 +814,23 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
         "type": category,
         "date": derived.date,
     }
-    content_hash = meta_mod.content_hash(markdown, meta_fields)
-    chunks = [
-        PreparedChunk(c.ord, c.heading_path, c.anchor, c.text)
-        for c in chunk_mod.chunk_markdown(markdown, root_title=title)
-    ]
+    asset_hashes = "\n".join(f"{a.asset_ref}:{a.sha256}" for a in assets)
+    chunk_fingerprint = "\n".join(
+        "\t".join(
+            (
+                str(c.ord),
+                c.heading_path,
+                c.anchor or "",
+                c.text,
+                c.definition_text or "",
+            )
+        )
+        for c in chunks
+    )
+    content_hash = meta_mod.content_hash(
+        f"{clean_html}\n{asset_hashes}\n{chunk_fingerprint}",
+        meta_fields,
+    )
     # W2.2: extract currency markers from the source HTML (alert panels +
     # body prose + history table). Cheap relative to the extract+chunk pass
     # already done; runs from the same parse if selectolax cached anything.
@@ -879,6 +850,8 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
         content_hash=content_hash,
         headings_text=" ".join(headings),
         anchors=anchors,
+        html=clean_html,
+        assets=assets,
         chunks=chunks,
         definitions=definitions,
         withdrawn_date=currency.withdrawn_date,
@@ -899,7 +872,12 @@ def _extract_definitions_for_doc(
         source_title=title,
         source_type=category,
         chunks=[
-            definition_mod.DefinitionChunk(c.ord, c.heading_path, c.anchor, c.text)
+            definition_mod.DefinitionChunk(
+                c.ord,
+                c.heading_path,
+                c.anchor,
+                c.definition_text or c.text,
+            )
             for c in chunks
         ],
     )
@@ -924,10 +902,37 @@ def _definition_rows(definitions: list[definition_mod.Definition]) -> list[tuple
     ]
 
 
+def _asset_rows(doc_id: str, assets: list[PreparedAsset]) -> list[tuple]:
+    return [
+        (
+            a.asset_ref,
+            doc_id,
+            a.source_path,
+            a.relative_path,
+            a.media_type,
+            a.alt,
+            a.title,
+            a.sha256,
+            a.size,
+        )
+        for a in assets
+    ]
+
+
+def _write_asset_files(asset_root: Path, assets: list[PreparedAsset]) -> None:
+    for asset in assets:
+        target = asset_root / asset.relative_path
+        if target.exists() and target.stat().st_size == asset.size:
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(base64.b64decode(asset.data_b64))
+
+
 def _previous_pack_record_has_current_definitions(
     prev_ref: DocRef,
     prev_manifest_path: Path | None,
     prev_packs: dict[str, PackInfo],
+    category: str,
 ) -> bool:
     """Return true only when a reusable old pack carries current definitions.
 
@@ -948,8 +953,11 @@ def _previous_pack_record_has_current_definitions(
         return False
     record = read_record(pack_path, prev_ref.offset, prev_ref.length)
     return (
-        record.get("definitions_format_version") == definition_mod.DEFINITIONS_FORMAT_VERSION
+        (record.get("type") or record.get("category") or "") == category
+        and record.get("definitions_format_version") == definition_mod.DEFINITIONS_FORMAT_VERSION
         and "definitions" in record
+        and "html" in record
+        and "assets" in record
     )
 
 
@@ -993,29 +1001,21 @@ def _encode_length_bucketed(
             end += 1
 
         batch_indices = order[pos:end]
-        batch = [texts[i] for i in batch_indices]
-        try:
-            encoded = model.encode(batch, is_query=False, batch_size=len(batch))
-        except Exception:
-            padded_tokens = max_len * len(batch_indices)
-            LOGGER.exception(
-                "embedding batch failed batch_size=%d max_len=%d "
-                "approx_padded_tokens=%d max_batch_tokens=%d pos=%d remaining=%d",
-                len(batch_indices),
-                max_len,
-                padded_tokens,
-                max_batch_tokens,
-                pos,
-                len(order) - pos,
-            )
-            raise
-        vectors[batch_indices, :] = encoded.vectors_int8
-        tokens_seen += encoded.tokens_seen
-        encode_calls += 1
-        padded_tokens = max_len * len(batch_indices)
-        approx_padded_tokens += padded_tokens
-        max_seen_batch_size = max(max_seen_batch_size, len(batch_indices))
-        max_seen_padded_tokens = max(max_seen_padded_tokens, padded_tokens)
+        stats = _encode_batch_with_split(
+            model,
+            texts,
+            lengths,
+            batch_indices,
+            vectors,
+            max_batch_tokens=max_batch_tokens,
+            pos=pos,
+            remaining=len(order) - pos,
+        )
+        tokens_seen += stats.tokens_seen
+        encode_calls += stats.encode_calls
+        approx_padded_tokens += stats.approx_padded_tokens
+        max_seen_batch_size = max(max_seen_batch_size, stats.max_batch_size)
+        max_seen_padded_tokens = max(max_seen_padded_tokens, stats.max_padded_tokens)
         pos = end
 
     return EncodedWindow(
@@ -1028,6 +1028,59 @@ def _encode_length_bucketed(
     )
 
 
+def _encode_batch_with_split(
+    model: EmbeddingModel,
+    texts: list[str],
+    lengths: list[int],
+    batch_indices: list[int],
+    vectors: np.ndarray,
+    *,
+    max_batch_tokens: int,
+    pos: int,
+    remaining: int,
+) -> BatchEncodeStats:
+    stats = BatchEncodeStats()
+    pending = [batch_indices]
+    while pending:
+        indices = pending.pop()
+        max_len = max(lengths[i] for i in indices)
+        padded_tokens = max_len * len(indices)
+        batch = [texts[i] for i in indices]
+        try:
+            encoded = model.encode(batch, is_query=False, batch_size=len(batch))
+        except Exception:
+            LOGGER.warning(
+                "embedding batch failed batch_size=%d max_len=%d "
+                "approx_padded_tokens=%d max_batch_tokens=%d pos=%d remaining=%d",
+                len(indices),
+                max_len,
+                padded_tokens,
+                max_batch_tokens,
+                pos,
+                remaining,
+                exc_info=True,
+            )
+            if len(indices) == 1:
+                raise
+            mid = len(indices) // 2
+            LOGGER.warning(
+                "splitting failed embedding batch into %d and %d rows",
+                mid,
+                len(indices) - mid,
+            )
+            pending.append(indices[mid:])
+            pending.append(indices[:mid])
+            continue
+
+        vectors[indices, :] = encoded.vectors_int8
+        stats.tokens_seen += encoded.tokens_seen
+        stats.encode_calls += 1
+        stats.approx_padded_tokens += padded_tokens
+        stats.max_batch_size = max(stats.max_batch_size, len(indices))
+        stats.max_padded_tokens = max(stats.max_padded_tokens, padded_tokens)
+    return stats
+
+
 def _write_window(
     *,
     conn,
@@ -1037,6 +1090,7 @@ def _write_window(
     empties: list[EmptyShell],
     vectors_i8: np.ndarray,
     zstd_level: int,
+    asset_root: Path,
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
     if empties:
@@ -1059,6 +1113,7 @@ def _write_window(
                 doc.downloaded_at,
                 doc.content_hash,
                 "PENDING",
+                zstd.ZstdCompressor(level=zstd_level).compress(doc.html.encode("utf-8")),
                 doc.withdrawn_date,
                 doc.superseded_by,
                 doc.replaces,
@@ -1076,9 +1131,12 @@ def _write_window(
     chunk_fts_rows = []
     vec_rows = []
     definition_rows = []
+    asset_rows = []
     zstd_compressor = zstd.ZstdCompressor(level=zstd_level)
 
     for doc, start, end in doc_chunk_ranges:
+        _write_asset_files(asset_root, doc.assets)
+        asset_rows.extend(_asset_rows(doc.doc_id, doc.assets))
         vectors = vectors_i8[start:end]
         record_chunks = []
         for local_idx, chunk in enumerate(doc.chunks):
@@ -1115,7 +1173,9 @@ def _write_window(
             "date": doc.date,
             "downloaded_at": doc.downloaded_at,
             "content_hash": doc.content_hash,
+            "html": doc.html,
             "anchors": doc.anchors,
+            "assets": [a.__dict__ for a in doc.assets],
             # W2.2 currency markers persist into the pack record so a future
             # incremental build that reuses this doc can replay the state.
             "withdrawn_date": doc.withdrawn_date,
@@ -1144,6 +1204,8 @@ def _write_window(
         conn.executemany(INSERT_CHUNK_WITH_ID, chunk_rows)
         conn.executemany(INSERT_CHUNK_FTS, chunk_fts_rows)
         conn.executemany(INSERT_VEC, vec_rows)
+    if asset_rows:
+        conn.executemany(INSERT_ASSET, asset_rows)
     if definition_rows:
         conn.executemany(INSERT_DEFINITION, definition_rows)
 
@@ -1170,6 +1232,7 @@ def _insert_from_previous(
     prev_ref: DocRef,
     prev_manifest_path: Path | None,
     prev_packs: dict[str, PackInfo],
+    asset_root: Path,
 ) -> None:
     """When reusing a document, we still need its rows in the new DB.
 
@@ -1197,6 +1260,7 @@ def _insert_from_previous(
             record["downloaded_at"],
             record["content_hash"],
             prev_ref.pack_sha8,
+            zstd.ZstdCompressor(level=3).compress(record["html"].encode("utf-8")),
             # Carry forward currency markers from the prior pack record. We
             # do NOT re-read the HTML for content-hash-stable docs, so a
             # withdrawal-status change without a body edit will be missed
@@ -1209,6 +1273,10 @@ def _insert_from_previous(
             record.get("replaces"),
         ),
     )
+    assets = [PreparedAsset(**a) for a in record.get("assets", [])]
+    _write_asset_files(asset_root, assets)
+    if assets:
+        conn.executemany(INSERT_ASSET, _asset_rows(record["doc_id"], assets))
     conn.execute(
         INSERT_TITLE_FTS,
         (record["doc_id"], record["title"], ""),

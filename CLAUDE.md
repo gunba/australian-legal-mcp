@@ -2,39 +2,30 @@
 
 The goal of this project is to maintain an on-device (with database build pulled from repo pre-baked) MCP server for searching the entire ATO database. 
 
-The user is not expected to have a GPU and may be using a low performance enterprise laptop.
+IMPORTANT: The user is not expected to have a GPU and may be using a low performance enterprise laptop.
 
 IMPORTANT: We should be looking to simplify the MCP surface and minimise extraneous context at all times.
 
 # Design Philosophy
 
-ATO-MCP should expose clean, source-grounded retrieval primitives and let agents
-do the reasoning. Prefer fewer tools, fewer parameters, and less context over
-feature breadth.
+- ATO-MCP should expose clean, source-grounded retrieval primitives and let agents do the reasoning. Prefer fewer tools, fewer parameters, and less context over feature breadth.
 
-Good features are deterministic and derived from stable, ubiquitous source
-structure. Examples: parsing an ATO document URL into its exact `doc_id`,
-constructing titles from HTML headings, removing repeated history/navigation
-metadata that appears across the corpus, and preserving exact chunk/document
-references.
+- Good features are deterministic and derived from stable, ubiquitous source structure. Examples: parsing an ATO document URL into its exact `doc_id`, constructing titles from HTML headings, removing repeated history/navigation metadata that appears across the corpus, and preserving exact chunk/document references.
 
-Do not add features built on hacky string substitutions, guessed citation
-aliases, hand-maintained act maps, or fragile interpretations of user prose.
-If logic would need ongoing maintenance against new ATO document shapes, it is
-not a good runtime feature. If it relies on an ephemeral ATO structure, add an
-audit/telemetry step first or leave it out.
+The document surface is cleaned source HTML, not Markdown. Preserve stable HTML structure so agents can navigate tags and attributes directly. 
+Internal ATO document links should become deterministic `data-doc-id` attributes rather than retained `href` URLs, and retained images should be compact `data-asset-ref` references resolvable through the asset tool. Do not inline image bytes or carry decorative/history icons into context.
 
-Do not add backwards-compatibility shims for users or installs that do not
-exist. Prefer one current deterministic layout, one environment variable, and
-one source-derived code path. If a breaking change is needed before there is a
-real installed user base, make the break cleanly and remove the old surface.
+- The semantic search/index path should use plain, source-derived text from the cleaned HTML. Do not introduce HTML-to-Markdown conversion, 
+- Markdown escaping, or host-rendering assumptions into stored chunks. Headings belong in metadata; links and images should contribute only useful visible text to search.
 
-No arbitrary timers, sleeps, or polling loops as control flow. Use deterministic
-completion signals or do not implement the behavior.
+- Do not add features built on hacky string substitutions, guessed citation aliases, hand-maintained act maps, or fragile interpretations of user prose.
+- If logic would need ongoing maintenance against new ATO document shapes, it is not a good runtime feature. If it relies on an ephemeral ATO structure, add an audit/telemetry step first or leave it out.
 
-Do not expose date-sensitive law resolution, historical-version selection, or
-similar legal interpretation helpers unless the corpus contains broad,
-source-derived version/effective-date data that can support the feature safely.
+- Do not add backwards-compatibility shims for users or installs that do not exist. Prefer one current deterministic layout, one environment variable, and one source-derived code path. If a breaking change is needed before there is a real installed user base, make the break cleanly and remove the old surface.
+
+- No arbitrary timers, sleeps, or polling loops as control flow. Use deterministic completion signals or do not implement the behavior.
+
+- Do not expose date-sensitive law resolution, historical-version selection, or similar legal interpretation helpers unless the corpus contains broad, source-derived version/effective-date data that can support the feature safely.
 
 # Workflow
 
@@ -42,6 +33,19 @@ Use `/r`, `/j`, `/b`, `/c`, and `/rj` from this repo root.
 
 For long-running Bash commands such as builds or test suites, launch them with background execution when the runtime supports it.
 Do NOT poll background tasks. Wait for completion before acting on dependent results.
+
+`build-index` consumes local embedding model files and writes corpus artifacts.
+Do not thread hosted model URLs, reranker URLs, or other distribution metadata
+through corpus building. The `release` step owns model/reranker distribution
+metadata and final manifest publication.
+Use `pip install -e '.[dev,gpu]'` for release builds; install the `cpu` and
+`gpu` extras separately because their ONNX Runtime wheels conflict.
+Maintainer corpus builds should pass `--gpu` and fail fast if CUDA is not
+available. The Rust end-user runtime must remain CPU-safe; do not make ordinary
+install, update, search, or serve require a GPU.
+Maintainer corpus rebuilds should run with sleep prevention active. `build-index`
+and `scripts/maintainer-sync.sh` do this automatically through `systemd-inhibit`
+or `caffeinate` when available.
 
 # Documentation
 

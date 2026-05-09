@@ -34,6 +34,8 @@ def _record(doc_id: str) -> dict:
         "has_content": True,
         "downloaded_at": "2026-04-18T00:00:00Z",
         "content_hash": "sha256:" + "0" * 64,
+        "html": f"<div><p>Hello world chunk for {doc_id}</p></div>",
+        "assets": [],
         "chunks": [
             {
                 "ord": 0,

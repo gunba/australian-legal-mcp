@@ -67,13 +67,28 @@ class EmbeddingModel:
         avail = set(ort.get_available_providers())
         default_providers = ["CPUExecutionProvider"]
         if "CUDAExecutionProvider" in avail:
-            # [EM-01] Prefer CUDA when present; transparently fall back to CPU on enterprise laptops without GPU.
+            # [EM-01] Prefer CUDA when present in auto mode; explicit --gpu is validated below.
             default_providers.insert(0, "CUDAExecutionProvider")
+        requested_providers = list(providers) if providers else default_providers
+        if providers and "CUDAExecutionProvider" in requested_providers and "CUDAExecutionProvider" not in avail:
+            raise RuntimeError(
+                "CUDAExecutionProvider was requested but is not available in ONNX Runtime. "
+                "Install the Python GPU extra and ensure LD_LIBRARY_PATH includes the "
+                "venv's nvidia/*/lib directories."
+            )
         self.session = ort.InferenceSession(
             str(self.model_path),
             sess_options=so,
-            providers=list(providers) if providers else default_providers,
+            providers=requested_providers,
         )
+        if providers and "CUDAExecutionProvider" in requested_providers:
+            active = set(self.session.get_providers())
+            if "CUDAExecutionProvider" not in active:
+                raise RuntimeError(
+                    "CUDAExecutionProvider was requested but the ONNX Runtime session "
+                    f"loaded providers {sorted(active)}. Ensure LD_LIBRARY_PATH includes "
+                    "the venv's nvidia/*/lib directories."
+                )
         self.input_names = {i.name for i in self.session.get_inputs()}
         self.output_names = [o.name for o in self.session.get_outputs()]
         # Prefer a pooled "sentence_embedding" output if the graph provides one.
@@ -148,7 +163,7 @@ def _f32_to_i8(vectors: np.ndarray) -> np.ndarray:
 
 
 def vec_to_bytes(vec: np.ndarray) -> bytes:
-    """Serialize a single int8 embedding as raw bytes for sqlite-vec."""
+    """Serialize a single int8 embedding as raw bytes."""
     if vec.dtype != np.int8:
         vec = vec.astype(np.int8)
     if vec.shape != (EMBEDDING_DIM,):

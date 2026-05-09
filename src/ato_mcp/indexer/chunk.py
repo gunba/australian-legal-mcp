@@ -1,14 +1,9 @@
-"""Heading-aware recursive chunker for ATO markdown.
+"""Heading-aware chunking for cleaned ATO HTML.
 
-Strategy:
-1. Split on ``#``/``##``/``###`` boundaries; track heading_path.
-2. For any chunk that still exceeds ``max_tokens``, re-split on blank lines and
-   then sentences.
-3. Stitch adjacent chunks under the same heading with a small token overlap so
-   section boundaries stay soft for vector search.
-
-Tokens are estimated with a simple whitespace heuristic — good enough for
-boundary control, since the embedding tokenizer enforces the real limit.
+The MCP document surface is cleaned source HTML, but semantic search should not
+embed Markdown, URLs, or host-rendering artefacts. This module converts the
+cleaned HTML fragment into compact plain text chunks for FTS/vector search while
+preserving heading paths and source anchors.
 """
 from __future__ import annotations
 
@@ -16,44 +11,406 @@ import re
 from dataclasses import dataclass
 from typing import Iterable
 
-_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*(?:\{#([^}]+)\})?\s*$")
-_ANCHOR_INLINE_RE = re.compile(r"\{#([^}]+)\}")
+from selectolax.parser import HTMLParser, Node
+
+_HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+_BLOCK_TAGS = {
+    "address",
+    "article",
+    "aside",
+    "blockquote",
+    "caption",
+    "dd",
+    "details",
+    "div",
+    "dl",
+    "dt",
+    "figcaption",
+    "figure",
+    "footer",
+    "header",
+    "li",
+    "main",
+    "ol",
+    "p",
+    "pre",
+    "section",
+    "table",
+    "td",
+    "th",
+    "tr",
+    "ul",
+}
+_CONTAINER_BLOCK_TAGS = {
+    "article",
+    "aside",
+    "details",
+    "div",
+    "dl",
+    "figure",
+    "footer",
+    "header",
+    "main",
+    "ol",
+    "section",
+    "ul",
+}
 _URL_HEADING_RE = re.compile(r"^/law/view/document\?docid=", re.IGNORECASE)
 _WS_RE = re.compile(r"\s+")
+_NUMERIC_RANGE_RE = re.compile(r"(?<=\d)\s+-\s+(?=\d)")
+_SPACED_QUOTE_RE = re.compile(r'"\s+([^"\n]*?)\s+"')
+_SENT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z(])")
 
 DEFAULT_MAX_TOKENS = 900
 DEFAULT_OVERLAP_TOKENS = 120
-# [IB-02] Section-aware chunking with tail-overlap bridge: 900 tokens cap, 120-token bridge between adjacent chunks under the same heading so vector search doesn't lose context at boundaries.
 TITLE_SEP = " — "
 PATH_SEP = " › "
 
 
+@dataclass
+class Chunk:
+    ord: int
+    heading_path: str
+    anchor: str | None
+    text: str
+    definition_text: str | None = None
+
+
+@dataclass
+class _Section:
+    heading_path: str
+    anchor: str | None
+    blocks: list[str]
+    definition_blocks: list[str]
+
+
+@dataclass
+class _WalkState:
+    root_title: str | None
+    heading_stack: list[str]
+    heading_levels: list[int]
+    anchor: str | None
+    blocks: list[str]
+    definition_blocks: list[str]
+    sections: list[_Section]
+
+
+def approx_tokens(text: str) -> int:
+    """Rough token count: whitespace split + a constant factor for subwords."""
+    return max(1, int(len(text.split()) * 1.3))
+
+
+def html_to_text(html: str) -> str:
+    """Return the plain semantic text used for metadata and diagnostics."""
+    if not html.strip():
+        return ""
+    tree = HTMLParser(html)
+    root = tree.body or tree.root
+    blocks: list[str] = []
+    _collect_visible_blocks(root, blocks)
+    return "\n\n".join(blocks)
+
+
+def chunk_html(
+    html: str,
+    *,
+    root_title: str | None = None,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    overlap_tokens: int = DEFAULT_OVERLAP_TOKENS,
+) -> list[Chunk]:
+    """Return heading-aware plain-text chunks for a cleaned HTML fragment."""
+    if not html.strip():
+        return []
+
+    tree = HTMLParser(html)
+    root = tree.body or tree.root
+    state = _WalkState(
+        root_title=root_title,
+        heading_stack=[root_title] if root_title else [],
+        heading_levels=[0] if root_title else [],
+        anchor=None,
+        blocks=[],
+        definition_blocks=[],
+        sections=[],
+    )
+    _walk_children(root, state)
+    _flush_section(state)
+
+    chunks: list[Chunk] = []
+    ord_counter = 0
+    for section in state.sections:
+        body = "\n\n".join(section.blocks).strip()
+        definition_body = "\n\n".join(section.definition_blocks).strip()
+        if not body:
+            continue
+        if approx_tokens(body) <= max_tokens:
+            chunks.append(
+                Chunk(
+                    ord=ord_counter,
+                    heading_path=section.heading_path,
+                    anchor=section.anchor,
+                    text=body,
+                    definition_text=definition_body or None,
+                )
+            )
+            ord_counter += 1
+            continue
+
+        parts = _split_long(body, max_tokens=max_tokens)
+        definition_parts = _split_long(definition_body, max_tokens=max_tokens) if definition_body else []
+        prev_tail = ""
+        prev_def_tail = ""
+        for idx, part in enumerate(parts):
+            text = (prev_tail + "\n\n" + part).strip() if prev_tail else part
+            definition_part = definition_parts[idx] if idx < len(definition_parts) else part
+            definition_text = (
+                (prev_def_tail + "\n\n" + definition_part).strip()
+                if prev_def_tail
+                else definition_part
+            )
+            chunks.append(
+                Chunk(
+                    ord=ord_counter,
+                    heading_path=section.heading_path,
+                    anchor=section.anchor,
+                    text=text,
+                    definition_text=definition_text or None,
+                )
+            )
+            ord_counter += 1
+            prev_tail = _tail_overlap(part, overlap_tokens)
+            prev_def_tail = _tail_overlap(definition_part, overlap_tokens)
+    return chunks
+
+
+def _walk_children(parent: Node, state: _WalkState) -> None:
+    inline_parts: list[str] = []
+    inline_definition_parts: list[str] = []
+    child = parent.child
+    while child is not None:
+        tag = (child.tag or "").lower()
+        if tag == "-text":
+            text = child.text() or ""
+            inline_parts.append(text)
+            inline_definition_parts.append(text)
+            child = child.next
+            continue
+        if tag in _HEADING_TAGS:
+            _flush_inline_block(inline_parts, inline_definition_parts, state)
+            _flush_section(state)
+            _push_heading(child, state)
+            child = child.next
+            continue
+        if _is_atomic_block(child):
+            _flush_inline_block(inline_parts, inline_definition_parts, state)
+            _append_block(child, state)
+            child = child.next
+            continue
+        if _contains_structural_child(child):
+            _flush_inline_block(inline_parts, inline_definition_parts, state)
+            _walk_children(child, state)
+            child = child.next
+            continue
+        inline_parts.append(_inline_text(child, definition_markers=False))
+        inline_definition_parts.append(_inline_text(child, definition_markers=True))
+        child = child.next
+    _flush_inline_block(inline_parts, inline_definition_parts, state)
+
+
+def _flush_inline_block(
+    parts: list[str],
+    definition_parts: list[str],
+    state: _WalkState,
+) -> None:
+    text = _normalise_text("".join(parts))
+    definition_text = _normalise_text("".join(definition_parts))
+    parts.clear()
+    definition_parts.clear()
+    if text:
+        state.blocks.append(text)
+        state.definition_blocks.append(definition_text or text)
+
+
+def _contains_structural_child(node: Node) -> bool:
+    return any(_child_is_structural(child) for child in node.iter(include_text=False))
+
+
+def _collect_visible_blocks(parent: Node, blocks: list[str]) -> None:
+    inline_parts: list[str] = []
+    child = parent.child
+    while child is not None:
+        tag = (child.tag or "").lower()
+        if tag == "-text":
+            inline_parts.append(child.text() or "")
+            child = child.next
+            continue
+        if tag in _HEADING_TAGS or _is_atomic_block(child):
+            _flush_visible_inline_block(inline_parts, blocks)
+            text = _block_text(child, definition_markers=False)
+            if text:
+                blocks.append(text)
+            child = child.next
+            continue
+        if _contains_structural_child(child):
+            _flush_visible_inline_block(inline_parts, blocks)
+            _collect_visible_blocks(child, blocks)
+            child = child.next
+            continue
+        inline_parts.append(_inline_text(child, definition_markers=False))
+        child = child.next
+    _flush_visible_inline_block(inline_parts, blocks)
+
+
+def _flush_visible_inline_block(parts: list[str], blocks: list[str]) -> None:
+    text = _normalise_text("".join(parts))
+    parts.clear()
+    if text:
+        blocks.append(text)
+
+
+def _is_atomic_block(node: Node) -> bool:
+    tag = (node.tag or "").lower()
+    if tag == "table":
+        return True
+    if tag in {"p", "pre", "blockquote", "dt", "dd", "li", "figcaption", "caption"}:
+        return True
+    if tag not in _BLOCK_TAGS:
+        return False
+    if tag in _CONTAINER_BLOCK_TAGS:
+        return not any(_child_is_structural(child) for child in node.iter(include_text=False))
+    return True
+
+
+def _child_is_structural(node: Node) -> bool:
+    tag = (node.tag or "").lower()
+    return tag in _HEADING_TAGS or tag in _BLOCK_TAGS
+
+
+def _append_block(node: Node, state: _WalkState) -> None:
+    text = _block_text(node, definition_markers=False)
+    definition_text = _block_text(node, definition_markers=True)
+    if text:
+        state.blocks.append(text)
+        state.definition_blocks.append(definition_text or text)
+
+
+def _push_heading(node: Node, state: _WalkState) -> None:
+    tag = (node.tag or "").lower()
+    level = int(tag[1])
+    heading = _normalise_text(_inline_text(node, definition_markers=False))
+    while state.heading_levels and state.heading_levels[-1] >= level:
+        state.heading_stack.pop()
+        state.heading_levels.pop()
+    if not (
+        state.root_title
+        and _norm_heading(heading) == _norm_heading(state.root_title)
+    ):
+        state.heading_stack.append(heading)
+        state.heading_levels.append(level)
+    state.anchor = _heading_anchor(node)
+
+
+def _heading_anchor(node: Node) -> str | None:
+    anchor = node.attributes.get("id")
+    if anchor:
+        return anchor
+    for child in node.css("a"):
+        anchor = child.attributes.get("id")
+        if anchor:
+            return anchor
+    return None
+
+
+def _flush_section(state: _WalkState) -> None:
+    if not state.blocks:
+        return
+    heading_path = _path_trail(state.heading_stack)
+    if state.root_title:
+        heading_path = strip_title_prefix(heading_path)
+    state.sections.append(
+        _Section(
+            heading_path=heading_path,
+            anchor=state.anchor,
+            blocks=state.blocks,
+            definition_blocks=state.definition_blocks,
+        )
+    )
+    state.blocks = []
+    state.definition_blocks = []
+
+
+def _block_text(node: Node, *, definition_markers: bool) -> str:
+    tag = (node.tag or "").lower()
+    if tag == "table":
+        return _table_text(node, definition_markers=definition_markers)
+    if tag in {"ul", "ol"}:
+        items = [
+            _normalise_text(_inline_text(li, definition_markers=definition_markers))
+            for li in node.css("li")
+        ]
+        return "\n".join(f"- {item}" for item in items if item)
+    return _normalise_text(_inline_text(node, definition_markers=definition_markers))
+
+
+def _table_text(table: Node, *, definition_markers: bool) -> str:
+    rows: list[str] = []
+    for row in table.css("tr"):
+        cells = [
+            _normalise_text(_inline_text(cell, definition_markers=definition_markers))
+            for cell in row.css("th,td")
+        ]
+        cells = [cell for cell in cells if cell]
+        if cells:
+            rows.append(" | ".join(cells))
+    if rows:
+        return "\n".join(rows)
+    return _normalise_text(_inline_text(table, definition_markers=definition_markers))
+
+
+def _inline_text(node: Node, *, definition_markers: bool) -> str:
+    tag = (node.tag or "").lower()
+    if tag == "br":
+        return "\n"
+    if (node.tag or "").lower() == "-text":
+        return node.text() or ""
+    if definition_markers and _is_definition_term_node(node):
+        term = _normalise_text(_inline_text_children(node, definition_markers=False))
+        return f"***{term}***" if term else ""
+    return _inline_text_children(node, definition_markers=definition_markers)
+
+
+def _inline_text_children(node: Node, *, definition_markers: bool) -> str:
+    parts: list[str] = []
+    child = node.child
+    while child is not None:
+        parts.append(_inline_text(child, definition_markers=definition_markers))
+        child = child.next
+    return "".join(part for part in parts if part)
+
+
+def _is_definition_term_node(node: Node) -> bool:
+    tag = (node.tag or "").lower()
+    if tag in {"strong", "b"}:
+        return any((child.tag or "").lower() in {"em", "i"} for child in node.css("em,i"))
+    if tag in {"em", "i"}:
+        return any((child.tag or "").lower() in {"strong", "b"} for child in node.css("strong,b"))
+    return False
+
+
+def _normalise_text(text: str) -> str:
+    text = text.replace("\xa0", " ")
+    text = _WS_RE.sub(" ", text).strip()
+    text = _NUMERIC_RANGE_RE.sub("-", text)
+    text = _SPACED_QUOTE_RE.sub(r'"\1"', text)
+    return text
+
+
 def _norm_heading(text: str) -> str:
-    return _WS_RE.sub(" ", text.strip()).lower()
+    return _normalise_text(text).casefold()
 
 
 def strip_title_prefix(heading_path: str) -> str:
-    """Drop the document title's front-matter echo from a heading path.
-
-    The chunker historically pushed the composed root_title onto the heading
-    stack and then also pushed each of its constituent leading h1/h2/h3
-    headings, producing paths like::
-
-        Taxation Ruling — TR 2024/3 — Subject › Taxation Ruling › TR 2024/3 › Ruling
-
-    This helper computes the de-duplicated form (``"Ruling"``) by:
-
-    1. Dropping any leading ``/law/view/document?docid=…`` segment (some
-       ATO pages emit a navigation anchor as a heading).
-    2. Treating the first remaining segment as the root title and building
-       a normalised component set from its ``" — "`` split.
-    3. Dropping subsequent segments while they match a component
-       (case-insensitive, whitespace-collapsed).
-
-    Pure string transform — safe to apply at chunk emission time and as a
-    one-shot rewrite over an existing ``chunks.heading_path`` column.
-    """
-    # [IB-04] Pure string transform — safe at chunk emission time AND as a one-shot rewrite over chunks.heading_path.
+    """Drop the document title's front-matter echo from a heading path."""
     if not heading_path:
         return ""
     parts = heading_path.split(PATH_SEP)
@@ -70,165 +427,53 @@ def strip_title_prefix(heading_path: str) -> str:
     return PATH_SEP.join(parts)
 
 
-@dataclass
-class Chunk:
-    ord: int
-    heading_path: str
-    anchor: str | None
-    text: str
-
-
-def approx_tokens(text: str) -> int:
-    """Rough token count: whitespace split + a constant factor for subwords."""
-    # [IB-05] Boundary-control heuristic only; the embedding tokenizer enforces the real per-batch token limit.
-    return max(1, int(len(text.split()) * 1.3))
-
-
-def _split_by_heading(md: str) -> list[dict]:
-    """Return list of {'level', 'heading', 'anchor', 'body'} sections."""
-    sections: list[dict] = []
-    current: dict | None = None
-    for line in md.splitlines():
-        m = _HEADING_RE.match(line)
-        if m:
-            if current is not None:
-                sections.append(current)
-            level = len(m.group(1))
-            heading = m.group(2).strip()
-            anchor = m.group(3)
-            current = {"level": level, "heading": heading, "anchor": anchor, "body": []}
-        else:
-            if current is None:
-                current = {"level": 0, "heading": "", "anchor": None, "body": []}
-            current["body"].append(line)
-    if current is not None:
-        sections.append(current)
-    return sections
-
-
-def _body_text(body: list[str]) -> str:
-    return "\n".join(body).strip()
-
-
 def _path_trail(stack: list[str]) -> str:
-    return " › ".join(s for s in stack if s)
+    return PATH_SEP.join(s for s in stack if s)
 
 
 def _split_long(text: str, max_tokens: int) -> list[str]:
-    """Paragraph-then-sentence split for oversize sections."""
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
     out: list[str] = []
     buf: list[str] = []
     buf_tokens = 0
-    for p in paragraphs:
-        p_tok = approx_tokens(p)
-        if p_tok > max_tokens:
-            # Further split by sentence.
-            for sentence in _sentence_split(p):
-                s_tok = approx_tokens(sentence)
-                if buf_tokens + s_tok > max_tokens and buf:
-                    out.append("\n\n".join(buf))
-                    buf, buf_tokens = [], 0
-                buf.append(sentence)
-                buf_tokens += s_tok
+    for paragraph in paragraphs:
+        paragraph_tokens = approx_tokens(paragraph)
+        if paragraph_tokens > max_tokens:
+            for sentence in _sentence_split(paragraph):
+                for piece in _word_windows(sentence, max_tokens=max_tokens):
+                    piece_tokens = approx_tokens(piece)
+                    if buf_tokens + piece_tokens > max_tokens and buf:
+                        out.append("\n\n".join(buf))
+                        buf, buf_tokens = [], 0
+                    buf.append(piece)
+                    buf_tokens += piece_tokens
             continue
-        if buf_tokens + p_tok > max_tokens and buf:
+        if buf_tokens + paragraph_tokens > max_tokens and buf:
             out.append("\n\n".join(buf))
             buf, buf_tokens = [], 0
-        buf.append(p)
-        buf_tokens += p_tok
+        buf.append(paragraph)
+        buf_tokens += paragraph_tokens
     if buf:
         out.append("\n\n".join(buf))
     return out or [text]
-
-
-_SENT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z(])")
 
 
 def _sentence_split(text: str) -> list[str]:
     return [s.strip() for s in _SENT_RE.split(text) if s.strip()]
 
 
-def chunk_markdown(
-    markdown: str,
-    *,
-    root_title: str | None = None,
-    max_tokens: int = DEFAULT_MAX_TOKENS,
-    overlap_tokens: int = DEFAULT_OVERLAP_TOKENS,
-) -> list[Chunk]:
-    """Return heading-aware chunks for a single document.
-
-    Each chunk carries a heading_path formed by joining the stack of active
-    headings with ``' › '`` (note the non-ASCII separator).
-    """
-    # [IB-01] Recursive chunker: heading-boundary split first, then paragraph (blank-line) split, then sentence split — never silently truncates.
-    if not markdown.strip():
-        return []
-
-    sections = _split_by_heading(markdown)
-    # heading_levels parallels heading_stack so same-level siblings can pop the
-    # previous entry instead of stacking under it. The old "truncate to
-    # root_offset + level - 1" logic only capped depth, leaving siblings (e.g.
-    # consecutive ``<h5>Note 1:</h5>`` / ``<h5>Note 2:</h5>`` blocks in
-    # ITAA legislation) falsely nested under each other.
-    heading_stack: list[str] = []
-    heading_levels: list[int] = []
-    if root_title:
-        heading_stack.append(root_title)
-        heading_levels.append(0)
-
-    chunks: list[Chunk] = []
-    ord_counter = 0
-
-    for section in sections:
-        level = section["level"]
-        heading = section["heading"]
-        anchor = section["anchor"]
-        if level > 0:
-            # [IB-03] Pop same-level siblings before pushing — converts consecutive <h5>Note 1:</h5> / <h5>Note 2:</h5> blocks from false 2-deep stack into siblings.
-            # Pop siblings and descendants of the new heading. This is what
-            # converts ``<h5>Note 1:</h5>`` followed by ``<h5>Note 2:</h5>``
-            # from a false 2-deep stack into siblings.
-            while heading_levels and heading_levels[-1] >= level:
-                heading_stack.pop()
-                heading_levels.pop()
-            # Echo suppression: a leading ``<h1>`` whose text matches the
-            # composed root_title is the document's own banner — don't push
-            # it onto the path. The body still emits with the current stack.
-            if not (root_title and heading.strip().lower() == root_title.strip().lower()):
-                heading_stack.append(heading)
-                heading_levels.append(level)
-
-        body = _body_text(section["body"])
-        if not body and level == 0:
-            continue
-        # Strip inline anchor markers from body; keep heading-level anchors via section[anchor].
-        body = _ANCHOR_INLINE_RE.sub("", body).strip()
-        if not body:
-            continue
-
-        heading_path = _path_trail(heading_stack)
-        if root_title:
-            heading_path = strip_title_prefix(heading_path)
-
-        if approx_tokens(body) <= max_tokens:
-            chunks.append(Chunk(ord=ord_counter, heading_path=heading_path, anchor=anchor, text=body))
-            ord_counter += 1
-            continue
-
-        parts = _split_long(body, max_tokens=max_tokens)
-        prev_tail: str = ""
-        for i, part in enumerate(parts):
-            text = (prev_tail + "\n\n" + part).strip() if prev_tail else part
-            chunks.append(Chunk(ord=ord_counter, heading_path=heading_path, anchor=anchor, text=text))
-            ord_counter += 1
-            prev_tail = _tail_overlap(part, overlap_tokens)
-
-    return chunks
+def _word_windows(text: str, max_tokens: int) -> list[str]:
+    if approx_tokens(text) <= max_tokens:
+        return [text]
+    words = text.split()
+    target_words = max(1, int(max_tokens / 1.3))
+    return [
+        " ".join(words[i : i + target_words])
+        for i in range(0, len(words), target_words)
+    ]
 
 
 def _tail_overlap(text: str, overlap_tokens: int) -> str:
-    """Keep the last ``overlap_tokens`` (approx) of ``text`` as a bridge."""
     words = text.split()
     target = max(1, int(overlap_tokens / 1.3))
     if len(words) <= target:
@@ -237,4 +482,4 @@ def _tail_overlap(text: str, overlap_tokens: int) -> str:
 
 
 def chunk_texts(chunks: Iterable[Chunk]) -> list[str]:
-    return [c.text for c in chunks]
+    return [chunk.text for chunk in chunks]

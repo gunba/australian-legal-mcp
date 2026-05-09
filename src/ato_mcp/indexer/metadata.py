@@ -103,6 +103,13 @@ def category_from_path(payload_path: str | None) -> str:
     return parts[0] if parts else "Unknown"
 
 
+def category_for_record(canonical_id: str, payload_path: str | None) -> str:
+    category = category_from_path(payload_path)
+    if category in {"Unknown", "whats_new"}:
+        return category_for_docid(canonical_id)
+    return category
+
+
 def parse_docid(canonical_id: str) -> tuple[str | None, str | None]:
     """Return ``(prefix, doc_type_name)``. Prefix is uppercased first segment
     of the docid, e.g. ``TR`` from ``TR/TR20243/NAT/ATO/00001``.
@@ -178,9 +185,9 @@ def representative_path_from_docid(
     return segments
 
 
-def extract_pub_date(markdown: str) -> str | None:
+def extract_pub_date(text: str) -> str | None:
     """Best-effort publication-date scrape. Returns ISO yyyy-mm-dd or None."""
-    match = _DATE_RE.search(markdown[:2000])
+    match = _DATE_RE.search(text[:2000])
     if not match:
         return None
     day, month_name, year = match.groups()
@@ -263,10 +270,10 @@ def human_code_for_doc_id(doc_id: str) -> str | None:
     return None
 
 
-def content_hash(markdown: str, metadata: dict[str, Any]) -> str:
-    """Stable hash of (cleaned markdown + key metadata). Used for delta diffing."""
+def content_hash(text: str, metadata: dict[str, Any]) -> str:
+    """Stable hash of cleaned source-derived text plus key metadata."""
     h = hashlib.sha256()
-    h.update(markdown.encode("utf-8", errors="replace"))
+    h.update(text.encode("utf-8", errors="replace"))
     for key in ("title", "doc_type", "pub_date", "status"):
         value = metadata.get(key)
         if value:
@@ -275,4 +282,3 @@ def content_hash(markdown: str, metadata: dict[str, Any]) -> str:
             h.update(b"=")
             h.update(str(value).encode("utf-8"))
     return "sha256:" + h.hexdigest()
-

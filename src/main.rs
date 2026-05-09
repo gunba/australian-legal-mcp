@@ -9,6 +9,7 @@ use regex::Regex;
 use reqwest::blocking::Client;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OpenFlags};
+use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
@@ -45,7 +46,7 @@ const ORDINARY_DICTIONARY_PATH_ENV: &str = "ATO_MCP_DICTIONARY_PATH";
 /// On-disk schema version this binary supports. Bump when introducing
 /// schema changes; older binaries reject newer corpora via [`open_read`]
 /// / [`open_write`] / [`apply_update_locked`] guards.
-const SUPPORTED_SCHEMA_VERSION: u32 = 6;
+const SUPPORTED_SCHEMA_VERSION: u32 = 7;
 /// Highest manifest format version (`Manifest.schema_version`) this binary
 /// will ingest. v2 (released alongside ato-mcp 0.5.0) signals that
 /// `min_client_version` is now meaningfully populated by the builder
@@ -55,8 +56,9 @@ const SUPPORTED_SCHEMA_VERSION: u32 = 6;
 /// `min_client_version > CARGO_PKG_VERSION` check inside
 /// `enforce_manifest_compatibility` is the actual cross-version gate;
 /// this constant is a belt-and-suspenders upper bound for future format
-/// bumps that older binaries can't decode.
-const MAX_SUPPORTED_MANIFEST_VERSION: u32 = 3;
+/// bumps that older binaries can't decode. v4 carries cleaned HTML and image
+/// asset records in release packs.
+const MAX_SUPPORTED_MANIFEST_VERSION: u32 = 4;
 /// Maximum number of RRF top-N candidates we feed into the cross-encoder
 /// reranker per query. Reranking is O(N) ONNX inference; the quantized
 /// ModernBERT cross-encoder is still CPU-expensive, so keep the rerank
@@ -160,20 +162,12 @@ enum Command {
     /// Fetch a document or a slice of it.
     GetDocument {
         doc_id: String,
-        #[arg(long, default_value = "outline")]
+        #[arg(long, default_value = "html")]
         format: DocumentFormat,
         #[arg(long)]
-        anchor: Option<String>,
-        #[arg(long)]
-        heading_path: Option<String>,
-        #[arg(long)]
-        from_ord: Option<i64>,
-        #[arg(long)]
-        include_children: bool,
-        #[arg(long)]
-        count: Option<usize>,
-        #[arg(long)]
         max_chars: Option<usize>,
+        #[arg(long)]
+        from_char: Option<usize>,
     },
     /// Fetch compact statutory definitions for a term.
     GetDefinition {
@@ -217,9 +211,7 @@ enum SearchMode {
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum DocumentFormat {
-    Outline,
-    Card,
-    Markdown,
+    Html,
     Json,
 }
 
@@ -328,12 +320,8 @@ fn main() -> Result<()> {
         Command::GetDocument {
             doc_id,
             format,
-            anchor,
-            heading_path,
-            from_ord,
-            include_children,
-            count,
             max_chars,
+            from_char,
         } => {
             println!(
                 "{}",
@@ -341,12 +329,8 @@ fn main() -> Result<()> {
                     &doc_id,
                     GetDocumentOptions {
                         format,
-                        anchor: anchor.as_deref(),
-                        heading_path: heading_path.as_deref(),
-                        from_ord,
-                        include_children,
-                        count,
                         max_chars,
+                        from_char,
                     },
                 )?
             );
@@ -415,6 +399,12 @@ fn data_dir() -> Result<PathBuf> {
 fn live_dir() -> Result<PathBuf> {
     let path = data_dir()?.join("live");
     fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
+fn live_assets_root() -> Result<PathBuf> {
+    let path = live_dir()?;
+    fs::create_dir_all(path.join("assets"))?;
     Ok(path)
 }
 
@@ -555,6 +545,7 @@ fn init_db(conn: &Connection) -> Result<()> {
             downloaded_at    TEXT NOT NULL,
             content_hash     TEXT NOT NULL,
             pack_sha8        TEXT NOT NULL,
+            html             BLOB NOT NULL,
             withdrawn_date   TEXT,
             superseded_by    TEXT,
             replaces         TEXT
@@ -590,6 +581,19 @@ fn init_db(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_definitions_norm_term ON definitions(norm_term);
         CREATE INDEX IF NOT EXISTS idx_definitions_doc ON definitions(doc_id);
 
+        CREATE TABLE IF NOT EXISTS document_assets (
+            asset_ref     TEXT PRIMARY KEY,
+            doc_id        TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+            source_path   TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            media_type    TEXT,
+            alt           TEXT,
+            title         TEXT,
+            sha256        TEXT NOT NULL,
+            bytes         INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_assets_doc ON document_assets(doc_id);
+
         CREATE TABLE IF NOT EXISTS chunk_embeddings (
             chunk_id   INTEGER PRIMARY KEY REFERENCES chunks(chunk_id) ON DELETE CASCADE,
             embedding  BLOB NOT NULL CHECK(length(embedding) = 256)
@@ -623,7 +627,7 @@ fn init_db(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_shells_last_checked ON empty_shells(last_checked_at);
         "#,
     )?;
-    set_meta(conn, "schema_version", "6")?;
+    set_meta(conn, "schema_version", "7")?;
     Ok(())
 }
 
@@ -2150,9 +2154,17 @@ fn direct_doc_id_from_query(query: &str) -> Option<String> {
     if let Some(doc_id) = ato_doc_id_from_link(query) {
         return Some(doc_id);
     }
-    let re = Regex::new(r"\b[A-Z]{2,}/[A-Za-z0-9_.()/-]+").expect("valid regex");
-    re.find(query)
-        .map(|m| m.as_str().trim_end_matches('.').to_string())
+    let candidate = query.trim().trim_matches('<').trim_matches('>');
+    if candidate.is_empty()
+        || candidate.contains(char::is_whitespace)
+        || !candidate.contains('/')
+        || !candidate
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '.' | '(' | ')' | '-'))
+    {
+        return None;
+    }
+    Some(candidate.to_string())
 }
 
 fn direct_title_hits(
@@ -2216,7 +2228,7 @@ fn load_title_hit(conn: &Connection, doc_id: &str, filter: &SqlFilter) -> Result
             chunk_id: None,
             ord: None,
             next_call: Some(format!(
-                "get_document(doc_id=\"{doc_id}\", format=\"card\")"
+                "get_document(doc_id=\"{doc_id}\", format=\"html\", max_chars=20000)"
             )),
             ranking: None,
             withdrawn_date: row.get("withdrawn_date")?,
@@ -2280,7 +2292,7 @@ fn search_titles(
             chunk_id: None,
             ord: None,
             next_call: Some(format!(
-                "get_document(doc_id=\"{doc_id}\", format=\"card\")"
+                "get_document(doc_id=\"{doc_id}\", format=\"html\", max_chars=20000)"
             )),
             ranking: None,
             withdrawn_date: row.get("withdrawn_date")?,
@@ -2322,73 +2334,25 @@ fn search_titles(
     }
 }
 
-#[derive(Serialize)]
-struct ChunkOut {
-    chunk_id: i64,
-    ord: i64,
-    heading_path: String,
-    anchor: Option<String>,
-    text: String,
-}
-
-struct GetDocumentOptions<'a> {
+struct GetDocumentOptions {
     format: DocumentFormat,
-    anchor: Option<&'a str>,
-    heading_path: Option<&'a str>,
-    from_ord: Option<i64>,
-    include_children: bool,
-    count: Option<usize>,
     max_chars: Option<usize>,
+    from_char: Option<usize>,
 }
 
-fn get_document(doc_id: &str, opts: GetDocumentOptions<'_>) -> Result<String> {
-    // [MT-11] get_document supports outline/card/markdown/json plus section and ordinal selection.
-    // [MT-12] Outline/card share outline_for_doc; markdown/json materialize selected chunks.
+fn get_document(doc_id: &str, opts: GetDocumentOptions) -> Result<String> {
     let conn = open_read()?;
     let doc = load_document_row(&conn, doc_id)?;
     let Some(doc) = doc else {
         return Ok(format!("_Document not found: `{}`_", doc_id));
     };
-    if opts.format == DocumentFormat::Outline {
-        let outline =
-            outline_for_doc(&conn, doc_id, opts.anchor, opts.heading_path, opts.from_ord)?;
-        return Ok(format_outline(&doc, &outline));
+    if opts.format == DocumentFormat::Html {
+        return format_document_html(&conn, &doc, opts.from_char.unwrap_or(0), opts.max_chars);
     }
-    if opts.format == DocumentFormat::Card {
-        let outline =
-            outline_for_doc(&conn, doc_id, opts.anchor, opts.heading_path, opts.from_ord)?;
-        return document_card(&conn, &doc, outline);
-    }
-    let selected = select_chunks(&conn, doc_id, &opts)?;
-    let Some((chunks, continuation_ord)) = selected else {
-        return Ok(format!(
-            "_Section not found in {} (anchor={:?}, heading_path={:?}, from_ord={:?})._",
-            doc_id, opts.anchor, opts.heading_path, opts.from_ord
-        ));
-    };
     if opts.format == DocumentFormat::Json {
-        let returned_chars = chunks.iter().map(|chunk| chunk.text.len()).sum::<usize>();
-        let next_call = continuation_ord.map(|ord| {
-            format!(
-                "get_document(doc_id=\"{}\", format=\"json\", from_ord={}, max_chars={})",
-                doc.doc_id,
-                ord,
-                opts.max_chars.unwrap_or(20_000)
-            )
-        });
-        return Ok(serde_json::to_string_pretty(&json!({
-            "document": doc,
-            "chunks": chunks,
-            "continuation_ord": continuation_ord,
-            "meta": {
-                "returned": chunks.len(),
-                "returned_chars": returned_chars,
-                "truncated": continuation_ord.is_some(),
-                "next_call": next_call,
-            },
-        }))?);
+        return format_document_json(&conn, &doc, opts.from_char.unwrap_or(0), opts.max_chars);
     }
-    Ok(format_document_markdown(&doc, &chunks, continuation_ord))
+    unreachable!("DocumentFormat is exhausted")
 }
 
 #[derive(Debug, Serialize)]
@@ -2422,274 +2386,114 @@ fn load_document_row(conn: &Connection, doc_id: &str) -> Result<Option<DocumentR
     }
 }
 
-fn document_card(
+fn load_document_html(conn: &Connection, doc_id: &str) -> Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT html FROM documents WHERE doc_id = ?")?;
+    let mut rows = stmt.query([doc_id])?;
+    if let Some(row) = rows.next()? {
+        let blob: Vec<u8> = row.get("html")?;
+        Ok(Some(decompress_text(blob)?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn format_document_html(
     conn: &Connection,
     doc: &DocumentRow,
-    outline: Vec<OutlineEntry>,
+    from_char: usize,
+    max_chars: Option<usize>,
 ) -> Result<String> {
-    let (chunk_count, first_ord, last_ord, compressed_bytes): (i64, Option<i64>, Option<i64>, i64) =
-        conn.query_row(
-            r#"
-            SELECT COUNT(*), MIN(ord), MAX(ord), COALESCE(SUM(length(text)), 0)
-            FROM chunks
-            WHERE doc_id = ?
-            "#,
-            [&doc.doc_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
-    let payload = json!({
-        "document": doc,
-        "summary": {
-            "chunk_count": chunk_count,
-            "heading_count": outline.len(),
-            "first_ord": first_ord,
-            "last_ord": last_ord,
-            "compressed_text_bytes": compressed_bytes,
-        },
-        "hydration": {
-            "full_body_call": format!("get_document(doc_id=\"{}\", format=\"markdown\", max_chars=20000)", doc.doc_id),
-            "first_page_call": format!("get_document(doc_id=\"{}\", format=\"json\", from_ord={}, max_chars=12000)", doc.doc_id, first_ord.unwrap_or(0)),
-            "outline_call": format!("get_document(doc_id=\"{}\", format=\"outline\")", doc.doc_id),
-            "chunk_range": {
-                "from_ord": first_ord,
-                "to_ord": last_ord,
-            },
-        },
-        "outline": outline,
-        "next_calls": [
-            format!("get_document(doc_id=\"{}\", format=\"outline\")", doc.doc_id),
-            format!("get_document(doc_id=\"{}\", format=\"markdown\", from_ord={})", doc.doc_id, first_ord.unwrap_or(0)),
-        ],
-    });
-    Ok(serde_json::to_string_pretty(&payload)?)
-}
-
-#[derive(Serialize)]
-struct OutlineEntry {
-    heading_path: String,
-    anchor: Option<String>,
-    depth: usize,
-    start_ord: i64,
-    chunk_count: i64,
-}
-
-fn outline_for_doc(
-    conn: &Connection,
-    doc_id: &str,
-    anchor: Option<&str>,
-    heading_path: Option<&str>,
-    from_ord: Option<i64>,
-) -> Result<Vec<OutlineEntry>> {
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT heading_path, anchor, MIN(ord) AS start_ord, COUNT(*) AS chunk_count
-        FROM chunks
-        WHERE doc_id = ?
-        GROUP BY heading_path
-        ORDER BY start_ord ASC
-        "#,
-    )?;
-    let entries = stmt
-        .query_map([doc_id], |row| {
-            let hp: String = row
-                .get::<_, Option<String>>("heading_path")?
-                .unwrap_or_default();
-            let depth = if hp.is_empty() {
-                0
-            } else if hp.contains(" > ") {
-                hp.matches(" > ").count() + 1
-            } else {
-                hp.matches(" › ").count() + 1
-            };
-            Ok(OutlineEntry {
-                heading_path: hp,
-                anchor: row.get("anchor")?,
-                depth,
-                start_ord: row.get("start_ord")?,
-                chunk_count: row.get("chunk_count")?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    if anchor.is_none() && heading_path.is_none() && from_ord.is_none() {
-        return Ok(entries);
-    }
-    let Some(start_idx) = entries.iter().position(|e| {
-        anchor
-            .map(|a| e.anchor.as_deref() == Some(a))
-            .unwrap_or(false)
-            || heading_path.map(|hp| e.heading_path == hp).unwrap_or(false)
-            || from_ord.map(|ord| e.start_ord >= ord).unwrap_or(false)
-    }) else {
-        return Ok(Vec::new());
-    };
-    let start_path = entries[start_idx].heading_path.clone();
-    let mut out = Vec::new();
-    for e in entries.into_iter().skip(start_idx) {
-        if start_path.is_empty()
-            || e.heading_path == start_path
-            || e.heading_path.starts_with(&(start_path.clone() + " › "))
-            || e.heading_path.starts_with(&(start_path.clone() + " > "))
-        {
-            out.push(e);
+    let html = load_document_html(conn, &doc.doc_id)?.unwrap_or_default();
+    let total_chars = html.chars().count();
+    let start_char = from_char.min(total_chars);
+    let start_byte = char_offset_to_byte(&html, start_char);
+    let remaining = &html[start_byte..];
+    let (body, next_offset) = if let Some(max_chars) = max_chars {
+        if remaining.chars().count() > max_chars {
+            let end = char_offset_to_byte(remaining, max_chars);
+            (&remaining[..end], Some(start_char + max_chars))
         } else {
-            break;
+            (remaining, None)
         }
+    } else {
+        (remaining, None)
+    };
+    let mut out = String::new();
+    out.push_str(&format!(
+        "<!-- ato-mcp doc_id=\"{}\" title=\"{}\" canonical_url=\"{}\" -->\n",
+        escape_html_attr(&doc.doc_id),
+        escape_html_attr(&doc.title),
+        escape_html_attr(&doc.canonical_url)
+    ));
+    out.push_str(body);
+    if let Some(next) = next_offset {
+        out.push_str(&format!(
+            "\n<!-- truncated; next_call: get_document(doc_id=\"{}\", format=\"html\", from_char={}, max_chars={}) -->",
+            escape_html_attr(&doc.doc_id),
+            next,
+            max_chars.unwrap_or(20_000)
+        ));
     }
     Ok(out)
 }
 
-fn select_chunks(
+fn format_document_json(
     conn: &Connection,
-    doc_id: &str,
-    opts: &GetDocumentOptions<'_>,
-) -> Result<Option<(Vec<ChunkOut>, Option<i64>)>> {
-    let mut stmt = conn.prepare(
-        "SELECT chunk_id, ord, heading_path, anchor, text FROM chunks WHERE doc_id = ? ORDER BY ord ASC",
-    )?;
-    let rows = stmt
-        .query_map([doc_id], |row| {
-            Ok((
-                row.get::<_, i64>("chunk_id")?,
-                row.get::<_, i64>("ord")?,
-                row.get::<_, Option<String>>("heading_path")?
-                    .unwrap_or_default(),
-                row.get::<_, Option<String>>("anchor")?,
-                row.get::<_, Vec<u8>>("text")?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    if rows.is_empty() {
-        return Ok(Some((Vec::new(), None)));
-    }
-
-    let start_idx =
-        if opts.anchor.is_none() && opts.heading_path.is_none() && opts.from_ord.is_none() {
-            0
-        } else {
-            let Some(idx) = rows.iter().position(|(_, ord, hp, anchor, _)| {
-                opts.anchor
-                    .map(|a| anchor.as_deref() == Some(a))
-                    .unwrap_or(false)
-                    || opts
-                        .heading_path
-                        .map(|target| hp == target)
-                        .unwrap_or(false)
-                    || opts
-                        .from_ord
-                        .map(|from_ord| *ord >= from_ord)
-                        .unwrap_or(false)
-            }) else {
-                return Ok(None);
-            };
-            idx
-        };
-    let start_path = rows[start_idx].2.clone();
-    let mut candidates: Vec<_> = rows.into_iter().skip(start_idx).collect();
-    if (opts.anchor.is_some() || opts.heading_path.is_some()) && !opts.include_children {
-        if let Some(anchor) = opts.anchor {
-            candidates.retain(|(_, _, _, a, _)| a.as_deref() == Some(anchor));
-        } else if let Some(hp) = opts.heading_path {
-            candidates.retain(|(_, _, h, _, _)| h == hp);
-        }
-    } else if (opts.anchor.is_some() || opts.heading_path.is_some()) && opts.include_children {
-        candidates = candidates
-            .into_iter()
-            .take_while(|(_, _, hp, _, _)| {
-                start_path.is_empty()
-                    || hp == &start_path
-                    || hp.starts_with(&(start_path.clone() + " › "))
-                    || hp.starts_with(&(start_path.clone() + " > "))
-            })
-            .collect();
-    }
-
-    let mut out = Vec::new();
-    let mut chars = 0usize;
-    let mut continuation_ord = None;
-    for idx in 0..candidates.len() {
-        let (chunk_id, ord, heading_path, anchor, blob) = &candidates[idx];
-        let text = decompress_text(blob.clone())?;
-        if opts
-            .max_chars
-            .is_some_and(|max| !out.is_empty() && chars + text.len() > max)
-        {
-            continuation_ord = Some(*ord);
-            break;
-        }
-        chars += text.len();
-        out.push(ChunkOut {
-            chunk_id: *chunk_id,
-            ord: *ord,
-            heading_path: heading_path.clone(),
-            anchor: anchor.clone(),
-            text,
-        });
-        if opts.count.is_some_and(|count| out.len() >= count) {
-            if let Some((_, next_ord, _, _, _)) = candidates.get(idx + 1) {
-                continuation_ord = Some(*next_ord);
-            }
-            break;
-        }
-    }
-    Ok(Some((out, continuation_ord)))
-}
-
-fn format_outline(doc: &DocumentRow, entries: &[OutlineEntry]) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("# {}\n\n", doc.title));
-    out.push_str(&format!("`{}` | `{}`", doc.doc_id, doc.doc_type));
-    if let Some(date) = &doc.date {
-        out.push_str(&format!(" | Date: {}", date));
-    }
-    out.push_str(&format!("\nSource: {}\n\n", doc.canonical_url));
-    if entries.is_empty() {
-        out.push_str("_No outline entries._");
-        return out;
-    }
-    out.push_str("| Ord | Chunks | Heading |\n|---:|---:|---|\n");
-    for e in entries {
-        // [OF-05] Outline rows indent by heading depth using doubled non-breaking spaces.
-        let indent = "&nbsp;".repeat(e.depth.saturating_sub(1) * 2);
-        let display = if e.heading_path.is_empty() {
-            "(intro)".to_string()
-        } else {
-            escape_md(&e.heading_path)
-        };
-        out.push_str(&format!(
-            "| {} | {} | {}{} |\n",
-            e.start_ord, e.chunk_count, indent, display
-        ));
-    }
-    out
-}
-
-fn format_document_markdown(
     doc: &DocumentRow,
-    chunks: &[ChunkOut],
-    continuation_ord: Option<i64>,
-) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("# {}\n\n", doc.title));
-    out.push_str(&format!("`{}` | `{}`", doc.doc_id, doc.doc_type));
-    if let Some(date) = &doc.date {
-        out.push_str(&format!(" | Date: {}", date));
-    }
-    out.push_str(&format!("\nSource: {}\n\n", doc.canonical_url));
-    for chunk in chunks {
-        if !chunk.heading_path.is_empty() {
-            out.push_str(&format!("## {}\n\n", chunk.heading_path));
+    from_char: usize,
+    max_chars: Option<usize>,
+) -> Result<String> {
+    let html = load_document_html(conn, &doc.doc_id)?.unwrap_or_default();
+    let total_chars = html.chars().count();
+    let start_char = from_char.min(total_chars);
+    let start_byte = char_offset_to_byte(&html, start_char);
+    let remaining = &html[start_byte..];
+    let (body, next_offset) = if let Some(max_chars) = max_chars {
+        if remaining.chars().count() > max_chars {
+            let end = char_offset_to_byte(remaining, max_chars);
+            (&remaining[..end], Some(start_char + max_chars))
+        } else {
+            (remaining, None)
         }
-        out.push_str(&chunk.text);
-        out.push_str("\n\n");
-    }
-    if let Some(ord) = continuation_ord {
-        out.push_str(&format!(
-            "_Truncated. Continue with `get_document(doc_id=\"{}\", format=\"markdown\", from_ord={})`._",
-            doc.doc_id, ord
-        ));
-    }
-    out
+    } else {
+        (remaining, None)
+    };
+    let returned_chars = body.chars().count();
+    let next_call = next_offset.map(|next| {
+        format!(
+            "get_document(doc_id=\"{}\", format=\"json\", from_char={}, max_chars={})",
+            doc.doc_id,
+            next,
+            max_chars.unwrap_or(20_000)
+        )
+    });
+    Ok(serde_json::to_string_pretty(&json!({
+        "document": doc,
+        "html": body,
+        "meta": {
+            "total_chars": total_chars,
+            "from_char": start_char,
+            "returned_chars": returned_chars,
+            "truncated": next_offset.is_some(),
+            "next_call": next_call,
+        },
+    }))?)
+}
+
+fn char_offset_to_byte(value: &str, chars: usize) -> usize {
+    value
+        .char_indices()
+        .nth(chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(value.len())
+}
+
+fn escape_html_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 struct GetDefinitionOptions<'a> {
@@ -3556,6 +3360,7 @@ fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
             &manifest_context,
             &docs_to_insert,
             &mut bytes_downloaded,
+            &live_assets_root()?,
         )?;
         set_meta(&tx, "index_version", &new_manifest.index_version)?;
         set_meta(&tx, "embedding_model_id", &new_manifest.model.id)?;
@@ -3627,6 +3432,7 @@ fn rebuild_live_db_from_manifest(
     }
     fs::create_dir_all(&staging_root)?;
     let staged_db = staging_root.join("ato.db");
+    let staged_asset_root = staging_root.join("live");
     let conn = open_write_at(&staged_db)?;
     init_db(&conn)?;
 
@@ -3639,6 +3445,7 @@ fn rebuild_live_db_from_manifest(
             context,
             &manifest.documents,
             &mut bytes_downloaded,
+            &staged_asset_root,
         )?;
         set_meta(&tx, "index_version", &manifest.index_version)?;
         set_meta(&tx, "embedding_model_id", &manifest.model.id)?;
@@ -3658,6 +3465,7 @@ fn rebuild_live_db_from_manifest(
     drop(conn);
 
     replace_live_db(&staged_db)?;
+    replace_live_assets(&staged_asset_root)?;
     let manifest_json = serde_json::to_vec_pretty(manifest)?;
     fs::write(installed_manifest_path()?, manifest_json)?;
     let _ = fs::remove_dir_all(&staging_root);
@@ -3694,12 +3502,27 @@ fn replace_live_db(staged_db: &Path) -> Result<()> {
     Ok(())
 }
 
+fn replace_live_assets(staged_asset_root: &Path) -> Result<()> {
+    let live_assets = live_dir()?.join("assets");
+    if live_assets.exists() {
+        fs::remove_dir_all(&live_assets)?;
+    }
+    let staged_assets = staged_asset_root.join("assets");
+    if staged_assets.exists() {
+        fs::rename(staged_assets, &live_assets)?;
+    } else {
+        fs::create_dir_all(&live_assets)?;
+    }
+    Ok(())
+}
+
 fn insert_docs_from_packs(
     conn: &Connection,
     manifest: &Manifest,
     context: &UrlContext,
     docs: &[DocRef],
     bytes_downloaded: &mut u64,
+    asset_root: &Path,
 ) -> Result<()> {
     // [UM-03] Pack bytes are fetched from manifest-resolved assets and sha256-verified.
     let mut pack_to_refs: HashMap<String, Vec<DocRef>> = HashMap::new();
@@ -3728,7 +3551,7 @@ fn insert_docs_from_packs(
         *bytes_downloaded += pack_bytes.len() as u64;
         for doc_ref in refs {
             let record = read_record_from_pack_bytes(&pack_bytes, doc_ref.offset, doc_ref.length)?;
-            insert_record(conn, &record, &doc_ref)?;
+            insert_record(conn, &record, &doc_ref, asset_root)?;
         }
     }
     Ok(())
@@ -4375,12 +4198,9 @@ struct PackRecord {
     date: Option<String>,
     downloaded_at: String,
     content_hash: String,
-    /// W2.2 currency markers. Older (pre-v6) packs omit these fields entirely;
-    /// `serde(default)` lets us still ingest them as None. Without these fields
-    /// every ingested row would have NULL currency columns, the `current_only`
-    /// filter would silently never exclude anything, and W2.4 would be dead in
-    /// production — see the C1 regression test (`currency_fields_round_trip_*`)
-    /// for the canary that catches this.
+    html: String,
+    /// W2.2 currency markers. The insert_record regression test proves these
+    /// pack fields survive ingestion into the searchable SQLite corpus.
     #[serde(default)]
     withdrawn_date: Option<String>,
     #[serde(default)]
@@ -4389,8 +4209,22 @@ struct PackRecord {
     replaces: Option<String>,
     #[serde(default)]
     definitions: Vec<PackDefinition>,
+    assets: Vec<PackAsset>,
     #[serde(default)]
     chunks: Vec<PackChunk>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackAsset {
+    asset_ref: String,
+    source_path: String,
+    relative_path: String,
+    media_type: Option<String>,
+    alt: Option<String>,
+    title: Option<String>,
+    sha256: String,
+    size: i64,
+    data_b64: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4445,7 +4279,12 @@ fn read_record_from_pack_bytes(pack: &[u8], offset: u64, length: u64) -> Result<
     Ok(serde_json::from_slice(&decoded)?)
 }
 
-fn insert_record(conn: &Connection, record: &PackRecord, doc_ref: &DocRef) -> Result<()> {
+fn insert_record(
+    conn: &Connection,
+    record: &PackRecord,
+    doc_ref: &DocRef,
+    asset_root: &Path,
+) -> Result<()> {
     let doc_type = if record.doc_type.is_empty() {
         "Unknown"
     } else {
@@ -4455,8 +4294,8 @@ fn insert_record(conn: &Connection, record: &PackRecord, doc_ref: &DocRef) -> Re
         r#"
         INSERT OR REPLACE INTO documents
             (doc_id, type, title, date, downloaded_at, content_hash, pack_sha8,
-             withdrawn_date, superseded_by, replaces)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             html, withdrawn_date, superseded_by, replaces)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
         params![
             record.doc_id,
@@ -4466,11 +4305,13 @@ fn insert_record(conn: &Connection, record: &PackRecord, doc_ref: &DocRef) -> Re
             record.downloaded_at,
             record.content_hash,
             doc_ref.pack_sha8,
+            compress_text(&record.html)?,
             record.withdrawn_date,
             record.superseded_by,
             record.replaces,
         ],
     )?;
+    write_record_assets(conn, record, asset_root)?;
     let headings = record
         .chunks
         .iter()
@@ -4530,6 +4371,58 @@ fn insert_record(conn: &Connection, record: &PackRecord, doc_ref: &DocRef) -> Re
                 definition.anchor,
                 definition.ord,
                 definition.body,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn write_record_assets(conn: &Connection, record: &PackRecord, asset_root: &Path) -> Result<()> {
+    for asset in &record.assets {
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(&asset.data_b64)
+            .with_context(|| format!("decoding asset {}", asset.asset_ref))?;
+        if data.len() as i64 != asset.size {
+            bail!(
+                "asset {} size mismatch: got {}, expected {}",
+                asset.asset_ref,
+                data.len(),
+                asset.size
+            );
+        }
+        let actual_sha = format!("{:x}", Sha256::digest(&data));
+        if actual_sha != asset.sha256 {
+            bail!("asset {} sha256 mismatch", asset.asset_ref);
+        }
+        let target = asset_root.join(&asset.relative_path);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let needs_write = if target.exists() {
+            let existing = fs::read(&target)?;
+            format!("{:x}", Sha256::digest(&existing)) != asset.sha256
+        } else {
+            true
+        };
+        if needs_write {
+            fs::write(&target, &data)?;
+        }
+        conn.execute(
+            r#"
+            INSERT OR REPLACE INTO document_assets
+                (asset_ref, doc_id, source_path, relative_path, media_type, alt, title, sha256, bytes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                asset.asset_ref,
+                record.doc_id,
+                asset.source_path,
+                asset.relative_path,
+                asset.media_type,
+                asset.alt,
+                asset.title,
+                asset.sha256,
+                asset.size,
             ],
         )?;
     }
@@ -4721,29 +4614,25 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
             let format = match args
                 .get("format")
                 .and_then(|v| v.as_str())
-                .unwrap_or("outline")
+                .unwrap_or("html")
             {
+                "html" => DocumentFormat::Html,
                 "json" => DocumentFormat::Json,
-                "markdown" => DocumentFormat::Markdown,
-                "card" => DocumentFormat::Card,
-                "outline" => DocumentFormat::Outline,
                 other => {
-                    bail!("format must be one of outline, card, markdown, json; got `{other}`")
+                    bail!("format must be one of html, json; got `{other}`")
                 }
             };
             get_document(
                 doc_id,
                 GetDocumentOptions {
                     format,
-                    anchor: args.get("anchor").and_then(|v| v.as_str()),
-                    heading_path: args.get("heading_path").and_then(|v| v.as_str()),
-                    from_ord: args.get("from_ord").and_then(|v| v.as_i64()),
-                    include_children: optional_bool(&args, "include_children").unwrap_or(false),
-                    count: optional_usize(&args, "count"),
                     max_chars: optional_usize(&args, "max_chars"),
+                    from_char: optional_usize(&args, "from_char"),
                 },
             )?
         }
+        "get_elements" => get_elements_mcp(&args)?,
+        "get_asset" => get_asset_mcp(&args)?,
         "get_chunks" => get_chunks_mcp(&args)?,
         "get_definition" => {
             let term = required_str(&args, "term")?;
@@ -4922,9 +4811,8 @@ fn get_chunks(chunk_ids: &[i64], opts: GetChunksOptions) -> Result<String> {
     }
     let next_call = truncated_at.as_ref().map(|chunk| {
         format!(
-            "get_document(doc_id=\"{}\", format=\"json\", from_ord={}, max_chars={})",
+            "get_document(doc_id=\"{}\", format=\"html\", max_chars={})",
             chunk.doc_id,
-            chunk.ord,
             opts.max_chars.unwrap_or(20_000)
         )
     });
@@ -5018,6 +4906,206 @@ fn load_chunks_by_ord_range(
         });
     }
     Ok(out)
+}
+
+#[derive(Debug, Serialize)]
+struct ElementOut {
+    ord: usize,
+    tag: String,
+    attrs: BTreeMap<String, String>,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    html: Option<String>,
+}
+
+fn get_elements_mcp(args: &JsonValue) -> Result<String> {
+    let doc_id = required_str(args, "doc_id")?;
+    let tags = optional_string_array(args, "tags")?.unwrap_or_else(|| {
+        vec![
+            "h1".into(),
+            "h2".into(),
+            "h3".into(),
+            "h4".into(),
+            "h5".into(),
+            "h6".into(),
+        ]
+    });
+    let attr = args.get("attr").and_then(|v| v.as_str());
+    get_elements(
+        doc_id,
+        tags,
+        attr,
+        optional_usize(args, "from_ord").unwrap_or(0),
+        optional_usize(args, "limit").unwrap_or(50).min(200),
+        optional_usize(args, "max_chars").unwrap_or(20_000),
+        optional_bool(args, "include_html").unwrap_or(true),
+    )
+}
+
+fn get_elements(
+    doc_id: &str,
+    tags: Vec<String>,
+    attr: Option<&str>,
+    from_ord: usize,
+    limit: usize,
+    max_chars: usize,
+    include_html: bool,
+) -> Result<String> {
+    if tags.is_empty() {
+        bail!("tags must contain at least one tag name");
+    }
+    let clean_tags = tags
+        .iter()
+        .map(|tag| validate_html_name(tag, "tag"))
+        .collect::<Result<Vec<_>>>()?;
+    let attr_filter = attr
+        .map(|name| validate_html_name(name, "attr"))
+        .transpose()?;
+    let selector_text = clean_tags.join(",");
+    let selector = Selector::parse(&selector_text)
+        .map_err(|err| anyhow!("invalid selector from tags {:?}: {err}", clean_tags))?;
+    let conn = open_read()?;
+    let doc = load_document_row(&conn, doc_id)?;
+    let Some(doc) = doc else {
+        return Ok(format!("_Document not found: `{}`_", doc_id));
+    };
+    let html = load_document_html(&conn, doc_id)?.unwrap_or_default();
+    let fragment = Html::parse_fragment(&html);
+    let mut elements = Vec::new();
+    let mut returned_chars = 0usize;
+    let mut matched_ord = 0usize;
+    let mut next_ord = None;
+    for element in fragment.select(&selector) {
+        if let Some(attr_name) = attr_filter.as_deref() {
+            if element.value().attr(attr_name).is_none() {
+                continue;
+            }
+        }
+        let ord = matched_ord;
+        matched_ord += 1;
+        if ord < from_ord {
+            continue;
+        }
+        let html_text = element.html();
+        let text = collapse_ws(&element.text().collect::<Vec<_>>().join(" "));
+        let projected = returned_chars + html_text.len();
+        if !elements.is_empty() && (elements.len() >= limit || projected > max_chars) {
+            next_ord = Some(ord);
+            break;
+        }
+        returned_chars = projected;
+        let attrs = element
+            .value()
+            .attrs()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect::<BTreeMap<_, _>>();
+        elements.push(ElementOut {
+            ord,
+            tag: element.value().name().to_string(),
+            attrs,
+            text,
+            html: include_html.then_some(html_text),
+        });
+    }
+    let next_call = next_ord.map(|ord| {
+        let tags_json = serde_json::to_string(&clean_tags).unwrap_or_else(|_| "[]".to_string());
+        let attr_part = attr_filter
+            .as_ref()
+            .map(|attr| format!(", attr=\"{}\"", attr))
+            .unwrap_or_default();
+        format!(
+            "get_elements(doc_id=\"{}\", tags={}, from_ord={}, limit={}, max_chars={}{})",
+            doc.doc_id, tags_json, ord, limit, max_chars, attr_part
+        )
+    });
+    let returned = elements.len();
+    Ok(serde_json::to_string_pretty(&json!({
+        "document": doc,
+        "query": {
+            "tags": clean_tags,
+            "attr": attr_filter,
+            "from_ord": from_ord,
+            "limit": limit,
+            "include_html": include_html,
+        },
+        "elements": elements,
+        "meta": {
+            "returned": returned,
+            "returned_chars": returned_chars,
+            "truncated": next_ord.is_some(),
+            "next_call": next_call,
+        },
+    }))?)
+}
+
+fn validate_html_name(value: &str, label: &str) -> Result<String> {
+    let clean = value.trim().to_ascii_lowercase();
+    if clean.is_empty()
+        || !clean
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        || clean.starts_with('-')
+    {
+        bail!("{label} must be a simple HTML name; got `{value}`");
+    }
+    Ok(clean)
+}
+
+fn collapse_ws(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[derive(Debug, Serialize)]
+struct DocumentAssetOut {
+    asset_ref: String,
+    doc_id: String,
+    source_path: String,
+    relative_path: String,
+    media_type: Option<String>,
+    alt: Option<String>,
+    title: Option<String>,
+    sha256: String,
+    bytes: i64,
+    path: String,
+}
+
+fn get_asset_mcp(args: &JsonValue) -> Result<String> {
+    let asset_ref = required_str(args, "asset_ref")?;
+    get_asset(asset_ref)
+}
+
+fn get_asset(asset_ref: &str) -> Result<String> {
+    let conn = open_read()?;
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT asset_ref, doc_id, source_path, relative_path, media_type,
+               alt, title, sha256, bytes
+        FROM document_assets
+        WHERE asset_ref = ?
+        "#,
+    )?;
+    let mut rows = stmt.query([asset_ref])?;
+    let Some(row) = rows.next()? else {
+        return Ok(format!("_Asset not found: `{}`_", asset_ref));
+    };
+    let relative_path: String = row.get("relative_path")?;
+    let path = live_dir()?.join(&relative_path);
+    if !path.exists() {
+        bail!("asset file missing for {asset_ref}: {}", path.display());
+    }
+    let out = DocumentAssetOut {
+        asset_ref: row.get("asset_ref")?,
+        doc_id: row.get("doc_id")?,
+        source_path: row.get("source_path")?,
+        relative_path,
+        media_type: row.get("media_type")?,
+        alt: row.get("alt")?,
+        title: row.get("title")?,
+        sha256: row.get("sha256")?,
+        bytes: row.get("bytes")?,
+        path: path.display().to_string(),
+    };
+    Ok(serde_json::to_string_pretty(&out)?)
 }
 
 fn server_instructions() -> String {
@@ -5414,20 +5502,44 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_document",
-            "description": "Fetch a document outline, full body, section, or ordinal range.",
+            "description": "Fetch the cleaned source HTML for a document. Internal ATO document links are data-doc-id attributes; retained images are data-asset-ref attributes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "doc_id": {"type": "string"},
-                    "format": {"type": "string", "enum": ["outline", "card", "markdown", "json"]},
-                    "anchor": {"type": "string"},
-                    "heading_path": {"type": "string"},
-                    "from_ord": {"type": "integer"},
-                    "include_children": {"type": "boolean"},
-                    "count": {"type": "integer"},
+                    "format": {"type": "string", "enum": ["html", "json"]},
+                    "from_char": {"type": "integer"},
                     "max_chars": {"type": "integer"}
                 },
                 "required": ["doc_id"]
+            }
+        },
+        {
+            "name": "get_elements",
+            "description": "Select elements from a cleaned document HTML fragment by tag name, with optional attribute presence filtering.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "doc_id": {"type": "string"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "attr": {"type": "string"},
+                    "from_ord": {"type": "integer"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                    "max_chars": {"type": "integer", "minimum": 1},
+                    "include_html": {"type": "boolean"}
+                },
+                "required": ["doc_id"]
+            }
+        },
+        {
+            "name": "get_asset",
+            "description": "Resolve an image asset reference from cleaned HTML to a local file path plus source metadata.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "asset_ref": {"type": "string"}
+                },
+                "required": ["asset_ref"]
             }
         },
         {
@@ -5676,15 +5788,19 @@ mod tests {
 
     fn insert_doc(conn: &Connection, doc_id: &str) -> Result<()> {
         conn.execute(
-            "INSERT INTO documents(doc_id, type, title, downloaded_at, content_hash, pack_sha8) VALUES (?, 'Public_ruling', ?, ?, ?, '00000000')",
-            params![doc_id, format!("{doc_id} title"), Utc::now().to_rfc3339(), "deadbeef"],
+            "INSERT INTO documents(doc_id, type, title, downloaded_at, content_hash, pack_sha8, html) VALUES (?, 'Public_ruling', ?, ?, ?, '00000000', ?)",
+            params![
+                doc_id,
+                format!("{doc_id} title"),
+                Utc::now().to_rfc3339(),
+                "deadbeef",
+                compress_text("<div></div>")?,
+            ],
         )?;
         Ok(())
     }
 
-    /// W2 helper: insert a document row with explicit currency fields. The
-    /// W1 helper above keeps its v5-shaped shorthand (NULL currency
-    /// columns) so existing tests don't churn.
+    /// Test helper: insert a document row with explicit currency fields.
     fn insert_doc_full(
         conn: &Connection,
         doc_id: &str,
@@ -5695,14 +5811,15 @@ mod tests {
     ) -> Result<()> {
         conn.execute(
             "INSERT INTO documents(doc_id, type, title, date, downloaded_at, \
-                content_hash, pack_sha8, withdrawn_date, superseded_by, replaces) \
-             VALUES (?, 'Public_ruling', ?, ?, ?, ?, '00000000', ?, ?, ?)",
+                content_hash, pack_sha8, html, withdrawn_date, superseded_by, replaces) \
+             VALUES (?, 'Public_ruling', ?, ?, ?, ?, '00000000', ?, ?, ?, ?)",
             params![
                 doc_id,
                 format!("{doc_id} title"),
                 date,
                 Utc::now().to_rfc3339(),
                 "deadbeef",
+                compress_text("<div></div>")?,
                 withdrawn_date,
                 superseded_by,
                 replaces,
@@ -5722,6 +5839,114 @@ mod tests {
             "INSERT INTO chunks(chunk_id, doc_id, ord, heading_path, anchor, text) VALUES (?, ?, ?, ?, NULL, ?)",
             params![chunk_id, doc_id, ord, "Section A", compress_text(text)?],
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn direct_doc_id_parser_accepts_only_deterministic_inputs() {
+        assert_eq!(
+            direct_doc_id_from_query(
+                "https://www.ato.gov.au/law/view/document?docid=PAC%2F19970038%2F203-55"
+            ),
+            Some("PAC/19970038/203-55".to_string())
+        );
+        assert_eq!(
+            direct_doc_id_from_query("PAC/19970038/203-55"),
+            Some("PAC/19970038/203-55".to_string())
+        );
+        assert_eq!(
+            direct_doc_id_from_query("see anchor PAC/19010002/Pt8 in the page"),
+            None
+        );
+        assert_eq!(direct_doc_id_from_query("not/a<script>"), None);
+    }
+
+    #[test]
+    fn html_elements_and_assets_are_queryable() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        let html = r#"<div id="LawContent"><h1 id="top">Example</h1><p>See <a data-doc-id="PAC/19970038/203-55">203-55</a>.</p><span data-asset-ref="ato-image://DOC_HTML/0">[image: Diagram]</span></div>"#;
+        conn.execute(
+            "INSERT INTO documents(doc_id, type, title, downloaded_at, content_hash, pack_sha8, html) VALUES (?, 'Public_ruling', ?, ?, ?, '00000000', ?)",
+            params![
+                "DOC_HTML",
+                "HTML doc",
+                Utc::now().to_rfc3339(),
+                "htmlhash",
+                compress_text(html)?,
+            ],
+        )?;
+        let asset_rel = "assets/aa/test.gif";
+        let asset_path = dir.path().join("live").join(asset_rel);
+        fs::create_dir_all(asset_path.parent().expect("asset parent"))?;
+        fs::write(&asset_path, b"gif")?;
+        conn.execute(
+            "INSERT INTO document_assets(asset_ref, doc_id, source_path, relative_path, media_type, alt, title, sha256, bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                "ato-image://DOC_HTML/0",
+                "DOC_HTML",
+                "assets/test.gif",
+                asset_rel,
+                "image/gif",
+                Option::<String>::None,
+                "Diagram",
+                format!("{:x}", Sha256::digest(b"gif")),
+                3i64,
+            ],
+        )?;
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            let elements = get_elements(
+                "DOC_HTML",
+                vec!["h1".to_string(), "p".to_string()],
+                None,
+                0,
+                10,
+                10_000,
+                true,
+            )?;
+            let parsed: JsonValue = serde_json::from_str(&elements)?;
+            assert_eq!(parsed["elements"][0]["tag"], "h1");
+            assert_eq!(parsed["elements"][1]["text"], "See 203-55 .");
+
+            let links = get_elements(
+                "DOC_HTML",
+                vec!["a".to_string()],
+                Some("data-doc-id"),
+                0,
+                10,
+                10_000,
+                true,
+            )?;
+            let parsed: JsonValue = serde_json::from_str(&links)?;
+            assert_eq!(
+                parsed["elements"][0]["attrs"]["data-doc-id"],
+                "PAC/19970038/203-55"
+            );
+
+            let asset_elements = get_elements(
+                "DOC_HTML",
+                vec!["span".to_string()],
+                Some("data-asset-ref"),
+                0,
+                10,
+                10_000,
+                true,
+            )?;
+            let parsed: JsonValue = serde_json::from_str(&asset_elements)?;
+            assert_eq!(
+                parsed["elements"][0]["attrs"]["data-asset-ref"],
+                "ato-image://DOC_HTML/0"
+            );
+
+            let asset = get_asset("ato-image://DOC_HTML/0")?;
+            let parsed: JsonValue = serde_json::from_str(&asset)?;
+            assert_eq!(parsed["title"], "Diagram");
+            assert_eq!(parsed["path"], asset_path.display().to_string());
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -6363,28 +6588,27 @@ mod tests {
 
     // ===== Wave 2 ===========================================================
 
-    // ----- W2.3 Schema v5 → v6 -----
+    // ----- Schema v7 -----
 
     #[test]
-    fn schema_init_writes_v6_metadata() -> Result<()> {
+    fn schema_init_writes_v7_metadata() -> Result<()> {
         let _lock = TEST_DB_LOCK.lock().unwrap();
         let (_dir, db) = make_test_db()?;
         let conn = open_write_at(&db)?;
         let value =
             get_meta(&conn, "schema_version")?.expect("init_db should have written schema_version");
         assert_eq!(value, SUPPORTED_SCHEMA_VERSION.to_string());
-        assert_eq!(SUPPORTED_SCHEMA_VERSION, 6);
+        assert_eq!(SUPPORTED_SCHEMA_VERSION, 7);
         Ok(())
     }
 
     #[test]
-    fn open_read_rejects_v5_corpus_with_rebuild_message() -> Result<()> {
+    fn open_read_rejects_unsupported_schema_corpus() -> Result<()> {
         let _lock = TEST_DB_LOCK.lock().unwrap();
         let (dir, db) = make_test_db()?;
         let conn = open_write_at(&db)?;
-        // Mimic a v5 install: stamp schema_version=5. The Rust binary's
-        // schema check is purely against the meta key — column-shape isn't
-        // re-validated. The user-facing error must mention rebuilding.
+        // Stamp an unsupported schema version. The user-facing error must
+        // refuse the corpus cleanly instead of trying to mutate it in place.
         set_meta(&conn, "schema_version", "5")?;
         drop(conn);
         with_data_dir(dir.path(), || -> Result<()> {
@@ -6921,10 +7145,12 @@ mod tests {
             date: Some("2018-01-01".to_string()),
             downloaded_at: Utc::now().to_rfc3339(),
             content_hash: "deadbeef".to_string(),
+            html: "<div><p>depreciation effective life schedule for plant.</p></div>".to_string(),
             withdrawn_date: Some("2024-06-15".to_string()),
             superseded_by: Some("TR 2024/1".to_string()),
             replaces: None,
             definitions: Vec::new(),
+            assets: Vec::new(),
             chunks: vec![PackChunk {
                 ord: 0,
                 heading_path: Some("Section A".to_string()),
@@ -6933,6 +7159,9 @@ mod tests {
                 embedding_b64: None,
             }],
         };
+        let asset_bytes = b"diagram";
+        let asset_sha = format!("{:x}", Sha256::digest(asset_bytes));
+        let asset_b64 = base64::engine::general_purpose::STANDARD.encode(asset_bytes);
         let current_record = PackRecord {
             doc_id: "TR_2024_CURRENT".to_string(),
             doc_type: "Public_ruling".to_string(),
@@ -6940,10 +7169,22 @@ mod tests {
             date: Some("2024-01-01".to_string()),
             downloaded_at: Utc::now().to_rfc3339(),
             content_hash: "feedface".to_string(),
+            html: "<div><p>depreciation effective life schedule for plant.</p></div>".to_string(),
             withdrawn_date: None,
             superseded_by: None,
             replaces: Some("TR 2018/X".to_string()),
             definitions: Vec::new(),
+            assets: vec![PackAsset {
+                asset_ref: "ato-image://TR_2024_CURRENT/0".to_string(),
+                source_path: "assets/source.gif".to_string(),
+                relative_path: "assets/aa/current.gif".to_string(),
+                media_type: Some("image/gif".to_string()),
+                alt: None,
+                title: Some("Current diagram".to_string()),
+                sha256: asset_sha.clone(),
+                size: asset_bytes.len() as i64,
+                data_b64: asset_b64,
+            }],
             chunks: vec![PackChunk {
                 ord: 0,
                 heading_path: Some("Section A".to_string()),
@@ -6968,8 +7209,18 @@ mod tests {
         };
 
         // Production insert path — DO NOT swap for `insert_doc_full`.
-        insert_record(&conn, &withdrawn_record, &withdrawn_ref)?;
-        insert_record(&conn, &current_record, &current_ref)?;
+        insert_record(
+            &conn,
+            &withdrawn_record,
+            &withdrawn_ref,
+            &dir.path().join("live"),
+        )?;
+        insert_record(
+            &conn,
+            &current_record,
+            &current_ref,
+            &dir.path().join("live"),
+        )?;
 
         // Sanity: the SELECT returns what insert_record wrote (catches the
         // INSERT-SQL drop-column bug directly, even before search runs).
@@ -6991,6 +7242,13 @@ mod tests {
         assert_eq!(wd2, None);
         assert_eq!(sb2, None);
         assert_eq!(rep2.as_deref(), Some("TR 2018/X"));
+        assert!(dir.path().join("live/assets/aa/current.gif").exists());
+        let stored_asset: String = conn.query_row(
+            "SELECT sha256 FROM document_assets WHERE asset_ref = ?",
+            ["ato-image://TR_2024_CURRENT/0"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(stored_asset, asset_sha);
         drop(conn);
 
         with_data_dir(dir.path(), || -> Result<()> {
@@ -7102,6 +7360,8 @@ mod tests {
             "date": "2026-05-01",
             "downloaded_at": "2026-05-01T00:00:00Z",
             "content_hash": "hash-real-update",
+            "html": "<div><p>Research and development tax incentive update path text.</p></div>",
+            "assets": [],
             "withdrawn_date": "2026-05-02",
             "superseded_by": "TR 2026/2",
             "replaces": JsonValue::Null,
@@ -7207,6 +7467,8 @@ mod tests {
             "date": "2026-05-01",
             "downloaded_at": "2026-05-01T00:00:00Z",
             "content_hash": "same-content-hash",
+            "html": "<div><p><strong>test term</strong> means the first definition.</p></div>",
+            "assets": [],
             "chunks": [{
                 "ord": 0,
                 "heading_path": "Ruling",
@@ -7402,6 +7664,8 @@ mod tests {
             "date": "2026-05-03",
             "downloaded_at": "2026-05-03T00:00:00Z",
             "content_hash": "hash-rebuild-schema",
+            "html": "<div><p>Unsupported schema update path must rebuild before semantic probes.</p></div>",
+            "assets": [],
             "withdrawn_date": JsonValue::Null,
             "superseded_by": JsonValue::Null,
             "replaces": JsonValue::Null,
@@ -7466,7 +7730,7 @@ mod tests {
             assert_eq!(stats.removed, 0);
 
             let conn = open_read()?;
-            assert_eq!(get_meta(&conn, "schema_version")?.as_deref(), Some("6"));
+            assert_eq!(get_meta(&conn, "schema_version")?.as_deref(), Some("7"));
             let title: String = conn.query_row(
                 "SELECT title FROM documents WHERE doc_id = ?",
                 ["DOC_REBUILD_SCHEMA"],
@@ -8029,9 +8293,9 @@ mod tests {
 
     #[test]
     fn manifest_compat_rejects_newer_manifest_format() {
-        // schema_version 4 is one above v3 (current MAX). Should fail.
         let m = sample_manifest((MAX_SUPPORTED_MANIFEST_VERSION + 1) as i64, "");
-        let err = enforce_manifest_compatibility(&m).expect_err("v4 should be rejected");
+        let err =
+            enforce_manifest_compatibility(&m).expect_err("newer manifest should be rejected");
         assert!(
             err.to_string().contains("upgrade the ato-mcp binary"),
             "expected upgrade-binary error, got: {err}"

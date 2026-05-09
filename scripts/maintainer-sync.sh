@@ -8,12 +8,19 @@
 #                      tokenizer.json and onnx/model_quantized.onnx
 #   ATO_MCP_MODEL_URL  optional approved model mirror URL
 #   ATO_MCP_RERANKER_BUNDLE optional dir holding reranker ONNX + tokenizer.json
+#                         (default: $ATO_MCP_REPO_DIR/models/reranker if present)
 #   ATO_MCP_RERANKER_URL optional pinned hf:// source for the reranker
 #   ATO_MCP_RERANKER_ID / SHA256 / SIZE / TOKENIZER_SHA256 optional overrides
 #   ATO_MCP_FORCE_REBUILD set to 1/true/yes/on to rebuild even when source did not change
 #   ATO_MCP_RELEASE_TAG  tag prefix (default: index)
 #   ATO_MCP_GH_REPO    owner/name (default: gunba/ato-mcp)
 #   ATO_MCP_MODE       incremental | catch_up | full (default: incremental)
+#   ATO_MCP_BUILD_WORKERS / WINDOW_DOCS / ENCODE_BATCH_SIZE / MAX_BATCH_TOKENS
+#                      optional build-index throughput knobs
+#   ATO_MCP_CHECKPOINT_EVERY optional resumable transaction checkpoint size
+#   ATO_MCP_PACK_TARGET_MB optional pack target for local rebuilds
+#   ATO_MCP_UNSAFE_FAST_SQLITE set to 1/true/yes/on for scratch build speed
+#   ATO_MCP_ALLOW_SLEEP set to 1/true/yes/on to skip automatic sleep prevention
 #
 # Flow:
 #   1. Run the requested source refresh mode when it is catch_up or full.
@@ -26,6 +33,21 @@
 #      so end-users' `ato-mcp update` picks it up on their next run.
 
 set -euo pipefail
+
+if [[ -z "${ATO_MCP_SLEEP_INHIBITED:-}" && -z "${ATO_MCP_ALLOW_SLEEP:-}" ]]; then
+    if command -v systemd-inhibit >/dev/null 2>&1 \
+        && systemd-inhibit --who=ato-mcp --what=sleep --mode=block \
+            --why="ato-mcp maintainer sync probe" true >/dev/null 2>&1; then
+        exec env ATO_MCP_SLEEP_INHIBITED=1 systemd-inhibit \
+            --who=ato-mcp \
+            --what=sleep \
+            --mode=block \
+            --why="ato-mcp scrape, corpus rebuild, and release" \
+            "$0" "$@"
+    elif command -v caffeinate >/dev/null 2>&1; then
+        exec env ATO_MCP_SLEEP_INHIBITED=1 caffeinate -dimsu "$0" "$@"
+    fi
+fi
 
 REPO_DIR="${ATO_MCP_REPO_DIR:?set ATO_MCP_REPO_DIR}"
 PAGES_DIR="${ATO_MCP_PAGES_DIR:-$REPO_DIR/../ato_pages}"
@@ -46,13 +68,16 @@ MODEL_URL_ARG=()
 if [ -n "$MODEL_URL" ]; then
     MODEL_URL_ARG=(--model-url "$MODEL_URL")
 fi
+DEFAULT_RERANKER_BUNDLE="$REPO_DIR/models/reranker"
 RERANKER_BUNDLE="${ATO_MCP_RERANKER_BUNDLE:-}"
+if [[ -z "$RERANKER_BUNDLE" && -d "$DEFAULT_RERANKER_BUNDLE" ]]; then
+    RERANKER_BUNDLE="$DEFAULT_RERANKER_BUNDLE"
+fi
 RERANKER_ID="${ATO_MCP_RERANKER_ID:-}"
 RERANKER_URL="${ATO_MCP_RERANKER_URL:-}"
 RERANKER_SHA256="${ATO_MCP_RERANKER_SHA256:-}"
 RERANKER_SIZE="${ATO_MCP_RERANKER_SIZE:-}"
 RERANKER_TOKENIZER_SHA256="${ATO_MCP_RERANKER_TOKENIZER_SHA256:-}"
-RERANKER_BUILD_ARGS=()
 RERANKER_RELEASE_ARGS=()
 if [ -n "$RERANKER_BUNDLE" ]; then
     RERANKER_RELEASE_ARGS+=(--reranker-bundle "$RERANKER_BUNDLE")
@@ -72,17 +97,28 @@ fi
 if [ -n "$RERANKER_TOKENIZER_SHA256" ]; then
     RERANKER_RELEASE_ARGS+=(--reranker-tokenizer-sha256 "$RERANKER_TOKENIZER_SHA256")
 fi
-if [ -n "$RERANKER_ID" ] && [ -n "$RERANKER_URL" ] && [ -n "$RERANKER_SHA256" ] && [ -n "$RERANKER_SIZE" ]; then
-    RERANKER_BUILD_ARGS=(
-        --reranker-id "$RERANKER_ID"
-        --reranker-url "$RERANKER_URL"
-        --reranker-sha256 "$RERANKER_SHA256"
-        --reranker-size "$RERANKER_SIZE"
-    )
-    if [ -n "$RERANKER_TOKENIZER_SHA256" ]; then
-        RERANKER_BUILD_ARGS+=(--reranker-tokenizer-sha256 "$RERANKER_TOKENIZER_SHA256")
-    fi
+BUILD_ARGS=()
+if [ -n "${ATO_MCP_BUILD_WORKERS:-}" ]; then
+    BUILD_ARGS+=(--workers "$ATO_MCP_BUILD_WORKERS")
 fi
+if [ -n "${ATO_MCP_WINDOW_DOCS:-}" ]; then
+    BUILD_ARGS+=(--window-docs "$ATO_MCP_WINDOW_DOCS")
+fi
+if [ -n "${ATO_MCP_ENCODE_BATCH_SIZE:-}" ]; then
+    BUILD_ARGS+=(--encode-batch-size "$ATO_MCP_ENCODE_BATCH_SIZE")
+fi
+if [ -n "${ATO_MCP_MAX_BATCH_TOKENS:-}" ]; then
+    BUILD_ARGS+=(--max-batch-tokens "$ATO_MCP_MAX_BATCH_TOKENS")
+fi
+if [ -n "${ATO_MCP_CHECKPOINT_EVERY:-}" ]; then
+    BUILD_ARGS+=(--checkpoint-every "$ATO_MCP_CHECKPOINT_EVERY")
+fi
+if [ -n "${ATO_MCP_PACK_TARGET_MB:-}" ]; then
+    BUILD_ARGS+=(--pack-target-mb "$ATO_MCP_PACK_TARGET_MB")
+fi
+case "${ATO_MCP_UNSAFE_FAST_SQLITE:-}" in
+    1|true|TRUE|yes|YES|on|ON) BUILD_ARGS+=(--unsafe-fast-sqlite) ;;
+esac
 GH_REPO="${ATO_MCP_GH_REPO:-gunba/ato-mcp}"
 MODE="${ATO_MCP_MODE:-incremental}"
 FORCE_REBUILD="${ATO_MCP_FORCE_REBUILD:-}"
@@ -92,7 +128,7 @@ cd "$REPO_DIR"
 VENV="$REPO_DIR/.venv"
 ATO_MCP="$VENV/bin/ato-mcp"
 if [[ ! -x "$ATO_MCP" ]]; then
-    echo "no venv at $VENV — run: python -m venv .venv && .venv/bin/pip install -e ." >&2
+    echo "no venv at $VENV — run: python -m venv .venv && .venv/bin/pip install -e '.[dev,gpu]'" >&2
     exit 2
 fi
 
@@ -171,7 +207,7 @@ fi
     --tokenizer-path "$TOKENIZER" \
     --gpu \
     "${PREV_ARG[@]}" \
-    "${RERANKER_BUILD_ARGS[@]}"
+    "${BUILD_ARGS[@]}"
 
 "$ATO_MCP" release \
     --out-dir "$RELEASE_DIR" \
