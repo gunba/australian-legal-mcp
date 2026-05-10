@@ -4722,11 +4722,7 @@ fn get_chunks(chunk_ids: &[i64], opts: GetChunksOptions) -> Result<String> {
         }
     }
     let next_call = truncated_at.as_ref().map(|chunk| {
-        format!(
-            "get_document(doc_id=\"{}\", max_chars={})",
-            chunk.doc_id,
-            opts.max_chars.unwrap_or(20_000)
-        )
+        format!("get_chunks(chunk_ids=[{}])", chunk.chunk_id)
     });
     let returned = out.len();
     Ok(serde_json::to_string_pretty(&json!({
