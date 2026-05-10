@@ -4854,7 +4854,7 @@ fn server_instructions() -> String {
         .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
     {
         Some(s) => format!(
-            "ATO legal corpus. Documents: {}, chunks: {}. Index: {}. Default search excludes Edited_private_advice and content dated before {} except legislation. Use include_old=true when older authorities are required. Call `stats` to see the per-prefix breakdown — filter by doc family with doc_scope=\"<PREFIX>/%\".",
+            "ATO legal corpus. Documents: {}, chunks: {}. Index: {}. Navigate via search → get_chunks: search returns slim hits (chunk_id, doc_id, ord, heading_path, anchor, score, optional snippet); get_chunks fetches bodies by chunk_id with before/after ordinal neighbours within the same doc. doc_scope accepts a single full doc_id for in-doc search or \"<PREFIX>/%\" for a family (see stats). Default search excludes Edited_private_advice, withdrawn rulings, and content dated before {} except legislation; override with current_only=false and include_old=true.",
             s["documents"].as_i64().unwrap_or(0),
             s["chunks"].as_i64().unwrap_or(0),
             s["index_version"].as_str().unwrap_or("?"),
@@ -4872,7 +4872,7 @@ fn tool_descriptors() -> JsonValue {
     json!([
         {
             "name": "search",
-            "description": "Search ATO legal documents. Defaults to hybrid semantic-plus-lexical ranking. Explicit mode=keyword is allowed, but hybrid/vector never fall back to keyword when semantic search is unavailable. Set include_snippet=false to skip BM25-windowed snippets when the caller will follow up with get_chunks.",
+            "description": "Hybrid semantic+lexical search over chunks. Returns slim pointer hits (chunk_id, doc_id, ord, heading_path, anchor, score, optional snippet) — fetch bodies via get_chunks. doc_scope filters by full doc_id (in-doc search) or \"<PREFIX>/%\" (family). mode=keyword forces lexical-only; hybrid/vector require the semantic index. Set include_snippet=false when the caller will follow up with get_chunks.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4894,7 +4894,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "search_titles",
-            "description": "Fast title-only search, with exact doc_id and ATO document-link lookup.",
+            "description": "Title-only search returning doc-level hits (no chunk_id/ord). Use search for chunk-level results. Accepts exact doc_id and ATO document-link lookup.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4910,7 +4910,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_document",
-            "description": "Fetch a document by doc_id. Default body is plaintext joined from the chunk pipeline (same text the agent sees in get_chunks; carries [doc:X]/[asset:X] annotations after a rebuild). Set as_html=true to receive the cleaned source HTML instead — internal ATO document links are data-doc-id attributes and retained images are data-asset-ref attributes. Pagination via from_char/max_chars applies to the selected body.",
+            "description": "Fetch a full document by doc_id. Default body is plaintext joined from chunks (carries [doc:X] cross-reference and [asset:X] image markers); as_html=true returns cleaned source HTML with data-doc-id and data-asset-ref attributes. Pagination via from_char/max_chars. Prefer search → get_chunks for in-doc reading; this is the full-doc escape hatch.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4924,7 +4924,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_asset",
-            "description": "Resolve an image asset reference from cleaned HTML to a local file path plus source metadata.",
+            "description": "Resolve an image asset reference (from [asset:X] markers in plaintext or data-asset-ref attributes in HTML) to a local file path plus source metadata.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4935,7 +4935,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_chunks",
-            "description": "Fetch exact chunks by chunk id from search results, optionally with before/after neighbor context.",
+            "description": "Fetch chunk bodies by chunk_id. before/after expand the response with ordinal neighbour chunks within the same doc (0-20 each). Plaintext carries [doc:X] cross-reference markers (resolve via search/get_document) and [asset:X] image markers (resolve via get_asset). On max_chars truncation, truncated_at + next_call point at the next chunk_id to continue scrolling.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
