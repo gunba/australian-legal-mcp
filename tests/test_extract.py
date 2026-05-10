@@ -707,3 +707,19 @@ def test_doc_id_parser_rejects_non_doc_ato_pages() -> None:
     ]
     for url in cases:
         assert _doc_id_from_ato_link(url) is None, url
+
+
+def test_doc_id_parser_handles_malformed_urls() -> None:
+    """urlparse raises ValueError on unbalanced brackets ("Invalid IPv6 URL")
+    and other malformed inputs. The function must catch and return None
+    rather than crash the caller — _doc_id_from_ato_link is invoked on every
+    href in the corpus and one bad URL must not kill the build window."""
+    cases = [
+        "http://[unclosed",
+        "[Note: see x]",
+        "http://[::1::2]/foo",
+        "http://[2001:db8:::1]/foo",
+        "[bracketed text]",
+    ]
+    for url in cases:
+        assert _doc_id_from_ato_link(url) is None, url

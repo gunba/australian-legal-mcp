@@ -568,7 +568,12 @@ def _doc_id_from_ato_link(target: str) -> str | None:
         target = target[1:-1]
     if " " in target:
         target = target.split(" ", 1)[0]
-    parsed = urlparse(target)
+    try:
+        parsed = urlparse(target)
+    except ValueError:
+        # urlparse rejects unbalanced brackets ("Invalid IPv6 URL") and other
+        # malformed inputs. Treat unparseable hrefs as non-ATO links.
+        return None
     host = (parsed.hostname or "").lower()
     path_lower = parsed.path.lower()
     is_ato_host = host.endswith("ato.gov.au")
