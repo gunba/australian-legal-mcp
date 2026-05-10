@@ -2179,9 +2179,7 @@ fn load_title_hit(conn: &Connection, doc_id: &str, filter: &SqlFilter) -> Result
             score: Some(-2000.0),
             chunk_id: None,
             ord: None,
-            next_call: Some(format!(
-                "get_document(doc_id=\"{doc_id}\", max_chars=20000)"
-            )),
+            next_call: None,
             withdrawn_date: row.get("withdrawn_date")?,
             superseded_by: row.get("superseded_by")?,
             replaces: row.get("replaces")?,
@@ -2241,9 +2239,7 @@ fn search_titles(
             score: row.get::<_, f64>("score").ok(),
             chunk_id: None,
             ord: None,
-            next_call: Some(format!(
-                "get_document(doc_id=\"{doc_id}\", max_chars=20000)"
-            )),
+            next_call: None,
             withdrawn_date: row.get("withdrawn_date")?,
             superseded_by: row.get("superseded_by")?,
             replaces: row.get("replaces")?,
