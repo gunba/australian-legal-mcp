@@ -289,3 +289,178 @@ def test_retry_missing_default_interval_is_quarter_second_via_orchestrator(
     pipeline.refresh_source(mode="retry_missing", output_dir=tmp_path, request_interval=1.0)
 
     assert seen_intervals == [0.25, 1.0]
+
+
+def test_retry_missing_accepts_explicit_links(tmp_path: Path) -> None:
+    """Explicit links are fetched even when index.jsonl has no eligible rows."""
+    index_path = tmp_path / "index.jsonl"
+    _write_index(
+        index_path,
+        [
+            {
+                "canonical_id": "/law/view/document?docid=ALREADY/OK",
+                "href": "/law/view/document?docid=ALREADY/OK",
+                "status": "success",
+                "payload_path": "payloads/Other_ATO_documents/already/already_ok.html",
+                "http_status": 200,
+            },
+        ],
+    )
+    untouched_payload = (
+        tmp_path / "payloads" / "Other_ATO_documents" / "already" / "already_ok.html"
+    )
+    untouched_payload.parent.mkdir(parents=True, exist_ok=True)
+    untouched_payload.write_text("<div>untouched</div>", encoding="utf-8")
+
+    requested: list[str] = []
+
+    def fake_fetcher(href: str) -> tuple[int, str]:
+        requested.append(href)
+        return 200, f"<html><body><article>{_FAT_BODY}</article></body></html>"
+
+    explicit = [
+        {
+            "canonical_id": "/law/view/document?docid=NEW/SISTER1",
+            "href": "/law/view/document?docid=NEW/SISTER1",
+            "pit": None,
+        },
+    ]
+
+    summary = pipeline._run_retry_missing(
+        output_dir=tmp_path,
+        base_url="https://www.ato.gov.au",
+        parser_run_date="2026-05-10T00:00:00Z",
+        max_workers=1,
+        request_interval=0.0,
+        verbose_progress=False,
+        page_fetcher=fake_fetcher,
+        explicit_links=explicit,
+    )
+
+    assert summary.eligible == 1
+    assert summary.recovered == 1
+    assert requested == ["/law/view/document?docid=NEW/SISTER1"]
+
+    rewritten = _read_index(tmp_path / "index.jsonl")
+    new_record = rewritten["/law/view/document?docid=NEW/SISTER1"]
+    assert new_record["status"] == "success"
+    assert new_record["payload_path"]
+
+
+def test_retry_missing_explicit_links_with_pit(tmp_path: Path) -> None:
+    """A PiT-suffixed canonical_id fetches the raw ``?PiT=...`` URL."""
+    index_path = tmp_path / "index.jsonl"
+    _write_index(index_path, [])
+
+    requested: list[str] = []
+
+    def fake_fetcher(href: str) -> tuple[int, str]:
+        requested.append(href)
+        return 200, f"<html><body><article>{_FAT_BODY}</article></body></html>"
+
+    explicit = [
+        {
+            "canonical_id": "/law/view/document?docid=TXR/TR967/NAT/ATO/00001@19960320000001",
+            "href": "/law/view/document?docid=TXR/TR967/NAT/ATO/00001&PiT=19960320000001",
+            "pit": "19960320000001",
+        },
+    ]
+
+    summary = pipeline._run_retry_missing(
+        output_dir=tmp_path,
+        base_url="https://www.ato.gov.au",
+        parser_run_date="2026-05-10T00:00:00Z",
+        max_workers=1,
+        request_interval=0.0,
+        verbose_progress=False,
+        page_fetcher=fake_fetcher,
+        explicit_links=explicit,
+    )
+
+    assert summary.eligible == 1
+    assert summary.recovered == 1
+    assert requested == [
+        "/law/view/document?docid=TXR/TR967/NAT/ATO/00001&PiT=19960320000001"
+    ]
+
+    rewritten = _read_index(tmp_path / "index.jsonl")
+    cid = "/law/view/document?docid=TXR/TR967/NAT/ATO/00001@19960320000001"
+    assert cid in rewritten
+    assert rewritten[cid]["status"] == "success"
+
+
+def test_retry_missing_explicit_links_dedup_against_index(tmp_path: Path) -> None:
+    """An explicit_link sharing canonical_id with an eligible index row is fetched once."""
+    index_path = tmp_path / "index.jsonl"
+    _write_index(
+        index_path,
+        [
+            {
+                "canonical_id": "/law/view/document?docid=DUPED/ROW",
+                "href": "/law/view/document?docid=DUPED/ROW",
+                "status": "missing_content",
+                "payload_path": None,
+                "http_status": 200,
+            },
+        ],
+    )
+
+    requested: list[str] = []
+
+    def fake_fetcher(href: str) -> tuple[int, str]:
+        requested.append(href)
+        return 200, f"<html><body><article>{_FAT_BODY}</article></body></html>"
+
+    explicit = [
+        {
+            "canonical_id": "/law/view/document?docid=DUPED/ROW",
+            "href": "/law/view/document?docid=DUPED/ROW",
+            "pit": None,
+        },
+    ]
+
+    summary = pipeline._run_retry_missing(
+        output_dir=tmp_path,
+        base_url="https://www.ato.gov.au",
+        parser_run_date="2026-05-10T00:00:00Z",
+        max_workers=1,
+        request_interval=0.0,
+        verbose_progress=False,
+        page_fetcher=fake_fetcher,
+        explicit_links=explicit,
+    )
+
+    assert summary.eligible == 1
+    assert summary.recovered == 1
+    assert len(requested) == 1
+
+
+def test_refresh_source_passes_explicit_links_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``refresh_source(mode='retry_missing', explicit_links=...)`` plumbs to the runner."""
+    (tmp_path / "index.jsonl").write_text("", encoding="utf-8")
+
+    captured: dict[str, Any] = {}
+
+    def stub_run(**kwargs: Any) -> pipeline.RetryMissingSummary:
+        captured.update(kwargs)
+        return pipeline.RetryMissingSummary(
+            eligible=0, recovered=0, confirmed_404=0, confirmed_stub=0, still_missing=0,
+        )
+
+    monkeypatch.setattr(pipeline, "_run_retry_missing", stub_run)
+
+    payload = [
+        {
+            "canonical_id": "/law/view/document?docid=A",
+            "href": "/law/view/document?docid=A",
+            "pit": None,
+        },
+    ]
+    pipeline.refresh_source(
+        mode="retry_missing",
+        output_dir=tmp_path,
+        explicit_links=payload,
+    )
+    assert captured["explicit_links"] == payload

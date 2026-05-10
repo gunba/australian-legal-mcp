@@ -16,6 +16,13 @@ def normalize_doc_href(href: str) -> str:
 	Examples:
 		https://www.ato.gov.au/law/view/document?docid=ABC -> /law/view/document?docid=ABC
 		/law/view/document?docid=ABC -> /law/view/document?docid=ABC
+		/law/view/document?docid=ABC&PiT=20120418000001
+		    -> /law/view/document?docid=ABC@20120418000001
+
+	The ``@<PiT>`` suffix on the docid value matches the historical-version
+	encoding used by ``anchors.py`` and parsed by
+	``build._parse_historical_doc_id``. Downstream ``metadata.doc_id_for``
+	extracts the docid value verbatim, yielding the ``<base>@<PiT>`` doc_id.
 	"""
 	if not href:
 		return ""
@@ -28,7 +35,16 @@ def normalize_doc_href(href: str) -> str:
 	docid_values = query_params.get("docid")
 	docid = docid_values[0] if docid_values else ""
 	docid = unquote(docid).strip("'\" ")
+	pit = ""
+	for key, values in query_params.items():
+		if key.lower() == "pit" and values:
+			candidate = unquote(values[0]).strip("'\" ")
+			if candidate:
+				pit = candidate
+				break
 	if docid:
+		if pit:
+			return f"/law/view/document?docid={docid}@{pit}"
 		return f"/law/view/document?docid={docid}"
 
 	query = f"?{parsed.query}" if parsed.query else ""

@@ -117,6 +117,7 @@ def refresh_source(
     root_query: str = "Mode=type&Action=initialise",
     max_nodes: int | None = None,
     path_prefix: list[str] | None = None,
+    explicit_links: list[dict[str, Any]] | None = None,
 ) -> RefreshResult:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -174,6 +175,7 @@ def refresh_source(
             max_workers=max_workers,
             request_interval=retry_interval,
             verbose_progress=verbose_progress,
+            explicit_links=explicit_links,
         )
         return RefreshResult(
             mode="retry_missing",
@@ -361,6 +363,7 @@ def _run_retry_missing(
     verbose_progress: bool,
     page_fetcher: Optional[Callable[[str], tuple[int, str]]] = None,
     asset_fetcher: Optional[Callable[[str], bytes]] = None,
+    explicit_links: list[dict[str, Any]] | None = None,
 ) -> "RetryMissingSummary":
     index_path = output_dir / "index.jsonl"
     if not index_path.exists():
@@ -370,6 +373,32 @@ def _run_retry_missing(
 
     eligible_ids: list[str] = []
     eligible_records: list[dict[str, Any]] = []
+    synthetic_links: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    # Explicit links win over index-derived eligibility: they were specifically
+    # requested (e.g. by discover-related-docs.py) and may not even appear in
+    # index.jsonl yet.
+    if explicit_links:
+        for link in explicit_links:
+            cid = link.get("canonical_id")
+            href = link.get("href")
+            if not cid or not href:
+                continue
+            if cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+            eligible_ids.append(cid)
+            synthetic_links.append(
+                {
+                    "canonical_id": cid,
+                    "href": href,
+                    "representative_path": ["Other_ATO_documents", "recovered"],
+                    "occurrences": 1,
+                    "folder_count": 1,
+                }
+            )
+
     with index_path.open("r", encoding="utf-8") as fh:
         for line in fh:
             text = line.strip()
@@ -379,27 +408,25 @@ def _run_retry_missing(
             if not _is_retry_eligible(rec):
                 continue
             cid = rec.get("canonical_id")
-            if not cid:
+            if not cid or cid in seen_ids:
                 continue
+            seen_ids.add(cid)
             eligible_ids.append(cid)
             eligible_records.append(rec)
+            synthetic_links.append(
+                {
+                    "canonical_id": cid,
+                    "href": cid,
+                    "representative_path": ["Other_ATO_documents", "recovered"],
+                    "occurrences": 1,
+                    "folder_count": 1,
+                }
+            )
 
     LOGGER.info("retry_missing: %d eligible records to refetch", len(eligible_ids))
     if not eligible_ids:
         return RetryMissingSummary(
             eligible=0, recovered=0, confirmed_404=0, confirmed_stub=0, still_missing=0,
-        )
-
-    synthetic_links: list[dict[str, Any]] = []
-    for cid in eligible_ids:
-        synthetic_links.append(
-            {
-                "canonical_id": cid,
-                "href": cid,
-                "representative_path": ["Other_ATO_documents", "recovered"],
-                "occurrences": 1,
-                "folder_count": 1,
-            }
         )
 
     fetcher = _retry_fetcher_for(page_fetcher, base_url=base_url)
