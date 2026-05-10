@@ -1,12 +1,16 @@
--- ato-mcp SQLite schema v7
+-- ato-mcp SQLite schema v8
 -- Minimal field set: doc_id PK, type, title, date + 3 build-time columns +
--- 3 currency columns (W2.2) — withdrawn_date, superseded_by, replaces.
+-- 3 currency columns (W2.2) — withdrawn_date, superseded_by, replaces +
+-- 3 navigation flags + 3 historical-version columns.
 --
 -- Design notes:
 --   doc_id   The full ATO docid path, slashes included. The canonical URL
 --            is synthesised at query time as
 --              https://www.ato.gov.au/law/view/document?docid={doc_id}
 --            so we don't store ``href`` separately.
+--            Historical versions encode their PiT timestamp as a suffix:
+--              <base_doc_id>@<YYYYMMDDHHMMSS>
+--            (the @ is unambiguous; not used by current ATO doc_ids).
 --   type     Top-level bucket ("Public_rulings", "Cases", ...). Finer
 --            doc_type is implicit in the first segment of doc_id.
 --   title    Human-readable label with citation inlined
@@ -20,6 +24,18 @@
 --                    `current_only=false` to include them.
 --   superseded_by    Short citation of the replacing doc (e.g. "TR 2022/1").
 --   replaces         Short citation of the doc this one replaces.
+--   has_in_doc_links / has_related_docs / has_history
+--                    Navigation hints surfaced on slim search hits. Set at
+--                    build time iff the doc emitted at least one anchor of
+--                    that kind. Tells the agent it's worth calling
+--                    get_doc_anchors(doc_id) to navigate.
+--   parent_doc_id    For historical versions: points back at the live
+--                    base doc. NULL for current docs.
+--   pit_timestamp    For historical versions: ATO PiT timestamp string
+--                    (YYYYMMDDHHMMSS). NULL for current docs.
+--   is_historical    1 iff this row is a historical version. Default
+--                    search excludes is_historical=1; pass
+--                    `include_historical=true` to include them.
 
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -38,26 +54,31 @@ CREATE TABLE IF NOT EXISTS documents (
     -- currency markers (W2.2):
     withdrawn_date   TEXT,
     superseded_by    TEXT,
-    replaces         TEXT
+    replaces         TEXT,
+    -- navigation hints (set at build time from doc_anchors):
+    has_in_doc_links INTEGER NOT NULL DEFAULT 0,
+    has_related_docs INTEGER NOT NULL DEFAULT 0,
+    has_history      INTEGER NOT NULL DEFAULT 0,
+    -- historical-version (point-in-time) markers:
+    parent_doc_id    TEXT,
+    pit_timestamp    TEXT,
+    is_historical    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_doc_type ON documents(type);
 CREATE INDEX IF NOT EXISTS idx_doc_date ON documents(date);
 CREATE INDEX IF NOT EXISTS idx_doc_withdrawn ON documents(withdrawn_date);
+CREATE INDEX IF NOT EXISTS idx_doc_parent ON documents(parent_doc_id);
+CREATE INDEX IF NOT EXISTS idx_doc_historical ON documents(is_historical);
 
 -- Chunks: text is zstd-compressed UTF-8.
--- [SL-03] chunks.text is zstd-compressed UTF-8 BLOB; heading_path uses ' › ' (U+203A) separator; empty-string == intro chunk.
---
--- heading_path: nearest-heading trail joined with " › ". Front-matter
--- echoes (the document title and its " — "-separated components) are
--- stripped at chunk emission time by chunk.strip_title_prefix, so a TR's
--- "Ruling" section reads as "Ruling" rather than
--- "Taxation Ruling — TR 2024/3 — … › Taxation Ruling › TR 2024/3 › Ruling".
--- Empty string == intro chunk, before any body heading.
+-- [SL-03] chunks.text is zstd-compressed UTF-8 BLOB. Heading text and
+-- emphasis (h1-h6, strong, em, blockquote, pre, li, dt+dd) are rendered
+-- inline using markdown markers so the embedder + BM25 see them as part
+-- of the chunk body. There is no separate heading_path column.
 CREATE TABLE IF NOT EXISTS chunks (
     chunk_id      INTEGER PRIMARY KEY,
     doc_id        TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
     ord           INTEGER NOT NULL,
-    heading_path  TEXT,
     anchor        TEXT,
     text          BLOB NOT NULL
 );
@@ -73,7 +94,6 @@ CREATE TABLE IF NOT EXISTS definitions (
     source_title  TEXT NOT NULL,
     source_type   TEXT NOT NULL,
     scope         TEXT,
-    heading_path  TEXT,
     anchor        TEXT,
     ord           INTEGER NOT NULL,
     body          TEXT NOT NULL
@@ -94,6 +114,21 @@ CREATE TABLE IF NOT EXISTS document_assets (
 );
 CREATE INDEX IF NOT EXISTS idx_assets_doc ON document_assets(doc_id);
 
+-- [SL-05] doc_anchors stores in-doc navigation, sister-doc references,
+-- and historical-version pointers extracted from <a href> markup at
+-- build time. Surfaced through the get_doc_anchors MCP tool.
+CREATE TABLE IF NOT EXISTS doc_anchors (
+    doc_id           TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+    ord              INTEGER NOT NULL,
+    kind             TEXT NOT NULL,  -- 'in_doc' | 'sister' | 'history'
+    label            TEXT NOT NULL,
+    target_chunk_id  INTEGER,         -- set for kind='in_doc'
+    target_doc_id    TEXT,             -- set for kind='sister' | 'history'
+    target_pit       TEXT,             -- set for kind='history'
+    PRIMARY KEY (doc_id, ord)
+);
+CREATE INDEX IF NOT EXISTS idx_doc_anchors_doc ON doc_anchors(doc_id);
+
 CREATE TABLE IF NOT EXISTS chunk_embeddings (
     chunk_id   INTEGER PRIMARY KEY REFERENCES chunks(chunk_id) ON DELETE CASCADE,
     embedding  BLOB NOT NULL CHECK(length(embedding) = 256)
@@ -109,9 +144,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS title_fts USING fts5(
     tokenize = "porter unicode61 remove_diacritics 2"
 );
 
+-- chunks_fts indexes only the chunk body. Heading and emphasis terms
+-- reach BM25 via inline markdown rendering in chunk.text — no separate
+-- heading column means no per-column weighting tricks needed.
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     text,
-    heading_path,
     tokenize = "porter unicode61 remove_diacritics 2"
 );
 

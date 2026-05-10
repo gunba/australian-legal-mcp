@@ -37,13 +37,15 @@ def _seed_doc(
             "sha256:" + "0" * 64, "deadbeef",
             zstd.ZstdCompressor(level=3).compress(b"<div></div>"),
             withdrawn_date, superseded_by, replaces,
+            0, 0, 0,         # has_in_doc_links, has_related_docs, has_history
+            None, None, 0,   # parent_doc_id, pit_timestamp, is_historical
         ),
     )
     conn.execute(INSERT_TITLE_FTS, (doc_id, title, ""))
     compressed = zstd.ZstdCompressor(level=3).compress(text.encode("utf-8"))
-    cur = conn.execute(INSERT_CHUNK, (doc_id, 0, "Root", None, compressed))
+    cur = conn.execute(INSERT_CHUNK, (doc_id, 0, None, compressed))
     rowid = cur.lastrowid
-    conn.execute(INSERT_CHUNK_FTS, (rowid, text, "Root"))
+    conn.execute(INSERT_CHUNK_FTS, (rowid, text))
     conn.execute(INSERT_VEC, (rowid, b"\x00" * store_db.EMBEDDING_DIM))
     return rowid
 

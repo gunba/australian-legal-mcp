@@ -19,7 +19,7 @@ Records are the fundamental delta unit. A document record contains:
         "downloaded_at": str,
         "content_hash": str,
         "chunks": [
-            {"ord": int, "heading_path": str, "anchor": str | None,
+            {"ord": int, "anchor": str | None,
              "text": str, "embedding_b64": str},
             ...
         ],

@@ -25,7 +25,6 @@ class Definition:
     source_title: str
     source_type: str
     scope: str | None
-    heading_path: str
     anchor: str | None
     ord: int
     body: str
@@ -34,7 +33,6 @@ class Definition:
 @dataclass(frozen=True)
 class DefinitionChunk:
     ord: int
-    heading_path: str
     anchor: str | None
     text: str
 
@@ -70,11 +68,9 @@ def _definition_id(doc_id: str, ord: int, term: str, body: str, offset: int) -> 
     return h.hexdigest()[:20]
 
 
-def _scope_from_title(title: str, source_type: str, heading_path: str) -> str | None:
+def _scope_from_title(title: str, source_type: str) -> str | None:
     if " s " in title:
         return title
-    if heading_path:
-        return heading_path
     return source_type or None
 
 
@@ -125,8 +121,7 @@ def extract_definitions(
                     doc_id=doc_id,
                     source_title=source_title,
                     source_type=source_type,
-                    scope=_scope_from_title(source_title, source_type, chunk.heading_path),
-                    heading_path=chunk.heading_path,
+                    scope=_scope_from_title(source_title, source_type),
                     anchor=chunk.anchor,
                     ord=chunk.ord,
                     body=body,

@@ -11,7 +11,6 @@ def test_extract_definitions_cuts_single_entry() -> None:
         chunks=[
             DefinitionChunk(
                 ord=1,
-                heading_path="Note 2:",
                 anchor=None,
                 text=(
                     "***corporate tax gross-up rate***\n\n"
@@ -36,7 +35,6 @@ def test_definition_ids_do_not_collide_on_shared_prefix() -> None:
         chunks=[
             DefinitionChunk(
                 ord=1,
-                heading_path="Note 2:",
                 anchor=None,
                 text=(
                     "***example term***\n\nmeans "

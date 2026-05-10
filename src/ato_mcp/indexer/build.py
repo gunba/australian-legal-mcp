@@ -23,7 +23,7 @@ import shutil
 import struct
 import time
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Literal
@@ -46,11 +46,14 @@ from ..store.queries import (
     INSERT_CHUNK,
     INSERT_CHUNK_FTS,
     INSERT_DEFINITION,
+    INSERT_DOC_ANCHOR,
     INSERT_DOCUMENT,
     INSERT_TITLE_FTS,
     INSERT_VEC,
+    UPDATE_DOC_NAVIGATION_FLAGS,
 )
 from ..util.log import get_logger
+from . import anchors as anchors_mod
 from . import chunk as chunk_mod
 from . import definitions as definition_mod
 from . import extract as extract_mod
@@ -77,8 +80,8 @@ BASE_URL = "https://www.ato.gov.au"
 CHECKPOINT_EVERY = 20_000
 
 INSERT_CHUNK_WITH_ID = """
-INSERT INTO chunks (chunk_id, doc_id, ord, heading_path, anchor, text)
-VALUES (?, ?, ?, ?, ?, ?)
+INSERT INTO chunks (chunk_id, doc_id, ord, anchor, text)
+VALUES (?, ?, ?, ?, ?)
 """
 
 
@@ -112,7 +115,6 @@ class BuildArgs:
 @dataclass
 class PreparedChunk:
     ord: int
-    heading_path: str
     anchor: str | None
     text: str
     definition_text: str | None = None
@@ -150,14 +152,28 @@ class PreparedDoc:
     withdrawn_date: str | None = None
     superseded_by: str | None = None
     replaces: str | None = None
+    doc_anchors: list[anchors_mod.AnchorRef] = field(default_factory=list)
 
 
 Prepared = PreparedDoc | None
 
 
-def _embedding_input(title: str, heading_path: str, text: str) -> str:
+def _embedding_input(title: str, text: str) -> str:
     """Compose the passage sent to EmbeddingGemma for a chunk."""
-    return f"{title}\n{heading_path}\n{text}".strip()
+    return f"{title}\n{text}".strip()
+
+
+def _parse_historical_doc_id(doc_id: str) -> tuple[str | None, str | None, int]:
+    """Return (parent_doc_id, pit_timestamp, is_historical) for a doc_id.
+
+    For ``TXR/TR967/NAT/ATO/00001@19960320000001`` -> (base, pit, 1).
+    For an unsuffixed doc_id -> (None, None, 0).
+    """
+    if "@" in doc_id:
+        base, sep, pit = doc_id.rpartition("@")
+        if sep and base and pit.isdigit():
+            return base, pit, 1
+    return None, None, 0
 
 
 @dataclass
@@ -263,11 +279,11 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
             doc_chunk_ranges: list[tuple[PreparedDoc, int, int]] = []
             for doc in docs:
                 start = len(texts)
-                # [W2.1] Embedder input prefixes title + heading_path. Lifts
-                # recall on legal text by giving the model the structural
-                # context EmbeddingGemma was pretrained against. Token budget
-                # (MAX_TOKENS=1024) accommodates the prefix on every chunk.
-                texts.extend(_embedding_input(doc.title, c.heading_path, c.text) for c in doc.chunks)
+                # [W2.1] Embedder input prefixes title. Lifts recall on legal
+                # text by giving the model the doc context EmbeddingGemma was
+                # pretrained against. Heading hierarchy is rendered inline in
+                # chunk.text already (# / ## / **) so it flows through here.
+                texts.extend(_embedding_input(doc.title, c.text) for c in doc.chunks)
                 doc_chunk_ranges.append((doc, start, len(texts)))
             chunks_count += len(texts)
 
@@ -574,7 +590,7 @@ def build(args: BuildArgs) -> Manifest:
                 # Branch 3: full re-extract + re-embed.
                 start = len(texts)
                 texts.extend(
-                    _embedding_input(item.title, c.heading_path, c.text)
+                    _embedding_input(item.title, c.text)
                     for c in item.chunks
                 )
                 doc_chunk_ranges.append((item, start, len(texts)))
@@ -869,7 +885,7 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
         title = (rec.get("title") or canonical_id).strip() or canonical_id
 
     chunks = [
-        PreparedChunk(c.ord, c.heading_path, c.anchor, c.text, c.definition_text)
+        PreparedChunk(c.ord, c.anchor, c.text, c.definition_text)
         for c in chunk_mod.chunk_html(clean_html, root_title=title)
     ] if has_content and clean_html else []
 
@@ -908,7 +924,6 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
         "\t".join(
             (
                 str(c.ord),
-                c.heading_path,
                 c.anchor or "",
                 c.text,
             )
@@ -938,6 +953,7 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
             "replaces": currency.replaces,
         }
     )
+    doc_anchors = anchors_mod.extract_anchors(clean_html, source_doc_id=doc_id)
     return PreparedDoc(
         doc_id=doc_id,
         category=category,
@@ -955,6 +971,7 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
         withdrawn_date=currency.withdrawn_date,
         superseded_by=currency.superseded_by,
         replaces=currency.replaces,
+        doc_anchors=doc_anchors,
     )
 
 
@@ -974,7 +991,6 @@ def _extract_definitions_for_doc(
         chunks=[
             definition_mod.DefinitionChunk(
                 c.ord,
-                c.heading_path,
                 c.anchor,
                 c.definition_text or c.text,
             )
@@ -993,7 +1009,6 @@ def _definition_rows(definitions: list[definition_mod.Definition]) -> list[tuple
             d.source_title,
             d.source_type,
             d.scope,
-            d.heading_path,
             d.anchor,
             d.ord,
             d.body,
@@ -1117,7 +1132,6 @@ def _record_content_hash_under_current_recipe(record: dict) -> str | None:
         "\t".join(
             (
                 str(c.get("ord", "")),
-                c.get("heading_path") or "",
                 c.get("anchor") or "",
                 c.get("text") or "",
             )
@@ -1266,19 +1280,7 @@ def _write_window(
     conn.executemany(
         INSERT_DOCUMENT,
         [
-            (
-                doc.doc_id,
-                doc.category,
-                doc.title,
-                doc.date,
-                doc.downloaded_at,
-                doc.content_hash,
-                "PENDING",
-                zstd.ZstdCompressor(level=zstd_level).compress(doc.html.encode("utf-8")),
-                doc.withdrawn_date,
-                doc.superseded_by,
-                doc.replaces,
-            )
+            _document_row(doc, "PENDING", zstd_level)
             for doc, _start, _end in doc_chunk_ranges
         ],
     )
@@ -1294,12 +1296,16 @@ def _write_window(
     definition_rows = []
     asset_rows = []
     zstd_compressor = zstd.ZstdCompressor(level=zstd_level)
+    # (PreparedDoc, [(chunk_id, chunk_text), ...]) so we can resolve in_doc
+    # anchor targets after chunks land in the DB.
+    doc_chunk_pairs: list[tuple[PreparedDoc, list[tuple[int, str]]]] = []
 
     for doc, start, end in doc_chunk_ranges:
         _write_asset_files(asset_root, doc.assets)
         asset_rows.extend(_asset_rows(doc.doc_id, doc.assets))
         vectors = vectors_i8[start:end]
         record_chunks = []
+        chunk_id_text_pairs: list[tuple[int, str]] = []
         for local_idx, chunk in enumerate(doc.chunks):
             chunk_id = next_chunk_id
             next_chunk_id += 1
@@ -1309,23 +1315,22 @@ def _write_window(
                     chunk_id,
                     doc.doc_id,
                     chunk.ord,
-                    chunk.heading_path,
                     chunk.anchor,
                     compressed_text,
                 )
             )
-            chunk_fts_rows.append((chunk_id, chunk.text, chunk.heading_path))
+            chunk_fts_rows.append((chunk_id, chunk.text))
             vec_bytes = vec_to_bytes(vectors[local_idx])
             vec_rows.append((chunk_id, vec_bytes))
             record_chunks.append(
                 {
                     "ord": chunk.ord,
-                    "heading_path": chunk.heading_path,
                     "anchor": chunk.anchor,
                     "text": chunk.text,
                     "embedding_b64": encode_embedding(vec_bytes),
                 }
             )
+            chunk_id_text_pairs.append((chunk_id, chunk.text))
 
         record = {
             "doc_id": doc.doc_id,
@@ -1360,6 +1365,7 @@ def _write_window(
             )
         )
         definition_rows.extend(_definition_rows(doc.definitions))
+        doc_chunk_pairs.append((doc, chunk_id_text_pairs))
 
     if chunk_rows:
         conn.executemany(INSERT_CHUNK_WITH_ID, chunk_rows)
@@ -1370,10 +1376,111 @@ def _write_window(
     if definition_rows:
         conn.executemany(INSERT_DEFINITION, definition_rows)
 
+    _persist_doc_anchors(conn, doc_chunk_pairs)
+
 
 def _next_chunk_id(conn) -> int:
     row = conn.execute("SELECT COALESCE(MAX(chunk_id), 0) + 1 AS next_id FROM chunks").fetchone()
     return int(row["next_id"])
+
+
+def _document_row(doc: PreparedDoc, pack_sha8: str, zstd_level: int) -> tuple:
+    """Build the INSERT_DOCUMENT row for a freshly-extracted PreparedDoc.
+
+    Navigation flags are written as 0; ``_persist_doc_anchors`` later updates
+    them in a single statement once the anchor rows are known.
+    """
+    parent_doc_id, pit_timestamp, is_historical = _parse_historical_doc_id(doc.doc_id)
+    return (
+        doc.doc_id,
+        doc.category,
+        doc.title,
+        doc.date,
+        doc.downloaded_at,
+        doc.content_hash,
+        pack_sha8,
+        zstd.ZstdCompressor(level=zstd_level).compress(doc.html.encode("utf-8")),
+        doc.withdrawn_date,
+        doc.superseded_by,
+        doc.replaces,
+        0,
+        0,
+        0,
+        parent_doc_id,
+        pit_timestamp,
+        is_historical,
+    )
+
+
+def _persist_doc_anchors(
+    conn,
+    doc_chunk_pairs: list[tuple[PreparedDoc, list[tuple[int, str]]]],
+) -> None:
+    """Insert doc_anchor rows and update the per-doc navigation flag triple.
+
+    ``doc_chunk_pairs`` carries each doc alongside its (chunk_id, text) pairs
+    so in_doc anchor labels can be resolved to chunk_ids via the
+    ``[anchor:<name>]`` markers emitted by the chunker.
+    """
+    if not doc_chunk_pairs:
+        return
+    anchor_rows: list[tuple] = []
+    flag_updates: list[tuple] = []
+    for doc, chunk_id_text_pairs in doc_chunk_pairs:
+        rows, flags = _build_doc_anchor_rows(doc, chunk_id_text_pairs)
+        anchor_rows.extend(rows)
+        flag_updates.append((*flags, doc.doc_id))
+    if anchor_rows:
+        conn.executemany(INSERT_DOC_ANCHOR, anchor_rows)
+    conn.executemany(UPDATE_DOC_NAVIGATION_FLAGS, flag_updates)
+
+
+def _build_doc_anchor_rows(
+    doc: PreparedDoc,
+    chunk_id_text_pairs: list[tuple[int, str]],
+) -> tuple[list[tuple], tuple[int, int, int]]:
+    """Return (anchor_rows, (has_in_doc, has_related, has_history)) for a doc.
+
+    ``in_doc`` rows are dropped when their target anchor cannot be resolved to
+    a chunk — the anchor would dangle and provide no useful navigation.
+    """
+    rows: list[tuple] = []
+    has_in_doc = has_related = has_history = 0
+    ord_counter = 0
+    for ref in doc.doc_anchors:
+        target_chunk_id: int | None = None
+        target_doc_id: str | None = None
+        target_pit: str | None = None
+        if ref.kind == "in_doc":
+            assert ref.target_anchor is not None
+            target_chunk_id = anchors_mod.anchor_target_to_chunk(
+                ref.target_anchor, chunk_id_text_pairs
+            )
+            if target_chunk_id is None:
+                continue
+            has_in_doc = 1
+        elif ref.kind == "sister":
+            target_doc_id = ref.target_doc_id
+            has_related = 1
+        elif ref.kind == "history":
+            target_doc_id = ref.target_doc_id
+            target_pit = ref.target_pit
+            has_history = 1
+        else:
+            continue
+        rows.append(
+            (
+                doc.doc_id,
+                ord_counter,
+                ref.kind,
+                ref.label,
+                target_chunk_id,
+                target_doc_id,
+                target_pit,
+            )
+        )
+        ord_counter += 1
+    return rows, (has_in_doc, has_related, has_history)
 
 
 def _windowed(items: Iterator[dict], size: int) -> Iterator[list[dict]]:
@@ -1398,10 +1505,12 @@ def _insert_from_previous_record(
     Caller supplies the already-loaded ``record`` so we don't read the
     previous pack twice in the dispatch loop.
     """
+    doc_id = record["doc_id"]
+    parent_doc_id, pit_timestamp, is_historical = _parse_historical_doc_id(doc_id)
     conn.execute(
         INSERT_DOCUMENT,
         (
-            record["doc_id"],
+            doc_id,
             record.get("type") or record.get("category") or "",
             record["title"],
             record.get("date") or record.get("first_published_date"),
@@ -1422,26 +1531,34 @@ def _insert_from_previous_record(
             record.get("withdrawn_date"),
             record.get("superseded_by"),
             record.get("replaces"),
+            0,
+            0,
+            0,
+            parent_doc_id,
+            pit_timestamp,
+            is_historical,
         ),
     )
     assets = [PreparedAsset(**a) for a in record.get("assets", [])]
     _write_asset_files(asset_root, assets)
     if assets:
-        conn.executemany(INSERT_ASSET, _asset_rows(record["doc_id"], assets))
+        conn.executemany(INSERT_ASSET, _asset_rows(doc_id, assets))
     conn.execute(
         INSERT_TITLE_FTS,
-        (record["doc_id"], record["title"], ""),
+        (doc_id, record["title"], ""),
     )
+    chunk_id_text_pairs: list[tuple[int, str]] = []
     for c in record.get("chunks", []):
         compressed_text = zstd.ZstdCompressor(level=3).compress(c["text"].encode("utf-8"))
         cur = conn.execute(
             INSERT_CHUNK,
-            (record["doc_id"], c["ord"], c.get("heading_path"), c.get("anchor"), compressed_text),
+            (doc_id, c["ord"], c.get("anchor"), compressed_text),
         )
         chunk_rowid = cur.lastrowid
-        conn.execute(INSERT_CHUNK_FTS, (chunk_rowid, c["text"], c.get("heading_path") or ""))
+        conn.execute(INSERT_CHUNK_FTS, (chunk_rowid, c["text"]))
         from .pack import decode_embedding as _dec
         conn.execute(INSERT_VEC, (chunk_rowid, _dec(c["embedding_b64"])))
+        chunk_id_text_pairs.append((chunk_rowid, c["text"]))
     if record.get("definitions_format_version") == definition_mod.DEFINITIONS_FORMAT_VERSION:
         definitions = record.get("definitions", [])
     else:
@@ -1450,7 +1567,6 @@ def _insert_from_previous_record(
         chunks = [
             PreparedChunk(
                 int(c["ord"]),
-                c.get("heading_path") or "",
                 c.get("anchor"),
                 c["text"],
             )
@@ -1459,7 +1575,7 @@ def _insert_from_previous_record(
         definitions = [
             d.__dict__
             for d in _extract_definitions_for_doc(
-                doc_id=record["doc_id"],
+                doc_id=doc_id,
                 title=record["title"],
                 category=record.get("type") or record.get("category") or "",
                 chunks=chunks,
@@ -1477,7 +1593,6 @@ def _insert_from_previous_record(
                     d["source_title"],
                     d["source_type"],
                     d.get("scope"),
-                    d.get("heading_path") or "",
                     d.get("anchor"),
                     d["ord"],
                     d["body"],
@@ -1485,6 +1600,39 @@ def _insert_from_previous_record(
                 for d in definitions
             ],
         )
+    # Re-extract anchors from the stored clean HTML rather than persisting
+    # them in the pack record. The pack record contract stays unchanged and
+    # the walk is cheap relative to a real rebuild.
+    refs = anchors_mod.extract_anchors(record["html"], source_doc_id=doc_id)
+    if refs:
+        synthetic_doc = _synthetic_anchor_doc(doc_id, refs)
+        _persist_doc_anchors(conn, [(synthetic_doc, chunk_id_text_pairs)])
+    else:
+        conn.execute(UPDATE_DOC_NAVIGATION_FLAGS, (0, 0, 0, doc_id))
+
+
+def _synthetic_anchor_doc(doc_id: str, refs: list[anchors_mod.AnchorRef]) -> PreparedDoc:
+    """Minimal PreparedDoc carrying just the fields ``_persist_doc_anchors`` reads.
+
+    The reuse paths re-extract anchors from stored HTML and don't need the
+    full prepared-doc state to insert them.
+    """
+    return PreparedDoc(
+        doc_id=doc_id,
+        category="",
+        title="",
+        date=None,
+        downloaded_at="",
+        content_hash="",
+        metadata_signature="",
+        headings_text="",
+        anchors=[],
+        html="",
+        assets=[],
+        chunks=[],
+        definitions=[],
+        doc_anchors=refs,
+    )
 
 
 def _write_metadata_refresh(
@@ -1518,32 +1666,20 @@ def _write_metadata_refresh(
     chunk_fts_rows = []
     vec_rows = []
     definition_rows = []
+    doc_chunk_pairs: list[tuple[PreparedDoc, list[tuple[int, str]]]] = []
 
     from .pack import decode_embedding as _dec
 
     for _rec, item, prev_ref, prev_pack_path in jobs:
         record = read_record(prev_pack_path, prev_ref.offset, prev_ref.length)
 
-        document_rows.append(
-            (
-                item.doc_id,
-                item.category,
-                item.title,
-                item.date,
-                item.downloaded_at,
-                item.content_hash,
-                "PENDING",
-                zstd_compressor.compress(item.html.encode("utf-8")),
-                item.withdrawn_date,
-                item.superseded_by,
-                item.replaces,
-            )
-        )
+        document_rows.append(_document_row(item, "PENDING", zstd_level))
         title_fts_rows.append((item.doc_id, item.title, item.headings_text))
         _write_asset_files(asset_root, item.assets)
         asset_rows.extend(_asset_rows(item.doc_id, item.assets))
 
         prev_chunks = record.get("chunks", [])
+        chunk_id_text_pairs: list[tuple[int, str]] = []
         for c in prev_chunks:
             chunk_id = next_chunk_id
             next_chunk_id += 1
@@ -1553,13 +1689,13 @@ def _write_metadata_refresh(
                     chunk_id,
                     item.doc_id,
                     c["ord"],
-                    c.get("heading_path") or "",
                     c.get("anchor"),
                     compressed_text,
                 )
             )
-            chunk_fts_rows.append((chunk_id, c["text"], c.get("heading_path") or ""))
+            chunk_fts_rows.append((chunk_id, c["text"]))
             vec_rows.append((chunk_id, _dec(c["embedding_b64"])))
+            chunk_id_text_pairs.append((chunk_id, c["text"]))
 
         new_record = {
             "doc_id": item.doc_id,
@@ -1592,6 +1728,7 @@ def _write_metadata_refresh(
             )
         )
         definition_rows.extend(_definition_rows(item.definitions))
+        doc_chunk_pairs.append((item, chunk_id_text_pairs))
 
     if document_rows:
         conn.executemany(INSERT_DOCUMENT, document_rows)
@@ -1605,6 +1742,8 @@ def _write_metadata_refresh(
         conn.executemany(INSERT_VEC, vec_rows)
     if definition_rows:
         conn.executemany(INSERT_DEFINITION, definition_rows)
+
+    _persist_doc_anchors(conn, doc_chunk_pairs)
 
 
 def _iter_index(pages_dir: Path) -> Iterator[dict]:

@@ -33,11 +33,6 @@ from . import chunk as chunk_mod
 _HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
 _NAV_LIKE_CLASSES = ("minimenu", "minimenu-bar")
 _NAV_LIKE_IDS = {"LawMiniMenuHeader"}
-_HISTORY_LABELS = {
-    "view history reference",
-    "view history note",
-    "hide history note",
-}
 _DROP_ATTRS = {
     "style", "width", "height", "align", "valign", "bgcolor",
     "name",
@@ -157,9 +152,9 @@ def extract(
 
     _strip_noise(container)
 
-    # Capture EM / Explanatory Statement front-matter BEFORE history stripping
-    # and link rewriting. The front-matter wrapper (#Lawfront) is a stable
-    # structural marker on parliamentary EM and regulation ES pages.
+    # Capture EM / Explanatory Statement front-matter BEFORE link rewriting.
+    # The front-matter wrapper (#Lawfront) is a stable structural marker on
+    # parliamentary EM and regulation ES pages.
     fm_chamber, fm_refs, fm_phrase = _collect_em_front_matter(container)
 
     # Capture "title headings" — consecutive leading headings before any body
@@ -167,7 +162,6 @@ def extract(
     lead_headings = _leading_headings(container)
     title = _compose_title(lead_headings) or html_title
 
-    _strip_history_html(container)
     _normalise_named_anchors(container)
     container = _rewrite_links_html(container)
     assets = _rewrite_images_html(container, doc_id=doc_id, source_path=source_path)
@@ -345,59 +339,6 @@ def _text_lc(value: str | None) -> str:
     return _text_norm(value).lower()
 
 
-def _node_text_lc(node: Node) -> str:
-    return _text_lc(node.text(deep=True, separator=" ", strip=True))
-
-
-def _node_has_history_id(node: Node) -> bool:
-    ident = _text_lc(node.attributes.get("id"))
-    return ident.startswith("history_")
-
-
-def _node_has_history_label(node: Node) -> bool:
-    title = _text_lc(node.attributes.get("title"))
-    label = _node_text_lc(node)
-    return title in _HISTORY_LABELS or label in _HISTORY_LABELS
-
-
-def _closest_panel_ancestor(node: Node) -> Node | None:
-    # Bootstrap convention: the outer panel wrapper has class `panel
-    # panel-default`; inner sub-containers are `panel-heading` / `panel-body`.
-    # We want the outer wrapper, so we match the bare `panel` class token.
-    current: Node | None = node.parent
-    while current is not None:
-        if (current.tag or "").lower() == "div":
-            classes = (current.attributes.get("class") or "").split()
-            if "panel" in classes:
-                return current
-        current = current.parent
-    return None
-
-
-def _strip_history_html(node: Node) -> None:
-    """Remove ATO version-history controls and blocks before HTML is exposed."""
-
-    for el in list(node.traverse()):
-        if _node_has_history_id(el):
-            el.decompose()
-
-    for el in list(node.traverse()):
-        tag = (el.tag or "").lower()
-        if tag in {"a", "button", "img"} and _node_has_history_label(el):
-            el.decompose()
-
-    for text_node in list(node.traverse(include_text=True)):
-        if (text_node.tag or "").lower() == "-text" and _text_lc(text_node.text()) in _HISTORY_LABELS:
-            text_node.decompose()
-
-    # Source-anchored timeline panel markers: `<a name="LawTimeLine">` lives in
-    # the panel-heading and `<div id="PiT">` wraps the body. Strip the
-    # enclosing panel container so the whole timeline panel disappears.
-    for marker in node.css("[name='LawTimeLine'], [id='PiT']"):
-        target = _closest_panel_ancestor(marker) or marker
-        target.decompose()
-
-
 def _normalise_named_anchors(node: Node) -> None:
     for el in node.css("a"):
         name = el.attributes.get("name")
@@ -413,9 +354,12 @@ def _rewrite_links_html(node: Node) -> Node:
         href = el.get("href")
         if not href:
             continue
-        doc_id = _doc_id_from_ato_link(href)
-        if doc_id:
+        resolved = _doc_id_from_ato_link(href)
+        if resolved:
+            doc_id, pit = resolved
             el["data-doc-id"] = doc_id
+            if pit:
+                el["data-pit"] = pit
             del el["href"]
             continue
         clean = _safe_href(href)
@@ -562,7 +506,12 @@ def _docid_from_query_string(query: str) -> str | None:
     return None
 
 
-def _doc_id_from_ato_link(target: str) -> str | None:
+def _doc_id_from_ato_link(target: str) -> tuple[str, str | None] | None:
+    """Parse an ATO link href into (doc_id, pit_timestamp).
+
+    Returns ``None`` for non-doc URLs. ``pit_timestamp`` is the literal
+    ``PiT`` query parameter (YYYYMMDDHHMMSS) when present, otherwise ``None``.
+    """
     target = target.strip()
     if target.startswith("<") and target.endswith(">"):
         target = target[1:-1]
@@ -581,6 +530,7 @@ def _doc_id_from_ato_link(target: str) -> str | None:
     if not (is_ato_host or has_ato_path):
         return None
     raw = _docid_from_query_string(parsed.query)
+    pit = _pit_from_query_string(parsed.query)
     if raw is None and parsed.fragment:
         # SPA-style URLs hide the doc id in the fragment, e.g.
         # `/law/#Law/table-of-contents?docid=X` or
@@ -588,6 +538,8 @@ def _doc_id_from_ato_link(target: str) -> str | None:
         if "?" in parsed.fragment:
             _, _, frag_query = parsed.fragment.partition("?")
             raw = _docid_from_query_string(frag_query)
+            if pit is None:
+                pit = _pit_from_query_string(frag_query)
     if not raw:
         return None
     # SPA category links carry a trailing `?` flag (e.g. `docid=tpa?`,
@@ -599,7 +551,17 @@ def _doc_id_from_ato_link(target: str) -> str | None:
     # Real ATO doc ids always contain a `/` (e.g. TXR/TR.../NAT/ATO).
     if not doc_id or "/" not in doc_id:
         return None
-    return doc_id
+    return doc_id, pit
+
+
+def _pit_from_query_string(query: str) -> str | None:
+    """Return the PiT timestamp from a query string, case-insensitive."""
+    for key, values in parse_qs(query).items():
+        if key.lower() == "pit" and values:
+            v = values[0].strip()
+            if v:
+                return v
+    return None
 
 
 def _collect_anchors(node: Node) -> list[tuple[str, str]]:

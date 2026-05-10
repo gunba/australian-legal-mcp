@@ -186,13 +186,14 @@ def test_extract_ignores_malformed_source_attribute_names() -> None:
     assert "PAC/19010002/Pt8" not in doc.html
 
 
-def test_extract_removes_history_noise_and_rewrites_internal_links() -> None:
+def test_extract_keeps_history_panel_and_rewrites_internal_links() -> None:
+    """We no longer strip the history panel — it's source data the agent can
+    use via the get_doc_anchors tool. Internal-doc links inside it become
+    data-doc-id markers (with data-pit when a PiT timestamp is present)."""
     html = """
     <div id="LawContent">
         <h1>Income Tax Assessment Act 1997 s 203-50</h1>
         <a href="/law/view/document?LocID=PAC%2F19970038%2F203-50&amp;db=HISTFT">View history reference</a>
-        <img src="x.gif" title="View history note">View history note
-        <img src="y.gif" title="Hide history note">Hide history note
         <div class="panel panel-default">
           <div class="panel-heading"><a name="LawTimeLine"></a><strong>Section history</strong></div>
           <div id="PiT"><p>S 203-50 inserted by No 48 of 2002.</p></div>
@@ -202,12 +203,13 @@ def test_extract_removes_history_noise_and_rewrites_internal_links() -> None:
     </div>
     """
     doc = extract(html)
-    assert "View history" not in doc.text
-    assert "Hide history" not in doc.text
-    assert "inserted by No 48" not in doc.text
+    # Body link is converted to a data-doc-id marker; the raw URL is gone.
     assert "203-55(1)" in doc.text
     assert 'data-doc-id="PAC/19970038/203-55(1)"' in doc.html
     assert "/law/view/document" not in doc.html
+    # History panel content is now visible alongside the rest of the doc.
+    assert "Section history" in doc.text
+    assert "inserted by No 48" in doc.text
 
 
 def test_extract_removes_ato_mini_menu_navigation() -> None:
@@ -279,7 +281,6 @@ def test_extract_rewrites_images_to_asset_refs(tmp_path: Path) -> None:
     assert "[image: Annual amount formula]" not in doc.text
     assert "Annual amount formula" not in doc.text
     assert "![" not in doc.text
-    assert "View history note" not in doc.html
 
 
 def test_extract_leaves_ambiguous_two_row_table_as_table() -> None:
@@ -654,21 +655,28 @@ def test_doc_id_parser_handles_view_htm_variants() -> None:
         ("http://ato.gov.au/law/view.htm?DocID=PSR/PS201112/NAT/ATO/00001", "PSR/PS201112/NAT/ATO/00001"),
     ]
     for url, expected in cases:
-        assert _doc_id_from_ato_link(url) == expected, url
+        assert _doc_id_from_ato_link(url) == (expected, None), url
 
 
-def test_doc_id_parser_handles_pit_query_alongside_docid() -> None:
-    """The legacy `&PiT=…` archived-as-of timestamp must not block parsing —
-    only the docid value is taken."""
+def test_doc_id_parser_extracts_pit_alongside_docid() -> None:
+    """The `&PiT=…` archived-as-of timestamp identifies a historical version.
+    Both the docid and the PiT timestamp should be returned so the caller can
+    construct a versioned doc_id (`<base>@<PiT>`)."""
     url = "http://law.ato.gov.au/atolaw/view.htm?Docid=JUD/2008ATC20-048/00001&PiT=99991231235958"
-    assert _doc_id_from_ato_link(url) == "JUD/2008ATC20-048/00001"
+    assert _doc_id_from_ato_link(url) == ("JUD/2008ATC20-048/00001", "99991231235958")
+
+
+def test_doc_id_parser_returns_none_pit_when_absent() -> None:
+    """Plain doc URLs without a PiT parameter return None for the timestamp."""
+    url = "https://www.ato.gov.au/law/view/document?docid=TXR/TR967/NAT/ATO/00001"
+    assert _doc_id_from_ato_link(url) == ("TXR/TR967/NAT/ATO/00001", None)
 
 
 def test_doc_id_parser_handles_quoted_urlencoded_value() -> None:
     """Some links wrap the doc id in URL-encoded quotes (`%22…%22`) — those
     quotes must be stripped, mirroring the existing /law/view/document path."""
     url = 'https://www.ato.gov.au/law/view/view.htm?docid=%22OPS%2FLI202520%2F00001%22'
-    assert _doc_id_from_ato_link(url) == "OPS/LI202520/00001"
+    assert _doc_id_from_ato_link(url) == ("OPS/LI202520/00001", None)
 
 
 def test_doc_id_parser_handles_spa_fragment_form() -> None:
@@ -679,7 +687,7 @@ def test_doc_id_parser_handles_spa_fragment_form() -> None:
         ("https://www.ato.gov.au/single-page-applications/legaldatabase/#Law/table-of-contents?docid=TPA/TA20253", "TPA/TA20253"),
     ]
     for url, expected in cases:
-        assert _doc_id_from_ato_link(url) == expected, url
+        assert _doc_id_from_ato_link(url) == (expected, None), url
 
 
 def test_doc_id_parser_rejects_spa_category_links() -> None:

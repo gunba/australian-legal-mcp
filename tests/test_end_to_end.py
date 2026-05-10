@@ -52,14 +52,11 @@ def tiny_pages_dir(tmp_path: Path) -> Path:
     return pages_dir
 
 
-def test_embedding_input_includes_heading_between_title_and_text() -> None:
+def test_embedding_input_concatenates_title_and_text() -> None:
     from ato_mcp.indexer.build import _embedding_input
 
-    assert (
-        _embedding_input("Example title", "Section 8-1 > Reasons", "Body text")
-        == "Example title\nSection 8-1 > Reasons\nBody text"
-    )
-    assert _embedding_input("", "", "Body text") == "Body text"
+    assert _embedding_input("Example title", "Body text") == "Example title\nBody text"
+    assert _embedding_input("", "Body text") == "Body text"
 
 
 def test_length_bucketed_encoder_reports_batch_telemetry(monkeypatch) -> None:
@@ -723,23 +720,21 @@ def test_build_small_index(sample_pages_dir: Path, tmp_path: Path, monkeypatch) 
                 "expected at least one embedder input to start with a stored document title; "
                 f"first 3 captured: {captured_texts[:3]!r}"
             )
-            headed_rows = conn.execute(
+            chunk_rows = conn.execute(
                 """
-                SELECT d.title, c.heading_path, c.text
+                SELECT d.title, c.text
                 FROM chunks c
                 JOIN documents d ON d.doc_id = c.doc_id
-                WHERE c.heading_path <> ''
                 LIMIT 20
                 """
             ).fetchall()
-            if headed_rows:
+            if chunk_rows:
                 expected = {
-                    build_module._embedding_input(row["title"], row["heading_path"], row["text"])
-                    for row in headed_rows
+                    build_module._embedding_input(row["title"], row["text"])
+                    for row in chunk_rows
                 }
                 assert expected.intersection(captured_texts), (
-                    "expected at least one embedder input to exactly preserve "
-                    "title\\nheading_path\\ntext; "
+                    "expected at least one embedder input to exactly preserve title\\ntext; "
                     f"expected sample: {list(expected)[:1]!r}, first 3 captured: {captured_texts[:3]!r}"
                 )
     finally:
