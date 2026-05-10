@@ -7,7 +7,6 @@ from ato_mcp.indexer.rules import (
     RuleInputs,
     Template,
     _compose_from_em_front_matter,
-    _compose_from_leading_headings,
     classify,
     derive_metadata,
 )
