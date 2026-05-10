@@ -4991,7 +4991,7 @@ fn get_doc_anchors(doc_id: &str) -> Result<String> {
                 if let Some(target) = target_doc_id {
                     let mut entry = serde_json::Map::new();
                     entry.insert("label".to_string(), JsonValue::String(label));
-                    entry.insert("doc_id".to_string(), JsonValue::String(target));
+                    entry.insert("doc_id".to_string(), JsonValue::String(target.clone()));
                     if let Some(pit) = target_pit.as_deref() {
                         entry.insert(
                             "pit".to_string(),
@@ -5000,6 +5000,15 @@ fn get_doc_anchors(doc_id: &str) -> Result<String> {
                         if let Some(date) = pit_to_date(pit) {
                             entry.insert("date".to_string(), JsonValue::String(date));
                         }
+                        // Fully-qualified URL the agent can WebFetch directly.
+                        // Historical content is not stored locally — agents
+                        // requesting the older version follow this URL.
+                        entry.insert(
+                            "url".to_string(),
+                            JsonValue::String(format!(
+                                "https://www.ato.gov.au/law/view/document?docid={target}&PiT={pit}"
+                            )),
+                        );
                     }
                     historical_versions.push(JsonValue::Object(entry));
                 }
@@ -5105,7 +5114,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_doc_anchors",
-            "description": "Return the navigation map for a document: in-doc anchors (paragraph references, contents-table entries), sister documents (errata, addenda), and historical versions (point-in-time URLs). Slim search hits surface `has_in_doc_links`, `has_related_docs`, or `has_history` flags when this tool would return useful entries — call it then to navigate. The `in_doc` array gives chunk_ids you can pass to get_chunks; `related_docs` give doc_ids you can pass to search or get_document. `historical_versions` entries carry {doc_id (the BASE doc_id of the document), pit (timestamp), date}; the corpus does not store historical content as separate rows, so use these to fetch the older version externally when needed.",
+            "description": "Return the navigation map for a document: in-doc anchors (paragraph references, contents-table entries), sister documents (errata, addenda, withdrawal notices), and historical versions (earlier point-in-time publications). Slim search hits surface `has_in_doc_links`, `has_related_docs`, or `has_history` when this tool would return useful entries — call it then to navigate. `in_doc` entries carry chunk_id (pass to get_chunks); `related_docs` carry doc_id (pass to search/get_document/get_chunks); `historical_versions` carry {doc_id, pit, date, url}. The corpus does not store historical content; use the `url` field with WebFetch to retrieve an older version when needed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -6568,6 +6577,10 @@ mod tests {
             assert_eq!(history[0]["pit"], json!("20200101000000"));
             assert_eq!(history[0]["label"], json!("Earlier version"));
             assert_eq!(history[0]["date"], json!("2020-01-01"));
+            assert_eq!(
+                history[0]["url"],
+                json!("https://www.ato.gov.au/law/view/document?docid=DOC_HISTORY&PiT=20200101000000")
+            );
             Ok(())
         })?;
         Ok(())
@@ -6595,6 +6608,10 @@ mod tests {
             assert_eq!(history[0]["doc_id"], json!("TR_1996_X"));
             assert_eq!(history[0]["pit"], json!("19960320000001"));
             assert_eq!(history[0]["date"], json!("1996-03-20"));
+            assert_eq!(
+                history[0]["url"],
+                json!("https://www.ato.gov.au/law/view/document?docid=TR_1996_X&PiT=19960320000001")
+            );
             Ok(())
         })?;
         Ok(())
