@@ -39,7 +39,7 @@ def normalize_doc_href(href: str) -> str:
 	for key, values in query_params.items():
 		if key.lower() == "pit" and values:
 			candidate = unquote(values[0]).strip("'\" ")
-			if candidate:
+			if candidate and candidate not in _SENTINEL_PITS:
 				pit = candidate
 				break
 	if docid:
@@ -49,6 +49,12 @@ def normalize_doc_href(href: str) -> str:
 
 	query = f"?{parsed.query}" if parsed.query else ""
 	return f"{path}{query}"
+
+
+# ATO uses sentinel PiT values: 99991231235958 ("current view, as at end
+# of time") and 10010101000001 ("earliest / original" placeholder). Both
+# alias the live doc, not a historical version — skip the @<PiT> suffix.
+_SENTINEL_PITS = {"99991231235958", "10010101000001"}
 
 
 @dataclass

@@ -36,6 +36,12 @@ from selectolax.parser import HTMLParser, Node
 
 from .extract import _doc_id_from_ato_link
 
+# ATO uses sentinel PiT values to mean "current view" (99991231235958, "as
+# at end of time") and "earliest / original" (10010101000001, year 1001).
+# Both alias the live doc rather than identifying a real historical
+# version, so skip the @<PiT> suffix when we see either.
+_SENTINEL_PITS = {"99991231235958", "10010101000001"}
+
 
 @dataclass(frozen=True)
 class AnchorRef:
@@ -79,6 +85,11 @@ def extract_anchors(html: str, *, source_doc_id: str) -> list[AnchorRef]:
         if not resolved:
             continue
         target_doc_id, pit = resolved
+        # ATO navigation panels use PiT=99991231235958 as the "current view"
+        # sentinel — it aliases the live doc, not a historical version.
+        # Treat it as a no-PiT link.
+        if pit in _SENTINEL_PITS:
+            pit = None
         if pit:
             # Historical version (same or other doc + PiT timestamp).
             label = _resolve_label(a, default_date=_pit_to_date(pit))
