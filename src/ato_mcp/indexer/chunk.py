@@ -56,7 +56,15 @@ _CONTAINER_BLOCK_TAGS = {
     "ul",
 }
 _URL_HEADING_RE = re.compile(r"^/law/view/document\?docid=", re.IGNORECASE)
-_WS_RE = re.compile(r"\s+")
+# Horizontal-only whitespace: keep \n/\r so <br>-introduced line breaks survive
+# normalisation and reach the chunk plaintext.
+_WS_RE = re.compile(r"[ \t\f\v]+")
+# Raw text nodes carry source-formatting whitespace (line breaks + indent).
+# Only <br> should introduce a structural newline, so flatten everything inside
+# a text node to a single space at the leaf.
+_RAW_TEXT_WS_RE = re.compile(r"\s+")
+_NEWLINE_PAD_RE = re.compile(r" *\n *")
+_NEWLINE_RUN_RE = re.compile(r"\n{3,}")
 _NUMERIC_RANGE_RE = re.compile(r"(?<=\d)\s+-\s+(?=\d)")
 _SPACED_QUOTE_RE = re.compile(r'"\s+([^"\n]*?)\s+"')
 _SENT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z(])")
@@ -190,7 +198,7 @@ def _walk_children(parent: Node, state: _WalkState) -> None:
     while child is not None:
         tag = (child.tag or "").lower()
         if tag == "-text":
-            text = child.text() or ""
+            text = _RAW_TEXT_WS_RE.sub(" ", child.text() or "")
             inline_parts.append(text)
             inline_definition_parts.append(text)
             child = child.next
@@ -241,7 +249,7 @@ def _collect_visible_blocks(parent: Node, blocks: list[str]) -> None:
     while child is not None:
         tag = (child.tag or "").lower()
         if tag == "-text":
-            inline_parts.append(child.text() or "")
+            inline_parts.append(_RAW_TEXT_WS_RE.sub(" ", child.text() or ""))
             child = child.next
             continue
         if tag in _HEADING_TAGS or _is_atomic_block(child):
@@ -371,8 +379,35 @@ def _inline_text(node: Node, *, definition_markers: bool) -> str:
     tag = (node.tag or "").lower()
     if tag == "br":
         return "\n"
-    if (node.tag or "").lower() == "-text":
-        return node.text() or ""
+    if tag == "-text":
+        # Raw text nodes carry formatting whitespace (newlines + indentation
+        # from the source markup). Collapse all whitespace so the only \n
+        # that reaches downstream is the one emitted by <br>.
+        raw = node.text() or ""
+        return _RAW_TEXT_WS_RE.sub(" ", raw)
+    # Annotate ATO cross-references and asset references inline so agents
+    # working from chunk plaintext can chain to the referenced doc / call
+    # get_asset without re-searching. Bracketed form survives BM25 windowing
+    # and is additive for old consumers.
+    if tag == "a":
+        doc_id = node.attributes.get("data-doc-id")
+        if not doc_id:
+            href = node.attributes.get("href")
+            if href:
+                # extract.py converts internal ATO links to data-doc-id at
+                # extract time, but URL-shape drift would otherwise silently
+                # drop cross-references from chunk plaintext. One source of
+                # truth for the parse — import the extractor's helper.
+                from .extract import _doc_id_from_ato_link
+
+                doc_id = _doc_id_from_ato_link(href)
+        if doc_id:
+            inner = _inline_text_children(node, definition_markers=definition_markers)
+            return f"{inner} [doc:{doc_id}]" if inner else f"[doc:{doc_id}]"
+    if tag == "span":
+        asset_ref = node.attributes.get("data-asset-ref")
+        if asset_ref:
+            return f"[asset:{asset_ref}]"
     if definition_markers and _is_definition_term_node(node):
         term = _normalise_text(_inline_text_children(node, definition_markers=False))
         return f"***{term}***" if term else ""
@@ -399,7 +434,10 @@ def _is_definition_term_node(node: Node) -> bool:
 
 def _normalise_text(text: str) -> str:
     text = text.replace("\xa0", " ")
-    text = _WS_RE.sub(" ", text).strip()
+    text = _WS_RE.sub(" ", text)
+    text = _NEWLINE_PAD_RE.sub("\n", text)
+    text = _NEWLINE_RUN_RE.sub("\n\n", text)
+    text = text.strip()
     text = _NUMERIC_RANGE_RE.sub("-", text)
     text = _SPACED_QUOTE_RE.sub(r'"\1"', text)
     return text

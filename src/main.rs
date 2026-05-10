@@ -9,7 +9,6 @@ use regex::Regex;
 use reqwest::blocking::Client;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OpenFlags};
-use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
@@ -162,8 +161,9 @@ enum Command {
     /// Fetch a document or a slice of it.
     GetDocument {
         doc_id: String,
-        #[arg(long, default_value = "html")]
-        format: DocumentFormat,
+        /// When set, return the raw cleaned HTML instead of plaintext.
+        #[arg(long, default_value_t = false)]
+        as_html: bool,
         #[arg(long)]
         max_chars: Option<usize>,
         #[arg(long)]
@@ -176,15 +176,6 @@ enum Command {
         context_doc_id: Option<String>,
         #[arg(long, default_value_t = 5)]
         max_defs: usize,
-        #[arg(long, default_value = "json")]
-        format: OutputFormat,
-    },
-    /// Verify that a quoted passage exists verbatim (whitespace-tolerant) in a document.
-    VerifyQuote {
-        doc_id: String,
-        quote: String,
-        #[arg(long)]
-        case_sensitive: bool,
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
@@ -206,12 +197,6 @@ enum SearchMode {
     Hybrid,
     Vector,
     Keyword,
-}
-
-#[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
-enum DocumentFormat {
-    Html,
-    Json,
 }
 
 fn main() -> Result<()> {
@@ -319,7 +304,7 @@ fn main() -> Result<()> {
         }
         Command::GetDocument {
             doc_id,
-            format,
+            as_html,
             max_chars,
             from_char,
         } => {
@@ -328,7 +313,7 @@ fn main() -> Result<()> {
                 get_document(
                     &doc_id,
                     GetDocumentOptions {
-                        format,
+                        as_html,
                         max_chars,
                         from_char,
                     },
@@ -353,15 +338,6 @@ fn main() -> Result<()> {
                     },
                 )?
             );
-            Ok(())
-        }
-        Command::VerifyQuote {
-            doc_id,
-            quote,
-            case_sensitive,
-            format,
-        } => {
-            println!("{}", verify_quote(&doc_id, &quote, case_sensitive, format)?);
             Ok(())
         }
     }
@@ -772,11 +748,13 @@ struct Hit {
     #[serde(skip_serializing_if = "Option::is_none")]
     snippet: Option<String>,
     canonical_url: String,
+    // 2-dp rounding keeps the wire shape stable across reranker on/off and
+    // BM25 magnitudes — the agent compares hit ordering, not micro-deltas.
+    #[serde(serialize_with = "serialize_score_round2")]
     score: Option<f64>,
     chunk_id: Option<i64>,
     ord: Option<i64>,
     next_call: Option<String>,
-    ranking: Option<RankingDetails>,
     /// W2.2 currency markers — only serialised when set so JSON output for
     /// in-force docs stays clean.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -785,20 +763,51 @@ struct Hit {
     superseded_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     replaces: Option<String>,
-    /// W3 cross-encoder relevance score in [0, 1] — populated only when
-    /// the reranker stage ran for this hit (top-N candidates only). Older
-    /// callers / corpora without the reranker omit this field entirely.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reranker_score: Option<f64>,
 }
 
-#[derive(Debug, Serialize, Clone, Default)]
-struct RankingDetails {
-    overall_score: Option<f64>,
-    vector_rank: Option<usize>,
-    vector_score: Option<f64>,
-    lexical_rank: Option<usize>,
-    lexical_score: Option<f64>,
+fn serialize_score_round2<S>(value: &Option<f64>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Some(v) if v.is_finite() => {
+            serializer.serialize_f64((v * 100.0).round() / 100.0)
+        }
+        Some(v) => serializer.serialize_f64(*v),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// Map negative-only or mixed-sign hit scores into [0, 1] (larger=better)
+/// via min-max on `-score`. No-op when every score is already non-negative.
+/// Hits with `score == None` are left untouched.
+fn normalise_hit_scores(hits: &mut [Hit]) {
+    if hits.is_empty() {
+        return;
+    }
+    if !hits
+        .iter()
+        .any(|h| h.score.map(|s| s < 0.0).unwrap_or(false))
+    {
+        return;
+    }
+    let scored: Vec<f64> = hits.iter().filter_map(|h| h.score.map(|s| -s)).collect();
+    if scored.is_empty() {
+        return;
+    }
+    let lo = scored.iter().cloned().fold(f64::INFINITY, f64::min);
+    let hi = scored.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let span = hi - lo;
+    for hit in hits.iter_mut() {
+        if let Some(s) = hit.score {
+            let v = -s;
+            hit.score = Some(if span.abs() < f64::EPSILON {
+                1.0
+            } else {
+                ((v - lo) / span).clamp(0.0, 1.0)
+            });
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -958,7 +967,6 @@ fn search(
     } else {
         Vec::new()
     };
-    let mut vector_hits = Vec::new();
     let mut ranked_hits = match opts.mode {
         SearchMode::Hybrid | SearchMode::Vector => {
             ensure_vector_search_ready(&conn)?;
@@ -966,17 +974,16 @@ fn search(
                 Some(state) => state.encode_query_embedding(query)?,
                 None => encode_query_embedding(query)?,
             };
-            vector_hits = vector_search(&conn, &query_embedding, &filter, internal_limit)?;
+            let vector_hits = vector_search(&conn, &query_embedding, &filter, internal_limit)?;
             if matches!(opts.mode, SearchMode::Hybrid) {
                 rrf_fuse(&vector_hits, &lexical_hits)
             } else {
-                vector_hits.clone()
+                vector_hits
             }
         }
         SearchMode::Keyword => lexical_hits.clone(),
     };
     let candidate_count = ranked_hits.len();
-    let mut provenance = rank_provenance(&vector_hits, &lexical_hits);
 
     // Cross-encoder rerank stage. We rerank only the top head because
     // each ONNX inference is O(N) and the marginal hit past the first
@@ -1048,18 +1055,20 @@ fn search(
     let mut records = Vec::new();
     for ranked_hit in deduped.into_iter() {
         if let Some(mut hit) = load_hit(&conn, ranked_hit.chunk_id, query, opts.include_snippet)? {
-            hit.score = Some(ranked_hit.score);
-            let mut ranking = provenance.remove(&ranked_hit.chunk_id).unwrap_or_default();
-            ranking.overall_score = Some(ranked_hit.score);
-            hit.ranking = Some(ranking);
-            // Surface the cross-encoder logit only when the reranker
-            // actually scored this chunk (it ran for the top-N only).
-            if let Some(s) = reranker_scores.get(&ranked_hit.chunk_id) {
-                hit.reranker_score = Some(*s);
-            }
+            // Reranker score (when it ran) overrides the first-stage
+            // RRF/BM25/vector value so head and tail hits sit on the same
+            // relevance scale.
+            let composed = reranker_scores
+                .get(&ranked_hit.chunk_id)
+                .copied()
+                .unwrap_or(ranked_hit.score);
+            hit.score = Some(composed);
             records.push(hit);
         }
     }
+    // Negative BM25 (raw fts5 score) leaks unsightly magnitudes; map any
+    // negative-only or mixed-sign result set into [0, 1] in one pass.
+    normalise_hit_scores(&mut records);
     if matches!(opts.sort_by, SortBy::Recency) {
         // [MT-06] Recency sort materializes a widened frontier, then sorts by date descending.
         records.sort_by(|a, b| b.date.cmp(&a.date));
@@ -1424,24 +1433,6 @@ fn rrf_fuse(vector_hits: &[VectorHit], lexical_hits: &[VectorHit]) -> Vec<Vector
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    out
-}
-
-fn rank_provenance(
-    vector_hits: &[VectorHit],
-    lexical_hits: &[VectorHit],
-) -> HashMap<i64, RankingDetails> {
-    let mut out: HashMap<i64, RankingDetails> = HashMap::new();
-    for (idx, hit) in vector_hits.iter().enumerate() {
-        let details = out.entry(hit.chunk_id).or_default();
-        details.vector_rank = Some(idx + 1);
-        details.vector_score = Some(hit.score);
-    }
-    for (idx, hit) in lexical_hits.iter().enumerate() {
-        let details = out.entry(hit.chunk_id).or_default();
-        details.lexical_rank = Some(idx + 1);
-        details.lexical_score = Some(hit.score);
-    }
     out
 }
 
@@ -1917,12 +1908,10 @@ fn load_hit(
         chunk_id: Some(chunk_id),
         ord: Some(ord),
         next_call: Some(format!("get_chunks(chunk_ids=[{chunk_id}])")),
-        ranking: None,
         heading_path,
         withdrawn_date: row.get("withdrawn_date")?,
         superseded_by: row.get("superseded_by")?,
         replaces: row.get("replaces")?,
-        reranker_score: None,
     }))
 }
 
@@ -2191,13 +2180,11 @@ fn load_title_hit(conn: &Connection, doc_id: &str, filter: &SqlFilter) -> Result
             chunk_id: None,
             ord: None,
             next_call: Some(format!(
-                "get_document(doc_id=\"{doc_id}\", format=\"html\", max_chars=20000)"
+                "get_document(doc_id=\"{doc_id}\", max_chars=20000)"
             )),
-            ranking: None,
             withdrawn_date: row.get("withdrawn_date")?,
             superseded_by: row.get("superseded_by")?,
             replaces: row.get("replaces")?,
-            reranker_score: None,
         }))
     } else {
         Ok(None)
@@ -2255,13 +2242,11 @@ fn search_titles(
             chunk_id: None,
             ord: None,
             next_call: Some(format!(
-                "get_document(doc_id=\"{doc_id}\", format=\"html\", max_chars=20000)"
+                "get_document(doc_id=\"{doc_id}\", max_chars=20000)"
             )),
-            ranking: None,
             withdrawn_date: row.get("withdrawn_date")?,
             superseded_by: row.get("superseded_by")?,
             replaces: row.get("replaces")?,
-            reranker_score: None,
         })
     }) {
         Ok(rows) => rows.collect::<rusqlite::Result<Vec<_>>>()?,
@@ -2279,6 +2264,9 @@ fn search_titles(
     rows.splice(0..0, direct_hits);
     let truncated = rows.len() > k;
     rows.truncate(k);
+    // Map raw negative BM25 + the -2000 direct-hit sentinel into [0,1]
+    // (larger=better) so the agent never sees BM25 magnitudes on the wire.
+    normalise_hit_scores(&mut rows);
     match format {
         OutputFormat::Json => Ok(serde_json::to_string_pretty(&json!({
             "query": query,
@@ -2297,7 +2285,10 @@ fn search_titles(
 }
 
 struct GetDocumentOptions {
-    format: DocumentFormat,
+    /// `false` (default) joins chunk plaintext; `true` serves the raw
+    /// cleaned-HTML blob from `documents.html`. Pagination applies to
+    /// whichever body is selected.
+    as_html: bool,
     max_chars: Option<usize>,
     from_char: Option<usize>,
 }
@@ -2308,13 +2299,79 @@ fn get_document(doc_id: &str, opts: GetDocumentOptions) -> Result<String> {
     let Some(doc) = doc else {
         return Ok(format!("_Document not found: `{}`_", doc_id));
     };
-    if opts.format == DocumentFormat::Html {
-        return format_document_html(&conn, &doc, opts.from_char.unwrap_or(0), opts.max_chars);
+    let body = if opts.as_html {
+        load_document_html(&conn, &doc.doc_id)?.unwrap_or_default()
+    } else {
+        load_document_plaintext(&conn, &doc.doc_id)?
+    };
+    format_document_response(
+        &doc,
+        &body,
+        opts.as_html,
+        opts.from_char.unwrap_or(0),
+        opts.max_chars,
+    )
+}
+
+/// Reassemble the document's plaintext as the chunk pipeline saw it. The
+/// chunks already carry the `[doc:X]` / `[asset:X]` annotations after a
+/// rebuild, so the agent sees the same text it would in `get_chunks`.
+fn load_document_plaintext(conn: &Connection, doc_id: &str) -> Result<String> {
+    let mut stmt =
+        conn.prepare("SELECT text FROM chunks WHERE doc_id = ? ORDER BY ord ASC")?;
+    let rows = stmt.query_map([doc_id], |row| row.get::<_, Vec<u8>>("text"))?;
+    let mut parts: Vec<String> = Vec::new();
+    for row in rows {
+        let blob = row?;
+        parts.push(decompress_text(blob)?);
     }
-    if opts.format == DocumentFormat::Json {
-        return format_document_json(&conn, &doc, opts.from_char.unwrap_or(0), opts.max_chars);
-    }
-    unreachable!("DocumentFormat is exhausted")
+    Ok(parts.join("\n\n"))
+}
+
+fn format_document_response(
+    doc: &DocumentRow,
+    body: &str,
+    as_html: bool,
+    from_char: usize,
+    max_chars: Option<usize>,
+) -> Result<String> {
+    let total_chars = body.chars().count();
+    let start_char = from_char.min(total_chars);
+    let start_byte = char_offset_to_byte(body, start_char);
+    let remaining = &body[start_byte..];
+    let (slice, next_offset) = if let Some(max_chars) = max_chars {
+        if remaining.chars().count() > max_chars {
+            let end = char_offset_to_byte(remaining, max_chars);
+            (&remaining[..end], Some(start_char + max_chars))
+        } else {
+            (remaining, None)
+        }
+    } else {
+        (remaining, None)
+    };
+    let returned_chars = slice.chars().count();
+    let next_call = next_offset.map(|next| {
+        let suffix = if as_html { ", as_html=true" } else { "" };
+        format!(
+            "get_document(doc_id=\"{}\", from_char={}, max_chars={}{})",
+            doc.doc_id,
+            next,
+            max_chars.unwrap_or(20_000),
+            suffix,
+        )
+    });
+    Ok(serde_json::to_string_pretty(&json!({
+        "document": doc,
+        "text": slice,
+        "meta": {
+            "as_html": as_html,
+            "total_chars": total_chars,
+            "from_char": start_char,
+            "returned_chars": returned_chars,
+            "truncated": next_offset.is_some(),
+            "next_call": next_call,
+        },
+    }))?)
 }
 
 #[derive(Debug, Serialize)]
@@ -2359,103 +2416,12 @@ fn load_document_html(conn: &Connection, doc_id: &str) -> Result<Option<String>>
     }
 }
 
-fn format_document_html(
-    conn: &Connection,
-    doc: &DocumentRow,
-    from_char: usize,
-    max_chars: Option<usize>,
-) -> Result<String> {
-    let html = load_document_html(conn, &doc.doc_id)?.unwrap_or_default();
-    let total_chars = html.chars().count();
-    let start_char = from_char.min(total_chars);
-    let start_byte = char_offset_to_byte(&html, start_char);
-    let remaining = &html[start_byte..];
-    let (body, next_offset) = if let Some(max_chars) = max_chars {
-        if remaining.chars().count() > max_chars {
-            let end = char_offset_to_byte(remaining, max_chars);
-            (&remaining[..end], Some(start_char + max_chars))
-        } else {
-            (remaining, None)
-        }
-    } else {
-        (remaining, None)
-    };
-    let mut out = String::new();
-    out.push_str(&format!(
-        "<!-- ato-mcp doc_id=\"{}\" title=\"{}\" canonical_url=\"{}\" -->\n",
-        escape_html_attr(&doc.doc_id),
-        escape_html_attr(&doc.title),
-        escape_html_attr(&doc.canonical_url)
-    ));
-    out.push_str(body);
-    if let Some(next) = next_offset {
-        out.push_str(&format!(
-            "\n<!-- truncated; next_call: get_document(doc_id=\"{}\", format=\"html\", from_char={}, max_chars={}) -->",
-            escape_html_attr(&doc.doc_id),
-            next,
-            max_chars.unwrap_or(20_000)
-        ));
-    }
-    Ok(out)
-}
-
-fn format_document_json(
-    conn: &Connection,
-    doc: &DocumentRow,
-    from_char: usize,
-    max_chars: Option<usize>,
-) -> Result<String> {
-    let html = load_document_html(conn, &doc.doc_id)?.unwrap_or_default();
-    let total_chars = html.chars().count();
-    let start_char = from_char.min(total_chars);
-    let start_byte = char_offset_to_byte(&html, start_char);
-    let remaining = &html[start_byte..];
-    let (body, next_offset) = if let Some(max_chars) = max_chars {
-        if remaining.chars().count() > max_chars {
-            let end = char_offset_to_byte(remaining, max_chars);
-            (&remaining[..end], Some(start_char + max_chars))
-        } else {
-            (remaining, None)
-        }
-    } else {
-        (remaining, None)
-    };
-    let returned_chars = body.chars().count();
-    let next_call = next_offset.map(|next| {
-        format!(
-            "get_document(doc_id=\"{}\", format=\"json\", from_char={}, max_chars={})",
-            doc.doc_id,
-            next,
-            max_chars.unwrap_or(20_000)
-        )
-    });
-    Ok(serde_json::to_string_pretty(&json!({
-        "document": doc,
-        "html": body,
-        "meta": {
-            "total_chars": total_chars,
-            "from_char": start_char,
-            "returned_chars": returned_chars,
-            "truncated": next_offset.is_some(),
-            "next_call": next_call,
-        },
-    }))?)
-}
-
 fn char_offset_to_byte(value: &str, chars: usize) -> usize {
     value
         .char_indices()
         .nth(chars)
         .map(|(idx, _)| idx)
         .unwrap_or(value.len())
-}
-
-fn escape_html_attr(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 struct GetDefinitionOptions<'a> {
@@ -4572,27 +4538,15 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
         }
         "get_document" => {
             let doc_id = required_str(&args, "doc_id")?;
-            let format = match args
-                .get("format")
-                .and_then(|v| v.as_str())
-                .unwrap_or("html")
-            {
-                "html" => DocumentFormat::Html,
-                "json" => DocumentFormat::Json,
-                other => {
-                    bail!("format must be one of html, json; got `{other}`")
-                }
-            };
             get_document(
                 doc_id,
                 GetDocumentOptions {
-                    format,
+                    as_html: optional_bool(&args, "as_html").unwrap_or(false),
                     max_chars: optional_usize(&args, "max_chars"),
                     from_char: optional_usize(&args, "from_char"),
                 },
             )?
         }
-        "get_elements" => get_elements_mcp(&args)?,
         "get_asset" => get_asset_mcp(&args)?,
         "get_chunks" => get_chunks_mcp(&args)?,
         "get_definition" => {
@@ -4606,7 +4560,6 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
                 },
             )?
         }
-        "verify_quote" => verify_quote_mcp(&args)?,
         "stats" => stats(output_format_arg(&args)?)?,
         _ => bail!("unknown tool: {name}"),
     };
@@ -4770,7 +4723,7 @@ fn get_chunks(chunk_ids: &[i64], opts: GetChunksOptions) -> Result<String> {
     }
     let next_call = truncated_at.as_ref().map(|chunk| {
         format!(
-            "get_document(doc_id=\"{}\", format=\"html\", max_chars={})",
+            "get_document(doc_id=\"{}\", max_chars={})",
             chunk.doc_id,
             opts.max_chars.unwrap_or(20_000)
         )
@@ -4849,153 +4802,6 @@ fn load_chunks_by_ord_range(
 }
 
 #[derive(Debug, Serialize)]
-struct ElementOut {
-    ord: usize,
-    tag: String,
-    attrs: BTreeMap<String, String>,
-    text: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    html: Option<String>,
-}
-
-fn get_elements_mcp(args: &JsonValue) -> Result<String> {
-    let doc_id = required_str(args, "doc_id")?;
-    let tags = optional_string_array(args, "tags")?.unwrap_or_else(|| {
-        vec![
-            "h1".into(),
-            "h2".into(),
-            "h3".into(),
-            "h4".into(),
-            "h5".into(),
-            "h6".into(),
-        ]
-    });
-    let attr = args.get("attr").and_then(|v| v.as_str());
-    get_elements(
-        doc_id,
-        tags,
-        attr,
-        optional_usize(args, "from_ord").unwrap_or(0),
-        optional_usize(args, "limit").unwrap_or(50).min(200),
-        optional_usize(args, "max_chars").unwrap_or(20_000),
-        optional_bool(args, "include_html").unwrap_or(true),
-    )
-}
-
-fn get_elements(
-    doc_id: &str,
-    tags: Vec<String>,
-    attr: Option<&str>,
-    from_ord: usize,
-    limit: usize,
-    max_chars: usize,
-    include_html: bool,
-) -> Result<String> {
-    if tags.is_empty() {
-        bail!("tags must contain at least one tag name");
-    }
-    let clean_tags = tags
-        .iter()
-        .map(|tag| validate_html_name(tag, "tag"))
-        .collect::<Result<Vec<_>>>()?;
-    let attr_filter = attr
-        .map(|name| validate_html_name(name, "attr"))
-        .transpose()?;
-    let selector_text = clean_tags.join(",");
-    let selector = Selector::parse(&selector_text)
-        .map_err(|err| anyhow!("invalid selector from tags {:?}: {err}", clean_tags))?;
-    let conn = open_read()?;
-    let doc = load_document_row(&conn, doc_id)?;
-    let Some(doc) = doc else {
-        return Ok(format!("_Document not found: `{}`_", doc_id));
-    };
-    let html = load_document_html(&conn, doc_id)?.unwrap_or_default();
-    let fragment = Html::parse_fragment(&html);
-    let mut elements = Vec::new();
-    let mut returned_chars = 0usize;
-    let mut matched_ord = 0usize;
-    let mut next_ord = None;
-    for element in fragment.select(&selector) {
-        if let Some(attr_name) = attr_filter.as_deref() {
-            if element.value().attr(attr_name).is_none() {
-                continue;
-            }
-        }
-        let ord = matched_ord;
-        matched_ord += 1;
-        if ord < from_ord {
-            continue;
-        }
-        let html_text = element.html();
-        let text = collapse_ws(&element.text().collect::<Vec<_>>().join(" "));
-        let projected = returned_chars + html_text.len();
-        if !elements.is_empty() && (elements.len() >= limit || projected > max_chars) {
-            next_ord = Some(ord);
-            break;
-        }
-        returned_chars = projected;
-        let attrs = element
-            .value()
-            .attrs()
-            .map(|(name, value)| (name.to_string(), value.to_string()))
-            .collect::<BTreeMap<_, _>>();
-        elements.push(ElementOut {
-            ord,
-            tag: element.value().name().to_string(),
-            attrs,
-            text,
-            html: include_html.then_some(html_text),
-        });
-    }
-    let next_call = next_ord.map(|ord| {
-        let tags_json = serde_json::to_string(&clean_tags).unwrap_or_else(|_| "[]".to_string());
-        let attr_part = attr_filter
-            .as_ref()
-            .map(|attr| format!(", attr=\"{}\"", attr))
-            .unwrap_or_default();
-        format!(
-            "get_elements(doc_id=\"{}\", tags={}, from_ord={}, limit={}, max_chars={}{})",
-            doc.doc_id, tags_json, ord, limit, max_chars, attr_part
-        )
-    });
-    let returned = elements.len();
-    Ok(serde_json::to_string_pretty(&json!({
-        "document": doc,
-        "query": {
-            "tags": clean_tags,
-            "attr": attr_filter,
-            "from_ord": from_ord,
-            "limit": limit,
-            "include_html": include_html,
-        },
-        "elements": elements,
-        "meta": {
-            "returned": returned,
-            "returned_chars": returned_chars,
-            "truncated": next_ord.is_some(),
-            "next_call": next_call,
-        },
-    }))?)
-}
-
-fn validate_html_name(value: &str, label: &str) -> Result<String> {
-    let clean = value.trim().to_ascii_lowercase();
-    if clean.is_empty()
-        || !clean
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
-        || clean.starts_with('-')
-    {
-        bail!("{label} must be a simple HTML name; got `{value}`");
-    }
-    Ok(clean)
-}
-
-fn collapse_ws(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-#[derive(Debug, Serialize)]
 struct DocumentAssetOut {
     asset_ref: String,
     doc_id: String,
@@ -5066,316 +4872,11 @@ fn server_instructions() -> String {
     }
 }
 
-// ---------------------------------------------------------------
-// verify_quote: hallucination-defense substring check
-// ---------------------------------------------------------------
-
-const VERIFY_QUOTE_MIN_CHARS: usize = 20;
-const VERIFY_QUOTE_MAX_MATCHES: usize = 10;
-const VERIFY_QUOTE_BOUNDARY_OVERLAP: usize = 200;
-
-#[derive(Debug, Clone, Serialize)]
-struct QuoteMatch {
-    chunk_id: i64,
-    ord: i64,
-    char_offset_in_chunk: usize,
-    char_length: usize,
-}
-
-fn verify_quote_mcp(args: &JsonValue) -> Result<String> {
-    let doc_id = required_str(args, "doc_id")?;
-    let quote = required_str(args, "quote")?;
-    let case_sensitive = optional_bool(args, "case_sensitive").unwrap_or(false);
-    let format = output_format_arg(args)?;
-    verify_quote(doc_id, quote, case_sensitive, format)
-}
-
-/// Whitespace-normalise: collapse runs of any whitespace into a single
-/// space and strip leading/trailing whitespace. Optionally lowercase.
-/// Returns (normalised string, mapping from byte offset in the normalised
-/// string to character offset in the original string). The map includes a
-/// final sentinel at `normalised.len()` for exclusive-end length arithmetic.
-fn normalise_with_offsets(input: &str, lowercase: bool) -> (String, Vec<usize>) {
-    let mut out = String::with_capacity(input.len());
-    let mut map: Vec<usize> = Vec::with_capacity(input.len() + 1);
-    let mut prev_was_space = true; // collapses leading whitespace
-    let mut input_chars = 0usize;
-    for (char_idx, (_byte_idx, ch)) in input.char_indices().enumerate() {
-        input_chars = char_idx + 1;
-        if ch.is_whitespace() {
-            if !prev_was_space {
-                map.push(char_idx);
-                out.push(' ');
-                prev_was_space = true;
-            }
-        } else {
-            let pushed = if lowercase {
-                // ASCII-fast lowercase to keep offsets predictable; for
-                // non-ASCII we still call to_lowercase() (which may emit
-                // multiple bytes/chars) but the offset map points at the
-                // original character's index.
-                if ch.is_ascii() {
-                    let mut c = [0u8; 4];
-                    let s = ch.to_ascii_lowercase().encode_utf8(&mut c).to_string();
-                    s
-                } else {
-                    ch.to_lowercase().collect::<String>()
-                }
-            } else {
-                ch.to_string()
-            };
-            for _ in 0..pushed.len() {
-                map.push(char_idx);
-            }
-            out.push_str(&pushed);
-            prev_was_space = false;
-        }
-    }
-    // If output ends with a single trailing space, drop it (we always
-    // collapse, but `prev_was_space` keeps us from emitting consecutive
-    // spaces; we still emit one if the last input char was whitespace).
-    if out.ends_with(' ') {
-        out.pop();
-        map.pop();
-    }
-    map.push(input_chars);
-    (out, map)
-}
-
-fn next_norm_search_start(s: &str, byte_idx: usize) -> usize {
-    if byte_idx >= s.len() {
-        return s.len();
-    }
-    let mut next = byte_idx + 1;
-    while next < s.len() && !s.is_char_boundary(next) {
-        next += 1;
-    }
-    next
-}
-
-fn verify_quote(
-    doc_id: &str,
-    quote: &str,
-    case_sensitive: bool,
-    format: OutputFormat,
-) -> Result<String> {
-    if quote.chars().count() < VERIFY_QUOTE_MIN_CHARS {
-        let body = json!({
-            "doc_id": doc_id,
-            "quote": quote,
-            "found": false,
-            "error": format!("quote too short (min {VERIFY_QUOTE_MIN_CHARS} chars)"),
-            "matches": [],
-        });
-        return Ok(match format {
-            OutputFormat::Json => serde_json::to_string_pretty(&body)?,
-        });
-    }
-    let lowercase = !case_sensitive;
-    let (norm_quote, _) = normalise_with_offsets(quote, lowercase);
-    if norm_quote.is_empty() {
-        let body = json!({
-            "doc_id": doc_id,
-            "quote": quote,
-            "normalized_quote": norm_quote,
-            "found": false,
-            "matches": [],
-            "error": "quote contains no non-whitespace characters",
-        });
-        return Ok(match format {
-            OutputFormat::Json => serde_json::to_string_pretty(&body)?,
-        });
-    }
-
-    let conn = open_read()?;
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT chunk_id, ord, text
-        FROM chunks
-        WHERE doc_id = ?
-        ORDER BY ord ASC
-        "#,
-    )?;
-    let rows = stmt.query_map([doc_id], |row| {
-        Ok((
-            row.get::<_, i64>("chunk_id")?,
-            row.get::<_, i64>("ord")?,
-            row.get::<_, Vec<u8>>("text")?,
-        ))
-    })?;
-
-    struct ChunkText {
-        chunk_id: i64,
-        ord: i64,
-        original: String,
-        norm: String,
-        norm_to_orig: Vec<usize>,
-    }
-
-    let mut chunks: Vec<ChunkText> = Vec::new();
-    for row in rows {
-        let (chunk_id, ord, text_blob) = row?;
-        let original = decompress_text(text_blob)?;
-        let (norm, norm_to_orig) = normalise_with_offsets(&original, lowercase);
-        chunks.push(ChunkText {
-            chunk_id,
-            ord,
-            original,
-            norm,
-            norm_to_orig,
-        });
-    }
-
-    let mut matches: Vec<QuoteMatch> = Vec::new();
-    let mut truncated = false;
-
-    // Pass 1: within-chunk substring search.
-    for chunk in &chunks {
-        if matches.len() >= VERIFY_QUOTE_MAX_MATCHES {
-            truncated = true;
-            break;
-        }
-        let mut start_byte = 0usize;
-        while let Some(rel) = chunk.norm[start_byte..].find(&norm_quote) {
-            if matches.len() >= VERIFY_QUOTE_MAX_MATCHES {
-                truncated = true;
-                break;
-            }
-            let abs = start_byte + rel;
-            // Map normalised offset back to the original text.
-            let orig_offset = chunk
-                .norm_to_orig
-                .get(abs)
-                .copied()
-                .unwrap_or_else(|| chunk.original.chars().count());
-            // Length: walk to the end of the match in the normalised
-            // text, then map that offset back to the original.
-            let end_norm = abs + norm_quote.len();
-            let orig_end = chunk
-                .norm_to_orig
-                .get(end_norm)
-                .copied()
-                .unwrap_or_else(|| chunk.original.chars().count());
-            let char_length = orig_end.saturating_sub(orig_offset);
-            matches.push(QuoteMatch {
-                chunk_id: chunk.chunk_id,
-                ord: chunk.ord,
-                char_offset_in_chunk: orig_offset,
-                char_length,
-            });
-            start_byte = next_norm_search_start(&chunk.norm, abs);
-        }
-    }
-
-    // Pass 2: cross-chunk boundary search. For each pair (N, N+1) build
-    // chunk_N + " " + chunk_{N+1}[..VERIFY_QUOTE_BOUNDARY_OVERLAP] in
-    // normalised form, then search. Only emit matches that genuinely
-    // straddle the boundary.
-    if !truncated {
-        for window in chunks.windows(2) {
-            if matches.len() >= VERIFY_QUOTE_MAX_MATCHES {
-                truncated = true;
-                break;
-            }
-            let chunk_n = &window[0];
-            let chunk_n1 = &window[1];
-            // Build joined original text + map back. We insert a synthetic
-            // space at the join only when neither side already provides a
-            // boundary whitespace; otherwise consecutive non-whitespace
-            // bytes from the two chunks would merge into a single token.
-            let next_overlap_chars: String = chunk_n1
-                .original
-                .chars()
-                .take(VERIFY_QUOTE_BOUNDARY_OVERLAP)
-                .collect();
-            let needs_synthetic_space = !chunk_n.original.ends_with(char::is_whitespace)
-                && !next_overlap_chars.starts_with(char::is_whitespace);
-            // Track the character offset of any synthetic space we inject so
-            // we can subtract it back from char_length when computing a
-            // boundary-match span. Currently always at most one.
-            let mut synthetic_offsets: Vec<usize> = Vec::new();
-            let joined = if needs_synthetic_space {
-                synthetic_offsets.push(chunk_n.original.chars().count());
-                format!("{} {}", chunk_n.original, next_overlap_chars)
-            } else {
-                format!("{}{}", chunk_n.original, next_overlap_chars)
-            };
-            let (joined_norm, joined_map) = normalise_with_offsets(&joined, lowercase);
-            // The normalised offset that marks the END of chunk_n in the
-            // joined string: count normalised bytes up to chunk_n.original
-            // boundary by looking at joined_map.
-            let chunk_n_orig_end = chunk_n.original.chars().count();
-            // Find the largest normalised idx whose joined-original
-            // offset is < chunk_n_orig_end. That's the boundary in the
-            // normalised string.
-            let n_boundary_norm = joined_map
-                .iter()
-                .position(|&o| o >= chunk_n_orig_end)
-                .unwrap_or(joined_norm.len());
-
-            let mut start_byte = 0usize;
-            while let Some(rel) = joined_norm[start_byte..].find(&norm_quote) {
-                if matches.len() >= VERIFY_QUOTE_MAX_MATCHES {
-                    truncated = true;
-                    break;
-                }
-                let abs = start_byte + rel;
-                let end_norm = abs + norm_quote.len();
-                // Boundary-only: start strictly inside chunk_n AND end
-                // past chunk_n.
-                if abs < n_boundary_norm && end_norm > n_boundary_norm {
-                    let joined_orig_offset =
-                        joined_map.get(abs).copied().unwrap_or(chunk_n_orig_end);
-                    // Within chunk_n, the original offset is the same as
-                    // joined_orig_offset because chunk_n is the prefix
-                    // of `joined`.
-                    let char_offset_in_chunk = joined_orig_offset.min(chunk_n_orig_end);
-                    // Compute char_length in *joined* original; that's
-                    // the number of original chars spanned by the match,
-                    // minus any synthetic chars we inserted that fell
-                    // inside the matched span.
-                    let joined_orig_end = joined_map
-                        .get(end_norm)
-                        .copied()
-                        .unwrap_or_else(|| joined.chars().count());
-                    let raw_span = joined_orig_end.saturating_sub(joined_orig_offset);
-                    let synthetic_in_span = synthetic_offsets
-                        .iter()
-                        .filter(|&&off| off >= joined_orig_offset && off < joined_orig_end)
-                        .count();
-                    let char_length = raw_span.saturating_sub(synthetic_in_span);
-                    matches.push(QuoteMatch {
-                        chunk_id: chunk_n.chunk_id,
-                        ord: chunk_n.ord,
-                        char_offset_in_chunk,
-                        char_length,
-                    });
-                }
-                start_byte = next_norm_search_start(&joined_norm, abs);
-            }
-        }
-    }
-
-    let found = !matches.is_empty();
-    let body = json!({
-        "doc_id": doc_id,
-        "quote": quote,
-        "normalized_quote": norm_quote,
-        "found": found,
-        "matches": matches,
-        "meta": {
-            "truncated": truncated,
-            "case_sensitive": case_sensitive,
-        },
-    });
-
-    Ok(match format {
-        OutputFormat::Json => serde_json::to_string_pretty(&body)?,
-    })
-}
-
 fn tool_descriptors() -> JsonValue {
-    // [SW-01] Tool surface is deliberately limited to six explicit MCP tools.
+    // [SW-01] Seven MCP tools are exposed by tool_descriptors/call_tool: search,
+    // search_titles, get_document, get_chunks, get_definition, get_asset, stats.
+    //   The surface stays small and explicit; unsupported tools fail through the
+    //   normal tools/call error path.
     json!([
         {
             "name": "search",
@@ -5417,31 +4918,14 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_document",
-            "description": "Fetch the cleaned source HTML for a document. Internal ATO document links are data-doc-id attributes; retained images are data-asset-ref attributes.",
+            "description": "Fetch a document by doc_id. Default body is plaintext joined from the chunk pipeline (same text the agent sees in get_chunks; carries [doc:X]/[asset:X] annotations after a rebuild). Set as_html=true to receive the cleaned source HTML instead — internal ATO document links are data-doc-id attributes and retained images are data-asset-ref attributes. Pagination via from_char/max_chars applies to the selected body.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "doc_id": {"type": "string"},
-                    "format": {"type": "string", "enum": ["html", "json"]},
+                    "as_html": {"type": "boolean", "description": "When true, return the cleaned source HTML; default plaintext."},
                     "from_char": {"type": "integer"},
                     "max_chars": {"type": "integer"}
-                },
-                "required": ["doc_id"]
-            }
-        },
-        {
-            "name": "get_elements",
-            "description": "Select elements from a cleaned document HTML fragment by tag name, with optional attribute presence filtering.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "doc_id": {"type": "string"},
-                    "tags": {"type": "array", "items": {"type": "string"}},
-                    "attr": {"type": "string"},
-                    "from_ord": {"type": "integer"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
-                    "max_chars": {"type": "integer", "minimum": 1},
-                    "include_html": {"type": "boolean"}
                 },
                 "required": ["doc_id"]
             }
@@ -5484,20 +4968,6 @@ fn tool_descriptors() -> JsonValue {
                     "format": {"type": "string", "enum": ["json"], "default": "json"}
                 },
                 "required": ["term"]
-            }
-        },
-        {
-            "name": "verify_quote",
-            "description": "Verify a quoted passage exists verbatim (whitespace-tolerant) in a document. Returns chunk_id, ord, and character offsets for each match. Use to check whether the model actually quoted ATO material or hallucinated it.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "doc_id": {"type": "string"},
-                    "quote": {"type": "string"},
-                    "case_sensitive": {"type": "boolean"},
-                    "format": {"type": "string", "enum": ["json"], "default": "json"}
-                },
-                "required": ["doc_id", "quote"]
             }
         },
         {
@@ -5685,13 +5155,13 @@ mod tests {
         assert_eq!(rerank_head_count(50, 200), RERANK_CANDIDATE_LIMIT);
     }
 
-    // ----- W1.4 verify_quote -----
+    // ----- shared in-memory corpus helpers -----
 
     /// Build an in-memory test corpus, return the open Connection.
     fn make_test_db() -> Result<(tempfile::TempDir, std::path::PathBuf)> {
         // We can't easily reuse `db_path()` here without setting env vars
         // for the data dir. Instead we set ATO_MCP_DATA_DIR so init_db
-        // and verify_quote both target the same file.
+        // and the test target the same file.
         let dir = tempdir()?;
         let db_dir = dir.path().join("live");
         fs::create_dir_all(&db_dir)?;
@@ -5813,49 +5283,6 @@ mod tests {
         drop(conn);
 
         with_data_dir(dir.path(), || -> Result<()> {
-            let elements = get_elements(
-                "DOC_HTML",
-                vec!["h1".to_string(), "p".to_string()],
-                None,
-                0,
-                10,
-                10_000,
-                true,
-            )?;
-            let parsed: JsonValue = serde_json::from_str(&elements)?;
-            assert_eq!(parsed["elements"][0]["tag"], "h1");
-            assert_eq!(parsed["elements"][1]["text"], "See 203-55 .");
-
-            let links = get_elements(
-                "DOC_HTML",
-                vec!["a".to_string()],
-                Some("data-doc-id"),
-                0,
-                10,
-                10_000,
-                true,
-            )?;
-            let parsed: JsonValue = serde_json::from_str(&links)?;
-            assert_eq!(
-                parsed["elements"][0]["attrs"]["data-doc-id"],
-                "PAC/19970038/203-55"
-            );
-
-            let asset_elements = get_elements(
-                "DOC_HTML",
-                vec!["span".to_string()],
-                Some("data-asset-ref"),
-                0,
-                10,
-                10_000,
-                true,
-            )?;
-            let parsed: JsonValue = serde_json::from_str(&asset_elements)?;
-            assert_eq!(
-                parsed["elements"][0]["attrs"]["data-asset-ref"],
-                "ato-image://DOC_HTML/0"
-            );
-
             let asset = get_asset("ato-image://DOC_HTML/0")?;
             let parsed: JsonValue = serde_json::from_str(&asset)?;
             assert_eq!(parsed["title"], "Diagram");
@@ -5940,180 +5367,6 @@ mod tests {
         } else {
             std::env::remove_var("ATO_MCP_AUTO_UPDATE");
         }
-    }
-
-    #[test]
-    fn verify_quote_rejects_short() {
-        let result = verify_quote("DOC1", "tiny", false, OutputFormat::Json).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["found"], json!(false));
-        assert!(parsed["error"].as_str().unwrap().contains("too short"));
-    }
-
-    #[test]
-    fn verify_quote_finds_exact_match() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
-        insert_doc(&conn, "DOC1")?;
-        insert_chunk(
-            &conn,
-            1,
-            "DOC1",
-            0,
-            "The taxpayer is entitled to a deduction under section 8-1 of the ITAA 1997.",
-        )?;
-        drop(conn);
-        with_data_dir(dir.path(), || -> Result<()> {
-            let json_str = verify_quote(
-                "DOC1",
-                "entitled to a deduction under section 8-1 of the ITAA",
-                false,
-                OutputFormat::Json,
-            )?;
-            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-            assert_eq!(parsed["found"], json!(true));
-            assert_eq!(parsed["matches"].as_array().unwrap().len(), 1);
-            let m = &parsed["matches"][0];
-            assert_eq!(m["chunk_id"], json!(1));
-            assert_eq!(m["ord"], json!(0));
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    #[test]
-    fn verify_quote_tolerates_extra_whitespace() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
-        insert_doc(&conn, "DOC2")?;
-        insert_chunk(
-            &conn,
-            1,
-            "DOC2",
-            0,
-            "the cost of a defective building works report is deductible",
-        )?;
-        drop(conn);
-        with_data_dir(dir.path(), || -> Result<()> {
-            let json_str = verify_quote(
-                "DOC2",
-                "the   cost   of\n  a    defective\tbuilding works report",
-                false,
-                OutputFormat::Json,
-            )?;
-            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-            assert_eq!(parsed["found"], json!(true));
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    #[test]
-    fn verify_quote_finds_cross_chunk_match() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
-        insert_doc(&conn, "DOC3")?;
-        // The phrase "deductible under section 8-1" straddles the boundary.
-        insert_chunk(
-            &conn,
-            1,
-            "DOC3",
-            0,
-            "preceding text ending with deductible under",
-        )?;
-        insert_chunk(
-            &conn,
-            2,
-            "DOC3",
-            1,
-            "section 8-1 of the ITAA 1997 follows here",
-        )?;
-        drop(conn);
-        with_data_dir(dir.path(), || -> Result<()> {
-            let json_str = verify_quote(
-                "DOC3",
-                "deductible under section 8-1 of the ITAA",
-                false,
-                OutputFormat::Json,
-            )?;
-            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-            assert_eq!(parsed["found"], json!(true), "json={parsed}");
-            // Boundary match must report against chunk N (chunk_id=1).
-            let matches = parsed["matches"].as_array().unwrap();
-            assert_eq!(matches.len(), 1);
-            assert_eq!(matches[0]["chunk_id"], json!(1));
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    #[test]
-    fn verify_quote_rejects_modified_quote() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
-        insert_doc(&conn, "DOC4")?;
-        insert_chunk(
-            &conn,
-            1,
-            "DOC4",
-            0,
-            "the taxpayer is entitled to a deduction for the cost of a building",
-        )?;
-        drop(conn);
-        with_data_dir(dir.path(), || -> Result<()> {
-            let json_str = verify_quote(
-                "DOC4",
-                "the taxpayer is entitled to refund for the cost of a building",
-                false,
-                OutputFormat::Json,
-            )?;
-            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-            assert_eq!(parsed["found"], json!(false));
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    #[test]
-    fn verify_quote_case_sensitive_override() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
-        insert_doc(&conn, "DOC5")?;
-        insert_chunk(
-            &conn,
-            1,
-            "DOC5",
-            0,
-            "The taxpayer's R&D Tax Incentive claim was reviewed in detail by the ATO.",
-        )?;
-        drop(conn);
-        with_data_dir(dir.path(), || -> Result<()> {
-            // Case-insensitive (default) matches.
-            let ci = verify_quote(
-                "DOC5",
-                "the TAXPAYER's r&d tax incentive claim was reviewed",
-                false,
-                OutputFormat::Json,
-            )?;
-            let parsed_ci: serde_json::Value = serde_json::from_str(&ci)?;
-            assert_eq!(parsed_ci["found"], json!(true));
-            // Case-sensitive does not.
-            let cs = verify_quote(
-                "DOC5",
-                "the TAXPAYER's r&d tax incentive claim was reviewed",
-                true,
-                OutputFormat::Json,
-            )?;
-            let parsed_cs: serde_json::Value = serde_json::from_str(&cs)?;
-            assert_eq!(parsed_cs["found"], json!(false));
-            Ok(())
-        })?;
-        Ok(())
     }
 
     // ----- W1.5 manifest version guards -----
@@ -6293,166 +5546,6 @@ mod tests {
         );
     }
 
-    // ----- Cleanup: verify_quote 10-match cap -----
-
-    #[test]
-    fn verify_quote_caps_at_max_matches() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
-        insert_doc(&conn, "DOC_CAP")?;
-        // 25-char phrase repeated 11 times, separated so each occurrence
-        // is independently findable.
-        let phrase = "abcdefghijklmnopqrstuvwxy"; // 25 chars
-        let mut chunk_text = String::new();
-        for _ in 0..11 {
-            chunk_text.push_str(phrase);
-            chunk_text.push_str(" SEP ");
-        }
-        insert_chunk(&conn, 1, "DOC_CAP", 0, &chunk_text)?;
-        drop(conn);
-        with_data_dir(dir.path(), || -> Result<()> {
-            let json_str = verify_quote("DOC_CAP", phrase, false, OutputFormat::Json)?;
-            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-            assert_eq!(parsed["found"], json!(true));
-            let matches = parsed["matches"].as_array().unwrap();
-            assert_eq!(
-                matches.len(),
-                VERIFY_QUOTE_MAX_MATCHES,
-                "should be capped at VERIFY_QUOTE_MAX_MATCHES, got {}",
-                matches.len()
-            );
-            assert_eq!(
-                parsed["meta"]["truncated"],
-                json!(true),
-                "truncated flag must be set when cap reached"
-            );
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    // ----- Cleanup: verify_quote no-double-emit at chunk boundary -----
-
-    #[test]
-    fn verify_quote_does_not_double_emit_when_phrase_in_overlap() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
-        insert_doc(&conn, "DOC_NODUP")?;
-        // The phrase lives entirely inside chunk N. Pass 2 builds a join
-        // of chunk_N + first 200 chars of chunk_{N+1}; if the phrase is
-        // near the end of chunk_N, the joined string still contains it,
-        // but Pass 2 must NOT emit a duplicate match because the phrase
-        // does not actually straddle the boundary.
-        let phrase = "the quick brown fox jumps over"; // 30 chars
-        let chunk_n_text = format!(
-            "preamble {} trailing words go here for padding only",
-            phrase
-        );
-        insert_chunk(&conn, 1, "DOC_NODUP", 0, &chunk_n_text)?;
-        // chunk N+1: arbitrary continuation, irrelevant to the match.
-        insert_chunk(
-            &conn,
-            2,
-            "DOC_NODUP",
-            1,
-            "next chunk continues with completely different content",
-        )?;
-        drop(conn);
-        with_data_dir(dir.path(), || -> Result<()> {
-            let json_str = verify_quote("DOC_NODUP", phrase, false, OutputFormat::Json)?;
-            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-            assert_eq!(parsed["found"], json!(true));
-            let matches = parsed["matches"].as_array().unwrap();
-            assert_eq!(
-                matches.len(),
-                1,
-                "boundary overlap window must not double-emit a within-chunk match, got: {parsed}"
-            );
-            assert_eq!(matches[0]["chunk_id"], json!(1));
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    // ----- Cleanup: cross-chunk char_length must equal original char count -----
-
-    #[test]
-    fn verify_quote_cross_chunk_char_length_excludes_synthetic_space() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
-        insert_doc(&conn, "DOC_BNDLEN")?;
-        // Pick chunks whose join requires a synthetic space (neither side
-        // ends/starts with whitespace). Quote spans the boundary.
-        let chunk_n_text = "alpha beta gamma deductible under";
-        let chunk_n1_text = "section 8-1 of the ITAA delta epsilon";
-        insert_chunk(&conn, 1, "DOC_BNDLEN", 0, chunk_n_text)?;
-        insert_chunk(&conn, 2, "DOC_BNDLEN", 1, chunk_n1_text)?;
-        drop(conn);
-
-        // Quote: chars from end of chunk_n + chars from start of chunk_n1.
-        let chunk_n_match_tail = "deductible under";
-        let chunk_n1_match_head = "section 8-1 of the ITAA";
-        // The true original-character count of the match in the doc text:
-        // tail chars from chunk_n PLUS head chars from chunk_n1. There is
-        // no boundary character in the original — chunks are separate strings.
-        let expected_char_length =
-            chunk_n_match_tail.chars().count() + chunk_n1_match_head.chars().count();
-        // The quote we feed verify_quote needs to be searchable post-
-        // normalisation: include a single space to simulate the boundary.
-        let quote = format!("{} {}", chunk_n_match_tail, chunk_n1_match_head);
-        with_data_dir(dir.path(), || -> Result<()> {
-            let json_str = verify_quote("DOC_BNDLEN", &quote, false, OutputFormat::Json)?;
-            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-            assert_eq!(parsed["found"], json!(true), "json={parsed}");
-            let matches = parsed["matches"].as_array().unwrap();
-            assert_eq!(matches.len(), 1, "exactly one boundary match expected");
-            let m = &matches[0];
-            assert_eq!(m["chunk_id"], json!(1));
-            let char_length = m["char_length"].as_u64().unwrap() as usize;
-            assert_eq!(
-                char_length, expected_char_length,
-                "char_length should equal the original-text byte count of the match, with no synthetic-byte inflation"
-            );
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    #[test]
-    fn verify_quote_reports_character_offsets_for_non_ascii_text() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
-        insert_doc(&conn, "DOC_UNICODE")?;
-        let prefix = "éé abc ";
-        let phrase = "deductible under section 8-1 of the ITAA";
-        let text = format!("{prefix}{phrase} 1997");
-        insert_chunk(&conn, 1, "DOC_UNICODE", 0, &text)?;
-        drop(conn);
-
-        with_data_dir(dir.path(), || -> Result<()> {
-            let json_str = verify_quote("DOC_UNICODE", phrase, false, OutputFormat::Json)?;
-            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-            assert_eq!(parsed["found"], json!(true), "json={parsed}");
-            let m = &parsed["matches"].as_array().unwrap()[0];
-            assert_eq!(
-                m["char_offset_in_chunk"],
-                json!(prefix.chars().count()),
-                "offset must be in characters, not UTF-8 bytes"
-            );
-            assert_eq!(
-                m["char_length"],
-                json!(phrase.chars().count()),
-                "length must be in characters, not UTF-8 bytes"
-            );
-            Ok(())
-        })?;
-        Ok(())
-    }
-
     fn sha256_hex(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))
     }
@@ -6604,11 +5697,9 @@ mod tests {
             chunk_id: None,
             ord: None,
             next_call: None,
-            ranking: None,
             withdrawn_date: None,
             superseded_by: None,
             replaces: None,
-            reranker_score: None,
         };
         let json_str = serde_json::to_string(&hit)?;
         assert!(
@@ -6635,11 +5726,9 @@ mod tests {
             chunk_id: None,
             ord: None,
             next_call: None,
-            ranking: None,
             withdrawn_date: Some("2025-10-31".to_string()),
             superseded_by: Some("TR 2025/1".to_string()),
             replaces: Some("TR 2021/3".to_string()),
-            reranker_score: None,
         };
         let parsed: serde_json::Value = serde_json::from_str(&serde_json::to_string(&hit)?)?;
         assert_eq!(parsed["withdrawn_date"], json!("2025-10-31"));
@@ -7605,9 +6694,9 @@ mod tests {
 
     // ===== Wave 3-B Reranker ===============================================
 
-    /// Helper: build a hit with `reranker_score` already populated. Used
-    /// by the JSON-shape assertions below.
-    fn make_hit_with_reranker(score: Option<f64>) -> Hit {
+    /// Helper: build a Hit with the slim contract — no `ranking` block, no
+    /// `reranker_score`. Tests below pin that the wire shape stays slim.
+    fn make_test_hit(score: Option<f64>) -> Hit {
         Hit {
             doc_id: "DOC".to_string(),
             title: "T".to_string(),
@@ -7617,34 +6706,68 @@ mod tests {
             anchor: None,
             snippet: Some("snip".to_string()),
             canonical_url: "https://x".to_string(),
-            score: Some(0.5),
+            score,
             chunk_id: Some(1),
             ord: Some(0),
             next_call: None,
-            ranking: None,
             withdrawn_date: None,
             superseded_by: None,
             replaces: None,
-            reranker_score: score,
         }
     }
 
     #[test]
-    fn hit_json_skips_reranker_score_when_unset() {
-        let hit = make_hit_with_reranker(None);
+    fn hit_json_omits_ranking_block_and_reranker_score() {
+        let hit = make_test_hit(Some(0.5));
         let json_str = serde_json::to_string(&hit).unwrap();
         assert!(
+            !json_str.contains("\"ranking\""),
+            "slim Hit JSON must not carry a `ranking` field; got {json_str}"
+        );
+        assert!(
             !json_str.contains("reranker_score"),
-            "reranker_score should be omitted when None; json={json_str}"
+            "slim Hit JSON must not carry `reranker_score`; got {json_str}"
         );
     }
 
     #[test]
-    fn hit_json_emits_reranker_score_when_set() {
-        let hit = make_hit_with_reranker(Some(0.87));
+    fn hit_json_score_rounded_to_two_decimals() {
+        let hit = make_test_hit(Some(0.8851304670696148));
         let parsed: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&hit).unwrap()).unwrap();
-        assert_eq!(parsed["reranker_score"], json!(0.87));
+        assert_eq!(parsed["score"], json!(0.89));
+    }
+
+    #[test]
+    fn hit_json_score_null_when_unset() {
+        let hit = make_test_hit(None);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&hit).unwrap()).unwrap();
+        assert!(parsed["score"].is_null());
+    }
+
+    #[test]
+    fn normalise_hit_scores_maps_negative_bm25_into_unit_range() {
+        // BM25 emits negative numbers; min-max on -score puts the most
+        // relevant hit at 1.0 and the least at 0.0.
+        let mut hits = vec![
+            make_test_hit(Some(-13.6)),
+            make_test_hit(Some(-5.0)),
+            make_test_hit(Some(-9.2)),
+        ];
+        normalise_hit_scores(&mut hits);
+        assert_eq!(hits[0].score, Some(1.0));
+        assert_eq!(hits[1].score, Some(0.0));
+        let mid = hits[2].score.unwrap();
+        assert!(mid > 0.0 && mid < 1.0);
+    }
+
+    #[test]
+    fn normalise_hit_scores_no_op_when_all_non_negative() {
+        let mut hits = vec![make_test_hit(Some(0.92)), make_test_hit(Some(0.018))];
+        normalise_hit_scores(&mut hits);
+        assert_eq!(hits[0].score, Some(0.92));
+        assert_eq!(hits[1].score, Some(0.018));
     }
 
     #[test]
@@ -7903,36 +7026,19 @@ mod tests {
         Ok(())
     }
 
-    // ----- I3: reranker_score replaces hit.score for the top-N --------------
+    // ----- I3: reranker score becomes hit.score for top-N (slim contract) -----
     //
-    // W3-B-search-pipeline overwrites `hit.score` with the sigmoid'd
-    // reranker output for chunks in the rerank head. This is the deviation
-    // from "hit.score is always the RRF score" the reviewer flagged: tests
-    // need to pin the contract so a future refactor doesn't accidentally
-    // drift the head back to RRF (which would break recency-sort and
-    // dedup-tie-break, both of which rely on `hit.score` being the
-    // reranker value when it ran).
-    //
-    // We can't synthesize a real reranker invocation here (the model isn't
-    // bundled in unit-test fixtures), so this asserts the *invariant on the
-    // assembled JSON* — the production contract surface — by inserting two
-    // ranked hits and stuffing reranker scores into `reranker_scores` the
-    // same way the production code would, then driving the JSON assembly
-    // by hand to confirm `score == reranker_score == ranking.overall_score`
-    // for the head.
+    // The slim Hit contract (MT-04 + MT-04-slim) carries one composite
+    // `score` field — when the reranker ran for a chunk, that's the
+    // sigmoid score; otherwise it's the first-stage RRF/lexical/vector
+    // value (BM25 negatives are normalised by the search pipeline). This
+    // test pins the JSON surface so a future refactor can't reintroduce
+    // a `ranking` block or `reranker_score` companion field.
 
     #[test]
     fn reranker_score_replaces_score_for_top_n() {
-        // Build two hits: one in the rerank head with a sigmoid score
-        // (~0.92), one in the tail with a raw RRF score (~0.018). The
-        // production search() path:
-        //   1. overwrites head.score = reranker score  (line ~989)
-        //   2. records ranking.overall_score = head.score  (line ~1026)
-        //   3. populates hit.reranker_score = reranker score  (line ~1031)
-        //
-        // After that, all three values for the head must be identical.
         let head_score = 0.92_f64;
-        let mut head_hit = Hit {
+        let head_hit = Hit {
             doc_id: "DOC_HEAD".to_string(),
             title: "head doc".to_string(),
             doc_type: "Public_ruling".to_string(),
@@ -7945,17 +7051,12 @@ mod tests {
             chunk_id: Some(1),
             ord: Some(0),
             next_call: None,
-            ranking: Some(RankingDetails {
-                overall_score: Some(head_score),
-                ..Default::default()
-            }),
             withdrawn_date: None,
             superseded_by: None,
             replaces: None,
-            reranker_score: Some(head_score),
         };
 
-        // Tail hit: only RRF score, no reranker_score.
+        // Tail hit retains the first-stage score (RRF here).
         let tail_rrf = 0.018_f64;
         let tail_hit = Hit {
             doc_id: "DOC_TAIL".to_string(),
@@ -7970,44 +7071,23 @@ mod tests {
             chunk_id: Some(2),
             ord: Some(0),
             next_call: None,
-            ranking: Some(RankingDetails {
-                overall_score: Some(tail_rrf),
-                ..Default::default()
-            }),
             withdrawn_date: None,
             superseded_by: None,
             replaces: None,
-            reranker_score: None,
         };
 
         let head_json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&head_hit).unwrap()).unwrap();
-        // Head invariant: score == reranker_score == ranking.overall_score
-        assert_eq!(head_json["score"], json!(head_score));
-        assert_eq!(head_json["reranker_score"], json!(head_score));
-        assert_eq!(head_json["ranking"]["overall_score"], json!(head_score));
+        // Score is the (rounded) reranker value; no companion fields leak.
+        assert_eq!(head_json["score"], json!(0.92));
+        assert!(head_json.get("reranker_score").is_none());
+        assert!(head_json.get("ranking").is_none());
 
         let tail_json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&tail_hit).unwrap()).unwrap();
-        // Tail: hit.score is the RRF value, reranker_score is omitted entirely.
-        assert_eq!(tail_json["score"], json!(tail_rrf));
-        assert!(
-            tail_json.get("reranker_score").is_none()
-                || tail_json["reranker_score"] == serde_json::Value::Null,
-            "tail hit must omit reranker_score (the rerank stage didn't see it)"
-        );
-        assert_eq!(tail_json["ranking"]["overall_score"], json!(tail_rrf));
-
-        // Touch the head's struct directly so a future refactor that
-        // splits the score field gets caught at compile time, not at the
-        // JSON level.
-        head_hit.reranker_score = Some(head_score);
-        assert_eq!(head_hit.score, Some(head_score));
-        assert_eq!(head_hit.reranker_score, Some(head_score));
-        assert_eq!(
-            head_hit.ranking.as_ref().and_then(|r| r.overall_score),
-            Some(head_score)
-        );
+        assert_eq!(tail_json["score"], json!(0.02));
+        assert!(tail_json.get("reranker_score").is_none());
+        assert!(tail_json.get("ranking").is_none());
     }
 
     // ----- I3: dedup behaviour at the mixed-scale boundary ------------------

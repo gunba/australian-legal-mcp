@@ -3,7 +3,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ato_mcp.indexer.extract import CurrencyInfo, extract, extract_currency
+from ato_mcp.indexer.extract import (
+    CurrencyInfo,
+    _doc_id_from_ato_link,
+    extract,
+    extract_currency,
+)
 
 
 def test_extract_law_contents_div() -> None:
@@ -268,7 +273,11 @@ def test_extract_rewrites_images_to_asset_refs(tmp_path: Path) -> None:
     assert len(doc.assets) == 1
     assert doc.assets[0].asset_ref == "ato-image://A%2FB%2FC/0"
     assert 'data-asset-ref="ato-image://A%2FB%2FC/0"' in doc.html
-    assert "[image: Annual amount formula]" in doc.text
+    # Plaintext drops the [image: alt] wrapper and emits the asset_ref marker
+    # so agents reading chunks can call get_asset directly.
+    assert "[asset:ato-image://A%2FB%2FC/0]" in doc.text
+    assert "[image: Annual amount formula]" not in doc.text
+    assert "Annual amount formula" not in doc.text
     assert "![" not in doc.text
     assert "View history note" not in doc.html
 
@@ -632,3 +641,69 @@ def test_extract_currency_title_suffix_does_not_override_real_date() -> None:
     """
     info = extract_currency(html)
     assert info.withdrawn_date == "1994-04-14"
+
+
+def test_doc_id_parser_handles_view_htm_variants() -> None:
+    """Live corpus carries pre-SPA `view.htm` URLs in three host shapes —
+    all three must resolve to the same doc_id rather than slipping through
+    as raw hrefs."""
+    cases = [
+        ("https://www.ato.gov.au/law/view/view.htm?docid=TXR/TR200416/NAT/ATO", "TXR/TR200416/NAT/ATO"),
+        ("http://law.ato.gov.au/view.htm?DocID=PSR/PS19981/NAT/ATO/00001", "PSR/PS19981/NAT/ATO/00001"),
+        ("http://law.ato.gov.au/atolaw/view.htm?DocID=TXR/TR200113/NAT/ATO/00001", "TXR/TR200113/NAT/ATO/00001"),
+        ("http://ato.gov.au/law/view.htm?DocID=PSR/PS201112/NAT/ATO/00001", "PSR/PS201112/NAT/ATO/00001"),
+    ]
+    for url, expected in cases:
+        assert _doc_id_from_ato_link(url) == expected, url
+
+
+def test_doc_id_parser_handles_pit_query_alongside_docid() -> None:
+    """The legacy `&PiT=…` archived-as-of timestamp must not block parsing —
+    only the docid value is taken."""
+    url = "http://law.ato.gov.au/atolaw/view.htm?Docid=JUD/2008ATC20-048/00001&PiT=99991231235958"
+    assert _doc_id_from_ato_link(url) == "JUD/2008ATC20-048/00001"
+
+
+def test_doc_id_parser_handles_quoted_urlencoded_value() -> None:
+    """Some links wrap the doc id in URL-encoded quotes (`%22…%22`) — those
+    quotes must be stripped, mirroring the existing /law/view/document path."""
+    url = 'https://www.ato.gov.au/law/view/view.htm?docid=%22OPS%2FLI202520%2F00001%22'
+    assert _doc_id_from_ato_link(url) == "OPS/LI202520/00001"
+
+
+def test_doc_id_parser_handles_spa_fragment_form() -> None:
+    """SPA-style URLs encode the doc id in the URL fragment (after `#`),
+    which urlparse otherwise hides from query parsing."""
+    cases = [
+        ("https://www.ato.gov.au/law/#Law/table-of-contents?locid=NEM/EM200558/NAT/ATO", "NEM/EM200558/NAT/ATO"),
+        ("https://www.ato.gov.au/single-page-applications/legaldatabase/#Law/table-of-contents?docid=TPA/TA20253", "TPA/TA20253"),
+    ]
+    for url, expected in cases:
+        assert _doc_id_from_ato_link(url) == expected, url
+
+
+def test_doc_id_parser_rejects_spa_category_links() -> None:
+    """Trailing `?` is the SPA category-browser flag (e.g. `docid=tpa?`,
+    `locid=rtf/sca?`) — these point at a category, not a specific doc, so
+    they must NOT be emitted as cross-references."""
+    cases = [
+        "https://www.ato.gov.au/law/#Law/table-of-contents?docid=tpa?",
+        "https://www.ato.gov.au/law/#Law/table-of-contents?locid=rtf/sca?",
+        "https://www.ato.gov.au/law/#Law/table-of-contents?category=ZG",
+        "https://www.ato.gov.au/single-page-applications/legaldatabase#Law/table-of-contents",
+    ]
+    for url in cases:
+        assert _doc_id_from_ato_link(url) is None, url
+
+
+def test_doc_id_parser_rejects_non_doc_ato_pages() -> None:
+    """Marketing/info pages on ato.gov.au must not be mistaken for doc links."""
+    cases = [
+        "http://www.ato.gov.au",
+        "https://www.ato.gov.au/About-ATO/Commitments-and-reporting/",
+        "https://www.ato.gov.au/Rates/Division-7A---benchmark-interest-rate/",
+        "https://www.ato.gov.au/law/view/pdf/inow/inow1234.pdf",
+        "https://example.com/foo",
+    ]
+    for url in cases:
+        assert _doc_id_from_ato_link(url) is None, url

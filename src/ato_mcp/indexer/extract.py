@@ -544,21 +544,57 @@ def _drop_attr(node: Node, attr: str) -> None:
         pass
 
 
+_ATO_DOC_PATH_HINTS = (
+    "/law/view/document",
+    "/law/view/view.htm",
+    "/law/view.htm",
+    "/atolaw/view.htm",
+    "/view.htm",
+)
+
+
+def _docid_from_query_string(query: str) -> str | None:
+    # Case-insensitive lookup over docid / locid in any quote casing the ATO
+    # has shipped: docid, DocID, Docid, LocID, locid, etc.
+    for key, values in parse_qs(query).items():
+        if key.lower() in ("docid", "locid") and values:
+            return values[0]
+    return None
+
+
 def _doc_id_from_ato_link(target: str) -> str | None:
     target = target.strip()
     if target.startswith("<") and target.endswith(">"):
         target = target[1:-1]
     if " " in target:
         target = target.split(" ", 1)[0]
-    if not ("/law/view/document" in target or "ato.gov.au/law/view/document" in target):
-        return None
     parsed = urlparse(target)
-    query = parse_qs(parsed.query)
-    raw = (query.get("docid") or query.get("DocID") or query.get("LocID") or query.get("locid"))
+    host = (parsed.hostname or "").lower()
+    path_lower = parsed.path.lower()
+    is_ato_host = host.endswith("ato.gov.au")
+    has_ato_path = any(hint in path_lower for hint in _ATO_DOC_PATH_HINTS)
+    if not (is_ato_host or has_ato_path):
+        return None
+    raw = _docid_from_query_string(parsed.query)
+    if raw is None and parsed.fragment:
+        # SPA-style URLs hide the doc id in the fragment, e.g.
+        # `/law/#Law/table-of-contents?docid=X` or
+        # `/single-page-applications/legaldatabase/#Law/table-of-contents?docid=X`.
+        if "?" in parsed.fragment:
+            _, _, frag_query = parsed.fragment.partition("?")
+            raw = _docid_from_query_string(frag_query)
     if not raw:
         return None
-    doc_id = unquote(raw[0]).strip().strip('"')
-    return doc_id or None
+    # SPA category links carry a trailing `?` flag (e.g. `docid=tpa?`,
+    # `locid=rtf/sca?`) and point to the category browser rather than to a
+    # specific document — drop those entirely instead of emitting a bogus id.
+    if raw.endswith("?"):
+        return None
+    doc_id = unquote(raw).strip().strip('"')
+    # Real ATO doc ids always contain a `/` (e.g. TXR/TR.../NAT/ATO).
+    if not doc_id or "/" not in doc_id:
+        return None
+    return doc_id
 
 
 def _collect_anchors(node: Node) -> list[tuple[str, str]]:

@@ -18,7 +18,6 @@ external URL recorded in the release manifest.
 | `search` | Hybrid semantic-plus-lexical search over the GPU-built corpus. Defaults exclude Edited Private Advice and very old non-legislation content. |
 | `search_titles` | Fast title lookup, plus exact `doc_id` and ATO document-link lookup. |
 | `get_document` | Fetch cleaned source HTML for a document. Internal ATO document links are `data-doc-id` attributes. |
-| `get_elements` | Select headings, paragraphs, tables, links, or asset references from cleaned HTML by tag and optional attribute. |
 | `get_asset` | Resolve a retained image `data-asset-ref` to a local file path and source metadata. |
 | `get_chunks` | Fetch exact chunks returned by `search`, with optional neighbor context. |
 | `get_definition` | Fetch compact statutory definitions for a term, with labelled ordinary-meaning fallback when no statutory definition is found. |
