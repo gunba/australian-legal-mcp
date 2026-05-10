@@ -7,7 +7,7 @@ from typing import Literal
 
 from ..util import paths
 
-SCHEMA_VERSION = "7"
+SCHEMA_VERSION = "8"
 EMBEDDING_DIM = 256
 EMBEDDING_DTYPE = "int8"
 

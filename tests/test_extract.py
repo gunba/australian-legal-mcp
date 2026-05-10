@@ -661,7 +661,8 @@ def test_doc_id_parser_handles_view_htm_variants() -> None:
 def test_doc_id_parser_extracts_pit_alongside_docid() -> None:
     """The `&PiT=…` archived-as-of timestamp identifies a historical version.
     Both the docid and the PiT timestamp should be returned so the caller can
-    construct a versioned doc_id (`<base>@<PiT>`)."""
+    record the timestamp on the resulting anchor (the corpus does not store
+    historical content as separate doc rows)."""
     url = "http://law.ato.gov.au/atolaw/view.htm?Docid=JUD/2008ATC20-048/00001&PiT=99991231235958"
     assert _doc_id_from_ato_link(url) == ("JUD/2008ATC20-048/00001", "99991231235958")
 

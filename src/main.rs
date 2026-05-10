@@ -140,9 +140,6 @@ enum Command {
         /// Include withdrawn / superseded rulings (default excludes them).
         #[arg(long)]
         include_withdrawn: bool,
-        /// Include historical (point-in-time) versions (default excludes them).
-        #[arg(long)]
-        include_historical: bool,
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
@@ -158,9 +155,6 @@ enum Command {
         /// Include withdrawn / superseded rulings (default excludes them).
         #[arg(long)]
         include_withdrawn: bool,
-        /// Include historical (point-in-time) versions (default excludes them).
-        #[arg(long)]
-        include_historical: bool,
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
@@ -256,7 +250,6 @@ fn main() -> Result<()> {
             sort_by,
             include_old,
             include_withdrawn,
-            include_historical,
             format,
         } => {
             let types = empty_vec_as_none(types);
@@ -279,7 +272,6 @@ fn main() -> Result<()> {
                     sort_by,
                     include_old,
                     current_only: !include_withdrawn,
-                    include_historical,
                     format,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
@@ -294,7 +286,6 @@ fn main() -> Result<()> {
             types,
             include_old,
             include_withdrawn,
-            include_historical,
             format,
         } => {
             let types = empty_vec_as_none(types);
@@ -306,7 +297,6 @@ fn main() -> Result<()> {
                     types.as_deref(),
                     include_old,
                     !include_withdrawn,
-                    include_historical,
                     format,
                 )?
             );
@@ -537,16 +527,11 @@ fn init_db(conn: &Connection) -> Result<()> {
             replaces         TEXT,
             has_in_doc_links INTEGER NOT NULL DEFAULT 0,
             has_related_docs INTEGER NOT NULL DEFAULT 0,
-            has_history      INTEGER NOT NULL DEFAULT 0,
-            parent_doc_id    TEXT,
-            pit_timestamp    TEXT,
-            is_historical    INTEGER NOT NULL DEFAULT 0
+            has_history      INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_doc_type ON documents(type);
         CREATE INDEX IF NOT EXISTS idx_doc_date ON documents(date);
         CREATE INDEX IF NOT EXISTS idx_doc_withdrawn ON documents(withdrawn_date);
-        CREATE INDEX IF NOT EXISTS idx_doc_parent ON documents(parent_doc_id);
-        CREATE INDEX IF NOT EXISTS idx_doc_historical ON documents(is_historical);
 
         CREATE TABLE IF NOT EXISTS chunks (
             chunk_id      INTEGER PRIMARY KEY,
@@ -703,7 +688,6 @@ fn build_doc_filter(
     doc_scope: Option<&str>,
     include_old: bool,
     current_only: bool,
-    include_historical: bool,
 ) -> SqlFilter {
     // [MT-10] Default search policy excludes EPA and old non-legislation unless overridden.
     let mut clauses = Vec::new();
@@ -755,12 +739,6 @@ fn build_doc_filter(
         // default. Callers that explicitly want the historical/withdrawn
         // material pass current_only=false.
         clauses.push(format!("{alias}.withdrawn_date IS NULL"));
-    }
-    if !include_historical {
-        // Default search excludes point-in-time historical versions.
-        // Callers that want earlier published versions pass
-        // include_historical=true.
-        clauses.push(format!("{alias}.is_historical = 0"));
     }
 
     SqlFilter {
@@ -872,10 +850,6 @@ struct SearchOptions<'a> {
     /// `withdrawn_date`, `superseded_by`, and `replaces` fields on the
     /// hit and can decide whether the source still applies.
     current_only: bool,
-    /// When false (default), historical (point-in-time) versions are
-    /// excluded from results. Set true to include earlier published
-    /// versions of documents alongside the current version.
-    include_historical: bool,
     format: OutputFormat,
     /// Internal-only: maximum chunks returned per document. Capped at
     /// `HARD_MAX_PER_DOC`. NOT exposed in the MCP tool descriptor for
@@ -1007,7 +981,6 @@ fn search(
         opts.doc_scope,
         opts.include_old,
         opts.current_only,
-        opts.include_historical,
     );
     // [MT-02] k is clamped, first-stage recall is widened, then candidates dedupe per document.
     let internal_limit = std::cmp::max(k * 5, 50);
@@ -1319,9 +1292,6 @@ fn search_next_call(query: &str, k: usize, opts: &SearchOptions<'_>) -> String {
     }
     if !opts.current_only {
         args.push("current_only=false".to_string());
-    }
-    if opts.include_historical {
-        args.push("include_historical=true".to_string());
     }
     format!("search({})", args.join(", "))
 }
@@ -2262,7 +2232,6 @@ fn search_titles(
     types: Option<&[String]>,
     include_old: bool,
     current_only: bool,
-    include_historical: bool,
     format: OutputFormat,
 ) -> Result<String> {
     // [MT-14] search_titles ranks title_fts independently and uses the same default filters.
@@ -2276,7 +2245,6 @@ fn search_titles(
         None,
         include_old,
         current_only,
-        include_historical,
     );
     let direct_hits = direct_title_hits(&conn, query, k, &filter)?;
     let where_filter = if filter.sql.is_empty() {
@@ -4225,13 +4193,6 @@ struct PackRecord {
     has_related_docs: i64,
     #[serde(default)]
     has_history: i64,
-    /// Historical-version (point-in-time) markers.
-    #[serde(default)]
-    parent_doc_id: Option<String>,
-    #[serde(default)]
-    pit_timestamp: Option<String>,
-    #[serde(default)]
-    is_historical: i64,
     /// Per-doc navigation anchors emitted by the build pipeline; ingested
     /// straight into the doc_anchors table.
     #[serde(default)]
@@ -4333,9 +4294,8 @@ fn insert_record(
         INSERT OR REPLACE INTO documents
             (doc_id, type, title, date, downloaded_at, content_hash, pack_sha8,
              html, withdrawn_date, superseded_by, replaces,
-             has_in_doc_links, has_related_docs, has_history,
-             parent_doc_id, pit_timestamp, is_historical)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             has_in_doc_links, has_related_docs, has_history)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
         params![
             record.doc_id,
@@ -4352,9 +4312,6 @@ fn insert_record(
             record.has_in_doc_links,
             record.has_related_docs,
             record.has_history,
-            record.parent_doc_id,
-            record.pit_timestamp,
-            record.is_historical,
         ],
     )?;
     write_record_assets(conn, record, asset_root)?;
@@ -4641,7 +4598,6 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
                     sort_by,
                     include_old: optional_bool(&args, "include_old").unwrap_or(false),
                     current_only: optional_bool(&args, "current_only").unwrap_or(true),
-                    include_historical: optional_bool(&args, "include_historical").unwrap_or(false),
                     format,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: optional_bool(&args, "include_snippet").unwrap_or(true),
@@ -4658,7 +4614,6 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
                 types.as_deref(),
                 optional_bool(&args, "include_old").unwrap_or(false),
                 optional_bool(&args, "current_only").unwrap_or(true),
-                optional_bool(&args, "include_historical").unwrap_or(false),
                 output_format_arg(&args)?,
             )?
         }
@@ -5038,6 +4993,10 @@ fn get_doc_anchors(doc_id: &str) -> Result<String> {
                     entry.insert("label".to_string(), JsonValue::String(label));
                     entry.insert("doc_id".to_string(), JsonValue::String(target));
                     if let Some(pit) = target_pit.as_deref() {
+                        entry.insert(
+                            "pit".to_string(),
+                            JsonValue::String(pit.to_string()),
+                        );
                         if let Some(date) = pit_to_date(pit) {
                             entry.insert("date".to_string(), JsonValue::String(date));
                         }
@@ -5064,7 +5023,7 @@ fn server_instructions() -> String {
         .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
     {
         Some(s) => format!(
-            "ATO legal corpus. Documents: {}, chunks: {}. Index: {}. Navigate via search → get_chunks: search returns slim hits (chunk_id, doc_id, ord, anchor, score, optional snippet); get_chunks fetches bodies by chunk_id with before/after ordinal neighbours within the same doc. doc_scope accepts a single full doc_id for in-doc search or \"<PREFIX>/%\" for a family (see stats). Default search excludes Edited_private_advice, withdrawn rulings, historical (point-in-time) versions, and content dated before {} except legislation; override with current_only=false, include_historical=true, and include_old=true. Slim hits surface has_in_doc_links / has_related_docs / has_history flags when calling get_doc_anchors(doc_id) would yield useful navigation entries.",
+            "ATO legal corpus. Documents: {}, chunks: {}. Index: {}. Navigate via search → get_chunks: search returns slim hits (chunk_id, doc_id, ord, anchor, score, optional snippet); get_chunks fetches bodies by chunk_id with before/after ordinal neighbours within the same doc. doc_scope accepts a single full doc_id for in-doc search or \"<PREFIX>/%\" for a family (see stats). Default search excludes Edited_private_advice, withdrawn rulings, and content dated before {} except legislation; override with current_only=false and include_old=true. Slim hits surface has_in_doc_links / has_related_docs / has_history flags when calling get_doc_anchors(doc_id) would yield useful navigation entries. Historical (point-in-time) versions of documents are not stored as separate rows; get_doc_anchors lists them as {{doc_id, pit, date}} entries so an agent can fetch the older URL externally.",
             s["documents"].as_i64().unwrap_or(0),
             s["chunks"].as_i64().unwrap_or(0),
             s["index_version"].as_str().unwrap_or("?"),
@@ -5083,7 +5042,7 @@ fn tool_descriptors() -> JsonValue {
     json!([
         {
             "name": "search",
-            "description": "Hybrid semantic+lexical search over chunks (chunk-level). Returns slim pointer hits (chunk_id, doc_id, ord, anchor, score, optional snippet) — fetch bodies via get_chunks. doc_scope filters by full doc_id (in-doc search) or \"<PREFIX>/%\" (family). mode=keyword forces lexical-only; hybrid/vector require the semantic index. Set include_snippet=false when the caller will follow up with get_chunks. Slim hits include navigation hints: has_in_doc_links (doc has paragraph anchors / contents entries — call get_doc_anchors to navigate), has_related_docs (doc has companion documents like errata / addenda), has_history (doc has earlier point-in-time versions). Default search excludes historical versions; set include_historical=true to include them.",
+            "description": "Hybrid semantic+lexical search over chunks (chunk-level). Returns slim pointer hits (chunk_id, doc_id, ord, anchor, score, optional snippet) — fetch bodies via get_chunks. doc_scope filters by full doc_id (in-doc search) or \"<PREFIX>/%\" (family). mode=keyword forces lexical-only; hybrid/vector require the semantic index. Set include_snippet=false when the caller will follow up with get_chunks. Slim hits include navigation hints: has_in_doc_links (doc has paragraph anchors / contents entries — call get_doc_anchors to navigate), has_related_docs (doc has companion documents like errata / addenda), has_history (doc has earlier point-in-time versions — get_doc_anchors lists their URLs).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5097,7 +5056,6 @@ fn tool_descriptors() -> JsonValue {
                     "sort_by": {"type": "string", "enum": ["relevance", "recency"]},
                     "include_old": {"type": "boolean"},
                     "current_only": {"type": "boolean", "description": "When true (default), excludes withdrawn rulings. Set false to include withdrawn material with a visible marker."},
-                    "include_historical": {"type": "boolean", "description": "When false (default), excludes historical (point-in-time) versions from results. Set true to include earlier published versions of documents."},
                     "include_snippet": {"type": "boolean", "description": "When true (default), each hit carries a BM25-windowed snippet. Set false to omit the snippet field entirely — useful when the caller will fetch full text via get_chunks."},
                     "format": {"type": "string", "enum": ["json"], "default": "json"}
                 },
@@ -5106,7 +5064,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "search_titles",
-            "description": "Title-only search returning doc-level hits (no chunk_id/ord). Use search for chunk-level results. Accepts exact doc_id and ATO document-link lookup. Hits include navigation hints (has_in_doc_links, has_related_docs, has_history) — call get_doc_anchors(doc_id) to navigate. Default search excludes historical versions; set include_historical=true to include earlier published versions.",
+            "description": "Title-only search returning doc-level hits (no chunk_id/ord). Use search for chunk-level results. Accepts exact doc_id and ATO document-link lookup. Hits include navigation hints (has_in_doc_links, has_related_docs, has_history) — call get_doc_anchors(doc_id) to navigate.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5115,7 +5073,6 @@ fn tool_descriptors() -> JsonValue {
                     "types": {"type": "array", "items": {"type": "string"}},
                     "include_old": {"type": "boolean"},
                     "current_only": {"type": "boolean", "description": "When true (default), excludes withdrawn rulings. Set false to include withdrawn material with a visible marker."},
-                    "include_historical": {"type": "boolean", "description": "When false (default), excludes historical (point-in-time) versions from results. Set true to include earlier published versions of documents."},
                     "format": {"type": "string", "enum": ["json"], "default": "json"}
                 },
                 "required": ["query"]
@@ -5148,7 +5105,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_doc_anchors",
-            "description": "Return the navigation map for a document: in-doc anchors (paragraph references, contents-table entries), sister documents (errata, addenda), and historical versions (point-in-time snapshots). Slim search hits surface `has_in_doc_links`, `has_related_docs`, or `has_history` flags when this tool would return useful entries — call it then to navigate. The `in_doc` array gives chunk_ids you can pass to get_chunks; `related_docs` and `historical_versions` give doc_ids you can pass to search or get_document.",
+            "description": "Return the navigation map for a document: in-doc anchors (paragraph references, contents-table entries), sister documents (errata, addenda), and historical versions (point-in-time URLs). Slim search hits surface `has_in_doc_links`, `has_related_docs`, or `has_history` flags when this tool would return useful entries — call it then to navigate. The `in_doc` array gives chunk_ids you can pass to get_chunks; `related_docs` give doc_ids you can pass to search or get_document. `historical_versions` entries carry {doc_id (the BASE doc_id of the document), pit (timestamp), date}; the corpus does not store historical content as separate rows, so use these to fetch the older version externally when needed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5833,7 +5790,7 @@ mod tests {
 
     #[test]
     fn build_doc_filter_includes_withdrawn_clause_by_default() {
-        let f = build_doc_filter("d", None, None, None, None, true, true, false);
+        let f = build_doc_filter("d", None, None, None, None, true, true);
         assert!(
             f.sql.contains("d.withdrawn_date IS NULL"),
             "current_only=true must add withdrawn_date IS NULL clause; sql={}",
@@ -5843,7 +5800,7 @@ mod tests {
 
     #[test]
     fn build_doc_filter_omits_withdrawn_clause_when_disabled() {
-        let f = build_doc_filter("d", None, None, None, None, true, false, false);
+        let f = build_doc_filter("d", None, None, None, None, true, false);
         assert!(
             !f.sql.contains("withdrawn_date"),
             "current_only=false must not mention withdrawn_date; sql={}",
@@ -5863,7 +5820,6 @@ mod tests {
             sort_by: SortBy::Relevance,
             include_old: false,
             current_only: false,
-            include_historical: false,
             format: OutputFormat::Json,
             max_per_doc: DEFAULT_MAX_PER_DOC,
             include_snippet: true,
@@ -5985,7 +5941,6 @@ mod tests {
                 None,
                 true, // include_old (date filter doesn't apply since title query)
                 true, // current_only
-                false, // include_historical
                 OutputFormat::Json,
             )?;
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
@@ -6012,7 +5967,6 @@ mod tests {
                 None,
                 true,
                 false, // current_only off
-                false, // include_historical
                 OutputFormat::Json,
             )?;
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
@@ -6078,7 +6032,6 @@ mod tests {
                 None,
                 false,
                 true,
-                false,
                 OutputFormat::Json,
             )?;
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
@@ -6089,7 +6042,6 @@ mod tests {
                 None,
                 false,
                 true,
-                false,
                 OutputFormat::Json,
             )?;
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
@@ -6305,9 +6257,6 @@ mod tests {
             has_in_doc_links: 0,
             has_related_docs: 0,
             has_history: 0,
-            parent_doc_id: None,
-            pit_timestamp: None,
-            is_historical: 0,
             anchors: Vec::new(),
             definitions: Vec::new(),
             assets: Vec::new(),
@@ -6335,9 +6284,6 @@ mod tests {
             has_in_doc_links: 0,
             has_related_docs: 0,
             has_history: 0,
-            parent_doc_id: None,
-            pit_timestamp: None,
-            is_historical: 0,
             anchors: Vec::new(),
             definitions: Vec::new(),
             assets: vec![PackAsset {
@@ -6431,7 +6377,6 @@ mod tests {
                     sort_by: SortBy::Relevance,
                     include_old: true,
                     current_only: true,
-                    include_historical: false,
                     format: OutputFormat::Json,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
@@ -6469,7 +6414,6 @@ mod tests {
                     sort_by: SortBy::Relevance,
                     include_old: true,
                     current_only: false,
-                    include_historical: false,
                     format: OutputFormat::Json,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
@@ -6501,7 +6445,7 @@ mod tests {
         Ok(())
     }
 
-    // ----- Wave 4 navigation flags + doc anchors + include_historical -----
+    // ----- Wave 4 navigation flags + doc anchors -----
 
     /// Test helper: insert a document row with the navigation flags set.
     fn insert_doc_with_nav_flags(
@@ -6523,31 +6467,6 @@ mod tests {
                 has_in_doc,
                 has_related,
                 has_history,
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Test helper: insert a document row with historical-version markers.
-    fn insert_historical_doc(
-        conn: &Connection,
-        doc_id: &str,
-        is_historical: i64,
-        parent_doc_id: Option<&str>,
-        pit_timestamp: Option<&str>,
-    ) -> Result<()> {
-        conn.execute(
-            "INSERT INTO documents(doc_id, type, title, downloaded_at, content_hash, pack_sha8, html, parent_doc_id, pit_timestamp, is_historical) \
-             VALUES (?, 'Public_ruling', ?, ?, ?, '00000000', ?, ?, ?, ?)",
-            params![
-                doc_id,
-                format!("{doc_id} title"),
-                Utc::now().to_rfc3339(),
-                "deadbeef",
-                compress_text("<div></div>")?,
-                parent_doc_id,
-                pit_timestamp,
-                is_historical,
             ],
         )?;
         Ok(())
@@ -6581,7 +6500,6 @@ mod tests {
                     sort_by: SortBy::Relevance,
                     include_old: false,
                     current_only: true,
-                    include_historical: false,
                     format: OutputFormat::Json,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
@@ -6622,6 +6540,8 @@ mod tests {
             "INSERT INTO doc_anchors(doc_id, ord, kind, label, target_chunk_id, target_doc_id, target_pit) VALUES (?, ?, 'sister', 'Errata', NULL, ?, NULL)",
             params!["DOC_ANCHORS", 1_i64, "DOC_SISTER"],
         )?;
+        // History anchor target_doc_id is the BASE doc_id; the timestamp
+        // travels alongside in target_pit.
         conn.execute(
             "INSERT INTO doc_anchors(doc_id, ord, kind, label, target_chunk_id, target_doc_id, target_pit) VALUES (?, ?, 'history', 'Earlier version', NULL, ?, ?)",
             params!["DOC_ANCHORS", 2_i64, "DOC_HISTORY", "20200101000000"],
@@ -6642,7 +6562,10 @@ mod tests {
             assert_eq!(related[0]["doc_id"], json!("DOC_SISTER"));
             assert_eq!(related[0]["label"], json!("Errata"));
             assert_eq!(history.len(), 1);
+            // doc_id is the BASE doc_id; pit carries the timestamp; date is
+            // derived from pit.
             assert_eq!(history[0]["doc_id"], json!("DOC_HISTORY"));
+            assert_eq!(history[0]["pit"], json!("20200101000000"));
             assert_eq!(history[0]["label"], json!("Earlier version"));
             assert_eq!(history[0]["date"], json!("2020-01-01"));
             Ok(())
@@ -6667,109 +6590,11 @@ mod tests {
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
             let history = parsed["historical_versions"].as_array().unwrap();
             assert_eq!(history.len(), 1);
+            // Base doc_id is preserved; the timestamp is exposed separately
+            // on the response so the agent can construct the external URL.
+            assert_eq!(history[0]["doc_id"], json!("TR_1996_X"));
+            assert_eq!(history[0]["pit"], json!("19960320000001"));
             assert_eq!(history[0]["date"], json!("1996-03-20"));
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_search_default_excludes_historical() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
-        // Two docs sharing keyword content. One is the live version, one
-        // is a historical PiT snapshot.
-        insert_historical_doc(&conn, "DOC_LIVE", 0, None, None)?;
-        insert_historical_doc(
-            &conn,
-            "DOC_PIT@19960320000000",
-            1,
-            Some("DOC_LIVE"),
-            Some("19960320000000"),
-        )?;
-        let text = "depreciation effective life schedule for plant.";
-        insert_chunk(&conn, 1, "DOC_LIVE", 0, text)?;
-        insert_chunk(&conn, 2, "DOC_PIT@19960320000000", 0, text)?;
-        conn.execute(
-            "INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)",
-            params![1_i64, text],
-        )?;
-        conn.execute(
-            "INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)",
-            params![2_i64, text],
-        )?;
-        drop(conn);
-
-        with_data_dir(dir.path(), || -> Result<()> {
-            // Default include_historical=false → only the live doc.
-            let json_str = search(
-                "depreciation",
-                SearchOptions {
-                    k: 10,
-                    types: None,
-                    date_from: None,
-                    date_to: None,
-                    doc_scope: None,
-                    mode: SearchMode::Keyword,
-                    sort_by: SortBy::Relevance,
-                    include_old: true,
-                    current_only: true,
-                    include_historical: false,
-                    format: OutputFormat::Json,
-                    max_per_doc: DEFAULT_MAX_PER_DOC,
-                    include_snippet: true,
-                },
-                None,
-            )?;
-            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-            let doc_ids: Vec<&str> = parsed["hits"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|h| h["doc_id"].as_str().unwrap())
-                .collect();
-            assert!(
-                doc_ids.contains(&"DOC_LIVE"),
-                "live doc should appear; got: {doc_ids:?}"
-            );
-            assert!(
-                !doc_ids.contains(&"DOC_PIT@19960320000000"),
-                "historical doc must be excluded by default; got: {doc_ids:?}"
-            );
-
-            // include_historical=true → both appear.
-            let json_str = search(
-                "depreciation",
-                SearchOptions {
-                    k: 10,
-                    types: None,
-                    date_from: None,
-                    date_to: None,
-                    doc_scope: None,
-                    mode: SearchMode::Keyword,
-                    sort_by: SortBy::Relevance,
-                    include_old: true,
-                    current_only: true,
-                    include_historical: true,
-                    format: OutputFormat::Json,
-                    max_per_doc: DEFAULT_MAX_PER_DOC,
-                    include_snippet: true,
-                },
-                None,
-            )?;
-            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-            let doc_ids: Vec<&str> = parsed["hits"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|h| h["doc_id"].as_str().unwrap())
-                .collect();
-            assert!(doc_ids.contains(&"DOC_LIVE"));
-            assert!(
-                doc_ids.contains(&"DOC_PIT@19960320000000"),
-                "include_historical=true must surface PiT versions; got: {doc_ids:?}"
-            );
             Ok(())
         })?;
         Ok(())
@@ -7440,7 +7265,6 @@ mod tests {
                     sort_by: SortBy::Relevance,
                     include_old: false,
                     current_only: true,
-                    include_historical: false,
                     format: OutputFormat::Json,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,

@@ -38,7 +38,6 @@ def _seed_doc(
             zstd.ZstdCompressor(level=3).compress(b"<div></div>"),
             withdrawn_date, superseded_by, replaces,
             0, 0, 0,         # has_in_doc_links, has_related_docs, has_history
-            None, None, 0,   # parent_doc_id, pit_timestamp, is_historical
         ),
     )
     conn.execute(INSERT_TITLE_FTS, (doc_id, title, ""))
@@ -98,5 +97,5 @@ def test_schema_inserts_and_queries(tmp_path: Path) -> None:
     assert row["withdrawn_date"] is None
 
     assert store_db.get_meta(conn, "schema_version") == store_db.SCHEMA_VERSION
-    assert store_db.SCHEMA_VERSION == "7"
+    assert store_db.SCHEMA_VERSION == "8"
     conn.close()

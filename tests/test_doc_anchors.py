@@ -66,14 +66,17 @@ def test_sister_doc_anchor() -> None:
 
 def test_history_anchor_with_pit_derives_date() -> None:
     """A link with a PiT param is a historical-version reference. The label
-    gets a YYYY-MM-DD date appended derived from the timestamp."""
+    gets a YYYY-MM-DD date appended derived from the timestamp. The
+    target_doc_id is the BASE doc_id; the timestamp travels separately in
+    target_pit so the anchor row records the existence of an older version
+    without our store treating it as a separate row."""
     html = """
     <p><a href="/law/view/document?docid=TXR/TR967/NAT/ATO/00001&PiT=19960320000001">Original ruling</a></p>
     """
     refs = extract_anchors(html, source_doc_id="TXR/TR967/NAT/ATO/00001")
     hist = [r for r in refs if r.kind == "history"]
     assert len(hist) == 1
-    assert hist[0].target_doc_id == "TXR/TR967/NAT/ATO/00001@19960320000001"
+    assert hist[0].target_doc_id == "TXR/TR967/NAT/ATO/00001"
     assert hist[0].target_pit == "19960320000001"
     assert "1996-03-20" in hist[0].label
     assert "Original ruling" in hist[0].label
@@ -92,7 +95,9 @@ def test_self_reference_without_pit_dropped() -> None:
 
 
 def test_history_table_with_three_versions() -> None:
-    """The TR 96/7 history table shape: row labels + version anchors."""
+    """The TR 96/7 history table shape: row labels + version anchors. Each
+    history anchor stores the BASE doc_id plus the PiT timestamp separately;
+    different PiTs of the same base doc are distinct anchors."""
     html = """
     <div>
         <table>
@@ -110,10 +115,10 @@ def test_history_table_with_three_versions() -> None:
     """
     refs = extract_anchors(html, source_doc_id="TXR/TR967/NAT/ATO/00001")
     hist = [r for r in refs if r.kind == "history"]
-    assert {r.target_doc_id for r in hist} == {
-        "TXR/TR967/NAT/ATO/00001@19960320000001",
-        "TXR/TR967/NAT/ATO/00001@20120418000001",
-        "TXR/TR967ER/NAT/ATO/00001@20120418000001",
+    assert {(r.target_doc_id, r.target_pit) for r in hist} == {
+        ("TXR/TR967/NAT/ATO/00001", "19960320000001"),
+        ("TXR/TR967/NAT/ATO/00001", "20120418000001"),
+        ("TXR/TR967ER/NAT/ATO/00001", "20120418000001"),
     }
     # Erratum has its own row label "18 April 2012" + own text "Erratum".
     erratum = next(r for r in hist if "Erratum" in r.label)
@@ -132,6 +137,9 @@ def test_pit_to_date_in_label_for_unlabelled_history_link() -> None:
     assert len(hist) == 1
     # Label is the date, since anchor text was empty.
     assert hist[0].label == "2020-01-01"
+    # target_doc_id is the BASE; the timestamp lives in target_pit.
+    assert hist[0].target_doc_id == "ABC/X/00001"
+    assert hist[0].target_pit == "20200101000000"
 
 
 def test_dedup_of_repeated_references() -> None:

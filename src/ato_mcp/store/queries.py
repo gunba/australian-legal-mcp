@@ -5,9 +5,8 @@ INSERT_DOCUMENT = """
 INSERT OR REPLACE INTO documents
     (doc_id, type, title, date, downloaded_at, content_hash, pack_sha8,
      html, withdrawn_date, superseded_by, replaces,
-     has_in_doc_links, has_related_docs, has_history,
-     parent_doc_id, pit_timestamp, is_historical)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     has_in_doc_links, has_related_docs, has_history)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 DELETE_DOCUMENT = "DELETE FROM documents WHERE doc_id = ?"

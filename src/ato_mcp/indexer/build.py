@@ -163,19 +163,6 @@ def _embedding_input(title: str, text: str) -> str:
     return f"{title}\n{text}".strip()
 
 
-def _parse_historical_doc_id(doc_id: str) -> tuple[str | None, str | None, int]:
-    """Return (parent_doc_id, pit_timestamp, is_historical) for a doc_id.
-
-    For ``TXR/TR967/NAT/ATO/00001@19960320000001`` -> (base, pit, 1).
-    For an unsuffixed doc_id -> (None, None, 0).
-    """
-    if "@" in doc_id:
-        base, sep, pit = doc_id.rpartition("@")
-        if sep and base and pit.isdigit():
-            return base, pit, 1
-    return None, None, 0
-
-
 @dataclass
 class FastPackBuilder(PackBuilder):
     zstd_level: int = 3
@@ -1390,7 +1377,6 @@ def _document_row(doc: PreparedDoc, pack_sha8: str, zstd_level: int) -> tuple:
     Navigation flags are written as 0; ``_persist_doc_anchors`` later updates
     them in a single statement once the anchor rows are known.
     """
-    parent_doc_id, pit_timestamp, is_historical = _parse_historical_doc_id(doc.doc_id)
     return (
         doc.doc_id,
         doc.category,
@@ -1406,9 +1392,6 @@ def _document_row(doc: PreparedDoc, pack_sha8: str, zstd_level: int) -> tuple:
         0,
         0,
         0,
-        parent_doc_id,
-        pit_timestamp,
-        is_historical,
     )
 
 
@@ -1506,7 +1489,6 @@ def _insert_from_previous_record(
     previous pack twice in the dispatch loop.
     """
     doc_id = record["doc_id"]
-    parent_doc_id, pit_timestamp, is_historical = _parse_historical_doc_id(doc_id)
     conn.execute(
         INSERT_DOCUMENT,
         (
@@ -1534,9 +1516,6 @@ def _insert_from_previous_record(
             0,
             0,
             0,
-            parent_doc_id,
-            pit_timestamp,
-            is_historical,
         ),
     )
     assets = [PreparedAsset(**a) for a in record.get("assets", [])]

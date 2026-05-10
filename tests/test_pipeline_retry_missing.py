@@ -360,7 +360,7 @@ def test_retry_missing_explicit_links_with_pit(tmp_path: Path) -> None:
 
     explicit = [
         {
-            "canonical_id": "/law/view/document?docid=TXR/TR967/NAT/ATO/00001@19960320000001",
+            "canonical_id": "/law/view/document?docid=TXR/TR967/NAT/ATO/00001",
             "href": "/law/view/document?docid=TXR/TR967/NAT/ATO/00001&PiT=19960320000001",
             "pit": "19960320000001",
         },
@@ -384,7 +384,7 @@ def test_retry_missing_explicit_links_with_pit(tmp_path: Path) -> None:
     ]
 
     rewritten = _read_index(tmp_path / "index.jsonl")
-    cid = "/law/view/document?docid=TXR/TR967/NAT/ATO/00001@19960320000001"
+    cid = "/law/view/document?docid=TXR/TR967/NAT/ATO/00001"
     assert cid in rewritten
     assert rewritten[cid]["status"] == "success"
 

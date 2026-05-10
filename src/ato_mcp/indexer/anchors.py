@@ -9,6 +9,9 @@ Walks the cleaned HTML for a single doc and classifies every `<a href>` as:
   errata, addenda, or related rulings.
 - ``history``: an external doc link to the same or another doc with a
   ``PiT=<YYYYMMDDHHMMSS>`` timestamp — a historical (point-in-time) version.
+  We do not store historical content; the anchor row only records the BASE
+  doc_id and the timestamp so an agent can reconstruct the external URL if
+  they need to fetch the older version.
 
 Label resolution priority:
 1. If the anchor sits inside a `<tr>` whose other cells contain plain text:
@@ -39,7 +42,7 @@ from .extract import _doc_id_from_ato_link
 # ATO uses sentinel PiT values to mean "current view" (99991231235958, "as
 # at end of time") and "earliest / original" (10010101000001, year 1001).
 # Both alias the live doc rather than identifying a real historical
-# version, so skip the @<PiT> suffix when we see either.
+# version, so drop the PiT entirely when we see either.
 _SENTINEL_PITS = {"99991231235958", "10010101000001"}
 
 
@@ -49,7 +52,9 @@ class AnchorRef:
     label: str
     # in_doc: anchor name (resolved to chunk_id by build.py)
     target_anchor: str | None = None
-    # sister/history: target doc_id (with @PiT suffix already applied for history)
+    # sister/history: target doc_id (always the BASE doc_id — historical
+    # versions are not stored as separate doc rows; the timestamp lives in
+    # ``target_pit``).
     target_doc_id: str | None = None
     target_pit: str | None = None
 
@@ -65,7 +70,7 @@ def extract_anchors(html: str, *, source_doc_id: str) -> list[AnchorRef]:
     tree = HTMLParser(html)
     targets = _collect_anchor_targets(tree)
     refs: list[AnchorRef] = []
-    seen: set[tuple[str, str, str | None]] = set()  # (kind, key, label) for dedup
+    seen: set[tuple[str, str, str | None, str | None]] = set()
     for a in tree.css("a[href]"):
         href = a.attributes.get("href") or ""
         if href.startswith("#"):
@@ -73,7 +78,7 @@ def extract_anchors(html: str, *, source_doc_id: str) -> list[AnchorRef]:
             if not target or target not in targets:
                 continue
             label = _resolve_label(a)
-            key = ("in_doc", target, label)
+            key = ("in_doc", target, None, label)
             if key in seen:
                 continue
             seen.add(key)
@@ -85,16 +90,19 @@ def extract_anchors(html: str, *, source_doc_id: str) -> list[AnchorRef]:
         if not resolved:
             continue
         target_doc_id, pit = resolved
-        # ATO navigation panels use PiT=99991231235958 as the "current view"
-        # sentinel — it aliases the live doc, not a historical version.
-        # Treat it as a no-PiT link.
+        # ATO navigation panels use sentinel PiT values that alias the live
+        # doc rather than a real historical version. Treat them as no-PiT
+        # links.
         if pit in _SENTINEL_PITS:
             pit = None
         if pit:
-            # Historical version (same or other doc + PiT timestamp).
+            # Historical version (same or other doc + PiT timestamp). The
+            # target_doc_id is the BASE doc_id; the timestamp travels in
+            # target_pit. We do not store historical content, so the
+            # anchor only points the agent at the URL they would fetch
+            # externally if they want the older version.
             label = _resolve_label(a, default_date=_pit_to_date(pit))
-            versioned_id = f"{target_doc_id}@{pit}"
-            key = ("history", versioned_id, label)
+            key = ("history", target_doc_id, pit, label)
             if key in seen:
                 continue
             seen.add(key)
@@ -102,7 +110,7 @@ def extract_anchors(html: str, *, source_doc_id: str) -> list[AnchorRef]:
                 AnchorRef(
                     kind="history",
                     label=label,
-                    target_doc_id=versioned_id,
+                    target_doc_id=target_doc_id,
                     target_pit=pit,
                 )
             )
@@ -111,7 +119,7 @@ def extract_anchors(html: str, *, source_doc_id: str) -> list[AnchorRef]:
             # Self-link without PiT — not a useful navigation entry.
             continue
         label = _resolve_label(a)
-        key = ("sister", target_doc_id, label)
+        key = ("sister", target_doc_id, None, label)
         if key in seen:
             continue
         seen.add(key)

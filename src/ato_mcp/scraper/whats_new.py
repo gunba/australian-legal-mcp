@@ -12,17 +12,19 @@ from bs4 import BeautifulSoup
 
 def normalize_doc_href(href: str) -> str:
 	"""
-	Normalize a law/view/document href to the relative canonical form used by deduped_links.jsonl.
+	Normalize a law/view/document href to the relative canonical form used by
+	deduped_links.jsonl.
+
 	Examples:
 		https://www.ato.gov.au/law/view/document?docid=ABC -> /law/view/document?docid=ABC
 		/law/view/document?docid=ABC -> /law/view/document?docid=ABC
 		/law/view/document?docid=ABC&PiT=20120418000001
-		    -> /law/view/document?docid=ABC@20120418000001
+		    -> /law/view/document?docid=ABC
 
-	The ``@<PiT>`` suffix on the docid value matches the historical-version
-	encoding used by ``anchors.py`` and parsed by
-	``build._parse_historical_doc_id``. Downstream ``metadata.doc_id_for``
-	extracts the docid value verbatim, yielding the ``<base>@<PiT>`` doc_id.
+	Historical (point-in-time) versions are NOT stored as separate doc rows in
+	the index — the existence of earlier versions is exposed only through
+	doc_anchors. PiT URLs therefore canonicalise to the same form as the live
+	doc; the PiT timestamp is dropped from the canonical href.
 	"""
 	if not href:
 		return ""
@@ -35,26 +37,11 @@ def normalize_doc_href(href: str) -> str:
 	docid_values = query_params.get("docid")
 	docid = docid_values[0] if docid_values else ""
 	docid = unquote(docid).strip("'\" ")
-	pit = ""
-	for key, values in query_params.items():
-		if key.lower() == "pit" and values:
-			candidate = unquote(values[0]).strip("'\" ")
-			if candidate and candidate not in _SENTINEL_PITS:
-				pit = candidate
-				break
 	if docid:
-		if pit:
-			return f"/law/view/document?docid={docid}@{pit}"
 		return f"/law/view/document?docid={docid}"
 
 	query = f"?{parsed.query}" if parsed.query else ""
 	return f"{path}{query}"
-
-
-# ATO uses sentinel PiT values: 99991231235958 ("current view, as at end
-# of time") and 10010101000001 ("earliest / original" placeholder). Both
-# alias the live doc, not a historical version — skip the @<PiT> suffix.
-_SENTINEL_PITS = {"99991231235958", "10010101000001"}
 
 
 @dataclass

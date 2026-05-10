@@ -1,16 +1,15 @@
 -- ato-mcp SQLite schema v8
 -- Minimal field set: doc_id PK, type, title, date + 3 build-time columns +
 -- 3 currency columns (W2.2) — withdrawn_date, superseded_by, replaces +
--- 3 navigation flags + 3 historical-version columns.
+-- 3 navigation flags. Historical (point-in-time) versions are NOT stored as
+-- separate document rows; the existence of earlier versions is surfaced
+-- through the doc_anchors table only.
 --
 -- Design notes:
 --   doc_id   The full ATO docid path, slashes included. The canonical URL
 --            is synthesised at query time as
 --              https://www.ato.gov.au/law/view/document?docid={doc_id}
 --            so we don't store ``href`` separately.
---            Historical versions encode their PiT timestamp as a suffix:
---              <base_doc_id>@<YYYYMMDDHHMMSS>
---            (the @ is unambiguous; not used by current ATO doc_ids).
 --   type     Top-level bucket ("Public_rulings", "Cases", ...). Finer
 --            doc_type is implicit in the first segment of doc_id.
 --   title    Human-readable label with citation inlined
@@ -29,13 +28,6 @@
 --                    build time iff the doc emitted at least one anchor of
 --                    that kind. Tells the agent it's worth calling
 --                    get_doc_anchors(doc_id) to navigate.
---   parent_doc_id    For historical versions: points back at the live
---                    base doc. NULL for current docs.
---   pit_timestamp    For historical versions: ATO PiT timestamp string
---                    (YYYYMMDDHHMMSS). NULL for current docs.
---   is_historical    1 iff this row is a historical version. Default
---                    search excludes is_historical=1; pass
---                    `include_historical=true` to include them.
 
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -58,17 +50,11 @@ CREATE TABLE IF NOT EXISTS documents (
     -- navigation hints (set at build time from doc_anchors):
     has_in_doc_links INTEGER NOT NULL DEFAULT 0,
     has_related_docs INTEGER NOT NULL DEFAULT 0,
-    has_history      INTEGER NOT NULL DEFAULT 0,
-    -- historical-version (point-in-time) markers:
-    parent_doc_id    TEXT,
-    pit_timestamp    TEXT,
-    is_historical    INTEGER NOT NULL DEFAULT 0
+    has_history      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_doc_type ON documents(type);
 CREATE INDEX IF NOT EXISTS idx_doc_date ON documents(date);
 CREATE INDEX IF NOT EXISTS idx_doc_withdrawn ON documents(withdrawn_date);
-CREATE INDEX IF NOT EXISTS idx_doc_parent ON documents(parent_doc_id);
-CREATE INDEX IF NOT EXISTS idx_doc_historical ON documents(is_historical);
 
 -- Chunks: text is zstd-compressed UTF-8.
 -- [SL-03] chunks.text is zstd-compressed UTF-8 BLOB. Heading text and
