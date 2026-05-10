@@ -155,10 +155,12 @@ def _sibling_cells_text(a: Node) -> str:
     row = _ancestor(a, {"tr"})
     if row is None:
         return ""
-    own_cell = _ancestor(a, {"td", "th"})
+    own_cell_html = _ancestor_html(a, {"td", "th"})
     parts: list[str] = []
     for cell in row.css("td, th"):
-        if cell is own_cell:
+        # selectolax returns fresh Node objects per css() call so identity
+        # comparison doesn't work; compare serialised HTML instead.
+        if cell.html == own_cell_html:
             continue
         text = (cell.text(strip=True) or "").strip()
         if text:
@@ -173,6 +175,12 @@ def _ancestor(node: Node, tags: set[str]) -> Node | None:
             return current
         current = current.parent
     return None
+
+
+def _ancestor_html(node: Node, tags: set[str]) -> str | None:
+    """Return the HTML of the closest ancestor matching one of ``tags``."""
+    ancestor = _ancestor(node, tags)
+    return ancestor.html if ancestor is not None else None
 
 
 def _pit_to_date(pit: str) -> str:
