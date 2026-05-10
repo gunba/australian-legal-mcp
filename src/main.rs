@@ -45,7 +45,7 @@ const ORDINARY_DICTIONARY_PATH_ENV: &str = "ATO_MCP_DICTIONARY_PATH";
 /// On-disk schema version this binary supports. Bump when introducing
 /// schema changes; older binaries reject newer corpora via [`open_read`]
 /// / [`open_write`] / [`apply_update_locked`] guards.
-const SUPPORTED_SCHEMA_VERSION: u32 = 7;
+const SUPPORTED_SCHEMA_VERSION: u32 = 8;
 /// Highest manifest format version (`Manifest.schema_version`) this binary
 /// will ingest. v2 (released alongside ato-mcp 0.5.0) signals that
 /// `min_client_version` is now meaningfully populated by the builder
@@ -140,6 +140,9 @@ enum Command {
         /// Include withdrawn / superseded rulings (default excludes them).
         #[arg(long)]
         include_withdrawn: bool,
+        /// Include historical (point-in-time) versions (default excludes them).
+        #[arg(long)]
+        include_historical: bool,
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
@@ -155,6 +158,9 @@ enum Command {
         /// Include withdrawn / superseded rulings (default excludes them).
         #[arg(long)]
         include_withdrawn: bool,
+        /// Include historical (point-in-time) versions (default excludes them).
+        #[arg(long)]
+        include_historical: bool,
         #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
@@ -250,6 +256,7 @@ fn main() -> Result<()> {
             sort_by,
             include_old,
             include_withdrawn,
+            include_historical,
             format,
         } => {
             let types = empty_vec_as_none(types);
@@ -272,6 +279,7 @@ fn main() -> Result<()> {
                     sort_by,
                     include_old,
                     current_only: !include_withdrawn,
+                    include_historical,
                     format,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
@@ -286,6 +294,7 @@ fn main() -> Result<()> {
             types,
             include_old,
             include_withdrawn,
+            include_historical,
             format,
         } => {
             let types = empty_vec_as_none(types);
@@ -297,6 +306,7 @@ fn main() -> Result<()> {
                     types.as_deref(),
                     include_old,
                     !include_withdrawn,
+                    include_historical,
                     format,
                 )?
             );
@@ -524,17 +534,24 @@ fn init_db(conn: &Connection) -> Result<()> {
             html             BLOB NOT NULL,
             withdrawn_date   TEXT,
             superseded_by    TEXT,
-            replaces         TEXT
+            replaces         TEXT,
+            has_in_doc_links INTEGER NOT NULL DEFAULT 0,
+            has_related_docs INTEGER NOT NULL DEFAULT 0,
+            has_history      INTEGER NOT NULL DEFAULT 0,
+            parent_doc_id    TEXT,
+            pit_timestamp    TEXT,
+            is_historical    INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_doc_type ON documents(type);
         CREATE INDEX IF NOT EXISTS idx_doc_date ON documents(date);
         CREATE INDEX IF NOT EXISTS idx_doc_withdrawn ON documents(withdrawn_date);
+        CREATE INDEX IF NOT EXISTS idx_doc_parent ON documents(parent_doc_id);
+        CREATE INDEX IF NOT EXISTS idx_doc_historical ON documents(is_historical);
 
         CREATE TABLE IF NOT EXISTS chunks (
             chunk_id      INTEGER PRIMARY KEY,
             doc_id        TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
             ord           INTEGER NOT NULL,
-            heading_path  TEXT,
             anchor        TEXT,
             text          BLOB NOT NULL
         );
@@ -549,7 +566,6 @@ fn init_db(conn: &Connection) -> Result<()> {
             source_title  TEXT NOT NULL,
             source_type   TEXT NOT NULL,
             scope         TEXT,
-            heading_path  TEXT,
             anchor        TEXT,
             ord           INTEGER NOT NULL,
             body          TEXT NOT NULL
@@ -570,6 +586,18 @@ fn init_db(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_assets_doc ON document_assets(doc_id);
 
+        CREATE TABLE IF NOT EXISTS doc_anchors (
+            doc_id           TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+            ord              INTEGER NOT NULL,
+            kind             TEXT NOT NULL,
+            label            TEXT NOT NULL,
+            target_chunk_id  INTEGER,
+            target_doc_id    TEXT,
+            target_pit       TEXT,
+            PRIMARY KEY (doc_id, ord)
+        );
+        CREATE INDEX IF NOT EXISTS idx_doc_anchors_doc ON doc_anchors(doc_id);
+
         CREATE TABLE IF NOT EXISTS chunk_embeddings (
             chunk_id   INTEGER PRIMARY KEY REFERENCES chunks(chunk_id) ON DELETE CASCADE,
             embedding  BLOB NOT NULL CHECK(length(embedding) = 256)
@@ -584,7 +612,6 @@ fn init_db(conn: &Connection) -> Result<()> {
 
         CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
             text,
-            heading_path,
             tokenize = "porter unicode61 remove_diacritics 2"
         );
 
@@ -594,7 +621,7 @@ fn init_db(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
-    set_meta(conn, "schema_version", "7")?;
+    set_meta(conn, "schema_version", "8")?;
     Ok(())
 }
 
@@ -676,6 +703,7 @@ fn build_doc_filter(
     doc_scope: Option<&str>,
     include_old: bool,
     current_only: bool,
+    include_historical: bool,
 ) -> SqlFilter {
     // [MT-10] Default search policy excludes EPA and old non-legislation unless overridden.
     let mut clauses = Vec::new();
@@ -728,6 +756,12 @@ fn build_doc_filter(
         // material pass current_only=false.
         clauses.push(format!("{alias}.withdrawn_date IS NULL"));
     }
+    if !include_historical {
+        // Default search excludes point-in-time historical versions.
+        // Callers that want earlier published versions pass
+        // include_historical=true.
+        clauses.push(format!("{alias}.is_historical = 0"));
+    }
 
     SqlFilter {
         sql: clauses.join(" AND "),
@@ -743,7 +777,6 @@ struct Hit {
     #[serde(rename = "type")]
     doc_type: String,
     date: Option<String>,
-    heading_path: String,
     anchor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     snippet: Option<String>,
@@ -763,6 +796,15 @@ struct Hit {
     superseded_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     replaces: Option<String>,
+    /// Navigation hint flags — only serialised when set (so a doc with no
+    /// matching anchors keeps the slim hit clean). `Some(true)` tells the
+    /// agent to call `get_doc_anchors(doc_id)` to navigate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    has_in_doc_links: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    has_related_docs: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    has_history: Option<bool>,
 }
 
 fn serialize_score_round2<S>(value: &Option<f64>, serializer: S) -> Result<S::Ok, S::Error>
@@ -830,6 +872,10 @@ struct SearchOptions<'a> {
     /// `withdrawn_date`, `superseded_by`, and `replaces` fields on the
     /// hit and can decide whether the source still applies.
     current_only: bool,
+    /// When false (default), historical (point-in-time) versions are
+    /// excluded from results. Set true to include earlier published
+    /// versions of documents alongside the current version.
+    include_historical: bool,
     format: OutputFormat,
     /// Internal-only: maximum chunks returned per document. Capped at
     /// `HARD_MAX_PER_DOC`. NOT exposed in the MCP tool descriptor for
@@ -845,9 +891,11 @@ struct SearchOptions<'a> {
 #[derive(Debug, Clone)]
 struct CandidateMeta {
     doc_id: String,
-    /// True when this chunk has an empty `heading_path` AND short text
-    /// (< 100 chars) — typically a document intro/preamble that crowds
-    /// out more useful chunks.
+    /// True when this chunk's plaintext is short (< 100 chars) and the
+    /// chunk sits at the start of the document — typically a stub
+    /// preamble that crowds out more useful chunks. Without a separate
+    /// heading_path column we approximate "intro" as ord == 0 with short
+    /// text, which still correctly demotes the leading stub chunks.
     is_intro: bool,
 }
 
@@ -959,6 +1007,7 @@ fn search(
         opts.doc_scope,
         opts.include_old,
         opts.current_only,
+        opts.include_historical,
     );
     // [MT-02] k is clamped, first-stage recall is widened, then candidates dedupe per document.
     let internal_limit = std::cmp::max(k * 5, 50);
@@ -1166,41 +1215,38 @@ fn load_candidate_meta(
     ids.dedup();
 
     let placeholders = vec!["?"; ids.len()].join(",");
-    // Two-step query: cheap path (heading_path + chunk_id + doc_id) for
-    // every candidate, plus a follow-up that decompresses the text BLOB
-    // for the small minority with empty heading_path so we can measure
-    // the *plain* text length precisely. The earlier zstd-blob-length
-    // proxy occasionally false-positived on intro-bordering chunks; this
-    // additional decompress costs ~50µs × N where N is typically <5.
+    // Two-step query: first read (chunk_id, doc_id, ord) for every
+    // candidate cheaply; then decompress the text BLOB only for the
+    // small minority sitting at ord == 0 so we can measure the *plain*
+    // text length precisely. Heading-path is gone; "intro" now means
+    // "leading stub chunk" (ord 0 with short text) which still
+    // correctly demotes the typical preamble pattern.
     let sql = format!(
-        "SELECT chunk_id, doc_id, COALESCE(heading_path, '') AS heading_path FROM chunks WHERE chunk_id IN ({placeholders})"
+        "SELECT chunk_id, doc_id, ord FROM chunks WHERE chunk_id IN ({placeholders})"
     );
     let params_vec: Vec<Value> = ids.into_iter().map(Value::Integer).collect();
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params_vec), |row| {
         let chunk_id: i64 = row.get("chunk_id")?;
         let doc_id: String = row.get("doc_id")?;
-        let heading_path: String = row.get("heading_path")?;
-        Ok((chunk_id, doc_id, heading_path))
+        let ord: i64 = row.get("ord")?;
+        Ok((chunk_id, doc_id, ord))
     })?;
-    let mut empty_heading_chunk_ids: Vec<i64> = Vec::new();
-    let mut staged: Vec<(i64, String, String)> = Vec::new();
+    let mut leading_chunk_ids: Vec<i64> = Vec::new();
+    let mut staged: Vec<(i64, String, i64)> = Vec::new();
     for row in rows {
-        let (chunk_id, doc_id, heading_path) = row?;
-        if heading_path.is_empty() {
-            empty_heading_chunk_ids.push(chunk_id);
+        let (chunk_id, doc_id, ord) = row?;
+        if ord == 0 {
+            leading_chunk_ids.push(chunk_id);
         }
-        staged.push((chunk_id, doc_id, heading_path));
+        staged.push((chunk_id, doc_id, ord));
     }
 
-    // Decompress text only for empty-heading candidates so we can compare
-    // against the spec's "text.len() < 100" threshold without paying for
-    // every candidate.
     let mut intro_set: HashSet<i64> = HashSet::new();
-    if !empty_heading_chunk_ids.is_empty() {
-        let placeholders2 = vec!["?"; empty_heading_chunk_ids.len()].join(",");
+    if !leading_chunk_ids.is_empty() {
+        let placeholders2 = vec!["?"; leading_chunk_ids.len()].join(",");
         let sql2 = format!("SELECT chunk_id, text FROM chunks WHERE chunk_id IN ({placeholders2})");
-        let params_vec2: Vec<Value> = empty_heading_chunk_ids
+        let params_vec2: Vec<Value> = leading_chunk_ids
             .into_iter()
             .map(Value::Integer)
             .collect();
@@ -1220,8 +1266,8 @@ fn load_candidate_meta(
     }
 
     let mut out = HashMap::new();
-    for (chunk_id, doc_id, heading_path) in staged {
-        let is_intro = heading_path.is_empty() && intro_set.contains(&chunk_id);
+    for (chunk_id, doc_id, _ord) in staged {
+        let is_intro = intro_set.contains(&chunk_id);
         out.insert(chunk_id, CandidateMeta { doc_id, is_intro });
     }
     Ok(out)
@@ -1273,6 +1319,9 @@ fn search_next_call(query: &str, k: usize, opts: &SearchOptions<'_>) -> String {
     }
     if !opts.current_only {
         args.push("current_only=false".to_string());
+    }
+    if opts.include_historical {
+        args.push("include_historical=true".to_string());
     }
     format!("search({})", args.join(", "))
 }
@@ -1610,7 +1659,7 @@ impl Reranker {
     /// we approximate ~4 chars per token for the pre-tokenization trim
     /// (cheaper than re-running the tokenizer twice). The tokenizer's own
     /// truncation handles the doc side; we leave a wide margin so the
-    /// 512-token budget can absorb a long heading_path-prefixed snippet.
+    /// 512-token budget can absorb a long chunk body.
     fn rerank(&mut self, query: &str, candidates: &[(i64, &str)]) -> Result<Vec<(i64, f64)>> {
         if candidates.is_empty() {
             return Ok(Vec::new());
@@ -1873,9 +1922,10 @@ fn load_hit(
 ) -> Result<Option<Hit>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT c.chunk_id, c.doc_id, c.ord, c.heading_path, c.anchor, c.text,
+        SELECT c.chunk_id, c.doc_id, c.ord, c.anchor, c.text,
                d.type, d.title, d.date,
-               d.withdrawn_date, d.superseded_by, d.replaces
+               d.withdrawn_date, d.superseded_by, d.replaces,
+               d.has_in_doc_links, d.has_related_docs, d.has_history
         FROM chunks c
         JOIN documents d ON d.doc_id = c.doc_id
         WHERE c.chunk_id = ?
@@ -1889,9 +1939,6 @@ fn load_hit(
     let text = decompress_text(row.get("text")?)?;
     let chunk_id: i64 = row.get("chunk_id")?;
     let ord: i64 = row.get("ord")?;
-    let heading_path: String = row
-        .get::<_, Option<String>>("heading_path")?
-        .unwrap_or_default();
     Ok(Some(Hit {
         doc_id: doc_id.clone(),
         title: row.get("title")?,
@@ -1899,7 +1946,7 @@ fn load_hit(
         date: row.get("date")?,
         anchor: row.get("anchor")?,
         snippet: if include_snippet {
-            Some(highlight_snippet(&text, query, SNIPPET_CHARS, &heading_path))
+            Some(highlight_snippet(&text, query, SNIPPET_CHARS))
         } else {
             None
         },
@@ -1908,10 +1955,24 @@ fn load_hit(
         chunk_id: Some(chunk_id),
         ord: Some(ord),
         next_call: Some(format!("get_chunks(chunk_ids=[{chunk_id}])")),
-        heading_path,
         withdrawn_date: row.get("withdrawn_date")?,
         superseded_by: row.get("superseded_by")?,
         replaces: row.get("replaces")?,
+        has_in_doc_links: row
+            .get::<_, i64>("has_in_doc_links")
+            .ok()
+            .filter(|v| *v != 0)
+            .map(|_| true),
+        has_related_docs: row
+            .get::<_, i64>("has_related_docs")
+            .ok()
+            .filter(|v| *v != 0)
+            .map(|_| true),
+        has_history: row
+            .get::<_, i64>("has_history")
+            .ok()
+            .filter(|v| *v != 0)
+            .map(|_| true),
     }))
 }
 
@@ -1969,20 +2030,21 @@ fn bm25_score_window(
 }
 
 /// Pick the highest-BM25 sliding window from `text` against `query`,
-/// trim to `max_chars`, and prefix with `heading_path` when present.
-fn highlight_snippet(text: &str, query: &str, max_chars: usize, heading_path: &str) -> String {
+/// trim to `max_chars`, and return it. Heading text now lives inside
+/// the chunk body (rendered inline via the chunker), so there is no
+/// separate prefix to attach.
+fn highlight_snippet(text: &str, query: &str, max_chars: usize) -> String {
     const WINDOW_WORDS: usize = 20;
     const STRIDE_WORDS: usize = 10;
     let cleaned = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if cleaned.is_empty() {
-        return prefix_heading(heading_path, &cleaned);
+        return cleaned;
     }
     let query_terms = snippet_query_terms(query);
     if query_terms.is_empty() {
         // No tokens worth ranking against — fall back to the document's
-        // opening fragment, still heading-prefixed.
-        let truncated = trim_chars(&cleaned, max_chars);
-        return prefix_heading(heading_path, &truncated);
+        // opening fragment.
+        return trim_chars(&cleaned, max_chars);
     }
 
     // Tokenise the cleaned text once. We keep both the lowercase form (for
@@ -1994,8 +2056,7 @@ fn highlight_snippet(text: &str, query: &str, max_chars: usize, heading_path: &s
         tokens.push((m.start(), m.end(), m.as_str().to_ascii_lowercase()));
     }
     if tokens.is_empty() {
-        let truncated = trim_chars(&cleaned, max_chars);
-        return prefix_heading(heading_path, &truncated);
+        return trim_chars(&cleaned, max_chars);
     }
 
     let mut chunk_term_freq: HashMap<String, usize> = HashMap::new();
@@ -2031,8 +2092,7 @@ fn highlight_snippet(text: &str, query: &str, max_chars: usize, heading_path: &s
         idx += STRIDE_WORDS;
     }
     if !produced_any {
-        let truncated = trim_chars(&cleaned, max_chars);
-        return prefix_heading(heading_path, &truncated);
+        return trim_chars(&cleaned, max_chars);
     }
 
     // Expand the chosen window outward to fill the snippet budget while
@@ -2058,15 +2118,7 @@ fn highlight_snippet(text: &str, query: &str, max_chars: usize, heading_path: &s
     if end < cleaned.len() {
         snippet.push_str("...");
     }
-    prefix_heading(heading_path, &snippet)
-}
-
-fn prefix_heading(heading_path: &str, body: &str) -> String {
-    if heading_path.is_empty() {
-        body.to_string()
-    } else {
-        format!("{heading_path} — {body}")
-    }
+    snippet
 }
 
 fn trim_chars(s: &str, max_chars: usize) -> String {
@@ -2155,7 +2207,8 @@ fn load_title_hit(conn: &Connection, doc_id: &str, filter: &SqlFilter) -> Result
     let sql = format!(
         r#"
         SELECT d.doc_id, d.type, d.title, d.date,
-               d.withdrawn_date, d.superseded_by, d.replaces
+               d.withdrawn_date, d.superseded_by, d.replaces,
+               d.has_in_doc_links, d.has_related_docs, d.has_history
         FROM documents d
         WHERE d.doc_id = ? {where_filter}
         "#
@@ -2173,7 +2226,6 @@ fn load_title_hit(conn: &Connection, doc_id: &str, filter: &SqlFilter) -> Result
             title: title.clone(),
             doc_type: row.get("type")?,
             date: row.get("date")?,
-            heading_path: String::new(),
             anchor: None,
             snippet: Some(title),
             score: Some(-2000.0),
@@ -2183,6 +2235,21 @@ fn load_title_hit(conn: &Connection, doc_id: &str, filter: &SqlFilter) -> Result
             withdrawn_date: row.get("withdrawn_date")?,
             superseded_by: row.get("superseded_by")?,
             replaces: row.get("replaces")?,
+            has_in_doc_links: row
+                .get::<_, i64>("has_in_doc_links")
+                .ok()
+                .filter(|v| *v != 0)
+                .map(|_| true),
+            has_related_docs: row
+                .get::<_, i64>("has_related_docs")
+                .ok()
+                .filter(|v| *v != 0)
+                .map(|_| true),
+            has_history: row
+                .get::<_, i64>("has_history")
+                .ok()
+                .filter(|v| *v != 0)
+                .map(|_| true),
         }))
     } else {
         Ok(None)
@@ -2195,12 +2262,22 @@ fn search_titles(
     types: Option<&[String]>,
     include_old: bool,
     current_only: bool,
+    include_historical: bool,
     format: OutputFormat,
 ) -> Result<String> {
     // [MT-14] search_titles ranks title_fts independently and uses the same default filters.
     let conn = open_read()?;
     let k = k.clamp(1, 100);
-    let filter = build_doc_filter("d", types, None, None, None, include_old, current_only);
+    let filter = build_doc_filter(
+        "d",
+        types,
+        None,
+        None,
+        None,
+        include_old,
+        current_only,
+        include_historical,
+    );
     let direct_hits = direct_title_hits(&conn, query, k, &filter)?;
     let where_filter = if filter.sql.is_empty() {
         String::new()
@@ -2211,7 +2288,8 @@ fn search_titles(
         r#"
         SELECT t.doc_id AS doc_id, bm25(title_fts) AS score,
                d.type, d.title, d.date,
-               d.withdrawn_date, d.superseded_by, d.replaces
+               d.withdrawn_date, d.superseded_by, d.replaces,
+               d.has_in_doc_links, d.has_related_docs, d.has_history
         FROM title_fts t
         JOIN documents d ON d.doc_id = t.doc_id
         WHERE title_fts MATCH ? {where_filter}
@@ -2233,7 +2311,6 @@ fn search_titles(
             title: title.clone(),
             doc_type: row.get("type")?,
             date: row.get("date")?,
-            heading_path: String::new(),
             anchor: None,
             snippet: Some(title),
             score: row.get::<_, f64>("score").ok(),
@@ -2243,6 +2320,21 @@ fn search_titles(
             withdrawn_date: row.get("withdrawn_date")?,
             superseded_by: row.get("superseded_by")?,
             replaces: row.get("replaces")?,
+            has_in_doc_links: row
+                .get::<_, i64>("has_in_doc_links")
+                .ok()
+                .filter(|v| *v != 0)
+                .map(|_| true),
+            has_related_docs: row
+                .get::<_, i64>("has_related_docs")
+                .ok()
+                .filter(|v| *v != 0)
+                .map(|_| true),
+            has_history: row
+                .get::<_, i64>("has_history")
+                .ok()
+                .filter(|v| *v != 0)
+                .map(|_| true),
         })
     }) {
         Ok(rows) => rows.collect::<rusqlite::Result<Vec<_>>>()?,
@@ -2433,7 +2525,6 @@ struct DefinitionSource {
     #[serde(rename = "type")]
     source_type: String,
     scope: Option<String>,
-    heading_path: String,
     anchor: Option<String>,
     ord: i64,
     canonical_url: String,
@@ -2522,7 +2613,7 @@ fn get_definition(term: &str, opts: GetDefinitionOptions<'_>) -> Result<String> 
     let mut stmt = conn.prepare(
         r#"
         SELECT definition_id, term, doc_id, source_title, source_type, scope,
-               heading_path, anchor, ord, body
+               anchor, ord, body
         FROM definitions
         WHERE norm_term = ? AND source_type = ?
         ORDER BY doc_id, ord, term
@@ -2543,9 +2634,6 @@ fn get_definition(term: &str, opts: GetDefinitionOptions<'_>) -> Result<String> 
                     title: row.get("source_title")?,
                     source_type: row.get("source_type")?,
                     scope: row.get("scope")?,
-                    heading_path: row
-                        .get::<_, Option<String>>("heading_path")?
-                        .unwrap_or_default(),
                     anchor: row.get("anchor")?,
                     ord: row.get("ord")?,
                 },
@@ -4129,6 +4217,25 @@ struct PackRecord {
     superseded_by: Option<String>,
     #[serde(default)]
     replaces: Option<String>,
+    /// Navigation hint flags. Set at build time by the maintainer pipeline
+    /// from the doc_anchors table; ingestion writes them straight through.
+    #[serde(default)]
+    has_in_doc_links: i64,
+    #[serde(default)]
+    has_related_docs: i64,
+    #[serde(default)]
+    has_history: i64,
+    /// Historical-version (point-in-time) markers.
+    #[serde(default)]
+    parent_doc_id: Option<String>,
+    #[serde(default)]
+    pit_timestamp: Option<String>,
+    #[serde(default)]
+    is_historical: i64,
+    /// Per-doc navigation anchors emitted by the build pipeline; ingested
+    /// straight into the doc_anchors table.
+    #[serde(default)]
+    anchors: Vec<PackDocAnchor>,
     #[serde(default)]
     definitions: Vec<PackDefinition>,
     assets: Vec<PackAsset>,
@@ -4160,8 +4267,6 @@ struct PackDefinition {
     #[serde(default)]
     scope: Option<String>,
     #[serde(default)]
-    heading_path: Option<String>,
-    #[serde(default)]
     anchor: Option<String>,
     ord: i64,
     body: String,
@@ -4171,12 +4276,23 @@ struct PackDefinition {
 struct PackChunk {
     ord: i64,
     #[serde(default)]
-    heading_path: Option<String>,
-    #[serde(default)]
     anchor: Option<String>,
     text: String,
     #[serde(default)]
     embedding_b64: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackDocAnchor {
+    ord: i64,
+    kind: String,
+    label: String,
+    #[serde(default)]
+    target_chunk_id: Option<i64>,
+    #[serde(default)]
+    target_doc_id: Option<String>,
+    #[serde(default)]
+    target_pit: Option<String>,
 }
 
 fn read_record_from_pack_bytes(pack: &[u8], offset: u64, length: u64) -> Result<PackRecord> {
@@ -4216,8 +4332,10 @@ fn insert_record(
         r#"
         INSERT OR REPLACE INTO documents
             (doc_id, type, title, date, downloaded_at, content_hash, pack_sha8,
-             html, withdrawn_date, superseded_by, replaces)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             html, withdrawn_date, superseded_by, replaces,
+             has_in_doc_links, has_related_docs, has_history,
+             parent_doc_id, pit_timestamp, is_historical)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
         params![
             record.doc_id,
@@ -4231,30 +4349,27 @@ fn insert_record(
             record.withdrawn_date,
             record.superseded_by,
             record.replaces,
+            record.has_in_doc_links,
+            record.has_related_docs,
+            record.has_history,
+            record.parent_doc_id,
+            record.pit_timestamp,
+            record.is_historical,
         ],
     )?;
     write_record_assets(conn, record, asset_root)?;
-    let headings = record
-        .chunks
-        .iter()
-        .filter_map(|c| c.heading_path.as_deref())
-        .collect::<Vec<_>>()
-        .join(" ");
+    // Heading text now lives inside chunk.text (rendered inline by the
+    // chunker). title_fts headings column carries an empty string — the
+    // title alone is the BM25 signal.
     conn.execute(
         "INSERT INTO title_fts (doc_id, title, headings) VALUES (?, ?, ?)",
-        params![record.doc_id, record.title, headings],
+        params![record.doc_id, record.title, ""],
     )?;
     for chunk in &record.chunks {
         let blob = compress_text(&chunk.text)?;
         conn.execute(
-            "INSERT INTO chunks (doc_id, ord, heading_path, anchor, text) VALUES (?, ?, ?, ?, ?)",
-            params![
-                record.doc_id,
-                chunk.ord,
-                chunk.heading_path,
-                chunk.anchor,
-                blob,
-            ],
+            "INSERT INTO chunks (doc_id, ord, anchor, text) VALUES (?, ?, ?, ?)",
+            params![record.doc_id, chunk.ord, chunk.anchor, blob,],
         )?;
         let rowid = conn.last_insert_rowid();
         if let Some(embedding_b64) = &chunk.embedding_b64 {
@@ -4265,11 +4380,25 @@ fn insert_record(
             )?;
         }
         conn.execute(
-            "INSERT INTO chunks_fts (rowid, text, heading_path) VALUES (?, ?, ?)",
+            "INSERT INTO chunks_fts (rowid, text) VALUES (?, ?)",
+            params![rowid, chunk.text],
+        )?;
+    }
+    for anchor in &record.anchors {
+        conn.execute(
+            r#"
+            INSERT INTO doc_anchors
+                (doc_id, ord, kind, label, target_chunk_id, target_doc_id, target_pit)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
             params![
-                rowid,
-                chunk.text,
-                chunk.heading_path.as_deref().unwrap_or("")
+                record.doc_id,
+                anchor.ord,
+                anchor.kind,
+                anchor.label,
+                anchor.target_chunk_id,
+                anchor.target_doc_id,
+                anchor.target_pit,
             ],
         )?;
     }
@@ -4278,8 +4407,8 @@ fn insert_record(
             r#"
             INSERT OR REPLACE INTO definitions
                 (definition_id, term, norm_term, doc_id, source_title, source_type,
-                 scope, heading_path, anchor, ord, body)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 scope, anchor, ord, body)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             params![
                 definition.definition_id,
@@ -4289,7 +4418,6 @@ fn insert_record(
                 definition.source_title,
                 definition.source_type,
                 definition.scope,
-                definition.heading_path,
                 definition.anchor,
                 definition.ord,
                 definition.body,
@@ -4513,6 +4641,7 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
                     sort_by,
                     include_old: optional_bool(&args, "include_old").unwrap_or(false),
                     current_only: optional_bool(&args, "current_only").unwrap_or(true),
+                    include_historical: optional_bool(&args, "include_historical").unwrap_or(false),
                     format,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: optional_bool(&args, "include_snippet").unwrap_or(true),
@@ -4529,6 +4658,7 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
                 types.as_deref(),
                 optional_bool(&args, "include_old").unwrap_or(false),
                 optional_bool(&args, "current_only").unwrap_or(true),
+                optional_bool(&args, "include_historical").unwrap_or(false),
                 output_format_arg(&args)?,
             )?
         }
@@ -4544,6 +4674,7 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
             )?
         }
         "get_asset" => get_asset_mcp(&args)?,
+        "get_doc_anchors" => get_doc_anchors_mcp(&args)?,
         "get_chunks" => get_chunks_mcp(&args)?,
         "get_definition" => {
             let term = required_str(&args, "term")?;
@@ -4649,7 +4780,6 @@ struct HydratedChunk {
     title: String,
     date: Option<String>,
     ord: i64,
-    heading_path: String,
     anchor: Option<String>,
     canonical_url: String,
     text: String,
@@ -4750,7 +4880,7 @@ fn load_chunks_by_ord_range(
 ) -> Result<Vec<HydratedChunk>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT c.chunk_id, c.doc_id, c.ord, c.heading_path, c.anchor, c.text,
+        SELECT c.chunk_id, c.doc_id, c.ord, c.anchor, c.text,
                d.type, d.title, d.date
         FROM chunks c
         JOIN documents d ON d.doc_id = c.doc_id
@@ -4767,15 +4897,13 @@ fn load_chunks_by_ord_range(
             row.get::<_, String>("title")?,
             row.get::<_, Option<String>>("date")?,
             row.get::<_, i64>("ord")?,
-            row.get::<_, Option<String>>("heading_path")?
-                .unwrap_or_default(),
             row.get::<_, Option<String>>("anchor")?,
             row.get::<_, Vec<u8>>("text")?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (chunk_id, doc_id, doc_type, title, date, ord, heading_path, anchor, text_blob) = row?;
+        let (chunk_id, doc_id, doc_type, title, date, ord, anchor, text_blob) = row?;
         out.push(HydratedChunk {
             chunk_id,
             requested: false,
@@ -4784,7 +4912,6 @@ fn load_chunks_by_ord_range(
             title,
             date,
             ord,
-            heading_path,
             anchor,
             canonical_url: canonical_url(&doc_id),
             text: decompress_text(text_blob)?,
@@ -4846,6 +4973,89 @@ fn get_asset(asset_ref: &str) -> Result<String> {
     Ok(serde_json::to_string_pretty(&out)?)
 }
 
+fn get_doc_anchors_mcp(args: &JsonValue) -> Result<String> {
+    let doc_id = required_str(args, "doc_id")?;
+    get_doc_anchors(doc_id)
+}
+
+/// Convert an ATO point-in-time timestamp (`YYYYMMDDHHMMSS`) to an ISO
+/// `YYYY-MM-DD` date. Returns `None` when the input is shorter than 8
+/// characters or its first 8 characters are not all digits.
+fn pit_to_date(pit: &str) -> Option<String> {
+    if pit.len() < 8 {
+        return None;
+    }
+    let head = &pit[..8];
+    if !head.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("{}-{}-{}", &head[..4], &head[4..6], &head[6..8]))
+}
+
+fn get_doc_anchors(doc_id: &str) -> Result<String> {
+    let conn = open_read()?;
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT ord, kind, label, target_chunk_id, target_doc_id, target_pit
+        FROM doc_anchors
+        WHERE doc_id = ?
+        ORDER BY ord ASC
+        "#,
+    )?;
+    let mut in_doc = Vec::<JsonValue>::new();
+    let mut related_docs = Vec::<JsonValue>::new();
+    let mut historical_versions = Vec::<JsonValue>::new();
+    let rows = stmt.query_map([doc_id], |row| {
+        let kind: String = row.get("kind")?;
+        let label: String = row.get("label")?;
+        let target_chunk_id: Option<i64> = row.get("target_chunk_id")?;
+        let target_doc_id: Option<String> = row.get("target_doc_id")?;
+        let target_pit: Option<String> = row.get("target_pit")?;
+        Ok((kind, label, target_chunk_id, target_doc_id, target_pit))
+    })?;
+    for row in rows {
+        let (kind, label, target_chunk_id, target_doc_id, target_pit) = row?;
+        match kind.as_str() {
+            "in_doc" => {
+                if let Some(chunk_id) = target_chunk_id {
+                    in_doc.push(json!({
+                        "label": label,
+                        "chunk_id": chunk_id,
+                    }));
+                }
+            }
+            "sister" => {
+                if let Some(target) = target_doc_id {
+                    related_docs.push(json!({
+                        "label": label,
+                        "doc_id": target,
+                    }));
+                }
+            }
+            "history" => {
+                if let Some(target) = target_doc_id {
+                    let mut entry = serde_json::Map::new();
+                    entry.insert("label".to_string(), JsonValue::String(label));
+                    entry.insert("doc_id".to_string(), JsonValue::String(target));
+                    if let Some(pit) = target_pit.as_deref() {
+                        if let Some(date) = pit_to_date(pit) {
+                            entry.insert("date".to_string(), JsonValue::String(date));
+                        }
+                    }
+                    historical_versions.push(JsonValue::Object(entry));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(serde_json::to_string_pretty(&json!({
+        "doc_id": doc_id,
+        "in_doc": in_doc,
+        "related_docs": related_docs,
+        "historical_versions": historical_versions,
+    }))?)
+}
+
 fn server_instructions() -> String {
     // [SW-02] Instructions are generated from live corpus stats.
     // [SW-03] Missing/unreadable stats fall back to static init guidance.
@@ -4854,7 +5064,7 @@ fn server_instructions() -> String {
         .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
     {
         Some(s) => format!(
-            "ATO legal corpus. Documents: {}, chunks: {}. Index: {}. Navigate via search → get_chunks: search returns slim hits (chunk_id, doc_id, ord, heading_path, anchor, score, optional snippet); get_chunks fetches bodies by chunk_id with before/after ordinal neighbours within the same doc. doc_scope accepts a single full doc_id for in-doc search or \"<PREFIX>/%\" for a family (see stats). Default search excludes Edited_private_advice, withdrawn rulings, and content dated before {} except legislation; override with current_only=false and include_old=true.",
+            "ATO legal corpus. Documents: {}, chunks: {}. Index: {}. Navigate via search → get_chunks: search returns slim hits (chunk_id, doc_id, ord, anchor, score, optional snippet); get_chunks fetches bodies by chunk_id with before/after ordinal neighbours within the same doc. doc_scope accepts a single full doc_id for in-doc search or \"<PREFIX>/%\" for a family (see stats). Default search excludes Edited_private_advice, withdrawn rulings, historical (point-in-time) versions, and content dated before {} except legislation; override with current_only=false, include_historical=true, and include_old=true. Slim hits surface has_in_doc_links / has_related_docs / has_history flags when calling get_doc_anchors(doc_id) would yield useful navigation entries.",
             s["documents"].as_i64().unwrap_or(0),
             s["chunks"].as_i64().unwrap_or(0),
             s["index_version"].as_str().unwrap_or("?"),
@@ -4865,14 +5075,15 @@ fn server_instructions() -> String {
 }
 
 fn tool_descriptors() -> JsonValue {
-    // [SW-01] Seven MCP tools are exposed by tool_descriptors/call_tool: search,
-    // search_titles, get_document, get_chunks, get_definition, get_asset, stats.
+    // [SW-01] Eight MCP tools are exposed by tool_descriptors/call_tool: search,
+    // search_titles, get_document, get_chunks, get_definition, get_asset,
+    // get_doc_anchors, stats.
     //   The surface stays small and explicit; unsupported tools fail through the
     //   normal tools/call error path.
     json!([
         {
             "name": "search",
-            "description": "Hybrid semantic+lexical search over chunks. Returns slim pointer hits (chunk_id, doc_id, ord, heading_path, anchor, score, optional snippet) — fetch bodies via get_chunks. doc_scope filters by full doc_id (in-doc search) or \"<PREFIX>/%\" (family). mode=keyword forces lexical-only; hybrid/vector require the semantic index. Set include_snippet=false when the caller will follow up with get_chunks.",
+            "description": "Hybrid semantic+lexical search over chunks (chunk-level). Returns slim pointer hits (chunk_id, doc_id, ord, anchor, score, optional snippet) — fetch bodies via get_chunks. doc_scope filters by full doc_id (in-doc search) or \"<PREFIX>/%\" (family). mode=keyword forces lexical-only; hybrid/vector require the semantic index. Set include_snippet=false when the caller will follow up with get_chunks. Slim hits include navigation hints: has_in_doc_links (doc has paragraph anchors / contents entries — call get_doc_anchors to navigate), has_related_docs (doc has companion documents like errata / addenda), has_history (doc has earlier point-in-time versions). Default search excludes historical versions; set include_historical=true to include them.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4886,6 +5097,7 @@ fn tool_descriptors() -> JsonValue {
                     "sort_by": {"type": "string", "enum": ["relevance", "recency"]},
                     "include_old": {"type": "boolean"},
                     "current_only": {"type": "boolean", "description": "When true (default), excludes withdrawn rulings. Set false to include withdrawn material with a visible marker."},
+                    "include_historical": {"type": "boolean", "description": "When false (default), excludes historical (point-in-time) versions from results. Set true to include earlier published versions of documents."},
                     "include_snippet": {"type": "boolean", "description": "When true (default), each hit carries a BM25-windowed snippet. Set false to omit the snippet field entirely — useful when the caller will fetch full text via get_chunks."},
                     "format": {"type": "string", "enum": ["json"], "default": "json"}
                 },
@@ -4894,7 +5106,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "search_titles",
-            "description": "Title-only search returning doc-level hits (no chunk_id/ord). Use search for chunk-level results. Accepts exact doc_id and ATO document-link lookup.",
+            "description": "Title-only search returning doc-level hits (no chunk_id/ord). Use search for chunk-level results. Accepts exact doc_id and ATO document-link lookup. Hits include navigation hints (has_in_doc_links, has_related_docs, has_history) — call get_doc_anchors(doc_id) to navigate. Default search excludes historical versions; set include_historical=true to include earlier published versions.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4903,6 +5115,7 @@ fn tool_descriptors() -> JsonValue {
                     "types": {"type": "array", "items": {"type": "string"}},
                     "include_old": {"type": "boolean"},
                     "current_only": {"type": "boolean", "description": "When true (default), excludes withdrawn rulings. Set false to include withdrawn material with a visible marker."},
+                    "include_historical": {"type": "boolean", "description": "When false (default), excludes historical (point-in-time) versions from results. Set true to include earlier published versions of documents."},
                     "format": {"type": "string", "enum": ["json"], "default": "json"}
                 },
                 "required": ["query"]
@@ -4931,6 +5144,17 @@ fn tool_descriptors() -> JsonValue {
                     "asset_ref": {"type": "string"}
                 },
                 "required": ["asset_ref"]
+            }
+        },
+        {
+            "name": "get_doc_anchors",
+            "description": "Return the navigation map for a document: in-doc anchors (paragraph references, contents-table entries), sister documents (errata, addenda), and historical versions (point-in-time snapshots). Slim search hits surface `has_in_doc_links`, `has_related_docs`, or `has_history` flags when this tool would return useful entries — call it then to navigate. The `in_doc` array gives chunk_ids you can pass to get_chunks; `related_docs` and `historical_versions` give doc_ids you can pass to search or get_document.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "doc_id": {"type": "string"}
+                },
+                "required": ["doc_id"]
             }
         },
         {
@@ -5024,7 +5248,7 @@ mod tests {
         for _ in 0..30 {
             text.push_str("zeta eta theta iota kappa ");
         }
-        let snippet = highlight_snippet(&text, "R&D tax incentive", SNIPPET_CHARS, "");
+        let snippet = highlight_snippet(&text, "R&D tax incentive", SNIPPET_CHARS);
         assert!(
             snippet.contains("R&D tax incentive"),
             "snippet should include the query phrase, got: {snippet}"
@@ -5032,24 +5256,16 @@ mod tests {
     }
 
     #[test]
-    fn snippet_prefixes_heading_path() {
+    fn snippet_returns_window_without_prefix() {
         let text = "The taxpayer claimed an R&D tax incentive deduction for eligible activities";
-        let snippet = highlight_snippet(text, "R&D", SNIPPET_CHARS, "Section 8-1 > Reasons");
-        assert!(
-            snippet.starts_with("Section 8-1 > Reasons — "),
-            "snippet should start with heading prefix, got: {snippet}"
-        );
-    }
-
-    #[test]
-    fn snippet_omits_prefix_when_heading_empty() {
-        let text = "The taxpayer claimed an R&D tax incentive deduction";
-        let snippet = highlight_snippet(text, "R&D", SNIPPET_CHARS, "");
+        let snippet = highlight_snippet(text, "R&D", SNIPPET_CHARS);
+        // Heading text now lives inside chunk.text via inline rendering;
+        // the snippet helper no longer produces a heading prefix.
+        assert!(snippet.contains("R&D"));
         assert!(
             !snippet.contains(" — "),
-            "empty heading should not produce a prefix delimiter, got: {snippet}"
+            "snippet should not carry a heading prefix delimiter, got: {snippet}"
         );
-        assert!(snippet.contains("R&D"));
     }
 
     // ----- W1.3 hierarchical dedup -----
@@ -5213,8 +5429,8 @@ mod tests {
         text: &str,
     ) -> Result<()> {
         conn.execute(
-            "INSERT INTO chunks(chunk_id, doc_id, ord, heading_path, anchor, text) VALUES (?, ?, ?, ?, NULL, ?)",
-            params![chunk_id, doc_id, ord, "Section A", compress_text(text)?],
+            "INSERT INTO chunks(chunk_id, doc_id, ord, anchor, text) VALUES (?, ?, ?, NULL, ?)",
+            params![chunk_id, doc_id, ord, compress_text(text)?],
         )?;
         Ok(())
     }
@@ -5304,8 +5520,8 @@ mod tests {
     ) -> Result<()> {
         conn.execute(
             "INSERT INTO definitions(definition_id, term, norm_term, doc_id, source_title, \
-             source_type, scope, heading_path, anchor, ord, body) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, '', NULL, 0, ?)",
+             source_type, scope, anchor, ord, body) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, ?)",
             params![
                 definition_id,
                 term,
@@ -5485,13 +5701,9 @@ mod tests {
     fn snippet_falls_back_when_query_has_no_usable_tokens() {
         // Query reduces to only single-character / punctuation tokens,
         // which `snippet_query_terms` filters out. We expect the opening
-        // fragment with the heading prefix.
+        // fragment of the chunk text without any heading prefix.
         let text = "The quick brown fox jumps over the lazy dog repeatedly throughout the day.";
-        let snippet = highlight_snippet(text, "a", SNIPPET_CHARS, "Heading");
-        assert!(
-            snippet.starts_with("Heading — "),
-            "heading prefix should remain on fallback, got: {snippet}"
-        );
+        let snippet = highlight_snippet(text, "a", SNIPPET_CHARS);
         assert!(
             snippet.contains("The quick brown fox"),
             "fallback should preserve the opening fragment, got: {snippet}"
@@ -5500,41 +5712,31 @@ mod tests {
 
     #[test]
     fn snippet_falls_back_when_chunk_text_is_empty() {
-        let snippet = highlight_snippet("", "anything goes here", SNIPPET_CHARS, "H");
-        // Empty cleaned text -> returns prefix_heading("H", "") -> "H — "
-        assert!(
-            snippet == "H — ",
-            "empty chunk text should still emit the heading prefix, got: {snippet:?}"
-        );
-        // And without a heading, the snippet is itself empty.
-        let snippet_no_heading = highlight_snippet("", "anything", SNIPPET_CHARS, "");
+        let snippet = highlight_snippet("", "anything goes here", SNIPPET_CHARS);
+        // Empty cleaned text -> returns the empty string (no heading prefix
+        // any more).
         assert_eq!(
-            snippet_no_heading, "",
-            "empty chunk + empty heading should produce an empty snippet"
+            snippet, "",
+            "empty chunk text should produce an empty snippet, got: {snippet:?}"
         );
     }
 
     #[test]
-    fn snippet_heading_only_fallback_when_no_tokens_match() {
+    fn snippet_emits_window_when_no_query_tokens_match() {
         // The chunk only contains tokens that don't appear in the query.
-        // BM25 still picks *some* window, but the highlight should still
-        // begin with the heading prefix and emit a sensible window.
+        // BM25 still picks *some* window so the snippet emits a sensible
+        // body window. Heading text now lives inside chunk.text so there
+        // is no separate prefix.
         let text = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor";
         let snippet = highlight_snippet(
             text,
             "completely unrelated query terms",
             SNIPPET_CHARS,
-            "Heading X",
         );
+        assert!(!snippet.is_empty(), "snippet should not be empty");
         assert!(
-            snippet.starts_with("Heading X — "),
-            "heading prefix should appear even when query tokens never match, got: {snippet}"
-        );
-        // Body should be drawn from the chunk text (we should still emit
-        // *something*, not crash or return empty).
-        assert!(
-            snippet.len() > "Heading X — ".len(),
-            "snippet should include a body window, got: {snippet}"
+            !snippet.contains(" — "),
+            "snippet should not carry a heading prefix, got: {snippet}"
         );
     }
 
@@ -5588,17 +5790,17 @@ mod tests {
 
     // ===== Wave 2 ===========================================================
 
-    // ----- Schema v7 -----
+    // ----- Schema v8 -----
 
     #[test]
-    fn schema_init_writes_v7_metadata() -> Result<()> {
+    fn schema_init_writes_v8_metadata() -> Result<()> {
         let _lock = TEST_DB_LOCK.lock().unwrap();
         let (_dir, db) = make_test_db()?;
         let conn = open_write_at(&db)?;
         let value =
             get_meta(&conn, "schema_version")?.expect("init_db should have written schema_version");
         assert_eq!(value, SUPPORTED_SCHEMA_VERSION.to_string());
-        assert_eq!(SUPPORTED_SCHEMA_VERSION, 7);
+        assert_eq!(SUPPORTED_SCHEMA_VERSION, 8);
         Ok(())
     }
 
@@ -5631,7 +5833,7 @@ mod tests {
 
     #[test]
     fn build_doc_filter_includes_withdrawn_clause_by_default() {
-        let f = build_doc_filter("d", None, None, None, None, true, true);
+        let f = build_doc_filter("d", None, None, None, None, true, true, false);
         assert!(
             f.sql.contains("d.withdrawn_date IS NULL"),
             "current_only=true must add withdrawn_date IS NULL clause; sql={}",
@@ -5641,7 +5843,7 @@ mod tests {
 
     #[test]
     fn build_doc_filter_omits_withdrawn_clause_when_disabled() {
-        let f = build_doc_filter("d", None, None, None, None, true, false);
+        let f = build_doc_filter("d", None, None, None, None, true, false, false);
         assert!(
             !f.sql.contains("withdrawn_date"),
             "current_only=false must not mention withdrawn_date; sql={}",
@@ -5661,6 +5863,7 @@ mod tests {
             sort_by: SortBy::Relevance,
             include_old: false,
             current_only: false,
+            include_historical: false,
             format: OutputFormat::Json,
             max_per_doc: DEFAULT_MAX_PER_DOC,
             include_snippet: true,
@@ -5681,7 +5884,6 @@ mod tests {
             title: "T".to_string(),
             doc_type: "Public_ruling".to_string(),
             date: None,
-            heading_path: String::new(),
             anchor: None,
             snippet: Some("snip".to_string()),
             canonical_url: "https://x".to_string(),
@@ -5692,6 +5894,9 @@ mod tests {
             withdrawn_date: None,
             superseded_by: None,
             replaces: None,
+            has_in_doc_links: None,
+            has_related_docs: None,
+            has_history: None,
         };
         let json_str = serde_json::to_string(&hit)?;
         assert!(
@@ -5700,6 +5905,9 @@ mod tests {
         );
         assert!(!json_str.contains("superseded_by"));
         assert!(!json_str.contains("replaces"));
+        assert!(!json_str.contains("has_in_doc_links"));
+        assert!(!json_str.contains("has_related_docs"));
+        assert!(!json_str.contains("has_history"));
         Ok(())
     }
 
@@ -5710,7 +5918,6 @@ mod tests {
             title: "T".to_string(),
             doc_type: "Public_ruling".to_string(),
             date: Some("2022-07-01".to_string()),
-            heading_path: String::new(),
             anchor: None,
             snippet: Some("snip".to_string()),
             canonical_url: "https://x".to_string(),
@@ -5721,6 +5928,9 @@ mod tests {
             withdrawn_date: Some("2025-10-31".to_string()),
             superseded_by: Some("TR 2025/1".to_string()),
             replaces: Some("TR 2021/3".to_string()),
+            has_in_doc_links: None,
+            has_related_docs: None,
+            has_history: None,
         };
         let parsed: serde_json::Value = serde_json::from_str(&serde_json::to_string(&hit)?)?;
         assert_eq!(parsed["withdrawn_date"], json!("2025-10-31"));
@@ -5775,6 +5985,7 @@ mod tests {
                 None,
                 true, // include_old (date filter doesn't apply since title query)
                 true, // current_only
+                false, // include_historical
                 OutputFormat::Json,
             )?;
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
@@ -5801,6 +6012,7 @@ mod tests {
                 None,
                 true,
                 false, // current_only off
+                false, // include_historical
                 OutputFormat::Json,
             )?;
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
@@ -5866,6 +6078,7 @@ mod tests {
                 None,
                 false,
                 true,
+                false,
                 OutputFormat::Json,
             )?;
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
@@ -5876,6 +6089,7 @@ mod tests {
                 None,
                 false,
                 true,
+                false,
                 OutputFormat::Json,
             )?;
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
@@ -6088,11 +6302,17 @@ mod tests {
             withdrawn_date: Some("2024-06-15".to_string()),
             superseded_by: Some("TR 2024/1".to_string()),
             replaces: None,
+            has_in_doc_links: 0,
+            has_related_docs: 0,
+            has_history: 0,
+            parent_doc_id: None,
+            pit_timestamp: None,
+            is_historical: 0,
+            anchors: Vec::new(),
             definitions: Vec::new(),
             assets: Vec::new(),
             chunks: vec![PackChunk {
                 ord: 0,
-                heading_path: Some("Section A".to_string()),
                 anchor: None,
                 text: "depreciation effective life schedule for plant.".to_string(),
                 embedding_b64: None,
@@ -6112,6 +6332,13 @@ mod tests {
             withdrawn_date: None,
             superseded_by: None,
             replaces: Some("TR 2018/X".to_string()),
+            has_in_doc_links: 0,
+            has_related_docs: 0,
+            has_history: 0,
+            parent_doc_id: None,
+            pit_timestamp: None,
+            is_historical: 0,
+            anchors: Vec::new(),
             definitions: Vec::new(),
             assets: vec![PackAsset {
                 asset_ref: "ato-image://TR_2024_CURRENT/0".to_string(),
@@ -6126,7 +6353,6 @@ mod tests {
             }],
             chunks: vec![PackChunk {
                 ord: 0,
-                heading_path: Some("Section A".to_string()),
                 anchor: None,
                 text: "depreciation effective life schedule for plant.".to_string(),
                 embedding_b64: None,
@@ -6205,6 +6431,7 @@ mod tests {
                     sort_by: SortBy::Relevance,
                     include_old: true,
                     current_only: true,
+                    include_historical: false,
                     format: OutputFormat::Json,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
@@ -6242,6 +6469,7 @@ mod tests {
                     sort_by: SortBy::Relevance,
                     include_old: true,
                     current_only: false,
+                    include_historical: false,
                     format: OutputFormat::Json,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
@@ -6271,6 +6499,288 @@ mod tests {
             Ok(())
         })?;
         Ok(())
+    }
+
+    // ----- Wave 4 navigation flags + doc anchors + include_historical -----
+
+    /// Test helper: insert a document row with the navigation flags set.
+    fn insert_doc_with_nav_flags(
+        conn: &Connection,
+        doc_id: &str,
+        has_in_doc: i64,
+        has_related: i64,
+        has_history: i64,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT INTO documents(doc_id, type, title, downloaded_at, content_hash, pack_sha8, html, has_in_doc_links, has_related_docs, has_history) \
+             VALUES (?, 'Public_ruling', ?, ?, ?, '00000000', ?, ?, ?, ?)",
+            params![
+                doc_id,
+                format!("{doc_id} title"),
+                Utc::now().to_rfc3339(),
+                "deadbeef",
+                compress_text("<div></div>")?,
+                has_in_doc,
+                has_related,
+                has_history,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Test helper: insert a document row with historical-version markers.
+    fn insert_historical_doc(
+        conn: &Connection,
+        doc_id: &str,
+        is_historical: i64,
+        parent_doc_id: Option<&str>,
+        pit_timestamp: Option<&str>,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT INTO documents(doc_id, type, title, downloaded_at, content_hash, pack_sha8, html, parent_doc_id, pit_timestamp, is_historical) \
+             VALUES (?, 'Public_ruling', ?, ?, ?, '00000000', ?, ?, ?, ?)",
+            params![
+                doc_id,
+                format!("{doc_id} title"),
+                Utc::now().to_rfc3339(),
+                "deadbeef",
+                compress_text("<div></div>")?,
+                parent_doc_id,
+                pit_timestamp,
+                is_historical,
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_search_hit_carries_navigation_flags() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        // Doc with has_in_doc_links=1; one chunk so search returns it.
+        insert_doc_with_nav_flags(&conn, "DOC_NAV", 1, 0, 0)?;
+        let text = "Research and development tax incentive paragraph navigation flag canary text.";
+        insert_chunk(&conn, 1, "DOC_NAV", 0, text)?;
+        conn.execute(
+            "INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)",
+            params![1_i64, text],
+        )?;
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            let json_str = search(
+                "research development",
+                SearchOptions {
+                    k: 5,
+                    types: None,
+                    date_from: None,
+                    date_to: None,
+                    doc_scope: None,
+                    mode: SearchMode::Keyword,
+                    sort_by: SortBy::Relevance,
+                    include_old: false,
+                    current_only: true,
+                    include_historical: false,
+                    format: OutputFormat::Json,
+                    max_per_doc: DEFAULT_MAX_PER_DOC,
+                    include_snippet: true,
+                },
+                None,
+            )?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            let hit = parsed["hits"]
+                .as_array()
+                .and_then(|a| a.first())
+                .expect("expected at least one hit");
+            assert_eq!(hit["doc_id"], json!("DOC_NAV"));
+            assert_eq!(hit["has_in_doc_links"], json!(true));
+            // Unset flags must stay absent on the wire (skip_serializing_if).
+            assert!(hit.get("has_related_docs").is_none());
+            assert!(hit.get("has_history").is_none());
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_doc_anchors_returns_three_kinds() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        insert_doc_with_nav_flags(&conn, "DOC_ANCHORS", 1, 1, 1)?;
+        // One chunk to satisfy the in_doc target_chunk_id reference.
+        insert_chunk(&conn, 100, "DOC_ANCHORS", 0, "body")?;
+        // Sister and history docs — referenced as targets but only need
+        // documents rows for FK integrity (doc_anchors.target_doc_id is
+        // not a FK, so unreferenced is fine — but we'll insert anyway).
+        conn.execute(
+            "INSERT INTO doc_anchors(doc_id, ord, kind, label, target_chunk_id, target_doc_id, target_pit) VALUES (?, ?, 'in_doc', 'Section A', ?, NULL, NULL)",
+            params!["DOC_ANCHORS", 0_i64, 100_i64],
+        )?;
+        conn.execute(
+            "INSERT INTO doc_anchors(doc_id, ord, kind, label, target_chunk_id, target_doc_id, target_pit) VALUES (?, ?, 'sister', 'Errata', NULL, ?, NULL)",
+            params!["DOC_ANCHORS", 1_i64, "DOC_SISTER"],
+        )?;
+        conn.execute(
+            "INSERT INTO doc_anchors(doc_id, ord, kind, label, target_chunk_id, target_doc_id, target_pit) VALUES (?, ?, 'history', 'Earlier version', NULL, ?, ?)",
+            params!["DOC_ANCHORS", 2_i64, "DOC_HISTORY", "20200101000000"],
+        )?;
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            let json_str = get_doc_anchors("DOC_ANCHORS")?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            assert_eq!(parsed["doc_id"], json!("DOC_ANCHORS"));
+            let in_doc = parsed["in_doc"].as_array().unwrap();
+            let related = parsed["related_docs"].as_array().unwrap();
+            let history = parsed["historical_versions"].as_array().unwrap();
+            assert_eq!(in_doc.len(), 1, "expected one in_doc anchor");
+            assert_eq!(in_doc[0]["chunk_id"], json!(100));
+            assert_eq!(in_doc[0]["label"], json!("Section A"));
+            assert_eq!(related.len(), 1);
+            assert_eq!(related[0]["doc_id"], json!("DOC_SISTER"));
+            assert_eq!(related[0]["label"], json!("Errata"));
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0]["doc_id"], json!("DOC_HISTORY"));
+            assert_eq!(history[0]["label"], json!("Earlier version"));
+            assert_eq!(history[0]["date"], json!("2020-01-01"));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_doc_anchors_pit_to_date() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        insert_doc_with_nav_flags(&conn, "DOC_PIT", 0, 0, 1)?;
+        conn.execute(
+            "INSERT INTO doc_anchors(doc_id, ord, kind, label, target_chunk_id, target_doc_id, target_pit) VALUES (?, ?, 'history', 'Original ruling', NULL, ?, ?)",
+            params!["DOC_PIT", 0_i64, "TR_1996_X", "19960320000001"],
+        )?;
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            let json_str = get_doc_anchors("DOC_PIT")?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            let history = parsed["historical_versions"].as_array().unwrap();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0]["date"], json!("1996-03-20"));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_search_default_excludes_historical() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        // Two docs sharing keyword content. One is the live version, one
+        // is a historical PiT snapshot.
+        insert_historical_doc(&conn, "DOC_LIVE", 0, None, None)?;
+        insert_historical_doc(
+            &conn,
+            "DOC_PIT@19960320000000",
+            1,
+            Some("DOC_LIVE"),
+            Some("19960320000000"),
+        )?;
+        let text = "depreciation effective life schedule for plant.";
+        insert_chunk(&conn, 1, "DOC_LIVE", 0, text)?;
+        insert_chunk(&conn, 2, "DOC_PIT@19960320000000", 0, text)?;
+        conn.execute(
+            "INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)",
+            params![1_i64, text],
+        )?;
+        conn.execute(
+            "INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)",
+            params![2_i64, text],
+        )?;
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            // Default include_historical=false → only the live doc.
+            let json_str = search(
+                "depreciation",
+                SearchOptions {
+                    k: 10,
+                    types: None,
+                    date_from: None,
+                    date_to: None,
+                    doc_scope: None,
+                    mode: SearchMode::Keyword,
+                    sort_by: SortBy::Relevance,
+                    include_old: true,
+                    current_only: true,
+                    include_historical: false,
+                    format: OutputFormat::Json,
+                    max_per_doc: DEFAULT_MAX_PER_DOC,
+                    include_snippet: true,
+                },
+                None,
+            )?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            let doc_ids: Vec<&str> = parsed["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["doc_id"].as_str().unwrap())
+                .collect();
+            assert!(
+                doc_ids.contains(&"DOC_LIVE"),
+                "live doc should appear; got: {doc_ids:?}"
+            );
+            assert!(
+                !doc_ids.contains(&"DOC_PIT@19960320000000"),
+                "historical doc must be excluded by default; got: {doc_ids:?}"
+            );
+
+            // include_historical=true → both appear.
+            let json_str = search(
+                "depreciation",
+                SearchOptions {
+                    k: 10,
+                    types: None,
+                    date_from: None,
+                    date_to: None,
+                    doc_scope: None,
+                    mode: SearchMode::Keyword,
+                    sort_by: SortBy::Relevance,
+                    include_old: true,
+                    current_only: true,
+                    include_historical: true,
+                    format: OutputFormat::Json,
+                    max_per_doc: DEFAULT_MAX_PER_DOC,
+                    include_snippet: true,
+                },
+                None,
+            )?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            let doc_ids: Vec<&str> = parsed["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["doc_id"].as_str().unwrap())
+                .collect();
+            assert!(doc_ids.contains(&"DOC_LIVE"));
+            assert!(
+                doc_ids.contains(&"DOC_PIT@19960320000000"),
+                "include_historical=true must surface PiT versions; got: {doc_ids:?}"
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_pit_to_date_handles_short_or_non_numeric_input() {
+        assert_eq!(pit_to_date("19960320000001"), Some("1996-03-20".to_string()));
+        assert_eq!(pit_to_date("19960320"), Some("1996-03-20".to_string()));
+        assert!(pit_to_date("1996032").is_none(), "shorter than 8 chars returns None");
+        assert!(pit_to_date("abcd0320000000").is_none());
     }
 
     #[test]
@@ -6308,7 +6818,6 @@ mod tests {
             "replaces": JsonValue::Null,
             "chunks": [{
                 "ord": 0,
-                "heading_path": "Ruling",
                 "anchor": "ruling",
                 "text": "Research and development tax incentive update path text.",
                 "embedding_b64": embedding_b64
@@ -6412,7 +6921,6 @@ mod tests {
             "assets": [],
             "chunks": [{
                 "ord": 0,
-                "heading_path": "Ruling",
                 "anchor": "ruling",
                 "text": "***test term*** means the first definition.",
                 "embedding_b64": embedding_b64
@@ -6469,7 +6977,6 @@ mod tests {
                 "source_title": "Definition repack",
                 "source_type": "Public_ruling",
                 "scope": "Definition repack",
-                "heading_path": "Ruling",
                 "anchor": "ruling",
                 "ord": 0,
                 "body": "means the first definition."
@@ -6612,7 +7119,6 @@ mod tests {
             "replaces": JsonValue::Null,
             "chunks": [{
                 "ord": 0,
-                "heading_path": "Ruling",
                 "anchor": "ruling",
                 "text": "Unsupported schema update path must rebuild before semantic probes.",
                 "embedding_b64": embedding_b64
@@ -6671,7 +7177,7 @@ mod tests {
             assert_eq!(stats.removed, 0);
 
             let conn = open_read()?;
-            assert_eq!(get_meta(&conn, "schema_version")?.as_deref(), Some("7"));
+            assert_eq!(get_meta(&conn, "schema_version")?.as_deref(), Some("8"));
             let title: String = conn.query_row(
                 "SELECT title FROM documents WHERE doc_id = ?",
                 ["DOC_REBUILD_SCHEMA"],
@@ -6694,7 +7200,6 @@ mod tests {
             title: "T".to_string(),
             doc_type: "Public_ruling".to_string(),
             date: None,
-            heading_path: String::new(),
             anchor: None,
             snippet: Some("snip".to_string()),
             canonical_url: "https://x".to_string(),
@@ -6705,6 +7210,9 @@ mod tests {
             withdrawn_date: None,
             superseded_by: None,
             replaces: None,
+            has_in_doc_links: None,
+            has_related_docs: None,
+            has_history: None,
         }
     }
 
@@ -6914,8 +7422,8 @@ mod tests {
         let text = "Research and development tax incentive material for CLI search.";
         insert_chunk(&conn, 1, "DOC_CLI_RERANK", 0, text)?;
         conn.execute(
-            "INSERT INTO chunks_fts(rowid, text, heading_path) VALUES (?, ?, ?)",
-            params![1_i64, text, "Section A"],
+            "INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)",
+            params![1_i64, text],
         )?;
         drop(conn);
 
@@ -6932,6 +7440,7 @@ mod tests {
                     sort_by: SortBy::Relevance,
                     include_old: false,
                     current_only: true,
+                    include_historical: false,
                     format: OutputFormat::Json,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
@@ -7035,7 +7544,6 @@ mod tests {
             title: "head doc".to_string(),
             doc_type: "Public_ruling".to_string(),
             date: None,
-            heading_path: String::new(),
             anchor: None,
             snippet: Some("snip".to_string()),
             canonical_url: "https://x".to_string(),
@@ -7046,6 +7554,9 @@ mod tests {
             withdrawn_date: None,
             superseded_by: None,
             replaces: None,
+            has_in_doc_links: None,
+            has_related_docs: None,
+            has_history: None,
         };
 
         // Tail hit retains the first-stage score (RRF here).
@@ -7055,7 +7566,6 @@ mod tests {
             title: "tail doc".to_string(),
             doc_type: "Public_ruling".to_string(),
             date: None,
-            heading_path: String::new(),
             anchor: None,
             snippet: Some("snip".to_string()),
             canonical_url: "https://y".to_string(),
@@ -7066,6 +7576,9 @@ mod tests {
             withdrawn_date: None,
             superseded_by: None,
             replaces: None,
+            has_in_doc_links: None,
+            has_related_docs: None,
+            has_history: None,
         };
 
         let head_json: serde_json::Value =
