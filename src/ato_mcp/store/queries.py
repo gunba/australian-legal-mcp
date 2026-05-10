@@ -49,17 +49,3 @@ FROM chunks WHERE doc_id = ? ORDER BY ord ASC
 """
 
 SELECT_DOCUMENT = "SELECT * FROM documents WHERE doc_id = ?"
-
-# Empty-shell tracker. UPSERT so build/retry runs can re-observe a doc
-# without the PK constraint firing — the ``excluded.*`` refs pull from
-# the would-be inserted row, bumping last_checked_at + the counter.
-INSERT_EMPTY_SHELL = """
-INSERT INTO empty_shells (doc_id, first_seen_at, last_checked_at, check_count, source)
-VALUES (?, ?, ?, 1, ?)
-ON CONFLICT(doc_id) DO UPDATE SET
-    last_checked_at = excluded.last_checked_at,
-    check_count     = empty_shells.check_count + 1,
-    source          = COALESCE(excluded.source, empty_shells.source)
-"""
-
-DELETE_EMPTY_SHELL = "DELETE FROM empty_shells WHERE doc_id = ?"

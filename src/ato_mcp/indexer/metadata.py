@@ -2,7 +2,7 @@
 
 The canonical_id for every ATO document is a URL fragment of the form
 ``/law/view/document?docid=<PREFIX>/<CODE>/.../<VERSION>`` where PREFIX is one
-of ~40 known document-type codes (TR, GSTR, ATOID, PCG, TA, LCR, PS LA, ...).
+of ~95 known document-type codes (TR, GSTR, ATOID, PCG, TA, LCR, PS LA, ...).
 
 We use the prefix as the primary doc_type signal; ``doc_id`` in the v4 schema
 is the entire docid path verbatim (prefix included), which is unique per
@@ -14,58 +14,14 @@ from __future__ import annotations
 
 import hashlib
 import re
-from importlib import resources
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
-
-import yaml
 
 _DATE_RE = re.compile(
     r"\b(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})\b",
     re.IGNORECASE,
 )
-
-_DOC_TYPE_MAP: dict[str, dict[str, str]] | None = None
-_WARNED_UNMAPPED_PREFIXES: set[str] = set()
-
-
-def _warn_unmapped_prefix(prefix: str) -> None:
-    """Warn once per unknown docid prefix so the maintainer can update the map."""
-    if prefix in _WARNED_UNMAPPED_PREFIXES:
-        return
-    _WARNED_UNMAPPED_PREFIXES.add(prefix)
-    # Imported here to avoid a module-load dependency for scripts that only
-    # use the pure parsing helpers.
-    from ..util.log import get_logger
-    get_logger(__name__).warning(
-        "unmapped docid prefix %r — add it to data/doc_type_map.yaml", prefix
-    )
-
-
-def _load_doc_type_map() -> dict[str, dict[str, str]]:
-    global _DOC_TYPE_MAP
-    if _DOC_TYPE_MAP is not None:
-        return _DOC_TYPE_MAP
-    # Try package-resource first; fall back to repo-root data/ during dev.
-    data_text: str | None = None
-    try:
-        files = resources.files("ato_mcp").joinpath("_data/doc_type_map.yaml")
-        if files.is_file():
-            data_text = files.read_text(encoding="utf-8")
-    except (FileNotFoundError, ModuleNotFoundError, AttributeError):
-        pass
-    if data_text is None:
-        repo_root = Path(__file__).resolve().parents[3]
-        candidate = repo_root / "data" / "doc_type_map.yaml"
-        if candidate.exists():
-            data_text = candidate.read_text(encoding="utf-8")
-    if data_text is None:
-        _DOC_TYPE_MAP = {}
-        return _DOC_TYPE_MAP
-    loaded = yaml.safe_load(data_text) or {}
-    _DOC_TYPE_MAP = {str(k).upper(): v for k, v in loaded.items()}
-    return _DOC_TYPE_MAP
 
 
 def _extract_docid_path(canonical_id: str) -> str | None:
@@ -111,8 +67,14 @@ def category_for_record(canonical_id: str, payload_path: str | None) -> str:
 
 
 def parse_docid(canonical_id: str) -> tuple[str | None, str | None]:
-    """Return ``(prefix, doc_type_name)``. Prefix is uppercased first segment
-    of the docid, e.g. ``TR`` from ``TR/TR20243/NAT/ATO/00001``.
+    """Return ``(prefix, doc_type_name)``. Prefix is the uppercased first
+    segment of the docid (e.g. ``TR`` from ``TR/TR20243/NAT/ATO/00001``).
+
+    The second tuple element is preserved for backwards compatibility with
+    callers that destructure the return value, but is now always ``None``:
+    human-readable doc-type names are not derived from a hand-maintained
+    prefix map. Surfaces that need prefix descriptions read them from the
+    Rust ``stats`` tool, which derives them from corpus titles.
     """
     docid = _extract_docid_path(canonical_id)
     if not docid:
@@ -120,25 +82,20 @@ def parse_docid(canonical_id: str) -> tuple[str | None, str | None]:
     segments = [s for s in docid.split("/") if s]
     if not segments:
         return None, None
-    prefix = segments[0].upper()
-    name = _load_doc_type_map().get(prefix, {}).get("name")
-    if name is None:
-        _warn_unmapped_prefix(prefix)
-    return prefix, name
+    return segments[0].upper(), None
 
 
 def category_for_docid(canonical_id: str) -> str:
-    """Return the ``ato_pages/payloads/<category>/`` bucket for this docid.
+    """Always returns ``Other_ATO_documents``.
 
-    Driven by ``data/doc_type_map.yaml``'s ``category`` hint. Falls back to
-    ``Other_ATO_documents`` for unknown prefixes so new docs still land in a
-    valid bucket rather than ``whats_new``.
+    The historical hand-maintained prefix-to-category map has been removed;
+    ``category_for_record`` still routes documents whose payload paths name a
+    real category (e.g. ``payloads/Public_rulings/...``) into that bucket. For
+    What's New entries and unknown payload paths there is no source-derived
+    category signal at this layer, so everything falls into the catch-all
+    bucket and downstream consumers can rebucket using the corpus-derived
+    prefix breakdown from the Rust ``stats`` tool.
     """
-    prefix, _ = parse_docid(canonical_id)
-    if prefix:
-        entry = _load_doc_type_map().get(prefix)
-        if entry and entry.get("category"):
-            return entry["category"]
     return "Other_ATO_documents"
 
 
@@ -166,18 +123,16 @@ def representative_path_from_docid(
 ) -> list[str]:
     """Derive a ``representative_path`` for the downloader using the docid alone.
 
-    Shape: ``[category, doc_type_name, year, title]``. Segments that can't be
-    resolved are omitted. This is used for What's New entries where we don't
-    have the tree-crawl-derived path — the first segment (category) is what
-    the indexer uses, so even partial classification is correct downstream.
+    Shape: ``[category, heading?, year?, title]``. The category segment is
+    always ``Other_ATO_documents`` because the hand-maintained prefix map has
+    been removed; the second segment is the source-derived ``heading`` from
+    the What's New page when available, which is enough to keep What's New
+    downloads grouped sensibly without inventing a doc-type taxonomy.
     """
     category = category_for_docid(canonical_id)
-    prefix, doc_type_name = parse_docid(canonical_id)
     year = year_for_docid(canonical_id)
     segments = [category]
-    if doc_type_name:
-        segments.append(doc_type_name)
-    elif heading:
+    if heading:
         segments.append(heading)
     if year:
         segments.append(year)
@@ -270,15 +225,48 @@ def human_code_for_doc_id(doc_id: str) -> str | None:
     return None
 
 
-def content_hash(text: str, metadata: dict[str, Any]) -> str:
-    """Stable hash of cleaned source-derived text plus key metadata."""
+def content_hash(text: str, metadata: dict[str, Any] | None = None) -> str:
+    """Stable hash of the chunk-deriving text only.
+
+    ``metadata`` is accepted for backward compatibility with existing callers
+    but is intentionally ignored. Title / doc_type / pub_date / status changes
+    no longer perturb ``content_hash`` because they don't affect the chunks
+    or their embeddings — equality of ``content_hash`` is the gate for
+    "chunks+embeddings are byte-reusable from the previous pack". Row-level
+    metadata equality is checked separately via ``metadata_signature``.
+    """
+    del metadata
     h = hashlib.sha256()
     h.update(text.encode("utf-8", errors="replace"))
-    for key in ("title", "doc_type", "pub_date", "status"):
-        value = metadata.get(key)
-        if value:
-            h.update(b"\0")
-            h.update(key.encode("ascii"))
-            h.update(b"=")
+    return "sha256:" + h.hexdigest()
+
+
+_METADATA_SIGNATURE_KEYS = (
+    "title",
+    "type",
+    "date",
+    "status",
+    "withdrawn_date",
+    "superseded_by",
+    "replaces",
+)
+
+
+def metadata_signature(meta_fields: dict[str, Any]) -> str:
+    """Stable hash of row-metadata fields used for the metadata-refresh check.
+
+    Hashes the values stored in the ``documents`` row (title, type, date,
+    status, currency markers). A change here triggers a metadata-refresh
+    rebuild path that rewrites the pack record header + DB row without
+    re-embedding chunks. Keys are visited in a fixed deterministic order so
+    the digest is stable across runs.
+    """
+    h = hashlib.sha256()
+    for key in _METADATA_SIGNATURE_KEYS:
+        value = meta_fields.get(key)
+        h.update(b"\0")
+        h.update(key.encode("ascii"))
+        h.update(b"=")
+        if value is not None:
             h.update(str(value).encode("utf-8"))
     return "sha256:" + h.hexdigest()

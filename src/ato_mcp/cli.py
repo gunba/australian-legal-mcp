@@ -14,7 +14,6 @@ from typing import Optional
 
 import typer
 
-from .util import paths
 from .util.log import get_logger
 
 LOGGER = get_logger("ato_mcp.cli")
@@ -47,7 +46,7 @@ def _maybe_reexec_with_nvidia_libs() -> None:
 
 @app.command("refresh-source")
 def refresh_source(
-    mode: str = typer.Option("incremental", help="incremental | full | catch_up"),
+    mode: str = typer.Option("incremental", help="incremental | full | catch_up | retry_missing"),
     output_dir: Path = typer.Option(Path("./ato_pages"), help="Destination for payloads/."),
     # [CC-05] refresh-source defaults to ./ato_pages; build-index requires --pages-dir pointing at a populated ato_pages/. Stages independently re-runnable — same pages dir can feed multiple builds.
     links_file: Optional[Path] = typer.Option(None, help="deduped_links.jsonl for incremental mode."),
@@ -55,7 +54,8 @@ def refresh_source(
     request_interval: float = typer.Option(
         0.5,
         help="Minimum seconds between HTTP request starts, globally across workers. "
-             "Default 0.5 s = ~2 req/sec. Drop to 1.0 for a slower/safer rate.",
+             "Default 0.5 s = ~2 req/sec. Drop to 1.0 for a slower/safer rate. "
+             "retry_missing mode falls back to 0.25 s when this is left at the default.",
     ),
     verbose: bool = typer.Option(False, help="Emit downloader status snapshots."),
     root_query: str = typer.Option(
@@ -66,6 +66,14 @@ def refresh_source(
 ) -> None:
     """Maintainer: scrape the ATO site into ``ato_pages/``."""
     from .scraper import refresh_source as run_refresh
+    from .util.power import maybe_reexec_with_sleep_inhibitor
+
+    if mode not in {"incremental", "full", "catch_up", "retry_missing"}:
+        raise typer.BadParameter(
+            f"mode must be one of incremental | full | catch_up | retry_missing (got {mode!r})"
+        )
+
+    maybe_reexec_with_sleep_inhibitor(f"ato-mcp source refresh ({mode})")
 
     result = run_refresh(
         mode=mode,  # type: ignore[arg-type]
@@ -86,6 +94,13 @@ def refresh_source(
         )
         for cat, n in s.by_category.items():
             typer.echo(f"  {n:6d}  {cat}")
+    if result.retry_missing_summary is not None:
+        r = result.retry_missing_summary
+        typer.echo(
+            f"retry-missing: eligible={r.eligible} recovered={r.recovered} "
+            f"confirmed_404={r.confirmed_404} confirmed_stub={r.confirmed_stub} "
+            f"still_missing={r.still_missing}"
+        )
 
 
 @app.command("catch-up")
@@ -319,108 +334,6 @@ def release(
         reranker_tokenizer_sha256=reranker_tokenizer_sha256,
     ))
     typer.echo(f"release {tag} published with manifest + packs")
-
-
-# ---------------------------------------------------------------------------
-# Empty-shell inspection.
-
-
-shells_app = typer.Typer(
-    no_args_is_help=True,
-    help="Inspect the empty_shells log (docs the scraper fetched but which "
-         "yielded no extractable content).",
-)
-app.add_typer(shells_app, name="empty-shells")
-
-
-@shells_app.command("count")
-def shells_count(
-    db_path: Optional[Path] = typer.Option(
-        None, help="Path to ato.db. Defaults to the live install path."
-    ),
-) -> None:
-    """Print total + top-20 doc_id-prefix breakdown."""
-    from .store import db as store_db
-    target = db_path or paths.db_path()
-    conn = store_db.connect(target, mode="ro")
-    try:
-        total = conn.execute("SELECT COUNT(*) AS n FROM empty_shells").fetchone()["n"]
-        typer.echo(f"total shells: {total:,}")
-        rows = conn.execute(
-            """
-            SELECT substr(doc_id, 1, instr(doc_id||'/', '/')-1) AS prefix,
-                   COUNT(*) AS n
-            FROM empty_shells GROUP BY prefix ORDER BY n DESC LIMIT 20
-            """
-        ).fetchall()
-        for r in rows:
-            typer.echo(f"  {r['prefix']:<8} {r['n']:>7,}")
-    finally:
-        conn.close()
-
-
-@shells_app.command("list")
-def shells_list(
-    limit: int = typer.Option(20, help="How many shells to show."),
-    prefix: Optional[str] = typer.Option(
-        None, help="Filter by doc_id prefix (e.g. 'EV', 'JUD')."
-    ),
-    db_path: Optional[Path] = typer.Option(None),
-) -> None:
-    """Show the N oldest-unchecked shells for diagnostics."""
-    from .store import db as store_db
-    target = db_path or paths.db_path()
-    conn = store_db.connect(target, mode="ro")
-    try:
-        sql = (
-            "SELECT doc_id, first_seen_at, last_checked_at, check_count, source "
-            "FROM empty_shells"
-        )
-        params: list = []
-        if prefix:
-            sql += " WHERE doc_id LIKE ?"
-            params.append(f"{prefix.rstrip('/')}/%")
-        sql += " ORDER BY last_checked_at ASC LIMIT ?"
-        params.append(limit)
-        rows = conn.execute(sql, params).fetchall()
-        for r in rows:
-            typer.echo(
-                f"{r['doc_id']:<50}  first={r['first_seen_at']}  "
-                f"last={r['last_checked_at']}  n={r['check_count']}  "
-                f"src={r['source'] or ''}"
-            )
-    finally:
-        conn.close()
-
-
-@shells_app.command("export")
-def shells_export(
-    out: Path = typer.Argument(..., help="Destination CSV path."),
-    db_path: Optional[Path] = typer.Option(None),
-) -> None:
-    """Dump the whole table to CSV (doc_id, canonical_url, first_seen_at, last_checked_at, check_count, source)."""
-    import csv
-    from .store import db as store_db
-    target = db_path or paths.db_path()
-    conn = store_db.connect(target, mode="ro")
-    try:
-        rows = conn.execute(
-            "SELECT doc_id, first_seen_at, last_checked_at, check_count, source "
-            "FROM empty_shells ORDER BY doc_id"
-        ).fetchall()
-        with out.open("w", newline="", encoding="utf-8") as fh:
-            w = csv.writer(fh)
-            w.writerow(["doc_id", "canonical_url", "first_seen_at",
-                        "last_checked_at", "check_count", "source"])
-            for r in rows:
-                w.writerow([
-                    r["doc_id"], f"https://www.ato.gov.au/law/view/document?docid={r['doc_id']}",
-                    r["first_seen_at"], r["last_checked_at"],
-                    r["check_count"], r["source"] or "",
-                ])
-        typer.echo(f"wrote {len(rows):,} rows to {out}")
-    finally:
-        conn.close()
 
 
 if __name__ == "__main__":

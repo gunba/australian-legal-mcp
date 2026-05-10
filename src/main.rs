@@ -116,7 +116,7 @@ enum Command {
     },
     /// Print index version and counts.
     Stats {
-        #[arg(long, default_value = "markdown")]
+        #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
     /// Run a search from the CLI.
@@ -141,7 +141,7 @@ enum Command {
         /// Include withdrawn / superseded rulings (default excludes them).
         #[arg(long)]
         include_withdrawn: bool,
-        #[arg(long, default_value = "markdown")]
+        #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
     /// Search document titles, plus exact doc_id / ATO document links.
@@ -156,7 +156,7 @@ enum Command {
         /// Include withdrawn / superseded rulings (default excludes them).
         #[arg(long)]
         include_withdrawn: bool,
-        #[arg(long, default_value = "markdown")]
+        #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
     /// Fetch a document or a slice of it.
@@ -176,7 +176,7 @@ enum Command {
         context_doc_id: Option<String>,
         #[arg(long, default_value_t = 5)]
         max_defs: usize,
-        #[arg(long, default_value = "markdown")]
+        #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
     /// Verify that a quoted passage exists verbatim (whitespace-tolerant) in a document.
@@ -185,14 +185,13 @@ enum Command {
         quote: String,
         #[arg(long)]
         case_sensitive: bool,
-        #[arg(long, default_value = "markdown")]
+        #[arg(long, default_value = "json")]
         format: OutputFormat,
     },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
 enum OutputFormat {
-    Markdown,
     Json,
 }
 
@@ -290,6 +289,7 @@ fn main() -> Result<()> {
                     current_only: !include_withdrawn,
                     format,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
+                    include_snippet: true,
                 },
             )?;
             println!("{}", out);
@@ -616,15 +616,6 @@ fn init_db(conn: &Connection) -> Result<()> {
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
-
-        CREATE TABLE IF NOT EXISTS empty_shells (
-            doc_id          TEXT PRIMARY KEY,
-            first_seen_at   TEXT NOT NULL,
-            last_checked_at TEXT NOT NULL,
-            check_count     INTEGER NOT NULL DEFAULT 1,
-            source          TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_shells_last_checked ON empty_shells(last_checked_at);
         "#,
     )?;
     set_meta(conn, "schema_version", "7")?;
@@ -778,7 +769,8 @@ struct Hit {
     date: Option<String>,
     heading_path: String,
     anchor: Option<String>,
-    snippet: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snippet: Option<String>,
     canonical_url: String,
     score: Option<f64>,
     chunk_id: Option<i64>,
@@ -825,15 +817,19 @@ struct SearchOptions<'a> {
     sort_by: SortBy,
     include_old: bool,
     /// W2.4: when true (default), withdrawn rulings are excluded from
-    /// results. Set to false to include them — the markdown formatter prefixes
-    /// the title with a `⚠️ withdrawn YYYY-MM-DD` marker so the caller sees
-    /// the status.
+    /// results. Set to false to include them so the caller sees the
+    /// `withdrawn_date`, `superseded_by`, and `replaces` fields on the
+    /// hit and can decide whether the source still applies.
     current_only: bool,
     format: OutputFormat,
     /// Internal-only: maximum chunks returned per document. Capped at
     /// `HARD_MAX_PER_DOC`. NOT exposed in the MCP tool descriptor for
     /// Wave 1 (would inflate the public surface).
     max_per_doc: usize,
+    /// When false, hit serialization omits the `snippet` field — callers
+    /// that intend to follow up with `get_chunks` save the BM25-windowed
+    /// snippet text and the highlight markup pass.
+    include_snippet: bool,
 }
 
 /// Metadata required to rank and dedup candidate chunks across documents.
@@ -1051,7 +1047,7 @@ fn search(
 
     let mut records = Vec::new();
     for ranked_hit in deduped.into_iter() {
-        if let Some(mut hit) = load_hit(&conn, ranked_hit.chunk_id, query)? {
+        if let Some(mut hit) = load_hit(&conn, ranked_hit.chunk_id, query, opts.include_snippet)? {
             hit.score = Some(ranked_hit.score);
             let mut ranking = provenance.remove(&ranked_hit.chunk_id).unwrap_or_default();
             ranking.overall_score = Some(ranked_hit.score);
@@ -1104,12 +1100,11 @@ fn search(
                 "distinct_docs": distinct_docs,
                 "max_per_doc": max_per_doc,
                 "truncated": candidate_count > records.len(),
-                "returned_chars": records.iter().map(|hit| hit.snippet.len()).sum::<usize>(),
+                "returned_chars": records.iter().map(|hit| hit.snippet.as_deref().map(str::len).unwrap_or(0)).sum::<usize>(),
                 "next_call": next_call,
             },
             "hits": records,
         }))?),
-        OutputFormat::Markdown => Ok(format_hits_markdown(&records)),
     }
 }
 
@@ -1879,7 +1874,12 @@ fn quantize_embedding(values: &[f32]) -> Result<[i8; EMBEDDING_DIM]> {
     Ok(out)
 }
 
-fn load_hit(conn: &Connection, chunk_id: i64, query: &str) -> Result<Option<Hit>> {
+fn load_hit(
+    conn: &Connection,
+    chunk_id: i64,
+    query: &str,
+    include_snippet: bool,
+) -> Result<Option<Hit>> {
     let mut stmt = conn.prepare(
         r#"
         SELECT c.chunk_id, c.doc_id, c.ord, c.heading_path, c.anchor, c.text,
@@ -1907,7 +1907,11 @@ fn load_hit(conn: &Connection, chunk_id: i64, query: &str) -> Result<Option<Hit>
         doc_type: row.get("type")?,
         date: row.get("date")?,
         anchor: row.get("anchor")?,
-        snippet: highlight_snippet(&text, query, SNIPPET_CHARS, &heading_path),
+        snippet: if include_snippet {
+            Some(highlight_snippet(&text, query, SNIPPET_CHARS, &heading_path))
+        } else {
+            None
+        },
         canonical_url: canonical_url(&doc_id),
         score: None,
         chunk_id: Some(chunk_id),
@@ -2087,47 +2091,6 @@ fn trim_chars(s: &str, max_chars: usize) -> String {
     s[..end].to_string()
 }
 
-fn format_hits_markdown(hits: &[Hit]) -> String {
-    // [OF-02] Empty hit lists render a compact no-hit marker; otherwise use a table.
-    if hits.is_empty() {
-        return "_No hits._".to_string();
-    }
-    let mut out = String::new();
-    out.push_str("| # | Chunk | Ord | Type | Date | Title | Section | Snippet |\n");
-    out.push_str("|---:|---:|---:|---|---|---|---|---|\n");
-    for (idx, hit) in hits.iter().enumerate() {
-        let chunk = hit.chunk_id.map(|id| id.to_string()).unwrap_or_default();
-        let ord = hit.ord.map(|ord| ord.to_string()).unwrap_or_default();
-        // W2.4: prefix the title with a withdrawn marker when present. Only
-        // ever appears when the caller asked for current_only=false; the
-        // default search drops these rows server-side.
-        let title_display = if let Some(date) = hit.withdrawn_date.as_deref() {
-            format!("⚠️ withdrawn {date} — {}", escape_md(&hit.title))
-        } else {
-            escape_md(&hit.title)
-        };
-        // [OF-03] Markdown hit rows prefer compact doc_id references; JSON keeps canonical_url.
-        out.push_str(&format!(
-            "| {} | {} | {} | `{}` | {} | {}<br><small>`{}`</small> | {} | {} |\n",
-            idx + 1,
-            chunk,
-            ord,
-            escape_md(&hit.doc_type),
-            hit.date.as_deref().unwrap_or(""),
-            title_display,
-            escape_md(&hit.doc_id),
-            escape_md(&hit.heading_path),
-            escape_md(&hit.snippet)
-        ));
-    }
-    out
-}
-
-fn escape_md(value: &str) -> String {
-    // [OF-04] Table cells escape pipes and flatten newlines so snippets cannot break the grid.
-    value.replace('|', "\\|").replace('\n', " ")
-}
-
 fn ato_doc_id_from_link(value: &str) -> Option<String> {
     let trimmed = value.trim().trim_matches('<').trim_matches('>');
     let parsed = Url::parse(trimmed)
@@ -2223,7 +2186,7 @@ fn load_title_hit(conn: &Connection, doc_id: &str, filter: &SqlFilter) -> Result
             date: row.get("date")?,
             heading_path: String::new(),
             anchor: None,
-            snippet: title,
+            snippet: Some(title),
             score: Some(-2000.0),
             chunk_id: None,
             ord: None,
@@ -2287,7 +2250,7 @@ fn search_titles(
             date: row.get("date")?,
             heading_path: String::new(),
             anchor: None,
-            snippet: title,
+            snippet: Some(title),
             score: row.get::<_, f64>("score").ok(),
             chunk_id: None,
             ord: None,
@@ -2326,11 +2289,10 @@ fn search_titles(
             "meta": {
                 "returned": rows.len(),
                 "truncated": truncated,
-                "returned_chars": rows.iter().map(|hit| hit.snippet.len()).sum::<usize>(),
+                "returned_chars": rows.iter().map(|hit| hit.snippet.as_deref().map(str::len).unwrap_or(0)).sum::<usize>(),
             },
             "hits": rows,
         }))?),
-        OutputFormat::Markdown => Ok(format_hits_markdown(&rows)),
     }
 }
 
@@ -2893,54 +2855,6 @@ fn format_definition_response(
                 "ordinary_meaning_error": ordinary_error,
             }
         }))?),
-        OutputFormat::Markdown => {
-            if statutory_found {
-                let mut out = String::new();
-                for hit in hits {
-                    out.push_str(&format!(
-                        "**{}**\n\n{}\n\n`definition_id: {}` | `{}` | ord `{}`\n\n",
-                        escape_md(&hit.term),
-                        hit.body,
-                        hit.definition_id,
-                        hit.source.doc_id,
-                        hit.source.ord
-                    ));
-                }
-                return Ok(out.trim_end().to_string());
-            }
-            if !definition_index_available {
-                return Ok(
-                    "_Definition index unavailable in this corpus; rebuild or update the corpus to use get_definition._"
-                        .to_string(),
-                );
-            }
-            if let Some(hit) = ordinary {
-                let mut out = format!(
-                    "**{}** (ordinary meaning; non-statutory)\n\n",
-                    escape_md(&hit.term)
-                );
-                for definition in hit.definitions {
-                    let prefix = definition
-                        .part_of_speech
-                        .map(|pos| format!("{}: ", escape_md(&pos)))
-                        .unwrap_or_default();
-                    out.push_str(&format!(
-                        "- {}{}\n",
-                        prefix,
-                        escape_md(&definition.definition)
-                    ));
-                }
-                out.push_str(&format!("\nSource: {}", escape_md(&hit.source)));
-                return Ok(out);
-            }
-            if let Some(err) = ordinary_error {
-                return Ok(format!(
-                    "_No statutory definition found. Ordinary-meaning source unavailable: {}_",
-                    escape_md(&err)
-                ));
-            }
-            Ok("_No statutory definition found._".to_string())
-        }
     }
 }
 
@@ -2968,6 +2882,11 @@ fn stats(format: OutputFormat) -> Result<String> {
         let (typ, n) = row?;
         types.insert(typ, n);
     }
+    // [SW-05] prefix_breakdown is corpus-derived: doc_id-prefix counts plus a
+    // sample title per prefix as the description. Replaces the hand-maintained
+    // prefix-to-doc-type map; agents read this to discover the canonical
+    // ``doc_scope="<PREFIX>/*"`` filter idiom for every prefix in the corpus.
+    let prefix_breakdown = collect_prefix_breakdown(&conn)?;
     let payload = json!({
         "data_dir": data_dir()?.display().to_string(),
         "index_version": get_meta(&conn, "index_version")?,
@@ -2980,6 +2899,7 @@ fn stats(format: OutputFormat) -> Result<String> {
         "chunk_embeddings": embeddings,
         "definitions": definitions,
         "types": types,
+        "prefix_breakdown": prefix_breakdown,
         "default_search_policy": {
             "excluded_types": DEFAULT_EXCLUDED_TYPES,
             "old_content_cutoff": OLD_CONTENT_CUTOFF,
@@ -2989,34 +2909,74 @@ fn stats(format: OutputFormat) -> Result<String> {
     match format {
         // [OF-06] JSON outputs use serde_json pretty rendering before return/write.
         OutputFormat::Json => Ok(serde_json::to_string_pretty(&payload)?),
-        OutputFormat::Markdown => {
-            let mut out = String::new();
-            out.push_str(&format!("data_dir: `{}`\n", data_dir()?.display()));
-            out.push_str(&format!(
-                "index_version: `{}`\n",
-                payload["index_version"].as_str().unwrap_or("?")
-            ));
-            out.push_str(&format!(
-                "last_update_at: `{}`\n",
-                payload["last_update_at"].as_str().unwrap_or("?")
-            ));
-            out.push_str(&format!(
-                "embedding_model_id: `{}`\n",
-                payload["embedding_model_id"].as_str().unwrap_or("?")
-            ));
-            out.push_str(&format!("documents: `{}`\n", docs));
-            out.push_str(&format!("chunks: `{}`\n", chunks));
-            out.push_str(&format!("chunk_embeddings: `{}`\n", embeddings));
-            out.push_str(&format!("definitions: `{}`\n", definitions));
-            out.push_str("default_search_mode: `hybrid`\n");
-            out.push_str(&format!(
-                "default_search: excludes `{}` and dates before `{}` except `{}`\n",
-                DEFAULT_EXCLUDED_TYPES.join(", "),
-                OLD_CONTENT_CUTOFF,
-                LEGISLATION_TYPE
-            ));
-            Ok(out)
-        }
+    }
+}
+
+/// Per-prefix corpus breakdown — doc_id-prefix counts plus a sample-title
+/// description. Replaces the hand-maintained prefix-to-doc-type yaml: the only
+/// signal we trust is the corpus itself.
+///
+/// The description is the leading segment of the first sample title (the part
+/// before ` — ` when present, otherwise the full title), since titles for many
+/// ATO doc types don't carry a doc-type label at all (cases, sections, etc.).
+fn collect_prefix_breakdown(conn: &rusqlite::Connection) -> Result<Vec<JsonValue>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+          CASE
+            WHEN INSTR(doc_id, '/') > 0
+              THEN UPPER(SUBSTR(doc_id, 1, INSTR(doc_id, '/') - 1))
+            ELSE UPPER(doc_id)
+          END AS prefix,
+          COUNT(*) AS doc_count
+        FROM documents
+        GROUP BY prefix
+        ORDER BY doc_count DESC, prefix ASC
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut entries: Vec<JsonValue> = Vec::new();
+    for row in rows {
+        let (prefix, count) = row?;
+        let pattern = format!("{}/%", prefix);
+        // Prefer a title that doesn't start with the raw "<PREFIX> " docid
+        // form, so EXM gets its "Explanatory Memorandum — …" composed title
+        // rather than "EXM ADEBB74A". Titles that legitimately start with a
+        // citation (e.g. "TR 2024/3 — …") use a DIFFERENT prefix string
+        // (TR vs TXR, CR vs CLR), so this skip never targets composed titles.
+        // When every doc in a prefix uses the docid form (SRS, EV, MLI), the
+        // tier collapses and we fall back to first by doc_id.
+        let docid_form = format!("{} %", prefix);
+        let description: Option<String> = conn
+            .query_row(
+                "SELECT title FROM documents WHERE doc_id LIKE ?1 \
+                 ORDER BY (CASE WHEN UPPER(title) LIKE ?2 THEN 1 ELSE 0 END), doc_id \
+                 LIMIT 1",
+                rusqlite::params![pattern, docid_form],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+            .map(|title| description_from_title(&title));
+        entries.push(json!({
+            "prefix": prefix,
+            "doc_count": count,
+            "description": description,
+        }));
+    }
+    Ok(entries)
+}
+
+/// Take the part before the first ` — ` em-dash separator if present, else the
+/// full title. ATO ruling titles use that separator to delimit the citation;
+/// for other doc types the title is already the cleanest description we have.
+fn description_from_title(title: &str) -> String {
+    const SEP: &str = " \u{2014} ";
+    match title.find(SEP) {
+        Some(idx) => title[..idx].trim().to_string(),
+        None => title.trim().to_string(),
     }
 }
 
@@ -4578,7 +4538,7 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
                 "recency" => SortBy::Recency,
                 _ => SortBy::Relevance,
             };
-            let format = output_format_arg(&args);
+            let format = output_format_arg(&args)?;
             search(
                 query,
                 SearchOptions {
@@ -4593,6 +4553,7 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
                     current_only: optional_bool(&args, "current_only").unwrap_or(true),
                     format,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
+                    include_snippet: optional_bool(&args, "include_snippet").unwrap_or(true),
                 },
                 Some(state),
             )?
@@ -4606,7 +4567,7 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
                 types.as_deref(),
                 optional_bool(&args, "include_old").unwrap_or(false),
                 optional_bool(&args, "current_only").unwrap_or(true),
-                output_format_arg(&args),
+                output_format_arg(&args)?,
             )?
         }
         "get_document" => {
@@ -4641,12 +4602,12 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
                 GetDefinitionOptions {
                     context_doc_id: args.get("context_doc_id").and_then(|v| v.as_str()),
                     max_defs: optional_usize(&args, "max_defs").unwrap_or(5),
-                    format: output_format_arg(&args),
+                    format: output_format_arg(&args)?,
                 },
             )?
         }
         "verify_quote" => verify_quote_mcp(&args)?,
-        "stats" => stats(output_format_arg(&args))?,
+        "stats" => stats(output_format_arg(&args)?)?,
         _ => bail!("unknown tool: {name}"),
     };
     Ok(json!({
@@ -4690,14 +4651,10 @@ fn optional_string_array(args: &JsonValue, name: &str) -> Result<Option<Vec<Stri
     Ok(Some(out))
 }
 
-fn output_format_arg(args: &JsonValue) -> OutputFormat {
-    match args
-        .get("format")
-        .and_then(|v| v.as_str())
-        .unwrap_or("markdown")
-    {
-        "json" => OutputFormat::Json,
-        _ => OutputFormat::Markdown,
+fn output_format_arg(args: &JsonValue) -> Result<OutputFormat> {
+    match args.get("format").and_then(|v| v.as_str()).unwrap_or("json") {
+        "json" => Ok(OutputFormat::Json),
+        other => bail!("format must be \"json\"; got `{other}`"),
     }
 }
 
@@ -4713,13 +4670,16 @@ fn get_chunks_mcp(args: &JsonValue) -> Result<String> {
                 .ok_or_else(|| anyhow!("chunk_ids must contain integers"))
         })
         .collect::<Result<Vec<_>>>()?;
+    // Validate the format arg so callers passing format=markdown see a clear
+    // error rather than a silently-accepted value; the JSON output path is the
+    // only remaining variant.
+    let _ = output_format_arg(args)?;
     get_chunks(
         &chunk_ids,
         GetChunksOptions {
             before: optional_usize(args, "before").unwrap_or(0).min(20),
             after: optional_usize(args, "after").unwrap_or(0).min(20),
             max_chars: optional_usize(args, "max_chars"),
-            format: output_format_arg(args),
         },
     )
 }
@@ -4728,7 +4688,6 @@ struct GetChunksOptions {
     before: usize,
     after: usize,
     max_chars: Option<usize>,
-    format: OutputFormat,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4817,44 +4776,25 @@ fn get_chunks(chunk_ids: &[i64], opts: GetChunksOptions) -> Result<String> {
         )
     });
     let returned = out.len();
-    if matches!(opts.format, OutputFormat::Json) {
-        return Ok(serde_json::to_string_pretty(&json!({
-            "requested_chunk_ids": chunk_ids,
-            "context": {
-                "before": opts.before,
-                "after": opts.after,
-            },
-            "chunks": out,
-            "meta": {
-                "returned": returned,
-                "returned_chars": returned_chars,
-                "truncated": truncated_at.is_some(),
-                "truncated_at": truncated_at.as_ref().map(|chunk| json!({
-                    "chunk_id": chunk.chunk_id,
-                    "doc_id": chunk.doc_id,
-                    "ord": chunk.ord,
-                })),
-                "next_call": next_call,
-            },
-        }))?);
-    }
-    let mut text = String::new();
-    for chunk in out {
-        text.push_str(&format!(
-            "**{}** ([{}]({})) - chunk `{}` / ord `{}` - {}\n\n{}\n\n---\n",
-            chunk.title,
-            chunk.doc_id,
-            chunk.canonical_url,
-            chunk.chunk_id,
-            chunk.ord,
-            chunk.heading_path,
-            chunk.text
-        ));
-    }
-    if let Some(next_call) = next_call {
-        text.push_str(&format!("_Truncated. Continue with `{next_call}`._\n"));
-    }
-    Ok(text)
+    Ok(serde_json::to_string_pretty(&json!({
+        "requested_chunk_ids": chunk_ids,
+        "context": {
+            "before": opts.before,
+            "after": opts.after,
+        },
+        "chunks": out,
+        "meta": {
+            "returned": returned,
+            "returned_chars": returned_chars,
+            "truncated": truncated_at.is_some(),
+            "truncated_at": truncated_at.as_ref().map(|chunk| json!({
+                "chunk_id": chunk.chunk_id,
+                "doc_id": chunk.doc_id,
+                "ord": chunk.ord,
+            })),
+            "next_call": next_call,
+        },
+    }))?)
 }
 
 fn load_chunks_by_ord_range(
@@ -5116,7 +5056,7 @@ fn server_instructions() -> String {
         .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
     {
         Some(s) => format!(
-            "ATO legal corpus. Documents: {}, chunks: {}. Index: {}. Default search excludes Edited_private_advice and content dated before {} except legislation. Use include_old=true when older authorities are required.",
+            "ATO legal corpus. Documents: {}, chunks: {}. Index: {}. Default search excludes Edited_private_advice and content dated before {} except legislation. Use include_old=true when older authorities are required. Call `stats` to see the per-prefix breakdown — filter by doc family with doc_scope=\"<PREFIX>/%\".",
             s["documents"].as_i64().unwrap_or(0),
             s["chunks"].as_i64().unwrap_or(0),
             s["index_version"].as_str().unwrap_or("?"),
@@ -5146,7 +5086,7 @@ fn verify_quote_mcp(args: &JsonValue) -> Result<String> {
     let doc_id = required_str(args, "doc_id")?;
     let quote = required_str(args, "quote")?;
     let case_sensitive = optional_bool(args, "case_sensitive").unwrap_or(false);
-    let format = output_format_arg(args);
+    let format = output_format_arg(args)?;
     verify_quote(doc_id, quote, case_sensitive, format)
 }
 
@@ -5229,9 +5169,6 @@ fn verify_quote(
         });
         return Ok(match format {
             OutputFormat::Json => serde_json::to_string_pretty(&body)?,
-            OutputFormat::Markdown => {
-                format!("_Quote too short (min {VERIFY_QUOTE_MIN_CHARS} chars)._")
-            }
         });
     }
     let lowercase = !case_sensitive;
@@ -5247,7 +5184,6 @@ fn verify_quote(
         });
         return Ok(match format {
             OutputFormat::Json => serde_json::to_string_pretty(&body)?,
-            OutputFormat::Markdown => "_Quote contains no non-whitespace characters._".to_string(),
         });
     }
 
@@ -5435,29 +5371,7 @@ fn verify_quote(
 
     Ok(match format {
         OutputFormat::Json => serde_json::to_string_pretty(&body)?,
-        OutputFormat::Markdown => format_verify_quote_markdown(&matches, found, truncated),
     })
-}
-
-fn format_verify_quote_markdown(matches: &[QuoteMatch], found: bool, truncated: bool) -> String {
-    if !found {
-        return "_No matches found._".to_string();
-    }
-    let mut out = String::new();
-    out.push_str("| chunk_id | ord | char_offset_in_chunk | char_length |\n");
-    out.push_str("|---:|---:|---:|---:|\n");
-    for m in matches {
-        out.push_str(&format!(
-            "| {} | {} | {} | {} |\n",
-            m.chunk_id, m.ord, m.char_offset_in_chunk, m.char_length
-        ));
-    }
-    if truncated {
-        out.push_str(&format!(
-            "_Truncated at {VERIFY_QUOTE_MAX_MATCHES} matches._\n"
-        ));
-    }
-    out
 }
 
 fn tool_descriptors() -> JsonValue {
@@ -5465,7 +5379,7 @@ fn tool_descriptors() -> JsonValue {
     json!([
         {
             "name": "search",
-            "description": "Search ATO legal documents. Defaults to hybrid semantic-plus-lexical ranking. Explicit mode=keyword is allowed, but hybrid/vector never fall back to keyword when semantic search is unavailable.",
+            "description": "Search ATO legal documents. Defaults to hybrid semantic-plus-lexical ranking. Explicit mode=keyword is allowed, but hybrid/vector never fall back to keyword when semantic search is unavailable. Set include_snippet=false to skip BM25-windowed snippets when the caller will follow up with get_chunks.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5479,7 +5393,8 @@ fn tool_descriptors() -> JsonValue {
                     "sort_by": {"type": "string", "enum": ["relevance", "recency"]},
                     "include_old": {"type": "boolean"},
                     "current_only": {"type": "boolean", "description": "When true (default), excludes withdrawn rulings. Set false to include withdrawn material with a visible marker."},
-                    "format": {"type": "string", "enum": ["markdown", "json"]}
+                    "include_snippet": {"type": "boolean", "description": "When true (default), each hit carries a BM25-windowed snippet. Set false to omit the snippet field entirely — useful when the caller will fetch full text via get_chunks."},
+                    "format": {"type": "string", "enum": ["json"], "default": "json"}
                 },
                 "required": ["query"]
             }
@@ -5495,7 +5410,7 @@ fn tool_descriptors() -> JsonValue {
                     "types": {"type": "array", "items": {"type": "string"}},
                     "include_old": {"type": "boolean"},
                     "current_only": {"type": "boolean", "description": "When true (default), excludes withdrawn rulings. Set false to include withdrawn material with a visible marker."},
-                    "format": {"type": "string", "enum": ["markdown", "json"]}
+                    "format": {"type": "string", "enum": ["json"], "default": "json"}
                 },
                 "required": ["query"]
             }
@@ -5552,7 +5467,7 @@ fn tool_descriptors() -> JsonValue {
                     "before": {"type": "integer", "minimum": 0, "maximum": 20},
                     "after": {"type": "integer", "minimum": 0, "maximum": 20},
                     "max_chars": {"type": "integer", "minimum": 1},
-                    "format": {"type": "string", "enum": ["markdown", "json"]}
+                    "format": {"type": "string", "enum": ["json"], "default": "json"}
                 },
                 "required": ["chunk_ids"]
             }
@@ -5566,7 +5481,7 @@ fn tool_descriptors() -> JsonValue {
                     "term": {"type": "string"},
                     "context_doc_id": {"type": "string"},
                     "max_defs": {"type": "integer", "minimum": 1, "maximum": 20},
-                    "format": {"type": "string", "enum": ["markdown", "json"]}
+                    "format": {"type": "string", "enum": ["json"], "default": "json"}
                 },
                 "required": ["term"]
             }
@@ -5580,18 +5495,18 @@ fn tool_descriptors() -> JsonValue {
                     "doc_id": {"type": "string"},
                     "quote": {"type": "string"},
                     "case_sensitive": {"type": "boolean"},
-                    "format": {"type": "string", "enum": ["markdown", "json"]}
+                    "format": {"type": "string", "enum": ["json"], "default": "json"}
                 },
                 "required": ["doc_id", "quote"]
             }
         },
         {
             "name": "stats",
-            "description": "Index version, document counts, and default search policy.",
+            "description": "Index version, document counts, default search policy, and per-prefix corpus breakdown. Use the prefix breakdown to discover the canonical filter idiom doc_scope=\"<PREFIX>/%\" for narrowing searches by document family.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "format": {"type": "string", "enum": ["markdown", "json"]}
+                    "format": {"type": "string", "enum": ["json"], "default": "json"}
                 }
             }
         }
@@ -6663,6 +6578,7 @@ mod tests {
             current_only: false,
             format: OutputFormat::Json,
             max_per_doc: DEFAULT_MAX_PER_DOC,
+            include_snippet: true,
         };
         let call = search_next_call("depreciation", 16, &opts);
         assert!(
@@ -6682,7 +6598,7 @@ mod tests {
             date: None,
             heading_path: String::new(),
             anchor: None,
-            snippet: "snip".to_string(),
+            snippet: Some("snip".to_string()),
             canonical_url: "https://x".to_string(),
             score: None,
             chunk_id: None,
@@ -6713,7 +6629,7 @@ mod tests {
             date: Some("2022-07-01".to_string()),
             heading_path: String::new(),
             anchor: None,
-            snippet: "snip".to_string(),
+            snippet: Some("snip".to_string()),
             canonical_url: "https://x".to_string(),
             score: None,
             chunk_id: None,
@@ -6730,64 +6646,6 @@ mod tests {
         assert_eq!(parsed["superseded_by"], json!("TR 2025/1"));
         assert_eq!(parsed["replaces"], json!("TR 2021/3"));
         Ok(())
-    }
-
-    // ----- W2.4 markdown formatter shows withdrawn marker -----
-
-    #[test]
-    fn format_hits_markdown_shows_withdrawn_marker() {
-        let hit = Hit {
-            doc_id: "DOC".to_string(),
-            title: "TR 2022/1 — effective life of depreciating assets".to_string(),
-            doc_type: "Public_ruling".to_string(),
-            date: Some("2022-06-29".to_string()),
-            heading_path: "Ruling".to_string(),
-            anchor: None,
-            snippet: "snip".to_string(),
-            canonical_url: "https://x".to_string(),
-            score: None,
-            chunk_id: Some(1),
-            ord: Some(0),
-            next_call: None,
-            ranking: None,
-            withdrawn_date: Some("2025-10-31".to_string()),
-            superseded_by: None,
-            replaces: None,
-            reranker_score: None,
-        };
-        let md = format_hits_markdown(&[hit]);
-        assert!(
-            md.contains("⚠️ withdrawn 2025-10-31"),
-            "withdrawn marker missing from markdown: {md}"
-        );
-    }
-
-    #[test]
-    fn format_hits_markdown_no_marker_for_current_docs() {
-        let hit = Hit {
-            doc_id: "DOC".to_string(),
-            title: "TR 2024/3".to_string(),
-            doc_type: "Public_ruling".to_string(),
-            date: Some("2024-06-01".to_string()),
-            heading_path: "Ruling".to_string(),
-            anchor: None,
-            snippet: "snip".to_string(),
-            canonical_url: "https://x".to_string(),
-            score: None,
-            chunk_id: Some(1),
-            ord: Some(0),
-            next_call: None,
-            ranking: None,
-            withdrawn_date: None,
-            superseded_by: None,
-            replaces: None,
-            reranker_score: None,
-        };
-        let md = format_hits_markdown(&[hit]);
-        assert!(
-            !md.contains("withdrawn"),
-            "current doc should not show withdrawn marker: {md}"
-        );
     }
 
     // ----- W2.4 integration: search filters out withdrawn docs by default -----
@@ -7268,6 +7126,7 @@ mod tests {
                     current_only: true,
                     format: OutputFormat::Json,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
+                    include_snippet: true,
                 },
                 None,
             )?;
@@ -7304,6 +7163,7 @@ mod tests {
                     current_only: false,
                     format: OutputFormat::Json,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
+                    include_snippet: true,
                 },
                 None,
             )?;
@@ -7755,7 +7615,7 @@ mod tests {
             date: None,
             heading_path: String::new(),
             anchor: None,
-            snippet: "snip".to_string(),
+            snippet: Some("snip".to_string()),
             canonical_url: "https://x".to_string(),
             score: Some(0.5),
             chunk_id: Some(1),
@@ -7959,6 +7819,7 @@ mod tests {
                     current_only: true,
                     format: OutputFormat::Json,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
+                    include_snippet: true,
                 },
             )
         });
@@ -8078,7 +7939,7 @@ mod tests {
             date: None,
             heading_path: String::new(),
             anchor: None,
-            snippet: "snip".to_string(),
+            snippet: Some("snip".to_string()),
             canonical_url: "https://x".to_string(),
             score: Some(head_score),
             chunk_id: Some(1),
@@ -8103,7 +7964,7 @@ mod tests {
             date: None,
             heading_path: String::new(),
             anchor: None,
-            snippet: "snip".to_string(),
+            snippet: Some("snip".to_string()),
             canonical_url: "https://y".to_string(),
             score: Some(tail_rrf),
             chunk_id: Some(2),

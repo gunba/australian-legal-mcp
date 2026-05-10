@@ -42,6 +42,22 @@ def test_extract_missing_lawcontents_uses_article() -> None:
     assert "Judgment text." in doc.text
 
 
+def test_picker_handles_law_contents_capital_outermost() -> None:
+    html = """
+    <html><body>
+      <div id="LawContents">
+        <div id="LawBody">
+          <h1>Old-format ATO doc</h1>
+          <p>This document uses the capital-L plural wrapper as outermost.</p>
+        </div>
+      </div>
+    </body></html>
+    """
+    doc = extract(html)
+    assert "Old-format ATO doc" in doc.text
+    assert "This document uses the capital-L plural wrapper as outermost." in doc.text
+
+
 def test_extract_empty_returns_empty_text() -> None:
     doc = extract("")
     assert doc.text == ""
@@ -81,6 +97,42 @@ def test_compose_title_from_leading_headings() -> None:
     assert doc.title == "Class Ruling — CR 2024/3 — Scrip for scrip rollover"
     # Background is a body section, not part of the title.
     assert "Background" not in (doc.title or "")
+
+
+def test_extract_records_heading_levels_for_each_heading() -> None:
+    """Heading levels are emitted in parallel with `headings` so downstream
+    rules can distinguish a real h1 from an h2-only chapter shell."""
+    html = """
+    <div id="LawContent">
+        <h1>Explanatory Memorandum</h1>
+        <h2>EM 2006/15</h2>
+        <h3>Tax Laws Amendment (Loss Recoupment Rules) Bill 2005</h3>
+        <p>This Bill amends...</p>
+    </div>
+    """
+    doc = extract(html)
+    assert doc.headings == [
+        "Explanatory Memorandum",
+        "EM 2006/15",
+        "Tax Laws Amendment (Loss Recoupment Rules) Bill 2005",
+    ]
+    assert doc.heading_levels == [1, 2, 3]
+
+
+def test_extract_h2_only_chapter_keeps_empty_h1_marker_absent() -> None:
+    """Subsidiary EM chapters expose only h2/h3; the heading_levels reflect
+    that no h1 is present so the title composer can fall back to docid."""
+    html = """
+    <div id="lawContents">
+        <div id="Lawbody">
+            <h2></h2>
+            <h3>EXPLANATORY STATEMENT</h3>
+            <p>Body text.</p>
+        </div>
+    </div>
+    """
+    doc = extract(html)
+    assert 1 not in doc.heading_levels
 
 
 def test_extract_unwraps_source_wrapped_inline_fragments() -> None:
@@ -136,8 +188,10 @@ def test_extract_removes_history_noise_and_rewrites_internal_links() -> None:
         <a href="/law/view/document?LocID=PAC%2F19970038%2F203-50&amp;db=HISTFT">View history reference</a>
         <img src="x.gif" title="View history note">View history note
         <img src="y.gif" title="Hide history note">Hide history note
-        <p>History</p>
-        <p>S 203-50 inserted by No 48 of 2002.</p>
+        <div class="panel panel-default">
+          <div class="panel-heading"><a name="LawTimeLine"></a><strong>Section history</strong></div>
+          <div id="PiT"><p>S 203-50 inserted by No 48 of 2002.</p></div>
+        </div>
         <h2>Operative provisions</h2>
         <p>See <a href="/law/view/document?LocID=%22PAC%2F19970038%2F203-55(1)%22">203-55(1)</a>.</p>
     </div>
@@ -219,65 +273,6 @@ def test_extract_rewrites_images_to_asset_refs(tmp_path: Path) -> None:
     assert "View history note" not in doc.html
 
 
-def test_extract_rewrites_simple_formula_table() -> None:
-    html = """
-    <div id="LawContent">
-        <p>Use the following formula:</p>
-        <table>
-          <tr><td></td><td>Amount of the frankable distribution</td><td>×</td><td>Franking % differential</td></tr>
-          <tr><td></td><td>Applicable gross-up rate</td></tr>
-        </table>
-    </div>
-    """
-    doc = extract(html)
-    assert (
-        "Formula: (Amount of the frankable distribution x Franking % differential) / "
-        "Applicable gross-up rate"
-    ) in doc.text
-
-
-def test_extract_rewrites_underlined_single_cell_fraction_table() -> None:
-    html = """
-    <div id="LawContent">
-        <p>Multiply by:</p>
-        <table class="table">
-          <tr>
-            <td></td>
-            <td><u>365</u><br>Number of days in reference period</td>
-            <td></td>
-          </tr>
-        </table>
-    </div>
-    """
-    doc = extract(html)
-    assert "Formula: 365 / Number of days in reference period" in doc.text
-    assert "| 365" not in doc.text
-
-
-def test_extract_rewrites_two_row_defined_term_fraction_table() -> None:
-    html = """
-    <div id="LawContent">
-        <table class="table">
-          <tr>
-            <td></td>
-            <td>100% - <br>*<br>Corporate tax rate for imputation purposes</td>
-            <td></td>
-          </tr>
-          <tr>
-            <td></td>
-            <td>*<br>Corporate tax rate for imputation purposes</td>
-            <td></td>
-          </tr>
-        </table>
-    </div>
-    """
-    doc = extract(html)
-    assert (
-        "Formula: (100% - Corporate tax rate for imputation purposes) / "
-        "Corporate tax rate for imputation purposes"
-    ) in doc.text
-
-
 def test_extract_leaves_ambiguous_two_row_table_as_table() -> None:
     html = """
     <div id="LawContent">
@@ -304,6 +299,83 @@ def test_extract_leaves_multi_cell_table_without_operator_as_table() -> None:
     doc = extract(html)
     assert "Formula:" not in doc.text
     assert "Label | Value\nTotal" in doc.text
+
+
+def test_extract_records_em_front_matter() -> None:
+    """Parliamentary EM front-matter signals — chamber, ref, phrase — are
+    captured from <div id="Lawfront"> for the title composer."""
+    html = """
+    <div id="Lawcontents">
+        <div id="Lawfront">
+            <strong>House of Representatives</strong>
+            <p></p><div class="ref"><strong>Some Bill 2024</strong></div><p></p>
+            <p><strong>Explanatory Memorandum</strong></p>(circulated by ...)
+        </div>
+        <div id="Lawbody">
+            <h2>Chapter 3</h2>
+            <p>Body text.</p>
+        </div>
+    </div>
+    """
+    doc = extract(html)
+    assert doc.front_matter_chamber == "House of Representatives"
+    assert doc.front_matter_refs == ["Some Bill 2024"]
+    assert doc.front_matter_phrase == "Explanatory Memorandum"
+
+
+def test_extract_records_em_front_matter_with_link_in_ref() -> None:
+    """When a ref's <strong> wraps an internal-doc <a>, only the visible
+    text is collected — the link metadata is not relevant to the citation."""
+    html = """
+    <div id="Lawcontents">
+        <div id="Lawfront">
+            <strong>House of Representatives</strong>
+            <p></p><div class="ref">
+                <strong><a data-doc-id="PAC/20240078">Bill Name</a></strong>
+            </div><p></p>
+            <p><strong>Explanatory Memorandum</strong></p>
+        </div>
+        <div id="Lawbody"><h2>Chapter 1</h2></div>
+    </div>
+    """
+    doc = extract(html)
+    assert doc.front_matter_refs == ["Bill Name"]
+    assert doc.front_matter_phrase == "Explanatory Memorandum"
+
+
+def test_extract_no_em_front_matter_returns_none() -> None:
+    """Pages without an EM front-matter wrapper produce empty front-matter."""
+    html = """
+    <div id="LawContent">
+        <h1>Taxation Ruling</h1>
+        <h2>TR 2024/3</h2>
+        <p>Body.</p>
+    </div>
+    """
+    doc = extract(html)
+    assert doc.front_matter_chamber is None
+    assert doc.front_matter_refs == []
+    assert doc.front_matter_phrase is None
+
+
+def test_extract_em_front_matter_no_chamber_for_regulation_es() -> None:
+    """Regulation Explanatory Statements (EXN/EXM/...) skip the chamber
+    block — front_matter_chamber is None but refs and phrase populate."""
+    html = """
+    <div id="Lawcontents">
+        <div id="Lawfront">
+            <p></p><div class="ref">
+                <strong><a data-doc-id="REG/20000109">Some Regulations 2000</a></strong>
+            </div><p></p>
+            <p><strong>Explanatory Statement</strong></p>Issued by ...
+        </div>
+        <div id="Lawbody"><h2>Explanatory Statement</h2></div>
+    </div>
+    """
+    doc = extract(html)
+    assert doc.front_matter_chamber is None
+    assert doc.front_matter_refs == ["Some Regulations 2000"]
+    assert doc.front_matter_phrase == "Explanatory Statement"
 
 
 # ---------------------------------------------------------------------------
@@ -522,3 +594,41 @@ def test_extract_currency_history_table_fallback() -> None:
     info = extract_currency(html)
     # Latest withdrawal entry wins — 15 November 2023.
     assert info.withdrawn_date == "2023-11-15"
+
+
+def test_extract_currency_title_suffix_only_uses_sentinel() -> None:
+    """`(Withdrawn)` in a heading with no other signal sets the sentinel.
+
+    Many ATO IDs/PSLAs carry their withdrawn status only in an h2 like
+    ``ATO ID 2001/746 (Withdrawn)``. Without this path those docs leak
+    into default searches as if they were current law.
+    """
+    html = """
+    <div id="LawContent">
+        <div id="LawBody">
+            <h1>ATO Interpretative Decision</h1>
+            <h2>ATO ID 2001/746 (Withdrawn)</h2>
+            <p>The Commissioner's view on income tax matters.</p>
+        </div>
+    </div>
+    """
+    info = extract_currency(html)
+    assert info.withdrawn_date == "0001-01-01"
+
+
+def test_extract_currency_title_suffix_does_not_override_real_date() -> None:
+    """When both a heading suffix and a real withdrawal date are present,
+    the real date wins — the sentinel is only a last-resort fallback."""
+    html = """
+    <div id="LawContent">
+        <div class="alert alert-block alert-warning" data-icon="w">
+            This document has been Withdrawn with effect from 14 April 1994.
+        </div>
+        <div id="LawBody">
+            <h2>ATO ID 2001/746 (Withdrawn)</h2>
+            <p>Body prose.</p>
+        </div>
+    </div>
+    """
+    info = extract_currency(html)
+    assert info.withdrawn_date == "1994-04-14"

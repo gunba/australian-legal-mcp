@@ -6,6 +6,8 @@ import pytest
 from ato_mcp.indexer.rules import (
     RuleInputs,
     Template,
+    _compose_from_em_front_matter,
+    _compose_from_leading_headings,
     classify,
     derive_metadata,
 )
@@ -281,6 +283,116 @@ def test_universal_fallback_populates_title():
     assert d.title == "NOTAPREFIX XYZ"
 
 
+def test_unmapped_prefix_with_h1_uses_h1_h2_h3_composition():
+    """Docs from prefixes the engine has no specific template for (NEM/EXN/
+    RTF/ESI/...) still produce readable titles when their HTML carries an
+    h1 plus h2 (and h3). The composition mirrors the ruling format
+    ``<h1> — <h2> — <h3>`` and replaces the docid-derived form."""
+    ins = RuleInputs(
+        doc_id="NEM/EM200615/00001",
+        headings=(
+            "Explanatory Memorandum",
+            "EM 2006/15",
+            "Tax Laws Amendment (Loss Recoupment Rules) Bill 2005",
+        ),
+        heading_levels=(1, 2, 3),
+        body_head="This Bill amends the Income Tax Assessment Act 1997...",
+    )
+    d = derive_metadata(ins)
+    assert d.title == (
+        "Explanatory Memorandum — EM 2006/15 — "
+        "Tax Laws Amendment (Loss Recoupment Rules) Bill 2005"
+    )
+    assert d.title is not None and not d.title.startswith("NEM ")
+
+
+def test_unmapped_prefix_h1_only_still_composes():
+    """When only h1 is present, the title is just that h1 — better than
+    the bare docid form even without h2/h3."""
+    ins = RuleInputs(
+        doc_id="ELD/EBL199702/00001",
+        headings=("EBL 1997/2",),
+        heading_levels=(1,),
+    )
+    d = derive_metadata(ins)
+    assert d.title == "EBL 1997/2"
+
+
+def test_unmapped_prefix_no_h1_falls_back_to_docid():
+    """Subsidiary EM chapters with empty/missing h1 keep the deterministic
+    docid form rather than drifting onto a generic body heading."""
+    ins = RuleInputs(
+        doc_id="NEM/EM970014/00002",
+        headings=("", "Overview", "Summary of the amendments"),
+        heading_levels=(2, 3, 3),
+    )
+    d = derive_metadata(ins)
+    assert d.title == "NEM EM970014"
+
+
+def test_em_section_page_uses_front_matter_composition():
+    """EM section pages compose <phrase> — <ref> — <body h2> from the
+    Lawfront front-matter even though they have no h1 of their own."""
+    ins = RuleInputs(
+        doc_id="NEM/EM201018/NAT/ATO/00003",
+        headings=(
+            "Chapter 1 - Introduction to the new R&D tax incentive",
+            "Outline of chapter",
+        ),
+        heading_levels=(2, 3),
+        front_matter_chamber="House of Representatives",
+        front_matter_refs=(
+            "Tax Laws Amendment (Research and Development) Bill 2010",
+        ),
+        front_matter_phrase="Explanatory Memorandum",
+    )
+    d = derive_metadata(ins)
+    assert d.title == (
+        "Explanatory Memorandum — "
+        "Tax Laws Amendment (Research and Development) Bill 2010 — "
+        "Chapter 1 - Introduction to the new R&D tax incentive"
+    )
+
+
+def test_em_explanatory_statement_redundancy_collapsed():
+    """Regulation Explanatory Statements often have the body h2 == phrase
+    ("Explanatory Statement"). The composer drops the redundant section."""
+    ins = RuleInputs(
+        doc_id="EXN/EN2000109/NAT/ATO/00001",
+        headings=("Explanatory Statement",),
+        heading_levels=(2,),
+        front_matter_refs=(
+            "Taxation Administration Amendment Regulations 2000 (No. 2)",
+        ),
+        front_matter_phrase="Explanatory Statement",
+    )
+    d = derive_metadata(ins)
+    assert d.title == (
+        "Explanatory Statement — "
+        "Taxation Administration Amendment Regulations 2000 (No. 2)"
+    )
+
+
+def test_em_no_phrase_falls_through_to_h1_composer():
+    """No front-matter phrase means the EM composer returns None; the
+    h1+h2+h3 composer takes over."""
+    ins = RuleInputs(
+        doc_id="NEM/EM200615/00001",
+        headings=(
+            "Explanatory Memorandum",
+            "EM 2006/15",
+            "Tax Laws Amendment (Loss Recoupment Rules) Bill 2005",
+        ),
+        heading_levels=(1, 2, 3),
+    )
+    assert _compose_from_em_front_matter(ins) is None
+    d = derive_metadata(ins)
+    assert d.title == (
+        "Explanatory Memorandum — EM 2006/15 — "
+        "Tax Laws Amendment (Loss Recoupment Rules) Bill 2005"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Date waterfall — ITAA 1997 mention in body should not hijack a 2024 TR
 
@@ -296,3 +408,73 @@ def test_itaa_1997_does_not_hijack_year():
     )
     d = derive_metadata(ins)
     assert d.date == "2024-01-01"
+
+
+# ---------------------------------------------------------------------------
+# Body-h2 and first-ref fallbacks
+
+
+def test_body_h2_fallback_when_no_h1():
+    """AFS / GDN / similar — page has no h1, no front-matter signals, just a
+    self-contained body h2. Title is the h2 text."""
+    ins = RuleInputs(
+        doc_id="GDN/GDN20241/NAT/ATO/00001",
+        headings=("First home super saver scheme", "GN 2024/1"),
+        heading_levels=(2, 3),
+    )
+    d = derive_metadata(ins)
+    assert d.title == "First home super saver scheme"
+
+
+def test_ref_fallback_when_only_refs():
+    """SRS — page has no headings and no Explanatory phrase, only the bill /
+    act ref pair from <div id="Lawfront">. Title is the first ref (the
+    bill being explained)."""
+    ins = RuleInputs(
+        doc_id="SRS/19770128/00001",
+        headings=(),
+        heading_levels=(),
+        front_matter_chamber="House of Representatives",
+        front_matter_refs=(
+            "Income Tax (Rates) Amendment Bill (No. 2) 1977",
+            "Income Tax (Rates) Amendment Act (No. 2) 1977",
+        ),
+    )
+    d = derive_metadata(ins)
+    assert d.title == "Income Tax (Rates) Amendment Bill (No. 2) 1977"
+
+
+def test_em_phrase_still_wins_over_h2():
+    """Priority — when the EM front-matter phrase is present alongside a body
+    h2, the EM composer fires first."""
+    ins = RuleInputs(
+        doc_id="NEM/EM201018/NAT/ATO/00003",
+        headings=(
+            "Chapter 1 - Introduction to the new R&D tax incentive",
+            "Outline of chapter",
+        ),
+        heading_levels=(2, 3),
+        front_matter_chamber="House of Representatives",
+        front_matter_refs=(
+            "Tax Laws Amendment (Research and Development) Bill 2010",
+        ),
+        front_matter_phrase="Explanatory Memorandum",
+    )
+    d = derive_metadata(ins)
+    assert d.title == (
+        "Explanatory Memorandum — "
+        "Tax Laws Amendment (Research and Development) Bill 2010 — "
+        "Chapter 1 - Introduction to the new R&D tax incentive"
+    )
+
+
+def test_h1_still_wins_over_h2_fallback():
+    """Priority — when h1 is present, the leading-headings composer fires
+    and the body-h2 fallback never runs."""
+    ins = RuleInputs(
+        doc_id="ELD/EBL199702/00001",
+        headings=("EBL 1997/2", "Some body section"),
+        heading_levels=(1, 2),
+    )
+    d = derive_metadata(ins)
+    assert d.title == "EBL 1997/2 — Some body section"

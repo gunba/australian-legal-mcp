@@ -31,26 +31,19 @@ from selectolax.parser import HTMLParser, Node
 from . import chunk as chunk_mod
 
 _HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
-_NAV_LIKE_CLASSES = (
-    "site-header",
-    "global-header",
-    "breadcrumb",
-    "breadcrumbs",
-    "minimenu",
-    "minimenu-bar",
-    "site-footer",
-    "page-footer",
-    "navigation",
-    "skip-links",
-)
+_NAV_LIKE_CLASSES = ("minimenu", "minimenu-bar")
 _NAV_LIKE_IDS = {"LawMiniMenuHeader"}
 _HISTORY_LABELS = {
     "view history reference",
     "view history note",
     "hide history note",
 }
-_STRUCTURAL_ATTRS = {"id", "href", "data-doc-id", "data-asset-ref", "data-media-type"}
-_TABLE_ATTRS = {"colspan", "rowspan", "scope", "headers"}
+_DROP_ATTRS = {
+    "style", "width", "height", "align", "valign", "bgcolor",
+    "name",
+    "data-icon", "cite",
+}
+_DROP_PREFIXES = ("on",)
 
 
 @dataclass(frozen=True)
@@ -73,8 +66,14 @@ class ExtractedDoc:
     title: str | None
     html_title: str | None = None  # raw <title> (browser tab text)
     headings: list[str] = field(default_factory=list)
+    heading_levels: list[int] = field(default_factory=list)  # parallel to headings (1-6)
     anchors: list[tuple[str, str]] = field(default_factory=list)  # (heading_text, anchor_id)
     assets: list[ExtractedAsset] = field(default_factory=list)
+    # Parliamentary EM / regulation Explanatory Statement front-matter signals.
+    # See _collect_em_front_matter for the structural fingerprint these capture.
+    front_matter_chamber: str | None = None
+    front_matter_refs: list[str] = field(default_factory=list)
+    front_matter_phrase: str | None = None
 
 
 @dataclass(frozen=True)
@@ -99,12 +98,45 @@ class CurrencyInfo:
     replaces: str | None = None
 
 
-@dataclass(frozen=True)
-class _FormulaCell:
-    index: int
-    parts: list[str]
-    has_break: bool
-    has_underline: bool
+class _CurrencyCounters:
+    # Per-path detection tallies for currency extraction. ``path`` keys count
+    # how often each detection surface (alert panel / timeline table / prose)
+    # contributed any field for a document. ``<path>_only`` keys count how
+    # often that path was the sole contributor across all three fields.
+    def __init__(self) -> None:
+        self.counts: dict[str, int] = {
+            "alert": 0,
+            "timeline": 0,
+            "prose": 0,
+            "title_suffix": 0,
+            "alert_only": 0,
+            "timeline_only": 0,
+            "prose_only": 0,
+            "title_suffix_only": 0,
+        }
+
+    def record(self, paths: set[str]) -> None:
+        for path in paths:
+            self.counts[path] = self.counts.get(path, 0) + 1
+        if len(paths) == 1:
+            (sole,) = paths
+            key = f"{sole}_only"
+            self.counts[key] = self.counts.get(key, 0) + 1
+
+    def reset(self) -> None:
+        for key in self.counts:
+            self.counts[key] = 0
+
+
+_CURRENCY_COUNTERS = _CurrencyCounters()
+
+
+def get_currency_path_counts() -> dict[str, int]:
+    return dict(_CURRENCY_COUNTERS.counts)
+
+
+def reset_currency_path_counts() -> None:
+    _CURRENCY_COUNTERS.reset()
 
 
 def extract(
@@ -125,23 +157,32 @@ def extract(
 
     _strip_noise(container)
 
+    # Capture EM / Explanatory Statement front-matter BEFORE history stripping
+    # and link rewriting. The front-matter wrapper (#Lawfront) is a stable
+    # structural marker on parliamentary EM and regulation ES pages.
+    fm_chamber, fm_refs, fm_phrase = _collect_em_front_matter(container)
+
     # Capture "title headings" — consecutive leading headings before any body
     # content. On ATO rulings that gives h1=doc_type, h2=code, h3=subject.
     lead_headings = _leading_headings(container)
     title = _compose_title(lead_headings) or html_title
 
     _strip_history_html(container)
-    _rewrite_formula_html_tables(container)
     _normalise_named_anchors(container)
     container = _rewrite_links_html(container)
     assets = _rewrite_images_html(container, doc_id=doc_id, source_path=source_path)
     _strip_attributes(container)
     anchors = _collect_anchors(container)
 
-    headings = [
-        (h.text(deep=True, separator=" ", strip=True) or "")
-        for h in container.css(",".join(_HEADING_TAGS))
-    ]
+    headings = []
+    heading_levels = []
+    for h in container.css(",".join(_HEADING_TAGS)):
+        text = h.text(deep=True, separator=" ", strip=True) or ""
+        headings.append(text)
+        try:
+            heading_levels.append(int((h.tag or "h0")[1:]))
+        except ValueError:
+            heading_levels.append(0)
     html_fragment = container.html or ""
     text = chunk_mod.html_to_text(html_fragment)
     return ExtractedDoc(
@@ -150,9 +191,66 @@ def extract(
         title=title,
         html_title=html_title,
         headings=headings,
+        heading_levels=heading_levels,
         anchors=anchors,
         assets=assets,
+        front_matter_chamber=fm_chamber,
+        front_matter_refs=fm_refs,
+        front_matter_phrase=fm_phrase,
     )
+
+
+def _collect_em_front_matter(container: Node) -> tuple[str | None, list[str], str | None]:
+    """Capture parliamentary EM / regulation ES front-matter signals.
+
+    Parliamentary Explanatory Memoranda (NEM) and regulation Explanatory
+    Statements (EXN/EXM/ESI/ESG/...) tuck the doc-type label and the
+    bill/regulation citation into a ``<div id="Lawfront">`` block instead of
+    a leading h1. Without those signals downstream rules can't compose a
+    title beyond the docid form.
+
+    Returns ``(chamber, refs, phrase)``:
+    - ``chamber``: ``"House of Representatives"`` / ``"Senate"`` if the first
+      direct ``<strong>`` child of the front-matter block is one of those.
+    - ``refs``: text of every ``<strong>`` inside ``<div class="ref">``
+      blocks under the front-matter, in document order.
+    - ``phrase``: the first ``<p><strong>...</strong></p>`` whose text starts
+      with "Explanatory " (Memorandum / Statement / future variants).
+    """
+    front = container.css_first("#Lawfront")
+    if front is None:
+        return None, [], None
+
+    chamber: str | None = None
+    refs: list[str] = []
+    phrase: str | None = None
+    first_strong_seen = False
+
+    for child in front.iter(include_text=False):
+        tag = (child.tag or "").lower()
+        if tag == "strong" and not first_strong_seen:
+            first_strong_seen = True
+            text = _text_norm(child.text(deep=True, separator=" ", strip=True))
+            if text.lower() in ("house of representatives", "senate"):
+                chamber = text
+            continue
+        if tag == "div":
+            cls = (child.attributes.get("class") or "").split()
+            if "ref" in cls:
+                strong = child.css_first("strong")
+                if strong is not None:
+                    ref_text = _text_norm(strong.text(deep=True, separator=" ", strip=True))
+                    if ref_text:
+                        refs.append(ref_text)
+            continue
+        if tag == "p" and phrase is None:
+            strong = child.css_first("strong")
+            if strong is not None:
+                ptext = _text_norm(strong.text(deep=True, separator=" ", strip=True))
+                if ptext.lower().startswith("explanatory "):
+                    phrase = ptext
+
+    return chamber, refs, phrase
 
 
 def _leading_headings(container: Node) -> list[str]:
@@ -218,7 +316,7 @@ def _first_text(tree: HTMLParser, selector: str) -> str | None:
 def _pick_container(tree: HTMLParser) -> Node | None:
     # [IB-06] Container fallback chain absorbs the various wrapper IDs ATO has used over the years; final fallback is body or root.
     # ATO has used several wrapper ids over the years; try each.
-    for selector in ("#LawContent", "#lawContents", "#contents", "#content", "article", "main"):
+    for selector in ("#LawContent", "#lawContents", "#LawContents", "#contents"):
         node = tree.css_first(selector)
         if node is not None:
             return node
@@ -262,18 +360,18 @@ def _node_has_history_label(node: Node) -> bool:
     return title in _HISTORY_LABELS or label in _HISTORY_LABELS
 
 
-def _strip_history_section_from(parent: Node, marker: Node) -> None:
-    children = list(parent.iter(include_text=False))
-    try:
-        start = children.index(marker)
-    except ValueError:
-        marker.decompose()
-        return
-    for child in children[start:]:
-        tag = (child.tag or "").lower()
-        if child is not marker and tag in _HEADING_TAGS:
-            break
-        child.decompose()
+def _closest_panel_ancestor(node: Node) -> Node | None:
+    # Bootstrap convention: the outer panel wrapper has class `panel
+    # panel-default`; inner sub-containers are `panel-heading` / `panel-body`.
+    # We want the outer wrapper, so we match the bare `panel` class token.
+    current: Node | None = node.parent
+    while current is not None:
+        if (current.tag or "").lower() == "div":
+            classes = (current.attributes.get("class") or "").split()
+            if "panel" in classes:
+                return current
+        current = current.parent
+    return None
 
 
 def _strip_history_html(node: Node) -> None:
@@ -292,17 +390,12 @@ def _strip_history_html(node: Node) -> None:
         if (text_node.tag or "").lower() == "-text" and _text_lc(text_node.text()) in _HISTORY_LABELS:
             text_node.decompose()
 
-    for el in list(node.traverse()):
-        tag = (el.tag or "").lower()
-        if tag not in {"p", "div", *_HEADING_TAGS}:
-            continue
-        if _node_text_lc(el) != "history":
-            continue
-        parent = el.parent
-        if parent is None:
-            el.decompose()
-        else:
-            _strip_history_section_from(parent, el)
+    # Source-anchored timeline panel markers: `<a name="LawTimeLine">` lives in
+    # the panel-heading and `<div id="PiT">` wraps the body. Strip the
+    # enclosing panel container so the whole timeline panel disappears.
+    for marker in node.css("[name='LawTimeLine'], [id='PiT']"):
+        target = _closest_panel_ancestor(marker) or marker
+        target.decompose()
 
 
 def _normalise_named_anchors(node: Node) -> None:
@@ -438,22 +531,10 @@ def _rewrite_images_html(
 
 def _strip_attributes(node: Node) -> None:
     for el in node.traverse():
-        tag = (el.tag or "").lower()
-        allowed = set(_STRUCTURAL_ATTRS)
-        if tag in {"td", "th"}:
-            allowed |= _TABLE_ATTRS
         for attr in list(el.attributes):
             attr_lc = attr.lower()
-            if attr_lc.startswith("data-") and attr_lc in _STRUCTURAL_ATTRS:
-                continue
-            if attr_lc in allowed:
-                if attr_lc != attr:
-                    value = el.attributes.get(attr)
-                    if value is not None:
-                        el.attrs[attr_lc] = value
-                    _drop_attr(el, attr)
-                continue
-            _drop_attr(el, attr)
+            if attr_lc in _DROP_ATTRS or attr_lc.startswith(_DROP_PREFIXES):
+                _drop_attr(el, attr)
 
 
 def _drop_attr(node: Node, attr: str) -> None:
@@ -461,88 +542,6 @@ def _drop_attr(node: Node, attr: str) -> None:
         del node.attrs[attr]
     except KeyError:
         pass
-
-
-def _clean_formula_part(value: str) -> str:
-    return " ".join(value.replace("\xa0", " ").split())
-
-
-def _formula_cell_parts(cell: Node) -> list[str]:
-    raw = cell.text(deep=True, separator="\n", strip=True) or ""
-    parts = [_clean_formula_part(part) for part in raw.splitlines()]
-    parts = [part for part in parts if part]
-    if len(parts) > 1:
-        parts = [part for part in parts if part != "*"]
-    return [part.removeprefix("*").strip() if part.startswith("* ") else part for part in parts]
-
-
-def _formula_cells(row: Node) -> list[_FormulaCell]:
-    cells: list[_FormulaCell] = []
-    for index, cell in enumerate(row.css("td,th")):
-        parts = _formula_cell_parts(cell)
-        if not parts:
-            continue
-        html = (cell.html or "").lower()
-        cells.append(
-            _FormulaCell(
-                index=index,
-                parts=parts,
-                has_break="<br" in html,
-                has_underline="<u" in html,
-            )
-        )
-    return cells
-
-
-def _formula_text(parts: list[str]) -> str:
-    text = " ".join(parts).replace("×", "x")
-    return " ".join(text.split())
-
-
-def _looks_like_formula_numerator(text: str) -> bool:
-    padded = f" {text} "
-    return bool(re.search(r"\d\s*%|\s[+\-/]\s|[×*]|\b[xX]\b", padded))
-
-
-def _formula_from_html_table(table: Node) -> str | None:
-    rows = [_formula_cells(row) for row in table.css("tr")]
-    rows = [row for row in rows if row]
-    if len(rows) == 1 and len(rows[0]) == 1:
-        cell = rows[0][0]
-        if cell.has_break and cell.has_underline and len(cell.parts) == 2:
-            return f"Formula: {_formula_text([cell.parts[0]])} / {_formula_text([cell.parts[1]])}"
-        return None
-
-    if len(rows) != 2:
-        return None
-    numerator = rows[0]
-    denominator = rows[1]
-    if len(denominator) != 1:
-        return None
-    denominator_col = denominator[0].index
-    numerator_cols = [cell.index for cell in numerator]
-    if len(numerator) == 1 and numerator[0].index != denominator_col:
-        return None
-    if len(numerator) > 1 and denominator_col not in numerator_cols:
-        return None
-
-    numerator_text = " ".join(_formula_text(cell.parts) for cell in numerator)
-    denominator_text = _formula_text(denominator[0].parts)
-    if not numerator_text or not denominator_text:
-        return None
-    if not _looks_like_formula_numerator(numerator_text):
-        return None
-    return f"Formula: ({numerator_text}) / {denominator_text}"
-
-
-def _rewrite_formula_html_tables(node: Node) -> None:
-    for table in node.css("table"):
-        formula = _formula_from_html_table(table)
-        if formula is None:
-            continue
-        replacement = HTMLParser(f"<p>{html_lib.escape(formula)}</p>").css_first("p")
-        if replacement is not None:
-            table.replace_with(replacement)
 
 
 def _doc_id_from_ato_link(target: str) -> str | None:
@@ -774,24 +773,28 @@ def _extract_self_withdrawn_by(text: str) -> str | None:
     return None
 
 
-def _container_text_for_currency(html: str) -> str:
-    """Combine the status-alert panel text and body prose into one search
-    string so a single regex pass can pick up either surface.
+def _alert_text_for_currency(html: str) -> str:
+    """Concatenate the status-alert panel text in document order.
 
-    We intentionally include the alert panel verbatim (including links) — the
-    panel text on a still-current doc that has been ADDENDUM'd reads "This
-    document has been Withdrawn" only on actually-withdrawn rulings, so the
-    `_RE_WITHDRAWN_PROSE` pattern (which requires a date alongside) won't fire
-    spuriously.
+    The alert panel on a still-current doc that has been ADDENDUM'd reads
+    "This document has been Withdrawn" only on actually-withdrawn rulings, so
+    the ``_RE_WITHDRAWN_PROSE`` pattern (which requires a date alongside)
+    won't fire spuriously.
     """
     tree = HTMLParser(html)
     chunks: list[str] = []
     for el in tree.css("div.alert"):
         chunks.append(el.text(deep=True, separator=" ", strip=True) or "")
-    body = tree.css_first("#LawBody") or tree.css_first("#LawContent") or tree.body
-    if body is not None:
-        chunks.append(body.text(deep=True, separator=" ", strip=True) or "")
     return " \n ".join(c for c in chunks if c)
+
+
+def _body_text_for_currency(html: str) -> str:
+    """Concatenate the LawBody / LawContent / body prose for currency regexes."""
+    tree = HTMLParser(html)
+    body = tree.css_first("#LawBody") or tree.css_first("#LawContent") or tree.body
+    if body is None:
+        return ""
+    return body.text(deep=True, separator=" ", strip=True) or ""
 
 
 def _date_from_history_table(html: str) -> str | None:
@@ -850,37 +853,104 @@ def _date_from_history_table(html: str) -> str | None:
     return latest
 
 
+def _scan_currency_text(text: str) -> tuple[str | None, str | None, str | None]:
+    """Return ``(withdrawn_date, superseded_by, replaces)`` for one text blob.
+
+    Each field is None when the corresponding regex did not match in this
+    blob. Used independently against alert-panel text and body-prose text so
+    callers can attribute hits to the surface they came from.
+    """
+    if not text:
+        return None, None, None
+    withdrawn_date = _extract_self_withdrawn_date(text)
+    superseded_by = _extract_self_withdrawn_by(text)
+    if superseded_by is None:
+        m = _RE_SUPERSEDED_BY_PROSE.search(text)
+        if m is not None:
+            superseded_by = _normalise_citation(m.group("cite"))
+    replaces: str | None = None
+    m = _RE_REPLACES_PROSE.search(text)
+    if m is not None:
+        replaces = _normalise_citation(m.group("cite"))
+    return withdrawn_date, superseded_by, replaces
+
+
+def _has_withdrawn_title_suffix(html: str) -> bool:
+    """Detect a literal ``(Withdrawn)`` suffix in a leading h1/h2/h3.
+
+    Many ATO IDs and PSLAs carry their withdrawn status only in the heading
+    text (e.g. ``<h2>ATO ID 2001/746 (Withdrawn)</h2>``) with no alert panel,
+    timeline row, or prose date. Without this signal those documents would
+    keep ``withdrawn_date IS NULL`` and leak into default searches.
+    """
+    tree = HTMLParser(html)
+    for el in tree.css("h1, h2, h3"):
+        text = el.text(deep=True, separator=" ", strip=True) or ""
+        if "(withdrawn)" in text.lower():
+            return True
+    return False
+
+
+# Sentinel used when the only withdrawal signal is a ``(Withdrawn)`` suffix
+# in a heading. Real withdrawal dates are ISO ``yyyy-mm-dd``; this value is
+# distinguishable so the runtime markdown formatter can render it as
+# "date unknown" while still satisfying the schema's TEXT type and the
+# `withdrawn_date IS NOT NULL` filter that drives current-only search.
+_TITLE_SUFFIX_WITHDRAWN_SENTINEL = "0001-01-01"
+
+
 def extract_currency(html: str) -> CurrencyInfo:
     """Best-effort currency / supersession extraction from raw page HTML.
 
     Returns ``CurrencyInfo()`` (all None) on empty input or when no markers
     are present. Each field is filled independently — see ``CurrencyInfo``.
+
+    Detection paths are tracked in ``_CURRENCY_COUNTERS`` so the build
+    pipeline can audit how often each surface (alert / timeline / prose) was
+    the sole source of an answer.
     """
     if not html or not html.strip():
         return CurrencyInfo()
-    text = _container_text_for_currency(html)
-    if not text:
-        return CurrencyInfo()
 
-    withdrawn_date: str | None = None
-    superseded_by: str | None = None
-    replaces: str | None = None
+    alert_text = _alert_text_for_currency(html)
+    body_text = _body_text_for_currency(html)
 
-    withdrawn_date = _extract_self_withdrawn_date(text)
+    a_withdrawn, a_super, a_replaces = _scan_currency_text(alert_text)
+    p_withdrawn, p_super, p_replaces = _scan_currency_text(body_text)
 
+    paths: set[str] = set()
+
+    withdrawn_date = a_withdrawn
+    if withdrawn_date is not None:
+        paths.add("alert")
+    if withdrawn_date is None and p_withdrawn is not None:
+        withdrawn_date = p_withdrawn
+        paths.add("prose")
     if withdrawn_date is None:
-        # Fall back to the timeline table if the prose form didn't fire.
-        withdrawn_date = _date_from_history_table(html)
+        timeline_date = _date_from_history_table(html)
+        if timeline_date is not None:
+            withdrawn_date = timeline_date
+            paths.add("timeline")
+    if withdrawn_date is None and _has_withdrawn_title_suffix(html):
+        withdrawn_date = _TITLE_SUFFIX_WITHDRAWN_SENTINEL
+        paths.add("title_suffix")
 
-    superseded_by = _extract_self_withdrawn_by(text)
+    superseded_by = a_super
+    if superseded_by is not None:
+        paths.add("alert")
+    if superseded_by is None and p_super is not None:
+        superseded_by = p_super
+        paths.add("prose")
 
-    m = _RE_SUPERSEDED_BY_PROSE.search(text)
-    if m and superseded_by is None:
-        superseded_by = _normalise_citation(m.group("cite"))
+    replaces = a_replaces
+    if replaces is not None:
+        paths.add("alert")
+    if replaces is None and p_replaces is not None:
+        replaces = p_replaces
+        paths.add("prose")
 
-    m = _RE_REPLACES_PROSE.search(text)
-    if m:
-        replaces = _normalise_citation(m.group("cite"))
+    if paths:
+        _CURRENCY_COUNTERS.record(paths)
 
     return CurrencyInfo(
         withdrawn_date=withdrawn_date,

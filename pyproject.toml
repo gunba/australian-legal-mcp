@@ -27,7 +27,6 @@ dependencies = [
     "platformdirs>=4",
     "pydantic>=2",
     "numpy>=1.26",
-    "pyyaml>=6",
     "requests>=2.31",
     "beautifulsoup4>=4.12",
     "tqdm>=4.66",
@@ -68,7 +67,6 @@ ato-mcp = "ato_mcp.cli:app"
 packages = ["src/ato_mcp"]
 
 [tool.hatch.build.targets.wheel.force-include]
-"data/doc_type_map.yaml" = "ato_mcp/_data/doc_type_map.yaml"
 "data/eval_queries.yaml" = "ato_mcp/_data/eval_queries.yaml"
 
 [tool.ruff]

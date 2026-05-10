@@ -314,6 +314,318 @@ def test_previous_manifest_changed_build_uses_windowed_embedding(
     assert "encode_batch_size=64 max_batch_tokens=8192" in caplog.text
 
 
+def test_metadata_only_change_skips_re_embed(
+    tiny_pages_dir: Path,
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    """A doc whose chunks are unchanged but whose row metadata (title, status,
+    withdrawn_date, ...) differs goes through the metadata-refresh branch:
+    chunks + embeddings are carried byte-identically from the prior pack
+    record, the embedding model is not invoked for this doc, and the new pack
+    record carries the new title.
+    """
+    import ato_mcp.indexer.build as build_module
+    import ato_mcp.indexer.rules as rules_module
+    from ato_mcp.embed.model import EncodedBatch
+    from ato_mcp.indexer.pack import read_record
+    from ato_mcp.store import db as store_db
+    from ato_mcp.store.manifest import load_manifest
+
+    encode_calls: list[int] = []
+
+    class StubModel:
+        def __init__(self, *a, **kw) -> None:
+            pass
+
+        def encode(self, texts, *, is_query, batch_size: int = 16):
+            texts_list = list(texts)
+            encode_calls.append(len(texts_list))
+            return EncodedBatch(
+                vectors_int8=np.zeros(
+                    (len(texts_list), store_db.EMBEDDING_DIM), dtype=np.int8,
+                ),
+                tokens_seen=len(texts_list),
+            )
+
+    monkeypatch.setattr(build_module, "EmbeddingModel", StubModel)
+
+    prev_out = tmp_path / "previous"
+    prev_manifest_path = prev_out / "manifest.json"
+    build_module.build(
+        build_module.BuildArgs(
+            pages_dir=tiny_pages_dir,
+            out_dir=prev_out,
+            db_path=prev_out / "ato.db",
+            model_id="stub",
+            model_path=Path("/dev/null"),
+            tokenizer_path=Path("/dev/null"),
+            workers=1,
+            window_docs=1,
+        )
+    )
+    prev_manifest = load_manifest(prev_manifest_path)
+    assert len(prev_manifest.documents) == 1
+    prev_doc_ref = prev_manifest.documents[0]
+    prev_pack_path = prev_out / "packs" / f"pack-{prev_doc_ref.pack_sha8}.bin.zst"
+    prev_record = read_record(prev_pack_path, prev_doc_ref.offset, prev_doc_ref.length)
+    prev_chunks = prev_record["chunks"]
+    assert prev_chunks, "fixture must produce at least one chunk"
+    prev_title = prev_record["title"]
+    prev_embeddings = [c["embedding_b64"] for c in prev_chunks]
+
+    encode_calls.clear()
+    real_derive = rules_module.derive_metadata
+    new_title = prev_title + " (renamed)"
+
+    from dataclasses import replace as dc_replace
+
+    def fake_derive_metadata(inputs):
+        return dc_replace(real_derive(inputs), title=new_title)
+
+    monkeypatch.setattr(build_module.rules_mod, "derive_metadata", fake_derive_metadata)
+
+    logger = logging.getLogger("tests.embedding.metadata_refresh")
+    logger.handlers.clear()
+    logger.propagate = True
+    monkeypatch.setattr(build_module, "LOGGER", logger)
+    caplog.set_level(logging.INFO, logger=logger.name)
+
+    out_dir = tmp_path / "refreshed"
+    new_manifest = build_module.build(
+        build_module.BuildArgs(
+            pages_dir=tiny_pages_dir,
+            out_dir=out_dir,
+            db_path=out_dir / "ato.db",
+            model_id="stub",
+            model_path=Path("/dev/null"),
+            tokenizer_path=Path("/dev/null"),
+            previous_manifest=prev_manifest_path,
+            workers=1,
+            window_docs=1,
+        )
+    )
+
+    assert encode_calls == [], (
+        f"metadata-only change must not invoke the embedding model; got {encode_calls}"
+    )
+    assert "metadata_refreshed=1" in caplog.text
+    assert "reused=0" in caplog.text
+    assert "changed=0" in caplog.text
+
+    assert len(new_manifest.documents) == 1
+    new_ref = new_manifest.documents[0]
+    new_pack_path = out_dir / "packs" / f"pack-{new_ref.pack_sha8}.bin.zst"
+    new_record = read_record(new_pack_path, new_ref.offset, new_ref.length)
+
+    assert new_record["title"] == new_title
+    assert new_record["title"] != prev_title
+    assert new_record["content_hash"] == prev_record["content_hash"]
+    assert [c["embedding_b64"] for c in new_record["chunks"]] == prev_embeddings, (
+        "metadata-refresh must carry chunk embeddings byte-identically from "
+        "the previous pack record"
+    )
+    assert [c["text"] for c in new_record["chunks"]] == [c["text"] for c in prev_chunks]
+
+
+def test_chunk_text_change_re_embeds(
+    tiny_pages_dir: Path,
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    """A doc whose chunk text changes (because its source HTML changed)
+    falls into the full re-extract + re-embed branch — the existing
+    incremental contract.
+    """
+    import ato_mcp.indexer.build as build_module
+    from ato_mcp.embed.model import EncodedBatch
+    from ato_mcp.store import db as store_db
+
+    encode_calls: list[int] = []
+
+    class StubModel:
+        def __init__(self, *a, **kw) -> None:
+            pass
+
+        def encode(self, texts, *, is_query, batch_size: int = 16):
+            texts_list = list(texts)
+            encode_calls.append(len(texts_list))
+            return EncodedBatch(
+                vectors_int8=np.zeros(
+                    (len(texts_list), store_db.EMBEDDING_DIM), dtype=np.int8,
+                ),
+                tokens_seen=len(texts_list),
+            )
+
+    monkeypatch.setattr(build_module, "EmbeddingModel", StubModel)
+
+    prev_out = tmp_path / "previous"
+    build_module.build(
+        build_module.BuildArgs(
+            pages_dir=tiny_pages_dir,
+            out_dir=prev_out,
+            db_path=prev_out / "ato.db",
+            model_id="stub",
+            model_path=Path("/dev/null"),
+            tokenizer_path=Path("/dev/null"),
+            workers=1,
+            window_docs=1,
+        )
+    )
+
+    encode_calls.clear()
+    payload_path = next((tiny_pages_dir / "payloads").iterdir())
+    payload_path.write_text(
+        payload_path.read_text(encoding="utf-8").replace(
+            "This is body text for the small telemetry build smoke.",
+            "Replacement body text changes the chunk fingerprint.",
+        ),
+        encoding="utf-8",
+    )
+
+    logger = logging.getLogger("tests.embedding.body_change")
+    logger.handlers.clear()
+    logger.propagate = True
+    monkeypatch.setattr(build_module, "LOGGER", logger)
+    caplog.set_level(logging.INFO, logger=logger.name)
+
+    out_dir = tmp_path / "rebuilt"
+    build_module.build(
+        build_module.BuildArgs(
+            pages_dir=tiny_pages_dir,
+            out_dir=out_dir,
+            db_path=out_dir / "ato.db",
+            model_id="stub",
+            model_path=Path("/dev/null"),
+            tokenizer_path=Path("/dev/null"),
+            previous_manifest=prev_out / "manifest.json",
+            workers=1,
+            window_docs=1,
+        )
+    )
+
+    assert encode_calls, "body change must trigger re-embedding"
+    assert "changed=1" in caplog.text
+    assert "metadata_refreshed=0" in caplog.text
+    assert "reused=0" in caplog.text
+
+
+def test_legacy_recipe_manifest_promotes_to_fast_path(
+    tiny_pages_dir: Path,
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    """A previous manifest whose stored content_hash was computed with the
+    legacy recipe (which mixed title / doc_type / pub_date / status into the
+    hash) still triggers Branches 1/2 when the actual chunks are unchanged.
+
+    The bridge logic in build() recomputes the prev pack record's hash under
+    the current recipe instead of trusting the stored manifest value, so a
+    corpus built before the recipe change can still be used as a fast-path
+    previous_manifest.
+    """
+    import hashlib
+
+    import ato_mcp.indexer.build as build_module
+    from ato_mcp.embed.model import EncodedBatch
+    from ato_mcp.store import db as store_db
+    from ato_mcp.store.manifest import load_manifest
+
+    encode_calls: list[int] = []
+
+    class StubModel:
+        def __init__(self, *a, **kw) -> None:
+            pass
+
+        def encode(self, texts, *, is_query, batch_size: int = 16):
+            texts_list = list(texts)
+            encode_calls.append(len(texts_list))
+            return EncodedBatch(
+                vectors_int8=np.zeros(
+                    (len(texts_list), store_db.EMBEDDING_DIM), dtype=np.int8,
+                ),
+                tokens_seen=len(texts_list),
+            )
+
+    monkeypatch.setattr(build_module, "EmbeddingModel", StubModel)
+
+    prev_out = tmp_path / "previous"
+    prev_manifest_path = prev_out / "manifest.json"
+    build_module.build(
+        build_module.BuildArgs(
+            pages_dir=tiny_pages_dir,
+            out_dir=prev_out,
+            db_path=prev_out / "ato.db",
+            model_id="stub",
+            model_path=Path("/dev/null"),
+            tokenizer_path=Path("/dev/null"),
+            workers=1,
+            window_docs=1,
+        )
+    )
+
+    # Rewrite each DocRef's content_hash to a deliberately-different value
+    # to simulate a manifest produced by the legacy recipe. We use a sha256
+    # of (prev_hash + "legacy-marker") so the value differs from any hash
+    # the current recipe could produce on these chunks.
+    prev_manifest_data = json.loads(prev_manifest_path.read_text(encoding="utf-8"))
+    assert prev_manifest_data["documents"], "fixture must produce at least one document"
+    for doc in prev_manifest_data["documents"]:
+        legacy_marker = (doc["content_hash"] + "legacy-marker").encode("utf-8")
+        doc["content_hash"] = "sha256:" + hashlib.sha256(legacy_marker).hexdigest()
+    prev_manifest_path.write_text(json.dumps(prev_manifest_data), encoding="utf-8")
+
+    # Sanity: the rewrite stuck.
+    rewritten = load_manifest(prev_manifest_path)
+    assert all(
+        d.content_hash.startswith("sha256:") for d in rewritten.documents
+    )
+
+    encode_calls.clear()
+    logger = logging.getLogger("tests.embedding.legacy_bridge")
+    logger.handlers.clear()
+    logger.propagate = True
+    monkeypatch.setattr(build_module, "LOGGER", logger)
+    caplog.set_level(logging.INFO, logger=logger.name)
+
+    out_dir = tmp_path / "rebuilt"
+    new_manifest = build_module.build(
+        build_module.BuildArgs(
+            pages_dir=tiny_pages_dir,
+            out_dir=out_dir,
+            db_path=out_dir / "ato.db",
+            model_id="stub",
+            model_path=Path("/dev/null"),
+            tokenizer_path=Path("/dev/null"),
+            previous_manifest=prev_manifest_path,
+            workers=1,
+            window_docs=1,
+        )
+    )
+
+    # Source HTML is unchanged, so no doc should fall into the re-embed path.
+    assert encode_calls == [], (
+        "legacy-recipe bridge must let unchanged chunks skip the embedding "
+        f"model; got {encode_calls}"
+    )
+    assert "changed=0" in caplog.text
+    # Either branch is acceptable: reused (full slot match) or
+    # metadata_refreshed (chunks reused, only metadata re-derived).
+    assert ("reused=1" in caplog.text) or ("metadata_refreshed=1" in caplog.text)
+
+    # The freshly-emitted manifest must carry the new-recipe hash, not the
+    # legacy marker we wrote above. Future incremental builds should then hit
+    # the optimised fast-path (manifest hash already matches item hash).
+    assert len(new_manifest.documents) == len(prev_manifest_data["documents"])
+    for new_ref, legacy_doc in zip(new_manifest.documents, prev_manifest_data["documents"]):
+        assert new_ref.content_hash != legacy_doc["content_hash"], (
+            "new manifest must be promoted off the legacy recipe hash"
+        )
+
+
 @pytest.fixture()
 def sample_pages_dir(tmp_path: Path) -> Path:
     if not (ATO_PAGES / "index.jsonl").exists():

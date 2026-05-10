@@ -167,6 +167,7 @@ def test_previous_pack_reuse_requires_current_definition_format(tmp_path: Path) 
                 url="packs/pack-old.bin.zst",
             )
         },
+        "Cases",
     )
     assert not _previous_pack_record_has_current_definitions(
         DocRef(
@@ -185,6 +186,7 @@ def test_previous_pack_reuse_requires_current_definition_format(tmp_path: Path) 
                 url="packs/pack-old-format.bin.zst",
             )
         },
+        "Cases",
     )
     assert _previous_pack_record_has_current_definitions(
         DocRef(
@@ -203,4 +205,5 @@ def test_previous_pack_reuse_requires_current_definition_format(tmp_path: Path) 
                 url="packs/pack-new.bin.zst",
             )
         },
+        "Cases",
     )

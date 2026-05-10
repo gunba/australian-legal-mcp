@@ -43,9 +43,36 @@ Field outputs:
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from enum import Enum
 from typing import Callable
+
+
+@dataclass
+class CitationPathCounters:
+    mailto_body_fired: int = 0
+    mailto_body_sole_source: int = 0
+    report_abbrev_year_fired: int = 0
+    markdown_case_header_fired: int = 0
+    docid_year2_fired: int = 0
+
+    def reset(self) -> None:
+        for f in fields(self):
+            setattr(self, f.name, 0)
+
+    def as_dict(self) -> dict[str, int]:
+        return {f.name: getattr(self, f.name) for f in fields(self)}
+
+
+_CITATION_COUNTERS = CitationPathCounters()
+
+
+def get_citation_path_counts() -> dict[str, int]:
+    return _CITATION_COUNTERS.as_dict()
+
+
+def reset_citation_path_counts() -> None:
+    _CITATION_COUNTERS.reset()
 
 
 # ---------------------------------------------------------------------------
@@ -57,9 +84,16 @@ class RuleInputs:
     doc_id: str
     title: str | None = None
     headings: tuple[str, ...] = ()
+    heading_levels: tuple[int, ...] = ()  # parallel to headings (1..6, 0 for unknown)
     body_head: str = ""
     category: str | None = None
     pub_date: str | None = None
+    # Parliamentary EM / regulation Explanatory Statement front-matter signals.
+    # Populated only on docs whose <div id="Lawfront"> has the EM/ES shape;
+    # consumed by the front-matter title composer. None / empty when absent.
+    front_matter_chamber: str | None = None
+    front_matter_refs: tuple[str, ...] = ()
+    front_matter_phrase: str | None = None
 
     @property
     def outer_prefix(self) -> str:
@@ -529,6 +563,152 @@ def _compose_title(primary: str | None, ins: RuleInputs) -> str | None:
     return " — ".join(parts)
 
 
+def _prefix_overlap(candidate: str, parts: list[str]) -> bool:
+    """True when candidate equals or is prefix-related to any existing part.
+
+    Reused by both title composers — the EM front-matter arm and the leading
+    h1+h2+h3 arm — to drop redundant trailing headings ("TR" + "TR 2024/3").
+    """
+    cand_lower = candidate.lower()
+    for p in parts:
+        p_lower = p.lower()
+        if cand_lower == p_lower:
+            return True
+        if cand_lower.startswith(p_lower):
+            return True
+        if p_lower.startswith(cand_lower):
+            return True
+    return False
+
+
+def _compose_from_em_front_matter(ins: RuleInputs) -> str | None:
+    """Title for parliamentary EM / regulation Explanatory Statement section
+    pages. These pages don't carry their own <h1>; the doc-type label and
+    citation live in <div id="Lawfront">, and the body opens with <h2> giving
+    the section heading. The title shape is:
+        <phrase> — <ref> — <h2>
+    Returns None when the pattern isn't present, so callers can fall through
+    to other composers.
+    """
+    phrase = (ins.front_matter_phrase or "").strip()
+    if not phrase:
+        return None
+    refs = [r for r in ins.front_matter_refs if r and r.strip()]
+    if not refs:
+        return None
+    # First ref is the primary bill / regulation; later refs are the resulting
+    # acts and supporting bills. Always cite the primary subject.
+    citation = " ".join(refs[0].split())
+
+    parts: list[str] = [phrase, citation]
+
+    section: str | None = None
+    for h in ins.headings:
+        t = " ".join((h or "").split())
+        if t:
+            section = t
+            break
+    if section and not _prefix_overlap(section, parts):
+        parts.append(section)
+
+    return " — ".join(parts)
+
+
+def _compose_from_body_h2(ins: RuleInputs) -> str | None:
+    """Title from the first non-empty h2 when no h1 anchors the doc.
+
+    Source-derived fallback for self-contained section pages that publish a
+    body h2 without a leading doc-type h1 (AFS / GDN / similar). Returns
+    ``None`` when level info is missing, when an h1 exists (the
+    leading-headings composer owns that case), or when no non-empty h2
+    is present.
+    """
+    headings = ins.headings
+    levels = ins.heading_levels
+    if not headings or len(levels) != len(headings):
+        return None
+    if any(lvl == 1 and " ".join((headings[i] or "").split())
+           for i, lvl in enumerate(levels)):
+        return None
+    h2_idx = next(
+        (i for i, lvl in enumerate(levels)
+         if lvl == 2 and " ".join((headings[i] or "").split())),
+        None,
+    )
+    if h2_idx is None:
+        return None
+    return " ".join(headings[h2_idx].split())
+
+
+def _compose_from_first_ref(ins: RuleInputs) -> str | None:
+    """Title from the first front_matter_refs entry when no headings carry one.
+
+    Source-derived fallback for parliamentary speech / statement pages that
+    expose only the bill/act reference list in <div id="Lawfront"> with no
+    h1, no body h2, and no Explanatory phrase. The first ref is the bill
+    being discussed (later refs are the resulting Acts and supporting
+    bills). Returns ``None`` when no non-empty ref is available.
+    """
+    if ins.front_matter_phrase:
+        return None
+    refs = [r for r in ins.front_matter_refs if r and r.strip()]
+    if not refs:
+        return None
+    return " ".join(refs[0].split())
+
+
+def _compose_from_leading_headings(ins: RuleInputs) -> str | None:
+    """Compose a readable title from h1 plus the next h2 (and h3) below it.
+
+    Source-derived fallback for documents that don't match a specific
+    template (NEM/EXN/RTF/ESI/...). When the page exposes a non-empty h1
+    anywhere in document order, we anchor on it and then append the first
+    h2 found at or after that position, plus the first h3 found at or
+    after that h2 (or the h1 if no h2 was found). Result mirrors the
+    ruling template format ``<h1> — <h2> — <h3>``.
+
+    h2 and h3 are dropped when missing, identical to a previous part
+    (case-insensitive), or when one part is a strict prefix of the other
+    (so "TR" followed by "TR 2024/3" doesn't double up — same suppression
+    as extract.py).
+
+    Returns ``None`` when no non-empty h1 is present (or when level info
+    is unavailable) so the caller can fall back to the docid-derived form.
+    """
+    headings = ins.headings
+    levels = ins.heading_levels
+    if not headings or len(levels) != len(headings):
+        return None
+    h1_idx = next(
+        (i for i, lvl in enumerate(levels)
+         if lvl == 1 and " ".join((headings[i] or "").split())),
+        None,
+    )
+    if h1_idx is None:
+        return None
+    h1 = " ".join(headings[h1_idx].split())
+    h2_idx = next(
+        (i for i in range(h1_idx + 1, len(levels))
+         if levels[i] == 2 and " ".join((headings[i] or "").split())),
+        None,
+    )
+    h3_anchor = h2_idx if h2_idx is not None else h1_idx
+    h3_idx = next(
+        (i for i in range(h3_anchor + 1, len(levels))
+         if levels[i] == 3 and " ".join((headings[i] or "").split())),
+        None,
+    )
+    parts: list[str] = [h1]
+    for idx in (h2_idx, h3_idx):
+        if idx is None:
+            continue
+        candidate = " ".join(headings[idx].split())
+        if _prefix_overlap(candidate, parts):
+            continue
+        parts.append(candidate)
+    return " — ".join(parts)
+
+
 # --- Template: Official Publication -----------------------------------------
 
 
@@ -656,6 +836,7 @@ def _extract_case_h1(ins: RuleInputs) -> DerivedMetadata:
         old = _RE_OLD_REPORT.search(ins.body_head[:400])
         if old:
             year = int(old["year"])
+            _CITATION_COUNTERS.report_abbrev_year_fired += 1
 
     precise = _precise_date(ins.body_head[:600])
     return DerivedMetadata(
@@ -673,6 +854,7 @@ def _extract_case_h2(ins: RuleInputs) -> DerivedMetadata:
         old = _RE_OLD_REPORT.search(ins.body_head[:500])
         if old:
             year = int(old["year"])
+            _CITATION_COUNTERS.report_abbrev_year_fired += 1
     precise = _precise_date(ins.body_head[:600])
     return DerivedMetadata(
         title=name,
@@ -767,6 +949,8 @@ def _extract_legislation_section(ins: RuleInputs) -> DerivedMetadata:
         for line in _parse_mailto_body(ins.body_head):
             if _RE_ACT_TITLE.match(line):
                 act_name = line
+                _CITATION_COUNTERS.mailto_body_fired += 1
+                _CITATION_COUNTERS.mailto_body_sole_source += 1
                 break
 
     if act_name:
@@ -807,6 +991,7 @@ def _extract_historical_case(ins: RuleInputs) -> DerivedMetadata:
     hdr = _RE_CASE_HEADER_NAME.search(ins.body_head[:400])
     if hdr:
         name = " ".join(hdr["name"].split())
+        _CITATION_COUNTERS.markdown_case_header_fired += 1
     if name is None:
         for line in _parse_mailto_body(ins.body_head):
             if line.lower() in ("cases",):
@@ -815,6 +1000,8 @@ def _extract_historical_case(ins: RuleInputs) -> DerivedMetadata:
                 nm = re.sub(r"\s*-\s*\([^)]+\)\s*$", "", line).strip()
                 if nm and len(nm) < 200:
                     name = nm
+                    _CITATION_COUNTERS.mailto_body_fired += 1
+                    _CITATION_COUNTERS.mailto_body_sole_source += 1
                     break
     if name is None:
         for h in ins.headings[:4]:
@@ -837,6 +1024,11 @@ def _extract_historical_case(ins: RuleInputs) -> DerivedMetadata:
 
 def _extract_bill_em(ins: RuleInputs) -> DerivedMetadata:
     """Bill / EM — no canonical short code but we can give a useful label."""
+    # Front-matter-driven path produces the most specific title when the page
+    # carries the EM/ES front-matter shape — runs ahead of the heading-based
+    # path because it can name the bill being amended even when the body
+    # opens straight to a chapter h2.
+    em_title = _compose_from_em_front_matter(ins)
     source = ins.h2 if _RE_BILL_YEAR.search(ins.h2) else ins.h1
     bill_title = " ".join(source.split())
     if not _RE_BILL_YEAR.search(bill_title) and not _RE_ACT_TITLE.match(bill_title):
@@ -847,9 +1039,21 @@ def _extract_bill_em(ins: RuleInputs) -> DerivedMetadata:
                 break
     ym = _RE_BILL_YEAR.search(bill_title) or _RE_ACT_YEAR.search(bill_title)
     year = int(ym["year"]) if ym else None
-    title = None
-    if bill_title:
+    title = em_title
+    if title is None and bill_title:
         title = f"EM to {bill_title}" if ("Explanatory" not in bill_title and ym) else bill_title
+    # When the only signal we have is the type-phrase ("Explanatory
+    # Memorandum") with no bill year, the generic h1+h2(+h3) composition is
+    # more useful than a one-word title — fall through to it before the
+    # docid-derived form.
+    if title is None or shape_of(title) in _TYPE_PHRASE_SHAPES:
+        composed = (
+            _compose_from_leading_headings(ins)
+            or _compose_from_body_h2(ins)
+            or _compose_from_first_ref(ins)
+        )
+        if composed:
+            title = composed
     precise = _precise_date(ins.body_head[:600])
     return DerivedMetadata(
         title=title,
@@ -903,6 +1107,7 @@ def _extract_from_docid(ins: RuleInputs) -> tuple[str | None, int | None]:
     m = _DOCID_YEAR2_RE.match(body)
     if m:
         series = m.group(1)
+        _CITATION_COUNTERS.docid_year2_fired += 1
         return f"{series} {m['year']}/{m['num']}", 1900 + int(m["year"])
     return None, None
 
@@ -938,8 +1143,15 @@ def _extract_other(ins: RuleInputs) -> DerivedMetadata:
     if ins.pub_date and len(ins.pub_date) >= 4 and ins.pub_date[:4].isdigit() and year is None:
         year = int(ins.pub_date[:4])
     precise = _precise_date(ins.body_head[:600])
+    title = (
+        _compose_from_em_front_matter(ins)
+        or _compose_from_leading_headings(ins)
+        or _compose_from_body_h2(ins)
+        or _compose_from_first_ref(ins)
+        or code
+    )
     return DerivedMetadata(
-        title=code,
+        title=title,
         date=precise or ins.pub_date or (f"{year}-01-01" if year else None),
     )
 

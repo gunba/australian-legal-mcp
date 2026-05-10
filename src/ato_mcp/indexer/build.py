@@ -47,7 +47,6 @@ from ..store.queries import (
     INSERT_CHUNK_FTS,
     INSERT_DEFINITION,
     INSERT_DOCUMENT,
-    INSERT_EMPTY_SHELL,
     INSERT_TITLE_FTS,
     INSERT_VEC,
 )
@@ -140,6 +139,7 @@ class PreparedDoc:
     date: str | None
     downloaded_at: str
     content_hash: str
+    metadata_signature: str
     headings_text: str
     anchors: list[tuple[str, str]]
     html: str
@@ -152,12 +152,7 @@ class PreparedDoc:
     replaces: str | None = None
 
 
-@dataclass
-class EmptyShell:
-    doc_id: str
-
-
-Prepared = PreparedDoc | EmptyShell | None
+Prepared = PreparedDoc | None
 
 
 def _embedding_input(title: str, heading_path: str, text: str) -> str:
@@ -260,9 +255,9 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
             timings.prepare += prepare_s
 
             docs = [item for item in prepared if isinstance(item, PreparedDoc)]
-            empties = [item for item in prepared if isinstance(item, EmptyShell)]
+            empty_count = sum(1 for item in prepared if item is None)
             docs_count += len(docs)
-            empty_shells += len(empties)
+            empty_shells += empty_count
 
             texts: list[str] = []
             doc_chunk_ranges: list[tuple[PreparedDoc, int, int]] = []
@@ -310,7 +305,6 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
                 pack_builder=pack_builder,
                 doc_refs=doc_refs,
                 doc_chunk_ranges=doc_chunk_ranges,
-                empties=empties,
                 vectors_i8=vectors_i8,
                 zstd_level=args.zstd_level,
                 asset_root=asset_root,
@@ -402,6 +396,11 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
 
 
 def build(args: BuildArgs) -> Manifest:
+    LOGGER.info(
+        "Embed batch config: encode_batch_size=%d max_batch_tokens=%d",
+        args.encode_batch_size,
+        args.max_batch_tokens,
+    )
     if args.previous_manifest is None:
         return _build_fresh_windowed(args)
 
@@ -461,7 +460,7 @@ def build(args: BuildArgs) -> Manifest:
 
     doc_refs: list[DocRef] = []
     timings = WindowTimings()
-    seen = processed = reused = changed = empty_shells = chunks_count = windows = 0
+    seen = processed = reused = metadata_refreshed = changed = empty_shells = chunks_count = windows = 0
     tokens_seen = encode_calls = approx_padded_tokens = 0
     since_checkpoint = 0
     t0 = time.monotonic()
@@ -484,40 +483,95 @@ def build(args: BuildArgs) -> Manifest:
             prepare_s = time.monotonic() - phase
             timings.prepare += prepare_s
 
-            empties: list[EmptyShell] = []
+            empty_count = 0
             texts: list[str] = []
             doc_chunk_ranges: list[tuple[PreparedDoc, int, int]] = []
+            metadata_refresh_jobs: list[tuple[dict, PreparedDoc, DocRef, Path]] = []
             window_reused = 0
+            window_metadata_refreshed = 0
 
             phase = time.monotonic()
             for rec, item in zip(active_records, prepared, strict=True):
                 if item is None:
-                    continue
-                if isinstance(item, EmptyShell):
-                    empties.append(item)
+                    empty_count += 1
                     continue
 
                 prev_ref = prev_docs.get(item.doc_id)
-                if (
-                    prev_ref
-                    and prev_ref.content_hash == item.content_hash
-                    and prev_ref.pack_sha8 in prev_pack_info
-                    and _previous_pack_record_has_current_definitions(
-                        prev_ref, args.previous_manifest, prev_pack_info, item.category
+                prev_pack_path: Path | None = None
+                prev_record: dict | None = None
+                prev_recipe_hash: str | None = None
+                if prev_ref is not None and prev_ref.pack_sha8 in prev_pack_info:
+                    prev_pack_path = _locate_previous_pack_path(
+                        prev_ref, args.previous_manifest, prev_pack_info
                     )
+                    if prev_pack_path is not None:
+                        # Optimization: when the manifest's stored hash already
+                        # matches the new-recipe item.content_hash, the manifest
+                        # was emitted by a build that used the current recipe.
+                        # Trust the stored value and skip the prev_record load
+                        # for this fast-path equality check; load lazily below
+                        # when the branch actually needs the record bytes.
+                        if prev_ref.content_hash == item.content_hash:
+                            prev_recipe_hash = prev_ref.content_hash
+                        else:
+                            prev_record = read_record(
+                                prev_pack_path, prev_ref.offset, prev_ref.length
+                            )
+                            prev_recipe_hash = (
+                                _record_content_hash_under_current_recipe(prev_record)
+                            )
+
+                chunks_unchanged = (
+                    prev_ref is not None
+                    and prev_recipe_hash is not None
+                    and prev_recipe_hash == item.content_hash
+                )
+
+                # If chunks_unchanged was decided via the manifest fast-path,
+                # we still need the actual pack record bytes for branches 1/2.
+                if chunks_unchanged and prev_record is None and prev_pack_path is not None:
+                    prev_record = read_record(
+                        prev_pack_path, prev_ref.offset, prev_ref.length
+                    )
+
+                # Branch 1: wholesale slot reuse — content + metadata both unchanged.
+                if (
+                    chunks_unchanged
+                    and prev_record is not None
+                    and _record_has_current_definitions(prev_record, item.category)
+                    and _record_metadata_signature(prev_record) == item.metadata_signature
                 ):
-                    doc_refs.append(prev_ref)
-                    _insert_from_previous(
+                    # Carry the new-recipe content_hash on the new manifest so
+                    # the next incremental build doesn't have to bridge again.
+                    new_ref = prev_ref.model_copy(update={"content_hash": item.content_hash})
+                    doc_refs.append(new_ref)
+                    _insert_from_previous_record(
                         conn,
-                        rec,
-                        prev_ref,
-                        args.previous_manifest,
-                        prev_pack_info,
+                        new_ref,
+                        prev_record,
                         asset_root,
                     )
                     window_reused += 1
                     continue
 
+                # Branch 2: metadata-refresh — chunks+embeddings reusable, but
+                # row-level metadata (title / status / withdrawn_date / ...)
+                # changed. Repack the record header + DB row without touching
+                # the embedding model. [TODO-IB metadata-refresh path: chunks
+                # and embedding_b64 carried byte-identically from prev pack
+                # record; only top-level metadata fields and definitions are
+                # rewritten.]
+                if (
+                    chunks_unchanged
+                    and prev_record is not None
+                    and _record_has_current_definitions(prev_record, item.category)
+                ):
+                    assert prev_pack_path is not None
+                    metadata_refresh_jobs.append((rec, item, prev_ref, prev_pack_path))
+                    window_metadata_refreshed += 1
+                    continue
+
+                # Branch 3: full re-extract + re-embed.
                 start = len(texts)
                 texts.extend(
                     _embedding_input(item.title, c.heading_path, c.text)
@@ -559,8 +613,15 @@ def build(args: BuildArgs) -> Manifest:
                 pack_builder=pack_builder,
                 doc_refs=doc_refs,
                 doc_chunk_ranges=doc_chunk_ranges,
-                empties=empties,
                 vectors_i8=vectors_i8,
+                zstd_level=args.zstd_level,
+                asset_root=asset_root,
+            )
+            _write_metadata_refresh(
+                conn=conn,
+                pack_builder=pack_builder,
+                doc_refs=doc_refs,
+                jobs=metadata_refresh_jobs,
                 zstd_level=args.zstd_level,
                 asset_root=asset_root,
             )
@@ -568,20 +629,32 @@ def build(args: BuildArgs) -> Manifest:
             timings.write += write_s
 
             window_changed = len(doc_chunk_ranges)
-            window_empty = len(empties)
+            window_empty = empty_count
             reused += window_reused
+            metadata_refreshed += window_metadata_refreshed
             changed += window_changed
             empty_shells += window_empty
             chunks_count += len(texts)
-            processed += window_reused + window_changed + window_empty
-            since_checkpoint += window_reused + window_changed + window_empty
+            processed += (
+                window_reused
+                + window_metadata_refreshed
+                + window_changed
+                + window_empty
+            )
+            since_checkpoint += (
+                window_reused
+                + window_metadata_refreshed
+                + window_changed
+                + window_empty
+            )
             if since_checkpoint >= args.checkpoint_every:
                 _checkpoint(conn, pack_builder, doc_refs)
                 since_checkpoint = 0
 
             elapsed = time.monotonic() - t0
             LOGGER.info(
-                "window=%d seen=%d processed=%d reused=%d changed=%d empty_shells=%d "
+                "window=%d seen=%d processed=%d reused=%d metadata_refreshed=%d "
+                "changed=%d empty_shells=%d "
                 "chunks=%d elapsed=%.1fs prepare=%.1fs embed=%.1fs write=%.1fs "
                 "embed_calls=%d tokens=%d tokens/s=%.1f chunks/s=%.1f "
                 "max_batch=%d max_padded_tokens=%d approx_padded_tokens=%d "
@@ -590,6 +663,7 @@ def build(args: BuildArgs) -> Manifest:
                 seen,
                 processed,
                 reused,
+                metadata_refreshed,
                 changed,
                 empty_shells,
                 chunks_count,
@@ -648,7 +722,8 @@ def build(args: BuildArgs) -> Manifest:
     save_update_summary(manifest, args.out_dir / "update.json")
     dt = time.monotonic() - t0
     LOGGER.info(
-        "Indexed %d records this session (%d changed, %d reused, %d empty shells); "
+        "Indexed %d records this session "
+        "(%d changed, %d reused, %d metadata_refreshed, %d empty shells); "
         "manifest has %d docs total in %.1fs "
         "(prepare=%.1fs embed=%.1fs write=%.1fs tokens=%d embed_calls=%d "
         "tokens/s=%.1f chunks/s=%.1f approx_padded_tokens=%d "
@@ -656,6 +731,7 @@ def build(args: BuildArgs) -> Manifest:
         processed,
         changed,
         reused,
+        metadata_refreshed,
         empty_shells,
         len(doc_refs_final),
         dt,
@@ -749,11 +825,15 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
     status = rec.get("status")
     has_content = status == "success"
     headings: list[str] = []
+    heading_levels: list[int] = []
     anchors: list[tuple[str, str]] = []
     title: str | None = None
     html: str | None = None
     clean_html = ""
     assets: list[PreparedAsset] = []
+    front_matter_chamber: str | None = None
+    front_matter_refs: tuple[str, ...] = ()
+    front_matter_phrase: str | None = None
 
     if has_content and rec.get("payload_path"):
         payload_path = pages_dir / rec["payload_path"]
@@ -762,7 +842,11 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
             extracted = extract_mod.extract(html, doc_id=doc_id, source_path=payload_path)
             clean_html = extracted.html
             headings = extracted.headings
+            heading_levels = extracted.heading_levels
             anchors = extracted.anchors
+            front_matter_chamber = extracted.front_matter_chamber
+            front_matter_refs = tuple(extracted.front_matter_refs)
+            front_matter_phrase = extracted.front_matter_phrase
             assets = [
                 PreparedAsset(
                     asset_ref=a.asset_ref,
@@ -793,7 +877,7 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
         has_content = False
 
     if not has_content:
-        return EmptyShell(doc_id=doc_id)
+        return None
 
     body_text = "\n\n".join(c.text for c in chunks)
     pub_date = meta_mod.extract_pub_date(body_text) if body_text else None
@@ -802,19 +886,24 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
             doc_id=doc_id,
             title=title,
             headings=tuple(headings),
+            heading_levels=tuple(heading_levels),
             body_head=body_text[:3000] if body_text else "",
             category=category,
             pub_date=pub_date,
+            front_matter_chamber=front_matter_chamber,
+            front_matter_refs=front_matter_refs,
+            front_matter_phrase=front_matter_phrase,
         )
     )
     derived_title = derived.title or title
     downloaded_at = rec.get("downloaded_at") or datetime.now(timezone.utc).isoformat()
-    meta_fields = {
-        "title": derived_title,
-        "type": category,
-        "date": derived.date,
-    }
     asset_hashes = "\n".join(f"{a.asset_ref}:{a.sha256}" for a in assets)
+    # chunk_fingerprint covers chunk-shape changes that aren't already captured
+    # by clean_html. We do NOT include c.definition_text: definition markers
+    # are a deterministic function of the cleaned HTML, so any change there
+    # already perturbs clean_html in the hash. Including definition_text here
+    # also blocks the bridge that recomputes content_hash from a stored pack
+    # record — the on-disk record carries text but not definition_text.
     chunk_fingerprint = "\n".join(
         "\t".join(
             (
@@ -822,14 +911,12 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
                 c.heading_path,
                 c.anchor or "",
                 c.text,
-                c.definition_text or "",
             )
         )
         for c in chunks
     )
     content_hash = meta_mod.content_hash(
         f"{clean_html}\n{asset_hashes}\n{chunk_fingerprint}",
-        meta_fields,
     )
     # W2.2: extract currency markers from the source HTML (alert panels +
     # body prose + history table). Cheap relative to the extract+chunk pass
@@ -841,6 +928,16 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
         category=category,
         chunks=chunks,
     )
+    metadata_signature = meta_mod.metadata_signature(
+        {
+            "title": derived_title,
+            "type": category,
+            "date": derived.date,
+            "withdrawn_date": currency.withdrawn_date,
+            "superseded_by": currency.superseded_by,
+            "replaces": currency.replaces,
+        }
+    )
     return PreparedDoc(
         doc_id=doc_id,
         category=category,
@@ -848,6 +945,7 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
         date=derived.date,
         downloaded_at=downloaded_at,
         content_hash=content_hash,
+        metadata_signature=metadata_signature,
         headings_text=" ".join(headings),
         anchors=anchors,
         html=clean_html,
@@ -867,6 +965,8 @@ def _extract_definitions_for_doc(
     category: str,
     chunks: list[PreparedChunk],
 ) -> list[definition_mod.Definition]:
+    if category != "Legislation_and_supporting_material":
+        return []
     return definition_mod.extract_definitions(
         doc_id=doc_id,
         source_title=title,
@@ -928,6 +1028,32 @@ def _write_asset_files(asset_root: Path, assets: list[PreparedAsset]) -> None:
         target.write_bytes(base64.b64decode(asset.data_b64))
 
 
+def _locate_previous_pack_path(
+    prev_ref: DocRef,
+    prev_manifest_path: Path | None,
+    prev_packs: dict[str, PackInfo],
+) -> Path | None:
+    if prev_manifest_path is None:
+        return None
+    prev_root = Path(prev_manifest_path).parent
+    pack_path = prev_root / "packs" / f"pack-{prev_ref.pack_sha8}.bin.zst"
+    if not pack_path.exists():
+        info = prev_packs.get(prev_ref.pack_sha8)
+        if info:
+            pack_path = prev_root / info.url
+    return pack_path if pack_path.exists() else None
+
+
+def _record_has_current_definitions(record: dict, category: str) -> bool:
+    return (
+        (record.get("type") or record.get("category") or "") == category
+        and record.get("definitions_format_version") == definition_mod.DEFINITIONS_FORMAT_VERSION
+        and "definitions" in record
+        and "html" in record
+        and "assets" in record
+    )
+
+
 def _previous_pack_record_has_current_definitions(
     prev_ref: DocRef,
     prev_manifest_path: Path | None,
@@ -941,23 +1067,66 @@ def _previous_pack_record_has_current_definitions(
     user installs.
     """
 
-    if prev_manifest_path is None:
-        return False
-    prev_root = Path(prev_manifest_path).parent
-    pack_path = prev_root / "packs" / f"pack-{prev_ref.pack_sha8}.bin.zst"
-    if not pack_path.exists():
-        info = prev_packs.get(prev_ref.pack_sha8)
-        if info:
-            pack_path = prev_root / info.url
-    if not pack_path.exists():
+    pack_path = _locate_previous_pack_path(prev_ref, prev_manifest_path, prev_packs)
+    if pack_path is None:
         return False
     record = read_record(pack_path, prev_ref.offset, prev_ref.length)
-    return (
-        (record.get("type") or record.get("category") or "") == category
-        and record.get("definitions_format_version") == definition_mod.DEFINITIONS_FORMAT_VERSION
-        and "definitions" in record
-        and "html" in record
-        and "assets" in record
+    return _record_has_current_definitions(record, category)
+
+
+def _record_metadata_signature(record: dict) -> str:
+    return meta_mod.metadata_signature(
+        {
+            "title": record.get("title"),
+            "type": record.get("type") or record.get("category"),
+            "date": record.get("date") or record.get("first_published_date"),
+            "withdrawn_date": record.get("withdrawn_date"),
+            "superseded_by": record.get("superseded_by"),
+            "replaces": record.get("replaces"),
+        }
+    )
+
+
+def _record_content_hash_under_current_recipe(record: dict) -> str | None:
+    """Recompute content_hash for a previous pack record using the current
+    recipe, from the record's own stored html / assets / chunks.
+
+    Bridges the recipe change: previous corpora built with the legacy recipe
+    (which mixed title / doc_type / pub_date / status into the hash) cannot
+    be matched against new-recipe hashes computed in ``_prepare_one``. By
+    rehashing straight from the pack record's stored chunks we sidestep the
+    legacy stored value — the pack record IS the source of truth for what
+    chunks exist on disk.
+
+    Returns the hash, or ``None`` if the record doesn't carry the fields
+    needed for a recompute (caller treats as a cache miss). The recipe
+    mirrors ``_prepare_one`` bit-for-bit so a fresh new-recipe corpus
+    yields identical hashes via this path.
+    """
+    clean_html = record.get("html")
+    if not clean_html:
+        return None
+    chunks = record.get("chunks")
+    assets = record.get("assets")
+    if chunks is None or assets is None:
+        return None
+    asset_hashes = "\n".join(
+        f"{a.get('asset_ref', '')}:{a.get('sha256', '')}" for a in assets
+    )
+    chunk_fingerprint = "\n".join(
+        "\t".join(
+            (
+                str(c.get("ord", "")),
+                c.get("heading_path") or "",
+                c.get("anchor") or "",
+                c.get("text") or "",
+            )
+        )
+        for c in chunks
+    )
+    return meta_mod.content_hash(
+        f"{clean_html}\n{asset_hashes}\n{chunk_fingerprint}",
+        {},
     )
 
 
@@ -1087,18 +1256,10 @@ def _write_window(
     pack_builder: PackBuilder,
     doc_refs: list[DocRef],
     doc_chunk_ranges: list[tuple[PreparedDoc, int, int]],
-    empties: list[EmptyShell],
     vectors_i8: np.ndarray,
     zstd_level: int,
     asset_root: Path,
 ) -> None:
-    now = datetime.now(timezone.utc).isoformat()
-    if empties:
-        conn.executemany(
-            INSERT_EMPTY_SHELL,
-            [(e.doc_id, now, now, "scrape") for e in empties],
-        )
-
     if not doc_chunk_ranges:
         return
 
@@ -1226,30 +1387,17 @@ def _windowed(items: Iterator[dict], size: int) -> Iterator[list[dict]]:
         yield window
 
 
-def _insert_from_previous(
+def _insert_from_previous_record(
     conn,
-    rec: dict,
     prev_ref: DocRef,
-    prev_manifest_path: Path | None,
-    prev_packs: dict[str, PackInfo],
+    record: dict,
     asset_root: Path,
 ) -> None:
-    """When reusing a document, we still need its rows in the new DB.
+    """Replay DB inserts for a doc whose pack record is reused verbatim.
 
-    We read the document record out of the previous pack file (next to the
-    previous manifest) and replay the inserts.
+    Caller supplies the already-loaded ``record`` so we don't read the
+    previous pack twice in the dispatch loop.
     """
-    if prev_manifest_path is None:
-        raise RuntimeError("cannot reuse document without previous manifest path")
-    prev_root = Path(prev_manifest_path).parent
-    pack_path = prev_root / "packs" / f"pack-{prev_ref.pack_sha8}.bin.zst"
-    if not pack_path.exists():
-        # Fallback: url relative to manifest root
-        info = prev_packs.get(prev_ref.pack_sha8)
-        if info:
-            pack_path = prev_root / info.url
-    record = read_record(pack_path, prev_ref.offset, prev_ref.length)
-
     conn.execute(
         INSERT_DOCUMENT,
         (
@@ -1258,7 +1406,10 @@ def _insert_from_previous(
             record["title"],
             record.get("date") or record.get("first_published_date"),
             record["downloaded_at"],
-            record["content_hash"],
+            # Persist the DocRef's content_hash (already migrated to the
+            # current recipe by the dispatch loop) rather than the legacy
+            # value stored in the pack record itself.
+            prev_ref.content_hash,
             prev_ref.pack_sha8,
             zstd.ZstdCompressor(level=3).compress(record["html"].encode("utf-8")),
             # Carry forward currency markers from the prior pack record. We
@@ -1336,6 +1487,126 @@ def _insert_from_previous(
         )
 
 
+def _write_metadata_refresh(
+    *,
+    conn,
+    pack_builder: PackBuilder,
+    doc_refs: list[DocRef],
+    jobs: list[tuple[dict, "PreparedDoc", DocRef, Path]],
+    zstd_level: int,
+    asset_root: Path,
+) -> None:
+    """Repack chunks+embeddings from the previous pack with new metadata.
+
+    For each job, we read the previous pack record (already located by the
+    dispatch loop), replace its top-level metadata fields with values from
+    the freshly extracted ``PreparedDoc``, and add the result to the active
+    PackBuilder. The ``chunks`` list — including ``embedding_b64`` — is
+    carried over byte-identically so no embedding-model work is needed.
+    The DB documents/chunks/embeddings rows are inserted as a normal new
+    document.
+    """
+    if not jobs:
+        return
+    zstd_compressor = zstd.ZstdCompressor(level=zstd_level)
+    next_chunk_id = _next_chunk_id(conn)
+
+    document_rows = []
+    title_fts_rows = []
+    asset_rows = []
+    chunk_rows = []
+    chunk_fts_rows = []
+    vec_rows = []
+    definition_rows = []
+
+    from .pack import decode_embedding as _dec
+
+    for _rec, item, prev_ref, prev_pack_path in jobs:
+        record = read_record(prev_pack_path, prev_ref.offset, prev_ref.length)
+
+        document_rows.append(
+            (
+                item.doc_id,
+                item.category,
+                item.title,
+                item.date,
+                item.downloaded_at,
+                item.content_hash,
+                "PENDING",
+                zstd_compressor.compress(item.html.encode("utf-8")),
+                item.withdrawn_date,
+                item.superseded_by,
+                item.replaces,
+            )
+        )
+        title_fts_rows.append((item.doc_id, item.title, item.headings_text))
+        _write_asset_files(asset_root, item.assets)
+        asset_rows.extend(_asset_rows(item.doc_id, item.assets))
+
+        prev_chunks = record.get("chunks", [])
+        for c in prev_chunks:
+            chunk_id = next_chunk_id
+            next_chunk_id += 1
+            compressed_text = zstd_compressor.compress(c["text"].encode("utf-8"))
+            chunk_rows.append(
+                (
+                    chunk_id,
+                    item.doc_id,
+                    c["ord"],
+                    c.get("heading_path") or "",
+                    c.get("anchor"),
+                    compressed_text,
+                )
+            )
+            chunk_fts_rows.append((chunk_id, c["text"], c.get("heading_path") or ""))
+            vec_rows.append((chunk_id, _dec(c["embedding_b64"])))
+
+        new_record = {
+            "doc_id": item.doc_id,
+            "type": item.category,
+            "title": item.title,
+            "date": item.date,
+            "downloaded_at": item.downloaded_at,
+            "content_hash": item.content_hash,
+            "html": item.html,
+            "anchors": item.anchors,
+            "assets": [a.__dict__ for a in item.assets],
+            "withdrawn_date": item.withdrawn_date,
+            "superseded_by": item.superseded_by,
+            "replaces": item.replaces,
+            "definitions_format_version": definition_mod.DEFINITIONS_FORMAT_VERSION,
+            "definitions": [d.__dict__ for d in item.definitions],
+            "chunks": prev_chunks,
+        }
+        pack_builder.add(item.doc_id, new_record)
+        doc_refs.append(
+            DocRef(
+                doc_id=item.doc_id,
+                content_hash=item.content_hash,
+                pack_sha8="PENDING",
+                offset=0,
+                length=0,
+                type=item.category,
+                title=item.title,
+                has_content=True,
+            )
+        )
+        definition_rows.extend(_definition_rows(item.definitions))
+
+    if document_rows:
+        conn.executemany(INSERT_DOCUMENT, document_rows)
+    if title_fts_rows:
+        conn.executemany(INSERT_TITLE_FTS, title_fts_rows)
+    if asset_rows:
+        conn.executemany(INSERT_ASSET, asset_rows)
+    if chunk_rows:
+        conn.executemany(INSERT_CHUNK_WITH_ID, chunk_rows)
+        conn.executemany(INSERT_CHUNK_FTS, chunk_fts_rows)
+        conn.executemany(INSERT_VEC, vec_rows)
+    if definition_rows:
+        conn.executemany(INSERT_DEFINITION, definition_rows)
+
+
 def _iter_index(pages_dir: Path) -> Iterator[dict]:
     index_path = pages_dir / "index.jsonl"
     with index_path.open("r", encoding="utf-8") as fh:
@@ -1356,7 +1627,7 @@ def _take(it: Iterator[dict], n: int) -> Iterator[dict]:
 
 
 def _today_version() -> str:
-    return datetime.now(timezone.utc).strftime("%Y.%m.%d")
+    return datetime.now().strftime("%Y.%m.%d")
 
 
 def _checkpoint(conn, pack_builder: PackBuilder, doc_refs: list[DocRef]) -> None:

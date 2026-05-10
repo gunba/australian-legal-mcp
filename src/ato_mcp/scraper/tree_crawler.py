@@ -7,7 +7,7 @@ from typing import Any, Deque, Dict, Iterable, List, Optional, Set
 from urllib.parse import parse_qs
 
 from .progress import progress_bar, progress_write
-from .constants import EXCLUDED_TITLES
+from .constants import build_excluded_titles_lookup, is_excluded_title
 
 LOGGER = logging.getLogger(__name__)
 
@@ -53,7 +53,7 @@ class AtoTreeCrawler:
 		self.client = client
 		self.logger = logger or LOGGER
 		self.skip_data_urls = skip_data_urls or set()
-		self.excluded_titles_lookup = {title.strip().lower() for title in (excluded_titles or EXCLUDED_TITLES)}
+		self.excluded_titles_lookup = build_excluded_titles_lookup(excluded_titles)
 
 	def crawl(
 		self,
@@ -90,7 +90,7 @@ class AtoTreeCrawler:
 				path=item["path"],
 			)
 
-			if self._is_excluded_title(node.title):
+			if is_excluded_title(node.title, self.excluded_titles_lookup):
 				progress_write(f"[crawl] skipping title '{node.title}'")
 				if node.data_url:
 					visited_data_urls.add(node.data_url)
@@ -195,6 +195,3 @@ class AtoTreeCrawler:
 		if toc_values:
 			return toc_values[0]
 		return data_url
-
-	def _is_excluded_title(self, title: str) -> bool:
-		return title.strip().lower() in self.excluded_titles_lookup

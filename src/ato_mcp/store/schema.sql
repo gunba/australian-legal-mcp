@@ -119,19 +119,3 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-
--- Empty-shell tracker: documents the scraper fetched but which yielded no
--- extractable content. Kept so a later retry run can re-probe them without
--- losing the list of "known empties" between sessions.
---
---   source: where the row came from — 'scrape' (seen empty during build),
---           'retry' (probed and still
---           empty). Free-form text beyond those is fine.
-CREATE TABLE IF NOT EXISTS empty_shells (
-    doc_id          TEXT PRIMARY KEY,
-    first_seen_at   TEXT NOT NULL,
-    last_checked_at TEXT NOT NULL,
-    check_count     INTEGER NOT NULL DEFAULT 1,
-    source          TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_shells_last_checked ON empty_shells(last_checked_at);

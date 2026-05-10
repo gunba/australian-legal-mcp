@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 from .progress import progress_bar
-from .constants import EXCLUDED_TITLES
+from .constants import build_excluded_titles_lookup, is_excluded_title
 
 
 @dataclass
@@ -38,7 +38,7 @@ class SnapshotReducer:
 
 	def __init__(self, nodes_path: Path | str, excluded_titles: Optional[Iterable[str]] = None) -> None:
 		self.nodes_path = Path(nodes_path)
-		self.excluded_titles_lookup = {title.strip().lower() for title in (excluded_titles or EXCLUDED_TITLES)}
+		self.excluded_titles_lookup = build_excluded_titles_lookup(excluded_titles)
 		self.excluded_counts: Dict[str, int] = defaultdict(int)
 		self.excluded_folder_urls: Set[str] = set()
 
@@ -72,9 +72,9 @@ class SnapshotReducer:
 			node_meta[uid] = {"parent": parent_uid, "data_url": data_url}
 
 			title = (record.get("title") or "").strip()
-			is_excluded_title = self._is_excluded_title(title)
+			is_excluded = is_excluded_title(title, self.excluded_titles_lookup)
 			parent_excluded = parent_uid in excluded_uids if parent_uid is not None else False
-			if is_excluded_title or parent_excluded:
+			if is_excluded or parent_excluded:
 				excluded_uids.add(uid)
 				self.excluded_counts[title or "(untitled)"] += 1
 				if data_url:
@@ -225,6 +225,3 @@ class SnapshotReducer:
 		skip_path.write_text(json.dumps(sorted(all_skip_urls), indent=2), encoding="utf-8")
 
 		return redundant_path, skip_path
-
-	def _is_excluded_title(self, title: str) -> bool:
-		return title.strip().lower() in self.excluded_titles_lookup
