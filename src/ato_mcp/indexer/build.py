@@ -939,6 +939,7 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
             "superseded_by": currency.superseded_by,
             "replaces": currency.replaces,
             "pack_format_version": meta_mod.PACK_FORMAT_VERSION,
+            "chunker_format_version": chunk_mod.CHUNKER_FORMAT_VERSION,
         }
     )
     doc_anchors = anchors_mod.extract_anchors(clean_html, source_doc_id=doc_id)
@@ -1102,11 +1103,17 @@ def _record_content_hash_under_current_recipe(record: dict) -> str | None:
     legacy stored value — the pack record IS the source of truth for what
     chunks exist on disk.
 
-    Returns the hash, or ``None`` if the record doesn't carry the fields
-    needed for a recompute (caller treats as a cache miss). The recipe
-    mirrors ``_prepare_one`` bit-for-bit so a fresh new-recipe corpus
-    yields identical hashes via this path.
+    Returns ``None`` when the record's ``chunker_format_version`` is missing
+    or stale, when the record doesn't carry the fields needed for a recompute,
+    or when the recompute fails. ``None`` short-circuits Branch 1 (wholesale
+    reuse) and Branch 2 (metadata-refresh), forcing the doc to Branch 3 (full
+    re-extract + re-embed). Use the version gate to retire old chunks whose
+    shape no longer matches the current chunker output (e.g. oversize chunks
+    the new word-window fallback would now cap).
     """
+    stored_version = record.get("chunker_format_version")
+    if stored_version != chunk_mod.CHUNKER_FORMAT_VERSION:
+        return None
     clean_html = record.get("html")
     if not clean_html:
         return None
@@ -1358,6 +1365,7 @@ def _write_window(
             "has_related_docs": nav_flags[1],
             "has_history": nav_flags[2],
             "pack_format_version": meta_mod.PACK_FORMAT_VERSION,
+            "chunker_format_version": chunk_mod.CHUNKER_FORMAT_VERSION,
             "definitions_format_version": definition_mod.DEFINITIONS_FORMAT_VERSION,
             "definitions": [d.__dict__ for d in doc.definitions],
             "chunks": record_chunks,
@@ -1736,6 +1744,7 @@ def _write_metadata_refresh(
             "has_related_docs": nav_flags[1],
             "has_history": nav_flags[2],
             "pack_format_version": meta_mod.PACK_FORMAT_VERSION,
+            "chunker_format_version": chunk_mod.CHUNKER_FORMAT_VERSION,
             "definitions_format_version": definition_mod.DEFINITIONS_FORMAT_VERSION,
             "definitions": [d.__dict__ for d in item.definitions],
             "chunks": prev_chunks,

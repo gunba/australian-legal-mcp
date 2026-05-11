@@ -81,6 +81,14 @@ _SENT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z(])")
 EMBED_MAX_TOKENS = 1024
 DEFAULT_MAX_TOKENS = EMBED_MAX_TOKENS
 
+# Bump when chunker output for the SAME source HTML would differ in a way
+# that the incremental-reuse path needs to detect — e.g. new inline-marker
+# format, new atomic-block rules, tighter oversize fallback. The build's
+# wholesale-reuse branch refuses to carry chunks from prior pack records
+# whose stored chunker_format_version doesn't match this constant, forcing
+# a re-extract+re-chunk under the current rules.
+CHUNKER_FORMAT_VERSION = 2
+
 
 @dataclass
 class Chunk:
