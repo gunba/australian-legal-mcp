@@ -1286,6 +1286,11 @@ def _write_window(
     # (PreparedDoc, [(chunk_id, chunk_text), ...]) so we can resolve in_doc
     # anchor targets after chunks land in the DB.
     doc_chunk_pairs: list[tuple[PreparedDoc, list[tuple[int, str]]]] = []
+    # Resolved doc_anchors + per-doc navigation flag updates collected as we
+    # build each pack record so the pack carries the same anchor rows that
+    # land in SQLite.
+    doc_anchor_rows_all: list[tuple] = []
+    nav_flag_updates: list[tuple] = []
 
     for doc, start, end in doc_chunk_ranges:
         _write_asset_files(asset_root, doc.assets)
@@ -1319,6 +1324,19 @@ def _write_window(
             )
             chunk_id_text_pairs.append((chunk_id, chunk.text))
 
+        anchor_rows, nav_flags = _build_doc_anchor_rows(doc, chunk_id_text_pairs)
+        pack_anchors = [
+            {
+                "ord": row[1],
+                "kind": row[2],
+                "label": row[3],
+                "target_chunk_id": row[4],
+                "target_doc_id": row[5],
+                "target_pit": row[6],
+            }
+            for row in anchor_rows
+        ]
+
         record = {
             "doc_id": doc.doc_id,
             "type": doc.category,
@@ -1327,18 +1345,23 @@ def _write_window(
             "downloaded_at": doc.downloaded_at,
             "content_hash": doc.content_hash,
             "html": doc.html,
-            "anchors": doc.anchors,
+            "anchors": pack_anchors,
             "assets": [a.__dict__ for a in doc.assets],
             # W2.2 currency markers persist into the pack record so a future
             # incremental build that reuses this doc can replay the state.
             "withdrawn_date": doc.withdrawn_date,
             "superseded_by": doc.superseded_by,
             "replaces": doc.replaces,
+            "has_in_doc_links": nav_flags[0],
+            "has_related_docs": nav_flags[1],
+            "has_history": nav_flags[2],
             "definitions_format_version": definition_mod.DEFINITIONS_FORMAT_VERSION,
             "definitions": [d.__dict__ for d in doc.definitions],
             "chunks": record_chunks,
         }
         pack_builder.add(doc.doc_id, record)
+        doc_anchor_rows_all.extend(anchor_rows)
+        nav_flag_updates.append((*nav_flags, doc.doc_id))
         doc_refs.append(
             DocRef(
                 doc_id=doc.doc_id,
@@ -1363,7 +1386,10 @@ def _write_window(
     if definition_rows:
         conn.executemany(INSERT_DEFINITION, definition_rows)
 
-    _persist_doc_anchors(conn, doc_chunk_pairs)
+    if doc_anchor_rows_all:
+        conn.executemany(INSERT_DOC_ANCHOR, doc_anchor_rows_all)
+    if nav_flag_updates:
+        conn.executemany(UPDATE_DOC_NAVIGATION_FLAGS, nav_flag_updates)
 
 
 def _next_chunk_id(conn) -> int:
@@ -1645,7 +1671,8 @@ def _write_metadata_refresh(
     chunk_fts_rows = []
     vec_rows = []
     definition_rows = []
-    doc_chunk_pairs: list[tuple[PreparedDoc, list[tuple[int, str]]]] = []
+    meta_anchor_rows: list[tuple] = []
+    meta_nav_flag_updates: list[tuple] = []
 
     from .pack import decode_embedding as _dec
 
@@ -1676,6 +1703,19 @@ def _write_metadata_refresh(
             vec_rows.append((chunk_id, _dec(c["embedding_b64"])))
             chunk_id_text_pairs.append((chunk_id, c["text"]))
 
+        anchor_rows, nav_flags = _build_doc_anchor_rows(item, chunk_id_text_pairs)
+        pack_anchors = [
+            {
+                "ord": row[1],
+                "kind": row[2],
+                "label": row[3],
+                "target_chunk_id": row[4],
+                "target_doc_id": row[5],
+                "target_pit": row[6],
+            }
+            for row in anchor_rows
+        ]
+
         new_record = {
             "doc_id": item.doc_id,
             "type": item.category,
@@ -1684,11 +1724,14 @@ def _write_metadata_refresh(
             "downloaded_at": item.downloaded_at,
             "content_hash": item.content_hash,
             "html": item.html,
-            "anchors": item.anchors,
+            "anchors": pack_anchors,
             "assets": [a.__dict__ for a in item.assets],
             "withdrawn_date": item.withdrawn_date,
             "superseded_by": item.superseded_by,
             "replaces": item.replaces,
+            "has_in_doc_links": nav_flags[0],
+            "has_related_docs": nav_flags[1],
+            "has_history": nav_flags[2],
             "definitions_format_version": definition_mod.DEFINITIONS_FORMAT_VERSION,
             "definitions": [d.__dict__ for d in item.definitions],
             "chunks": prev_chunks,
@@ -1707,7 +1750,8 @@ def _write_metadata_refresh(
             )
         )
         definition_rows.extend(_definition_rows(item.definitions))
-        doc_chunk_pairs.append((item, chunk_id_text_pairs))
+        meta_anchor_rows.extend(anchor_rows)
+        meta_nav_flag_updates.append((*nav_flags, item.doc_id))
 
     if document_rows:
         conn.executemany(INSERT_DOCUMENT, document_rows)
@@ -1722,7 +1766,10 @@ def _write_metadata_refresh(
     if definition_rows:
         conn.executemany(INSERT_DEFINITION, definition_rows)
 
-    _persist_doc_anchors(conn, doc_chunk_pairs)
+    if meta_anchor_rows:
+        conn.executemany(INSERT_DOC_ANCHOR, meta_anchor_rows)
+    if meta_nav_flag_updates:
+        conn.executemany(UPDATE_DOC_NAVIGATION_FLAGS, meta_nav_flag_updates)
 
 
 def _iter_index(pages_dir: Path) -> Iterator[dict]:

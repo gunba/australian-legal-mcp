@@ -251,6 +251,11 @@ _METADATA_SIGNATURE_KEYS = (
     "replaces",
 )
 
+# Bump this to force every doc through the metadata-refresh path on the next
+# build without changing the chunk fingerprint. Use when pack-record shape
+# changes (e.g. new fields) need to land but embeddings can be reused.
+_PACK_FORMAT_VERSION = 2
+
 
 def metadata_signature(meta_fields: dict[str, Any]) -> str:
     """Stable hash of row-metadata fields used for the metadata-refresh check.
@@ -262,6 +267,7 @@ def metadata_signature(meta_fields: dict[str, Any]) -> str:
     the digest is stable across runs.
     """
     h = hashlib.sha256()
+    h.update(f"pack_format={_PACK_FORMAT_VERSION}\0".encode("ascii"))
     for key in _METADATA_SIGNATURE_KEYS:
         value = meta_fields.get(key)
         h.update(b"\0")
