@@ -468,6 +468,7 @@ def _inline_text(
         # Cross-doc link → [doc:X] (with @PiT suffix when present).
         doc_id = node.attributes.get("data-doc-id")
         pit = node.attributes.get("data-pit")
+        view = node.attributes.get("data-view")
         if not doc_id:
             href = node.attributes.get("href")
             if href:
@@ -475,12 +476,17 @@ def _inline_text(
 
                 resolved = _doc_id_from_ato_link(href)
                 if resolved:
-                    doc_id, pit = resolved
+                    doc_id, pit, view = resolved
         if doc_id:
             inner = _inline_text_children(
                 node, referenced_anchors, definition_markers=definition_markers
             )
-            marker = f"[doc:{doc_id}@{pit}]" if pit else f"[doc:{doc_id}]"
+            qualifiers = ""
+            if pit:
+                qualifiers += f"@{pit}"
+            if view:
+                qualifiers += f" view={view}"
+            marker = f"[doc:{doc_id}{qualifiers}]"
             return f"{inner} {marker}" if inner else marker
         # In-doc anchor target.
         name = node.attributes.get("name")

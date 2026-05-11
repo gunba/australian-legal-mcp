@@ -397,10 +397,12 @@ def _rewrite_links_html(node: Node) -> Node:
             continue
         resolved = _doc_id_from_ato_link(href)
         if resolved:
-            doc_id, pit = resolved
+            doc_id, pit, view = resolved
             el["data-doc-id"] = doc_id
             if pit:
                 el["data-pit"] = pit
+            if view:
+                el["data-view"] = view
             del el["href"]
             continue
         clean = _safe_href(href)
@@ -547,11 +549,20 @@ def _docid_from_query_string(query: str) -> str | None:
     return None
 
 
-def _doc_id_from_ato_link(target: str) -> tuple[str, str | None] | None:
-    """Parse an ATO link href into (doc_id, pit_timestamp).
+def _doc_id_from_ato_link(target: str) -> tuple[str, str | None, str | None] | None:
+    """Parse an ATO link href into (doc_id, pit_timestamp, view_db).
 
-    Returns ``None`` for non-doc URLs. ``pit_timestamp`` is the literal
-    ``PiT`` query parameter (YYYYMMDDHHMMSS) when present, otherwise ``None``.
+    Returns ``None`` for non-doc URLs.
+    - ``pit_timestamp``: the literal ``PiT=YYYYMMDDHHMMSS`` query parameter
+      when present, otherwise ``None``. Identifies a point-in-time snapshot
+      of the same doc.
+    - ``view_db``: the ``db=`` query parameter normalised to upper-case when
+      it matches a known view (currently ``HISTFT`` — the amendment-trail
+      rendering of the same doc, with EM / Second Reading Speech links).
+      Preserves links that target an alternative view of the doc so the
+      ``[doc:X view=HISTFT]`` marker in chunk text tells the agent the
+      cross-reference points at the amendment history surface, not the
+      live text.
     """
     target = target.strip()
     if target.startswith("<") and target.endswith(">"):
@@ -572,6 +583,7 @@ def _doc_id_from_ato_link(target: str) -> tuple[str, str | None] | None:
         return None
     raw = _docid_from_query_string(parsed.query)
     pit = _pit_from_query_string(parsed.query)
+    view = _view_from_query_string(parsed.query)
     if raw is None and parsed.fragment:
         # SPA-style URLs hide the doc id in the fragment, e.g.
         # `/law/#Law/table-of-contents?docid=X` or
@@ -581,6 +593,8 @@ def _doc_id_from_ato_link(target: str) -> tuple[str, str | None] | None:
             raw = _docid_from_query_string(frag_query)
             if pit is None:
                 pit = _pit_from_query_string(frag_query)
+            if view is None:
+                view = _view_from_query_string(frag_query)
     if not raw:
         return None
     # SPA category links carry a trailing `?` flag (e.g. `docid=tpa?`,
@@ -592,7 +606,7 @@ def _doc_id_from_ato_link(target: str) -> tuple[str, str | None] | None:
     # Real ATO doc ids always contain a `/` (e.g. TXR/TR.../NAT/ATO).
     if not doc_id or "/" not in doc_id:
         return None
-    return doc_id, pit
+    return doc_id, pit, view
 
 
 def _pit_from_query_string(query: str) -> str | None:
@@ -601,6 +615,25 @@ def _pit_from_query_string(query: str) -> str | None:
         if key.lower() == "pit" and values:
             v = values[0].strip()
             if v:
+                return v
+    return None
+
+
+# ATO uses ``db=HISTFT`` to render a doc's amendment-trail view (assent
+# dates, EM / Second Reading Speech links). It's not a historical snapshot
+# (that's PiT) — it's an alternative surface of the same live doc. We
+# preserve the qualifier in the [doc:X view=HISTFT] inline marker so the
+# agent reading the cross-reference knows it pointed at the amendment
+# history, not the live text.
+_KNOWN_DOC_VIEWS = {"HISTFT"}
+
+
+def _view_from_query_string(query: str) -> str | None:
+    """Return a normalised view qualifier from ``db=`` if known."""
+    for key, values in parse_qs(query).items():
+        if key.lower() == "db" and values:
+            v = values[0].strip().upper()
+            if v in _KNOWN_DOC_VIEWS:
                 return v
     return None
 

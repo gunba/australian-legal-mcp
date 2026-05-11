@@ -89,7 +89,7 @@ def extract_anchors(html: str, *, source_doc_id: str) -> list[AnchorRef]:
         resolved = _doc_id_from_ato_link(href)
         if not resolved:
             continue
-        target_doc_id, pit = resolved
+        target_doc_id, pit, _view = resolved
         # ATO navigation panels use sentinel PiT values that alias the live
         # doc rather than a real historical version. Treat them as no-PiT
         # links.

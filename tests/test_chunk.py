@@ -200,6 +200,33 @@ def test_doc_id_link_with_pit_emits_versioned_marker() -> None:
     assert "Original ruling [doc:TXR/TR967/NAT/ATO/00001@19960320000001]" in chunks[0].text
 
 
+def test_doc_id_link_with_view_emits_view_qualifier() -> None:
+    """ATO `db=HISTFT` URLs render the amendment-trail view of a doc.
+    Preserve the qualifier in the inline marker so an agent reading the
+    chunk knows the cross-reference pointed at the alternative surface,
+    not the live text."""
+    html = (
+        '<p>see history of '
+        '<a data-doc-id="PAC/19970038/Pt3-6" data-view="HISTFT">Part 3-6</a>'
+        '</p>'
+    )
+    chunks = chunk_html(html)
+    assert chunks
+    assert "Part 3-6 [doc:PAC/19970038/Pt3-6 view=HISTFT]" in chunks[0].text
+
+
+def test_doc_id_link_with_view_via_href_fallback() -> None:
+    """`<a href>` containing `db=HISTFT` falls through the chunker's
+    href-parsing path and the qualifier still survives."""
+    html = (
+        '<p><a href="https://www.ato.gov.au/law/view/document?LocID=PAC%2F19970038%2FPt3-6&db=HISTFT&stylesheet=HIST">'
+        "Pt 3-6 history</a></p>"
+    )
+    chunks = chunk_html(html)
+    assert chunks
+    assert "Pt 3-6 history [doc:PAC/19970038/Pt3-6 view=HISTFT]" in chunks[0].text
+
+
 def test_doc_id_link_emits_marker_via_href_fallback() -> None:
     html = (
         '<p><a href="https://www.ato.gov.au/law/view/document?docid=TXR/TR20243/NAT/ATO/00001">'

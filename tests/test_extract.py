@@ -655,7 +655,7 @@ def test_doc_id_parser_handles_view_htm_variants() -> None:
         ("http://ato.gov.au/law/view.htm?DocID=PSR/PS201112/NAT/ATO/00001", "PSR/PS201112/NAT/ATO/00001"),
     ]
     for url, expected in cases:
-        assert _doc_id_from_ato_link(url) == (expected, None), url
+        assert _doc_id_from_ato_link(url) == (expected, None, None), url
 
 
 def test_doc_id_parser_extracts_pit_alongside_docid() -> None:
@@ -664,20 +664,38 @@ def test_doc_id_parser_extracts_pit_alongside_docid() -> None:
     record the timestamp on the resulting anchor (the corpus does not store
     historical content as separate doc rows)."""
     url = "http://law.ato.gov.au/atolaw/view.htm?Docid=JUD/2008ATC20-048/00001&PiT=99991231235958"
-    assert _doc_id_from_ato_link(url) == ("JUD/2008ATC20-048/00001", "99991231235958")
+    assert _doc_id_from_ato_link(url) == ("JUD/2008ATC20-048/00001", "99991231235958", None)
 
 
 def test_doc_id_parser_returns_none_pit_when_absent() -> None:
     """Plain doc URLs without a PiT parameter return None for the timestamp."""
     url = "https://www.ato.gov.au/law/view/document?docid=TXR/TR967/NAT/ATO/00001"
-    assert _doc_id_from_ato_link(url) == ("TXR/TR967/NAT/ATO/00001", None)
+    assert _doc_id_from_ato_link(url) == ("TXR/TR967/NAT/ATO/00001", None, None)
+
+
+def test_doc_id_parser_extracts_histft_view() -> None:
+    """ATO uses `db=HISTFT&stylesheet=HIST` to render the amendment-trail
+    surface of a doc (assent dates, EM links, Second Reading Speech refs).
+    It's not a historical snapshot (that's PiT) but a different rendering
+    of the same live doc. Preserve the view qualifier so the agent sees
+    [doc:X view=HISTFT] inline and can WebFetch the alternative view."""
+    url = "https://www.ato.gov.au/law/view/document?LocID=PAC%2F19970038%2FPt3-6&db=HISTFT&stylesheet=HIST"
+    assert _doc_id_from_ato_link(url) == ("PAC/19970038/Pt3-6", None, "HISTFT")
+
+
+def test_doc_id_parser_ignores_unknown_db_views() -> None:
+    """`db=` parameters other than HISTFT are unknown ATO surfaces; don't
+    propagate them — we'd be guessing what the agent should do with the
+    qualifier."""
+    url = "https://www.ato.gov.au/law/view/document?docid=PAC/19970038/Pt3-6&db=UNKNOWNDB"
+    assert _doc_id_from_ato_link(url) == ("PAC/19970038/Pt3-6", None, None)
 
 
 def test_doc_id_parser_handles_quoted_urlencoded_value() -> None:
     """Some links wrap the doc id in URL-encoded quotes (`%22…%22`) — those
     quotes must be stripped, mirroring the existing /law/view/document path."""
     url = 'https://www.ato.gov.au/law/view/view.htm?docid=%22OPS%2FLI202520%2F00001%22'
-    assert _doc_id_from_ato_link(url) == ("OPS/LI202520/00001", None)
+    assert _doc_id_from_ato_link(url) == ("OPS/LI202520/00001", None, None)
 
 
 def test_doc_id_parser_handles_spa_fragment_form() -> None:
@@ -688,7 +706,7 @@ def test_doc_id_parser_handles_spa_fragment_form() -> None:
         ("https://www.ato.gov.au/single-page-applications/legaldatabase/#Law/table-of-contents?docid=TPA/TA20253", "TPA/TA20253"),
     ]
     for url, expected in cases:
-        assert _doc_id_from_ato_link(url) == (expected, None), url
+        assert _doc_id_from_ato_link(url) == (expected, None, None), url
 
 
 def test_doc_id_parser_rejects_spa_category_links() -> None:
