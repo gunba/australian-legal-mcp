@@ -163,6 +163,7 @@ def extract(
     title = _compose_title(lead_headings) or html_title
 
     _normalise_named_anchors(container)
+    _strip_history_ui_controls(container)
     container = _rewrite_links_html(container)
     assets = _rewrite_images_html(container, doc_id=doc_id, source_path=source_path)
     _strip_attributes(container)
@@ -345,6 +346,46 @@ def _normalise_named_anchors(node: Node) -> None:
         if name and not el.attributes.get("id"):
             el.attrs["id"] = name
         _drop_attr(el, "name")
+
+
+# UI control labels that wrap the show/hide JavaScript toggles on ATO
+# history-note panels. The actual history-note body (the "History" heading
+# and the inserted-by-Act-N text) stays — only the toggle-icon images and
+# their literal label text get pruned. Match is case-insensitive on the
+# image's title/alt and on bare text-node content.
+_HISTORY_UI_LABELS = {
+    "view history note",
+    "hide history note",
+    "view history reference",
+    "hide history reference",
+}
+
+
+def _strip_history_ui_controls(node: Node) -> None:
+    """Decompose the show/hide-history-note image toggles + their label text.
+
+    Leaves the actual history-note body (which lives inside the same panel
+    but contains substantive content like 'Pt 3-1 inserted by No 46 of
+    1998.') untouched. Without this, every history panel emits noise like
+    `[asset:ato-image://X/0] View history note [asset:...] Hide history note`
+    that competes with the real history-note content for the agent's
+    attention budget.
+    """
+    for el in list(node.traverse(include_text=False)):
+        tag = (el.tag or "").lower()
+        if tag != "img":
+            continue
+        for attr in ("title", "alt"):
+            value = (el.attributes.get(attr) or "").strip().lower()
+            if value in _HISTORY_UI_LABELS:
+                el.decompose()
+                break
+    for text_node in list(node.traverse(include_text=True)):
+        if (text_node.tag or "").lower() != "-text":
+            continue
+        raw = (text_node.text() or "").strip().lower()
+        if raw in _HISTORY_UI_LABELS:
+            text_node.decompose()
 
 
 def _rewrite_links_html(node: Node) -> Node:
