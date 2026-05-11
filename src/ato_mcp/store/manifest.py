@@ -23,13 +23,40 @@ from pydantic import BaseModel, Field
 # `schema_version > MAX_SUPPORTED_SCHEMA_VERSION` check catches them earlier.
 MANIFEST_SCHEMA_VERSION = 4
 
-# Default `min_client_version` for newly-built manifests. The Rust binary
-# rejects any manifest whose `min_client_version` is greater than
-# `CARGO_PKG_VERSION`, so this is the actual gate that prevents an older
-# binary from ingesting a newer corpus. Bump in lockstep with binary
-# releases that introduce schema or model changes (Wave 3: 0.6.x introduces
-# the optional cross-encoder reranker bundle).
-DEFAULT_MIN_CLIENT_VERSION = "0.6.9"
+
+def _binary_version_from_cargo_toml() -> str:
+    """Read the runtime binary version from Cargo.toml.
+
+    Couples corpus releases to the binary that built them: every
+    build-index run stamps the manifest with the maintainer's current
+    Cargo.toml version, and the Rust runtime rejects updates from older
+    binaries. Falls back to a hardcoded constant if Cargo.toml can't be
+    found (e.g. installed-from-wheel scenarios).
+    """
+    candidates = [
+        Path(__file__).resolve().parents[3] / "Cargo.toml",
+        Path.cwd() / "Cargo.toml",
+    ]
+    for cargo_toml in candidates:
+        if not cargo_toml.is_file():
+            continue
+        for line in cargo_toml.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("version"):
+                continue
+            _, _, value = stripped.partition("=")
+            value = value.strip().strip('"')
+            if value:
+                return value
+    return "0.6.9"
+
+
+# `min_client_version` is read from Cargo.toml at build time so corpus
+# releases are always pinned to the binary that built them. The Rust
+# runtime rejects any manifest whose `min_client_version` exceeds the
+# binary's `CARGO_PKG_VERSION` — agents setting up the MCP cannot pair
+# an old binary with a newer corpus by accident.
+DEFAULT_MIN_CLIENT_VERSION = _binary_version_from_cargo_toml()
 
 
 class ModelInfo(BaseModel):
