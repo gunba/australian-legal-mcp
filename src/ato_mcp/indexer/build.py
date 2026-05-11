@@ -938,6 +938,7 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
             "withdrawn_date": currency.withdrawn_date,
             "superseded_by": currency.superseded_by,
             "replaces": currency.replaces,
+            "pack_format_version": meta_mod.PACK_FORMAT_VERSION,
         }
     )
     doc_anchors = anchors_mod.extract_anchors(clean_html, source_doc_id=doc_id)
@@ -1085,6 +1086,7 @@ def _record_metadata_signature(record: dict) -> str:
             "withdrawn_date": record.get("withdrawn_date"),
             "superseded_by": record.get("superseded_by"),
             "replaces": record.get("replaces"),
+            "pack_format_version": record.get("pack_format_version"),
         }
     )
 
@@ -1355,6 +1357,7 @@ def _write_window(
             "has_in_doc_links": nav_flags[0],
             "has_related_docs": nav_flags[1],
             "has_history": nav_flags[2],
+            "pack_format_version": meta_mod.PACK_FORMAT_VERSION,
             "definitions_format_version": definition_mod.DEFINITIONS_FORMAT_VERSION,
             "definitions": [d.__dict__ for d in doc.definitions],
             "chunks": record_chunks,
@@ -1732,6 +1735,7 @@ def _write_metadata_refresh(
             "has_in_doc_links": nav_flags[0],
             "has_related_docs": nav_flags[1],
             "has_history": nav_flags[2],
+            "pack_format_version": meta_mod.PACK_FORMAT_VERSION,
             "definitions_format_version": definition_mod.DEFINITIONS_FORMAT_VERSION,
             "definitions": [d.__dict__ for d in item.definitions],
             "chunks": prev_chunks,
