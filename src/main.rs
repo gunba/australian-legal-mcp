@@ -2938,46 +2938,60 @@ fn stats(format: OutputFormat) -> Result<String> {
 /// before ` — ` when present, otherwise the full title), since titles for many
 /// ATO doc types don't carry a doc-type label at all (cases, sections, etc.).
 fn collect_prefix_breakdown(conn: &rusqlite::Connection) -> Result<Vec<JsonValue>> {
+    // Single-pass window function: partition by docid prefix, compute count
+    // + pick one representative title per prefix. Replaces N+1 selects that
+    // each ran an UPPER(title) LIKE sort over thousands of rows — that
+    // pattern stalled MCP `initialize` on large corpora.
+    //
+    // Title preference: when a prefix has at least one title that doesn't
+    // start with the docid form ("EXM ADEBB74A"), prefer the composed one
+    // ("Explanatory Memorandum — …"). Title scan is case-sensitive — ATO
+    // docid-form titles are always uppercase, so dropping UPPER() saves a
+    // per-row case fold without changing results.
     let mut stmt = conn.prepare(
         r#"
-        SELECT
-          CASE
-            WHEN INSTR(doc_id, '/') > 0
-              THEN UPPER(SUBSTR(doc_id, 1, INSTR(doc_id, '/') - 1))
-            ELSE UPPER(doc_id)
-          END AS prefix,
-          COUNT(*) AS doc_count
-        FROM documents
-        GROUP BY prefix
+        WITH ranked AS (
+          SELECT
+            CASE
+              WHEN INSTR(doc_id, '/') > 0
+                THEN UPPER(SUBSTR(doc_id, 1, INSTR(doc_id, '/') - 1))
+              ELSE UPPER(doc_id)
+            END AS prefix,
+            title,
+            doc_id
+          FROM documents
+        ),
+        windowed AS (
+          SELECT
+            prefix,
+            title,
+            doc_id,
+            COUNT(*) OVER (PARTITION BY prefix) AS doc_count,
+            ROW_NUMBER() OVER (
+              PARTITION BY prefix
+              ORDER BY
+                CASE WHEN title LIKE prefix || ' %' THEN 1 ELSE 0 END,
+                doc_id
+            ) AS rn
+          FROM ranked
+        )
+        SELECT prefix, doc_count, title
+        FROM windowed
+        WHERE rn = 1
         ORDER BY doc_count DESC, prefix ASC
         "#,
     )?;
     let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
     })?;
     let mut entries: Vec<JsonValue> = Vec::new();
     for row in rows {
-        let (prefix, count) = row?;
-        let pattern = format!("{}/%", prefix);
-        // Prefer a title that doesn't start with the raw "<PREFIX> " docid
-        // form, so EXM gets its "Explanatory Memorandum — …" composed title
-        // rather than "EXM ADEBB74A". Titles that legitimately start with a
-        // citation (e.g. "TR 2024/3 — …") use a DIFFERENT prefix string
-        // (TR vs TXR, CR vs CLR), so this skip never targets composed titles.
-        // When every doc in a prefix uses the docid form (SRS, EV, MLI), the
-        // tier collapses and we fall back to first by doc_id.
-        let docid_form = format!("{} %", prefix);
-        let description: Option<String> = conn
-            .query_row(
-                "SELECT title FROM documents WHERE doc_id LIKE ?1 \
-                 ORDER BY (CASE WHEN UPPER(title) LIKE ?2 THEN 1 ELSE 0 END), doc_id \
-                 LIMIT 1",
-                rusqlite::params![pattern, docid_form],
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .ok()
-            .flatten()
-            .map(|title| description_from_title(&title));
+        let (prefix, count, title) = row?;
+        let description = title.map(|t| description_from_title(&t));
         entries.push(json!({
             "prefix": prefix,
             "doc_count": count,
