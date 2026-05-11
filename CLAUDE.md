@@ -6,6 +6,8 @@ IMPORTANT: The user is not expected to have a GPU and may be using a low perform
 
 IMPORTANT: We should be looking to simplify the MCP surface and minimise extraneous context at all times.
 
+IMPORTANT: Tool responses must contain only information a tax-professional agent would act on. Do NOT serialise internal debug metadata to the agent — no ranking scores, no model identifiers, no candidate counts, no reranker_used flags, no chunk ordinals, no echo of the query, no excluded-types policy, no `returned_chars`, no `distinct_docs`. If a field doesn't help the agent navigate or cite documents, it doesn't belong on the wire. Empty-value Option fields must use `skip_serializing_if = "Option::is_none"` rather than render as JSON null. Every byte the agent reads competes with the source text for their attention budget.
+
 # Design Philosophy
 
 - ATO-MCP should expose clean, source-grounded retrieval primitives and let agents do the reasoning. Prefer fewer tools, fewer parameters, and less context over feature breadth.

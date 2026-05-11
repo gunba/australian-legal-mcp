@@ -609,9 +609,21 @@ def _pack_chunks(blocks: list[_Block], *, max_tokens: int) -> list[Chunk]:
 def _split_oversize_block(
     block: _Block, *, max_tokens: int
 ) -> Iterable[tuple[str, str]]:
-    """Yield (text, definition_text) pairs for a block that exceeds max_tokens."""
+    """Yield (text, definition_text) pairs for a block that exceeds max_tokens.
+
+    Hard cap: every emitted piece is guaranteed to be ≤ max_tokens, regardless
+    of how granular the source structure is. Order of fallbacks:
+    1. tables → row split (rows stay whole)
+    2. prose  → sentence split
+    3. single sentence / row still too large → word-window split
+
+    The final word-window catches pathological cases where a single sentence
+    or row alone exceeds max_tokens (court-case extracts with no terminal
+    punctuation, oversize column cells, etc.).
+    """
     if block.is_oversize_table and block.table_node is not None:
-        yield from _table_row_split(block.table_node, max_tokens=max_tokens)
+        for piece, defn in _table_row_split(block.table_node, max_tokens=max_tokens):
+            yield from _enforce_max_tokens(piece, defn, max_tokens=max_tokens)
         return
     # Prose fallback: sentence split, greedy-pack within max_tokens.
     sentences = _sentence_split(block.text)
@@ -621,7 +633,7 @@ def _split_oversize_block(
         sent_tokens = approx_tokens(sentence)
         if buf and buf_tokens + sent_tokens > max_tokens:
             piece = " ".join(buf)
-            yield piece, piece
+            yield from _enforce_max_tokens(piece, piece, max_tokens=max_tokens)
             buf = [sentence]
             buf_tokens = sent_tokens
         else:
@@ -629,6 +641,21 @@ def _split_oversize_block(
             buf_tokens += sent_tokens
     if buf:
         piece = " ".join(buf)
+        yield from _enforce_max_tokens(piece, piece, max_tokens=max_tokens)
+
+
+def _enforce_max_tokens(
+    text: str, definition_text: str, *, max_tokens: int
+) -> Iterable[tuple[str, str]]:
+    """Last-resort word-window split for pieces still over the embedder cap."""
+    if approx_tokens(text) <= max_tokens:
+        yield text, definition_text
+        return
+    words = text.split()
+    # Tokens ≈ words × 1.3; conservative bound to ensure the split piece fits.
+    target_words = max(1, int(max_tokens / 1.4))
+    for i in range(0, len(words), target_words):
+        piece = " ".join(words[i : i + target_words])
         yield piece, piece
 
 

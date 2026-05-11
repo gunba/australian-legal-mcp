@@ -754,17 +754,16 @@ struct Hit {
     title: String,
     #[serde(rename = "type")]
     doc_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     anchor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     snippet: Option<String>,
     canonical_url: String,
-    // 2-dp rounding keeps the wire shape stable across reranker on/off and
-    // BM25 magnitudes — the agent compares hit ordering, not micro-deltas.
-    #[serde(serialize_with = "serialize_score_round2")]
-    score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     chunk_id: Option<i64>,
-    ord: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     next_call: Option<String>,
     /// W2.2 currency markers — only serialised when set so JSON output for
     /// in-force docs stays clean.
@@ -783,51 +782,6 @@ struct Hit {
     has_related_docs: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     has_history: Option<bool>,
-}
-
-fn serialize_score_round2<S>(value: &Option<f64>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    match value {
-        Some(v) if v.is_finite() => {
-            serializer.serialize_f64((v * 100.0).round() / 100.0)
-        }
-        Some(v) => serializer.serialize_f64(*v),
-        None => serializer.serialize_none(),
-    }
-}
-
-/// Map negative-only or mixed-sign hit scores into [0, 1] (larger=better)
-/// via min-max on `-score`. No-op when every score is already non-negative.
-/// Hits with `score == None` are left untouched.
-fn normalise_hit_scores(hits: &mut [Hit]) {
-    if hits.is_empty() {
-        return;
-    }
-    if !hits
-        .iter()
-        .any(|h| h.score.map(|s| s < 0.0).unwrap_or(false))
-    {
-        return;
-    }
-    let scored: Vec<f64> = hits.iter().filter_map(|h| h.score.map(|s| -s)).collect();
-    if scored.is_empty() {
-        return;
-    }
-    let lo = scored.iter().cloned().fold(f64::INFINITY, f64::min);
-    let hi = scored.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let span = hi - lo;
-    for hit in hits.iter_mut() {
-        if let Some(s) = hit.score {
-            let v = -s;
-            hit.score = Some(if span.abs() < f64::EPSILON {
-                1.0
-            } else {
-                ((v - lo) / span).clamp(0.0, 1.0)
-            });
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1012,8 +966,6 @@ fn search(
     // few pages is dominated by first-stage recall. Tail candidates retain
     // their RRF order so they can still surface via `next_call` paging or
     // recency sort.
-    let mut reranker_used = false;
-    let mut reranker_scores: HashMap<i64, f64> = HashMap::new();
     if let Some(state) = server_state.as_mut() {
         let head_count = rerank_head_count(k, ranked_hits.len());
         if head_count > 0 {
@@ -1031,8 +983,7 @@ fn search(
                 .collect();
             if !candidate_refs.is_empty() {
                 if let Some(scores) = state.rerank_candidates(query, &candidate_refs)? {
-                    reranker_used = true;
-                    reranker_scores = scores.iter().copied().collect();
+                    let reranker_scores: HashMap<i64, f64> = scores.iter().copied().collect();
                     // Re-order the head by reranker score (desc). Tail
                     // (below RERANK_CANDIDATE_LIMIT) keeps RRF order. We
                     // overwrite the per-chunk score with the reranker
@@ -1068,29 +1019,16 @@ fn search(
     // dedup pass doesn't have to round-trip per chunk.
     let candidate_meta = load_candidate_meta(&conn, &ranked_hits)?;
     let deduped = dedup_per_doc(ranked_hits, &candidate_meta, frontier, max_per_doc);
-    let distinct_docs = deduped
-        .iter()
-        .filter_map(|h| candidate_meta.get(&h.chunk_id).map(|m| m.doc_id.as_str()))
-        .collect::<HashSet<_>>()
-        .len();
 
     let mut records = Vec::new();
     for ranked_hit in deduped.into_iter() {
-        if let Some(mut hit) = load_hit(&conn, ranked_hit.chunk_id, query, opts.include_snippet)? {
-            // Reranker score (when it ran) overrides the first-stage
-            // RRF/BM25/vector value so head and tail hits sit on the same
-            // relevance scale.
-            let composed = reranker_scores
-                .get(&ranked_hit.chunk_id)
-                .copied()
-                .unwrap_or(ranked_hit.score);
-            hit.score = Some(composed);
+        if let Some(hit) = load_hit(&conn, ranked_hit.chunk_id, query, opts.include_snippet)? {
+            // First-stage RRF / reranker scores drive `deduped` ordering;
+            // we just iterate in that order. Internal scores never reach
+            // the agent — results are presented sorted by relevance.
             records.push(hit);
         }
     }
-    // Negative BM25 (raw fts5 score) leaks unsightly magnitudes; map any
-    // negative-only or mixed-sign result set into [0, 1] in one pass.
-    normalise_hit_scores(&mut records);
     if matches!(opts.sort_by, SortBy::Recency) {
         // [MT-06] Recency sort materializes a widened frontier, then sorts by date descending.
         records.sort_by(|a, b| b.date.cmp(&a.date));
@@ -1102,40 +1040,23 @@ fn search(
     } else {
         None
     };
-    let reranker_model_id = if reranker_used {
-        get_meta(&conn, "reranker_model_id")?
-    } else {
-        None
-    };
 
     match opts.format {
-        OutputFormat::Json => Ok(serde_json::to_string_pretty(&json!({
-            "query": query,
-            "mode": search_mode_name(opts.mode),
-            "ranking": {
-                "semantic_required": !matches!(opts.mode, SearchMode::Keyword),
-                "vector": matches!(opts.mode, SearchMode::Hybrid | SearchMode::Vector),
-                "lexical": matches!(opts.mode, SearchMode::Hybrid | SearchMode::Keyword),
-                "embedding_model_id": get_meta(&conn, "embedding_model_id")?,
-                "reranker_used": reranker_used,
-                "reranker_model_id": reranker_model_id,
-            },
-            "filters": {
-                "excluded_by_default": DEFAULT_EXCLUDED_TYPES,
-                "old_content_cutoff": if opts.include_old { JsonValue::Null } else { json!(OLD_CONTENT_CUTOFF) },
-            },
-            "meta": {
-                "returned": records.len(),
-                "candidate_count": candidate_count,
-                "deduped_from_candidates": candidate_count,
-                "distinct_docs": distinct_docs,
-                "max_per_doc": max_per_doc,
-                "truncated": candidate_count > records.len(),
-                "returned_chars": records.iter().map(|hit| hit.snippet.as_deref().map(str::len).unwrap_or(0)).sum::<usize>(),
-                "next_call": next_call,
-            },
-            "hits": records,
-        }))?),
+        OutputFormat::Json => {
+            let mut meta = serde_json::Map::new();
+            if candidate_count > records.len() {
+                meta.insert("truncated".to_string(), json!(true));
+                if let Some(nc) = next_call {
+                    meta.insert("next_call".to_string(), json!(nc));
+                }
+            }
+            let mut response = serde_json::Map::new();
+            response.insert("hits".to_string(), json!(records));
+            if !meta.is_empty() {
+                response.insert("meta".to_string(), JsonValue::Object(meta));
+            }
+            Ok(serde_json::to_string_pretty(&JsonValue::Object(response))?)
+        }
     }
 }
 
@@ -1908,7 +1829,6 @@ fn load_hit(
     let doc_id: String = row.get("doc_id")?;
     let text = decompress_text(row.get("text")?)?;
     let chunk_id: i64 = row.get("chunk_id")?;
-    let ord: i64 = row.get("ord")?;
     Ok(Some(Hit {
         doc_id: doc_id.clone(),
         title: row.get("title")?,
@@ -1921,9 +1841,7 @@ fn load_hit(
             None
         },
         canonical_url: canonical_url(&doc_id),
-        score: None,
         chunk_id: Some(chunk_id),
-        ord: Some(ord),
         next_call: Some(format!("get_chunks(chunk_ids=[{chunk_id}])")),
         withdrawn_date: row.get("withdrawn_date")?,
         superseded_by: row.get("superseded_by")?,
@@ -2198,9 +2116,7 @@ fn load_title_hit(conn: &Connection, doc_id: &str, filter: &SqlFilter) -> Result
             date: row.get("date")?,
             anchor: None,
             snippet: Some(title),
-            score: Some(-2000.0),
             chunk_id: None,
-            ord: None,
             next_call: None,
             withdrawn_date: row.get("withdrawn_date")?,
             superseded_by: row.get("superseded_by")?,
@@ -2281,9 +2197,7 @@ fn search_titles(
             date: row.get("date")?,
             anchor: None,
             snippet: Some(title),
-            score: row.get::<_, f64>("score").ok(),
             chunk_id: None,
-            ord: None,
             next_call: None,
             withdrawn_date: row.get("withdrawn_date")?,
             superseded_by: row.get("superseded_by")?,
@@ -2312,31 +2226,18 @@ fn search_titles(
     let direct_doc_ids: HashSet<String> =
         direct_hits.iter().map(|hit| hit.doc_id.clone()).collect();
     rows.retain(|hit| !direct_doc_ids.contains(&hit.doc_id));
-    rows.sort_by(|a, b| {
-        a.score
-            .partial_cmp(&b.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
     rows.splice(0..0, direct_hits);
     let truncated = rows.len() > k;
     rows.truncate(k);
-    // Map raw negative BM25 + the -2000 direct-hit sentinel into [0,1]
-    // (larger=better) so the agent never sees BM25 magnitudes on the wire.
-    normalise_hit_scores(&mut rows);
     match format {
-        OutputFormat::Json => Ok(serde_json::to_string_pretty(&json!({
-            "query": query,
-            "filters": {
-                "excluded_by_default": DEFAULT_EXCLUDED_TYPES,
-                "old_content_cutoff": if include_old { JsonValue::Null } else { json!(OLD_CONTENT_CUTOFF) },
-            },
-            "meta": {
-                "returned": rows.len(),
-                "truncated": truncated,
-                "returned_chars": rows.iter().map(|hit| hit.snippet.as_deref().map(str::len).unwrap_or(0)).sum::<usize>(),
-            },
-            "hits": rows,
-        }))?),
+        OutputFormat::Json => {
+            let mut response = serde_json::Map::new();
+            response.insert("hits".to_string(), json!(rows));
+            if truncated {
+                response.insert("meta".to_string(), json!({"truncated": true}));
+            }
+            Ok(serde_json::to_string_pretty(&JsonValue::Object(response))?)
+        }
     }
 }
 
@@ -5866,9 +5767,7 @@ mod tests {
             anchor: None,
             snippet: Some("snip".to_string()),
             canonical_url: "https://x".to_string(),
-            score: None,
             chunk_id: None,
-            ord: None,
             next_call: None,
             withdrawn_date: None,
             superseded_by: None,
@@ -5900,9 +5799,7 @@ mod tests {
             anchor: None,
             snippet: Some("snip".to_string()),
             canonical_url: "https://x".to_string(),
-            score: None,
             chunk_id: None,
-            ord: None,
             next_call: None,
             withdrawn_date: Some("2025-10-31".to_string()),
             superseded_by: Some("TR 2025/1".to_string()),
@@ -7048,9 +6945,9 @@ mod tests {
 
     // ===== Wave 3-B Reranker ===============================================
 
-    /// Helper: build a Hit with the slim contract — no `ranking` block, no
-    /// `reranker_score`. Tests below pin that the wire shape stays slim.
-    fn make_test_hit(score: Option<f64>) -> Hit {
+    /// Helper: build a Hit with the slim contract. Tests below pin that the
+    /// wire shape stays slim (no score, no ord, no debug metadata).
+    fn make_test_hit() -> Hit {
         Hit {
             doc_id: "DOC".to_string(),
             title: "T".to_string(),
@@ -7059,9 +6956,7 @@ mod tests {
             anchor: None,
             snippet: Some("snip".to_string()),
             canonical_url: "https://x".to_string(),
-            score,
             chunk_id: Some(1),
-            ord: Some(0),
             next_call: None,
             withdrawn_date: None,
             superseded_by: None,
@@ -7073,57 +6968,21 @@ mod tests {
     }
 
     #[test]
-    fn hit_json_omits_ranking_block_and_reranker_score() {
-        let hit = make_test_hit(Some(0.5));
+    fn hit_json_is_slim_no_score_no_ord_no_debug() {
+        let hit = make_test_hit();
         let json_str = serde_json::to_string(&hit).unwrap();
-        assert!(
-            !json_str.contains("\"ranking\""),
-            "slim Hit JSON must not carry a `ranking` field; got {json_str}"
-        );
-        assert!(
-            !json_str.contains("reranker_score"),
-            "slim Hit JSON must not carry `reranker_score`; got {json_str}"
-        );
-    }
-
-    #[test]
-    fn hit_json_score_rounded_to_two_decimals() {
-        let hit = make_test_hit(Some(0.8851304670696148));
-        let parsed: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&hit).unwrap()).unwrap();
-        assert_eq!(parsed["score"], json!(0.89));
-    }
-
-    #[test]
-    fn hit_json_score_null_when_unset() {
-        let hit = make_test_hit(None);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&hit).unwrap()).unwrap();
-        assert!(parsed["score"].is_null());
-    }
-
-    #[test]
-    fn normalise_hit_scores_maps_negative_bm25_into_unit_range() {
-        // BM25 emits negative numbers; min-max on -score puts the most
-        // relevant hit at 1.0 and the least at 0.0.
-        let mut hits = vec![
-            make_test_hit(Some(-13.6)),
-            make_test_hit(Some(-5.0)),
-            make_test_hit(Some(-9.2)),
-        ];
-        normalise_hit_scores(&mut hits);
-        assert_eq!(hits[0].score, Some(1.0));
-        assert_eq!(hits[1].score, Some(0.0));
-        let mid = hits[2].score.unwrap();
-        assert!(mid > 0.0 && mid < 1.0);
-    }
-
-    #[test]
-    fn normalise_hit_scores_no_op_when_all_non_negative() {
-        let mut hits = vec![make_test_hit(Some(0.92)), make_test_hit(Some(0.018))];
-        normalise_hit_scores(&mut hits);
-        assert_eq!(hits[0].score, Some(0.92));
-        assert_eq!(hits[1].score, Some(0.018));
+        for forbidden in [
+            "\"score\"",
+            "\"ord\"",
+            "\"ranking\"",
+            "reranker_score",
+            "embedding_model_id",
+        ] {
+            assert!(
+                !json_str.contains(forbidden),
+                "slim Hit JSON must not carry `{forbidden}`; got {json_str}"
+            );
+        }
     }
 
     #[test]
@@ -7315,7 +7174,9 @@ mod tests {
         );
         let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
         assert_eq!(parsed["hits"][0]["doc_id"], json!("DOC_CLI_RERANK"));
-        assert_eq!(parsed["ranking"]["reranker_used"], json!(false));
+        // Slim response: no `ranking` block, no reranker debug metadata
+        // surfaces to the agent.
+        assert!(parsed.get("ranking").is_none(), "ranking block must not be exposed");
         Ok(())
     }
 
@@ -7382,29 +7243,24 @@ mod tests {
         Ok(())
     }
 
-    // ----- I3: reranker score becomes hit.score for top-N (slim contract) -----
+    // ----- I3: slim Hit JSON surface ---------------------------------------
     //
-    // The slim Hit contract (MT-04 + MT-04-slim) carries one composite
-    // `score` field — when the reranker ran for a chunk, that's the
-    // sigmoid score; otherwise it's the first-stage RRF/lexical/vector
-    // value (BM25 negatives are normalised by the search pipeline). This
-    // test pins the JSON surface so a future refactor can't reintroduce
-    // a `ranking` block or `reranker_score` companion field.
+    // The slim Hit contract (MT-04 + MT-04-slim) hides internal scoring from
+    // the agent — no `score`, no `ord`, no `ranking` block, no
+    // `reranker_score`. Pins the JSON shape so a future refactor can't
+    // reintroduce internal-metric leakage.
 
     #[test]
-    fn reranker_score_replaces_score_for_top_n() {
-        let head_score = 0.92_f64;
-        let head_hit = Hit {
-            doc_id: "DOC_HEAD".to_string(),
-            title: "head doc".to_string(),
+    fn hit_json_hides_internal_scoring_metadata() {
+        let hit = Hit {
+            doc_id: "DOC".to_string(),
+            title: "doc".to_string(),
             doc_type: "Public_ruling".to_string(),
             date: None,
             anchor: None,
             snippet: Some("snip".to_string()),
             canonical_url: "https://x".to_string(),
-            score: Some(head_score),
             chunk_id: Some(1),
-            ord: Some(0),
             next_call: None,
             withdrawn_date: None,
             superseded_by: None,
@@ -7413,41 +7269,20 @@ mod tests {
             has_related_docs: None,
             has_history: None,
         };
-
-        // Tail hit retains the first-stage score (RRF here).
-        let tail_rrf = 0.018_f64;
-        let tail_hit = Hit {
-            doc_id: "DOC_TAIL".to_string(),
-            title: "tail doc".to_string(),
-            doc_type: "Public_ruling".to_string(),
-            date: None,
-            anchor: None,
-            snippet: Some("snip".to_string()),
-            canonical_url: "https://y".to_string(),
-            score: Some(tail_rrf),
-            chunk_id: Some(2),
-            ord: Some(0),
-            next_call: None,
-            withdrawn_date: None,
-            superseded_by: None,
-            replaces: None,
-            has_in_doc_links: None,
-            has_related_docs: None,
-            has_history: None,
-        };
-
-        let head_json: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&head_hit).unwrap()).unwrap();
-        // Score is the (rounded) reranker value; no companion fields leak.
-        assert_eq!(head_json["score"], json!(0.92));
-        assert!(head_json.get("reranker_score").is_none());
-        assert!(head_json.get("ranking").is_none());
-
-        let tail_json: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&tail_hit).unwrap()).unwrap();
-        assert_eq!(tail_json["score"], json!(0.02));
-        assert!(tail_json.get("reranker_score").is_none());
-        assert!(tail_json.get("ranking").is_none());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&hit).unwrap()).unwrap();
+        for forbidden in [
+            "score",
+            "ord",
+            "ranking",
+            "reranker_score",
+            "embedding_model_id",
+        ] {
+            assert!(
+                parsed.get(forbidden).is_none(),
+                "slim Hit JSON must not expose `{forbidden}`; got {parsed:?}"
+            );
+        }
     }
 
     // ----- I3: dedup behaviour at the mixed-scale boundary ------------------
