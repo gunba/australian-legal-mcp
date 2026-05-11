@@ -4947,7 +4947,7 @@ fn server_instructions() -> String {
         .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
     {
         Some(s) => format!(
-            "ATO legal corpus. Documents: {}, chunks: {}. Index: {}. Navigate via search → get_chunks: search returns slim hits (chunk_id, doc_id, ord, anchor, score, optional snippet); get_chunks fetches bodies by chunk_id with before/after ordinal neighbours within the same doc. doc_scope accepts a single full doc_id for in-doc search or \"<PREFIX>/%\" for a family (see stats). Default search excludes Edited_private_advice, withdrawn rulings, and content dated before {} except legislation; override with current_only=false and include_old=true. Slim hits surface has_in_doc_links / has_related_docs / has_history flags when calling get_doc_anchors(doc_id) would yield useful navigation entries. Historical (point-in-time) versions of documents are not stored as separate rows; get_doc_anchors lists them as {{doc_id, pit, date}} entries so an agent can fetch the older URL externally.",
+            "ATO legal corpus. Documents: {}, chunks: {}. Index: {}. Navigate via search → get_chunks: search returns slim hits (chunk_id, doc_id, anchor, optional snippet); get_chunks fetches bodies by chunk_id with before/after ordinal neighbours within the same doc. doc_scope accepts a single full doc_id for in-doc search or \"<PREFIX>/%\" for a family (see stats). Default search excludes Edited_private_advice, withdrawn rulings, and content dated before {} except legislation; override with current_only=false and include_old=true. Slim hits surface has_in_doc_links / has_related_docs / has_history flags when calling get_doc_anchors(doc_id) would yield useful navigation entries. Historical (point-in-time) versions of documents are not stored as separate rows; get_doc_anchors lists them as {{doc_id, pit, date}} entries so an agent can fetch the older URL externally.",
             s["documents"].as_i64().unwrap_or(0),
             s["chunks"].as_i64().unwrap_or(0),
             s["index_version"].as_str().unwrap_or("?"),
@@ -4966,7 +4966,7 @@ fn tool_descriptors() -> JsonValue {
     json!([
         {
             "name": "search",
-            "description": "Hybrid semantic+lexical search over chunks (chunk-level). Returns slim pointer hits (chunk_id, doc_id, ord, anchor, score, optional snippet) — fetch bodies via get_chunks. doc_scope filters by full doc_id (in-doc search) or \"<PREFIX>/%\" (family). mode=keyword forces lexical-only; hybrid/vector require the semantic index. Set include_snippet=false when the caller will follow up with get_chunks. Slim hits include navigation hints: has_in_doc_links (doc has paragraph anchors / contents entries — call get_doc_anchors to navigate), has_related_docs (doc has companion documents like errata / addenda), has_history (doc has earlier point-in-time versions — get_doc_anchors lists their URLs).",
+            "description": "Hybrid semantic+lexical search over chunks (chunk-level). Returns slim pointer hits (chunk_id, doc_id, anchor, optional snippet) — fetch bodies via get_chunks. doc_scope filters by full doc_id (in-doc search) or \"<PREFIX>/%\" (family). mode=keyword forces lexical-only; hybrid/vector require the semantic index. Set include_snippet=false when the caller will follow up with get_chunks. Slim hits include navigation hints: has_in_doc_links (doc has paragraph anchors / contents entries — call get_doc_anchors to navigate), has_related_docs (doc has companion documents like errata / addenda), has_history (doc has earlier point-in-time versions — get_doc_anchors lists their URLs).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4988,7 +4988,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "search_titles",
-            "description": "Title-only search returning doc-level hits (no chunk_id/ord). Use search for chunk-level results. Accepts exact doc_id and ATO document-link lookup. Hits include navigation hints (has_in_doc_links, has_related_docs, has_history) — call get_doc_anchors(doc_id) to navigate.",
+            "description": "Title-only search returning doc-level hits (no chunk_id). Use search for chunk-level results. Accepts exact doc_id and ATO document-link lookup. Hits include navigation hints (has_in_doc_links, has_related_docs, has_history) — call get_doc_anchors(doc_id) to navigate.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
