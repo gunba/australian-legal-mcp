@@ -397,6 +397,11 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
         args.max_batch_tokens,
     )
     _derive_citations(conn)
+    # The transaction opened by the trailing _checkpoint() still needs to
+    # commit so citation rows persist; the connection is in autocommit
+    # mode (isolation_level=None) so a COMMIT here closes the implicit
+    # transaction started after the last checkpoint.
+    conn.execute("COMMIT")
     _log_currency_summary(conn)
     return manifest
 
@@ -733,6 +738,7 @@ def build(args: BuildArgs) -> Manifest:
         args.max_batch_tokens,
     )
     _derive_citations(conn)
+    conn.execute("COMMIT")
     _log_currency_summary(conn)
     return manifest
 
