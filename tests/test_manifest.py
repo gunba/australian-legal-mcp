@@ -86,12 +86,16 @@ def test_manifest_schema_version_bumped_to_4() -> None:
     assert fresh.schema_version == 4
 
 
-def test_min_client_version_pins_to_0_6_9() -> None:
-    """The HTML/assets corpus requires the matching Rust binary.
-    """
-    assert DEFAULT_MIN_CLIENT_VERSION == "0.6.9"
+def test_min_client_version_tracks_cargo_toml() -> None:
+    """``DEFAULT_MIN_CLIENT_VERSION`` is read from Cargo.toml at import
+    time so corpus manifests are always pinned to the binary that built
+    them. A fresh ``Manifest()`` carries the same value."""
+    import re
+    cargo = (Path(__file__).resolve().parents[1] / "Cargo.toml").read_text()
+    cargo_version = re.search(r'^version\s*=\s*"([^"]+)"', cargo, re.MULTILINE).group(1)
+    assert DEFAULT_MIN_CLIENT_VERSION == cargo_version
     fresh = _m([])
-    assert fresh.min_client_version == "0.6.9"
+    assert fresh.min_client_version == cargo_version
 
 
 def test_manifest_with_reranker_serializes_and_deserializes(tmp_path: Path) -> None:

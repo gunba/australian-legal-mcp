@@ -31,21 +31,24 @@ from ato_mcp.store.manifest import (
 
 
 def test_freshly_built_manifest_pins_min_client_version() -> None:
-    """A freshly-constructed Manifest must default `min_client_version` to
-    "0.6.9" so older binaries refuse to ingest this corpus.
+    """A freshly-constructed Manifest defaults ``min_client_version`` to
+    the Cargo.toml version, so older binaries refuse to ingest this corpus.
 
     The Rust enforce_manifest_compatibility check compares this field to
-    `CARGO_PKG_VERSION`; without this default the gate is dormant and a
+    ``CARGO_PKG_VERSION``; without this default the gate is dormant and a
     pre-HTML-surface binary would silently download a v4 corpus and only fail
     AFTER the install via the schema-version DB check.
     """
+    import re
+    cargo = (Path(__file__).resolve().parents[1] / "Cargo.toml").read_text()
+    cargo_version = re.search(r'^version\s*=\s*"([^"]+)"', cargo, re.MULTILINE).group(1)
     manifest = Manifest(
         index_version="2026.05.03",
         created_at="2026-05-03T00:00:00+00:00",
         model=ModelInfo(id="m", sha256="0" * 64, size=1, url="model/m.onnx.zst"),
     )
-    assert manifest.min_client_version == "0.6.9"
-    assert DEFAULT_MIN_CLIENT_VERSION == "0.6.9"
+    assert manifest.min_client_version == cargo_version
+    assert DEFAULT_MIN_CLIENT_VERSION == cargo_version
     # And the manifest format version is bumped to v4 (HTML/assets boundary).
     assert manifest.schema_version == MANIFEST_SCHEMA_VERSION
     assert MANIFEST_SCHEMA_VERSION == 4
