@@ -46,7 +46,7 @@ def _maybe_reexec_with_nvidia_libs() -> None:
 
 @app.command("refresh-source")
 def refresh_source(
-    mode: str = typer.Option("incremental", help="incremental | full | catch_up | retry_missing"),
+    mode: str = typer.Option("incremental", help="incremental | full | catch_up"),
     output_dir: Path = typer.Option(Path("./ato_pages"), help="Destination for payloads/."),
     # [CC-05] refresh-source defaults to ./ato_pages; build-index requires --pages-dir pointing at a populated ato_pages/. Stages independently re-runnable — same pages dir can feed multiple builds.
     links_file: Optional[Path] = typer.Option(None, help="deduped_links.jsonl for incremental mode."),
@@ -54,8 +54,7 @@ def refresh_source(
     request_interval: float = typer.Option(
         0.5,
         help="Minimum seconds between HTTP request starts, globally across workers. "
-             "Default 0.5 s = ~2 req/sec. Drop to 1.0 for a slower/safer rate. "
-             "retry_missing mode falls back to 0.25 s when this is left at the default.",
+             "Default 0.5 s = ~2 req/sec. Drop to 1.0 for a slower/safer rate.",
     ),
     verbose: bool = typer.Option(False, help="Emit downloader status snapshots."),
     root_query: str = typer.Option(
@@ -63,34 +62,17 @@ def refresh_source(
         help="Tree root. Override to scope catch_up to a subtree.",
     ),
     max_nodes: Optional[int] = typer.Option(None, help="Cap for debugging."),
-    explicit_links_file: Optional[Path] = typer.Option(
-        None,
-        "--explicit-links-file",
-        help=(
-            "Optional JSONL file with explicit links to fetch (one record per line: "
-            "{\"canonical_id\": \"...\", \"href\": \"...\", \"pit\": \"...\" | null}). "
-            "Combined with the standard mode's link source — useful for backfilling "
-            "sister docs or PiT historical versions discovered via discover-related-docs.py."
-        ),
-    ),
 ) -> None:
     """Maintainer: scrape the ATO site into ``ato_pages/``."""
     from .scraper import refresh_source as run_refresh
     from .util.power import maybe_reexec_with_sleep_inhibitor
 
-    if mode not in {"incremental", "full", "catch_up", "retry_missing"}:
+    if mode not in {"incremental", "full", "catch_up"}:
         raise typer.BadParameter(
-            f"mode must be one of incremental | full | catch_up | retry_missing (got {mode!r})"
+            f"mode must be one of incremental | full | catch_up (got {mode!r})"
         )
 
     maybe_reexec_with_sleep_inhibitor(f"ato-mcp source refresh ({mode})")
-
-    explicit_links: Optional[list[dict]] = None
-    if explicit_links_file is not None:
-        explicit_links = _load_explicit_links_file(explicit_links_file)
-        typer.echo(
-            f"explicit-links: loaded {len(explicit_links)} record(s) from {explicit_links_file}"
-        )
 
     result = run_refresh(
         mode=mode,  # type: ignore[arg-type]
@@ -101,7 +83,6 @@ def refresh_source(
         verbose_progress=verbose,
         root_query=root_query,
         max_nodes=max_nodes,
-        explicit_links=explicit_links,
     )
     typer.echo(f"refresh-source complete: mode={result.mode} output={result.output_dir}")
     if result.catch_up_summary is not None:
@@ -112,64 +93,6 @@ def refresh_source(
         )
         for cat, n in s.by_category.items():
             typer.echo(f"  {n:6d}  {cat}")
-    if result.retry_missing_summary is not None:
-        r = result.retry_missing_summary
-        typer.echo(
-            f"retry-missing: eligible={r.eligible} recovered={r.recovered} "
-            f"confirmed_404={r.confirmed_404} confirmed_stub={r.confirmed_stub} "
-            f"still_missing={r.still_missing}"
-        )
-
-
-def _load_explicit_links_file(path: Path) -> list[dict]:
-    """Parse a JSONL file of explicit links to fetch.
-
-    Each line must be a JSON object with at minimum ``canonical_id`` and
-    ``href`` keys; ``pit`` is optional. Malformed or non-conforming lines are
-    skipped with a warning so a single bad row doesn't abort the run.
-    """
-    import json as _json
-
-    out: list[dict] = []
-    if not path.exists():
-        raise typer.BadParameter(f"explicit-links file not found: {path}")
-    with path.open("r", encoding="utf-8") as fh:
-        for lineno, raw in enumerate(fh, start=1):
-            text = raw.strip()
-            if not text:
-                continue
-            try:
-                rec = _json.loads(text)
-            except _json.JSONDecodeError as exc:
-                LOGGER.warning(
-                    "skipping malformed line %d in %s: %s", lineno, path, exc
-                )
-                continue
-            if not isinstance(rec, dict):
-                LOGGER.warning(
-                    "skipping non-object line %d in %s", lineno, path
-                )
-                continue
-            cid = rec.get("canonical_id")
-            href = rec.get("href")
-            if not isinstance(cid, str) or not cid:
-                LOGGER.warning(
-                    "skipping line %d in %s: missing/invalid canonical_id", lineno, path
-                )
-                continue
-            if not isinstance(href, str) or not href:
-                LOGGER.warning(
-                    "skipping line %d in %s: missing/invalid href", lineno, path
-                )
-                continue
-            out.append(
-                {
-                    "canonical_id": cid,
-                    "href": href,
-                    "pit": rec.get("pit"),
-                }
-            )
-    return out
 
 
 @app.command("catch-up")
