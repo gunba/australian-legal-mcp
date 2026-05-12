@@ -114,10 +114,7 @@ enum Command {
         rollback: bool,
     },
     /// Print index version and counts.
-    Stats {
-        #[arg(long, default_value = "json")]
-        format: OutputFormat,
-    },
+    Stats {},
     /// Run a search from the CLI.
     Search {
         query: String,
@@ -140,8 +137,6 @@ enum Command {
         /// Include withdrawn / superseded rulings (default excludes them).
         #[arg(long)]
         include_withdrawn: bool,
-        #[arg(long, default_value = "json")]
-        format: OutputFormat,
     },
     /// Search document titles, plus exact doc_id / ATO document links.
     SearchTitles {
@@ -155,8 +150,6 @@ enum Command {
         /// Include withdrawn / superseded rulings (default excludes them).
         #[arg(long)]
         include_withdrawn: bool,
-        #[arg(long, default_value = "json")]
-        format: OutputFormat,
     },
     /// Fetch a document or a slice of it.
     GetDocument {
@@ -176,14 +169,7 @@ enum Command {
         context_doc_id: Option<String>,
         #[arg(long, default_value_t = 5)]
         max_defs: usize,
-        #[arg(long, default_value = "json")]
-        format: OutputFormat,
     },
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum OutputFormat {
-    Json,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -254,8 +240,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Doctor { rollback } => doctor(rollback),
-        Command::Stats { format } => {
-            println!("{}", stats(format)?);
+        Command::Stats {} => {
+            println!("{}", stats()?);
             Ok(())
         }
         Command::Search {
@@ -269,7 +255,6 @@ fn main() -> Result<()> {
             sort_by,
             include_old,
             include_withdrawn,
-            format,
         } => {
             let types = empty_vec_as_none(types);
             // Construct a transient ServerState so the CLI's `search` call
@@ -288,7 +273,6 @@ fn main() -> Result<()> {
                     sort_by,
                     include_old,
                     current_only: !include_withdrawn,
-                    format,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
                     similar_to_chunk_id: None,
@@ -303,7 +287,6 @@ fn main() -> Result<()> {
             types,
             include_old,
             include_withdrawn,
-            format,
         } => {
             let types = empty_vec_as_none(types);
             println!(
@@ -314,7 +297,6 @@ fn main() -> Result<()> {
                     types.as_deref(),
                     include_old,
                     !include_withdrawn,
-                    format,
                 )?
             );
             Ok(())
@@ -342,7 +324,6 @@ fn main() -> Result<()> {
             term,
             context_doc_id,
             max_defs,
-            format,
         } => {
             println!(
                 "{}",
@@ -351,7 +332,6 @@ fn main() -> Result<()> {
                     GetDefinitionOptions {
                         context_doc_id: context_doc_id.as_deref(),
                         max_defs,
-                        format,
                     },
                 )?
             );
@@ -824,7 +804,6 @@ struct SearchOptions<'a> {
     /// `withdrawn_date`, `superseded_by`, and `replaces` fields on the
     /// hit and can decide whether the source still applies.
     current_only: bool,
-    format: OutputFormat,
     /// Internal-only: maximum chunks returned per document. Capped at
     /// `HARD_MAX_PER_DOC`. NOT exposed in the MCP tool descriptor for
     /// Wave 1 (would inflate the public surface).
@@ -1099,23 +1078,19 @@ fn search(
         None
     };
 
-    match opts.format {
-        OutputFormat::Json => {
-            let mut meta = serde_json::Map::new();
-            if candidate_count > records.len() {
-                meta.insert("truncated".to_string(), json!(true));
-                if let Some(nc) = next_call {
-                    meta.insert("next_call".to_string(), json!(nc));
-                }
-            }
-            let mut response = serde_json::Map::new();
-            response.insert("hits".to_string(), json!(records));
-            if !meta.is_empty() {
-                response.insert("meta".to_string(), JsonValue::Object(meta));
-            }
-            Ok(serde_json::to_string_pretty(&JsonValue::Object(response))?)
+    let mut meta = serde_json::Map::new();
+    if candidate_count > records.len() {
+        meta.insert("truncated".to_string(), json!(true));
+        if let Some(nc) = next_call {
+            meta.insert("next_call".to_string(), json!(nc));
         }
     }
+    let mut response = serde_json::Map::new();
+    response.insert("hits".to_string(), json!(records));
+    if !meta.is_empty() {
+        response.insert("meta".to_string(), JsonValue::Object(meta));
+    }
+    Ok(serde_json::to_string_pretty(&JsonValue::Object(response))?)
 }
 
 fn search_cli(query: &str, opts: SearchOptions<'_>) -> Result<(String, ServerState)> {
@@ -2216,7 +2191,6 @@ fn search_titles(
     types: Option<&[String]>,
     include_old: bool,
     current_only: bool,
-    format: OutputFormat,
 ) -> Result<String> {
     // [MT-14] search_titles ranks title_fts independently and uses the same default filters.
     let conn = open_read()?;
@@ -2297,16 +2271,12 @@ fn search_titles(
     rows.splice(0..0, direct_hits);
     let truncated = rows.len() > k;
     rows.truncate(k);
-    match format {
-        OutputFormat::Json => {
-            let mut response = serde_json::Map::new();
-            response.insert("hits".to_string(), json!(rows));
-            if truncated {
-                response.insert("meta".to_string(), json!({"truncated": true}));
-            }
-            Ok(serde_json::to_string_pretty(&JsonValue::Object(response))?)
-        }
+    let mut response = serde_json::Map::new();
+    response.insert("hits".to_string(), json!(rows));
+    if truncated {
+        response.insert("meta".to_string(), json!({"truncated": true}));
     }
+    Ok(serde_json::to_string_pretty(&JsonValue::Object(response))?)
 }
 
 struct GetDocumentOptions {
@@ -2458,7 +2428,6 @@ fn char_offset_to_byte(value: &str, chars: usize) -> usize {
 struct GetDefinitionOptions<'a> {
     context_doc_id: Option<&'a str>,
     max_defs: usize,
-    format: OutputFormat,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -2548,7 +2517,7 @@ fn get_definition(term: &str, opts: GetDefinitionOptions<'_>) -> Result<String> 
     let conn = open_read()?;
     if !table_exists(&conn, "definitions")? {
         let (ordinary, ordinary_error) = ordinary_meaning_or_error(term);
-        return format_definition_response(term, &[], ordinary, ordinary_error, false, opts.format);
+        return format_definition_response(term, &[], ordinary, ordinary_error, false);
     }
     let norm = normalize_definition_term(term);
     let max_defs = opts.max_defs.clamp(1, 20);
@@ -2590,7 +2559,7 @@ fn get_definition(term: &str, opts: GetDefinitionOptions<'_>) -> Result<String> 
     } else {
         (None, None)
     };
-    format_definition_response(term, &hits, ordinary, ordinary_error, true, opts.format)
+    format_definition_response(term, &hits, ordinary, ordinary_error, true)
 }
 
 fn ordinary_meaning_or_error(term: &str) -> (Option<OrdinaryMeaningHit>, Option<String>) {
@@ -2832,24 +2801,21 @@ fn format_definition_response(
     ordinary: Option<OrdinaryMeaningHit>,
     ordinary_error: Option<String>,
     definition_index_available: bool,
-    format: OutputFormat,
 ) -> Result<String> {
     let statutory_found = !hits.is_empty();
-    match format {
-        OutputFormat::Json => Ok(serde_json::to_string_pretty(&json!({
-            "term": term,
-            "statutory_definition_found": statutory_found,
-            "definitions": hits,
-            "ordinary_meaning": ordinary,
-            "meta": {
-                "definition_index_available": definition_index_available,
-                "ordinary_meaning_error": ordinary_error,
-            }
-        }))?),
-    }
+    Ok(serde_json::to_string_pretty(&json!({
+        "term": term,
+        "statutory_definition_found": statutory_found,
+        "definitions": hits,
+        "ordinary_meaning": ordinary,
+        "meta": {
+            "definition_index_available": definition_index_available,
+            "ordinary_meaning_error": ordinary_error,
+        }
+    }))?)
 }
 
-fn stats(format: OutputFormat) -> Result<String> {
+fn stats() -> Result<String> {
     let conn = open_read()?;
     let docs: i64 = conn.query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))?;
     let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
@@ -2897,10 +2863,8 @@ fn stats(format: OutputFormat) -> Result<String> {
             "old_content_exception_types": [LEGISLATION_TYPE],
         }
     });
-    match format {
-        // [OF-06] JSON outputs use serde_json pretty rendering before return/write.
-        OutputFormat::Json => Ok(serde_json::to_string_pretty(&payload)?),
-    }
+    // [OF-06] JSON outputs use serde_json pretty rendering before return/write.
+    Ok(serde_json::to_string_pretty(&payload)?)
 }
 
 /// Per-prefix corpus breakdown — doc_id-prefix counts plus a sample-title
@@ -4569,7 +4533,6 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
                 "recency" => SortBy::Recency,
                 _ => SortBy::Relevance,
             };
-            let format = output_format_arg(&args)?;
             search(
                 query,
                 SearchOptions {
@@ -4582,7 +4545,6 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
                     sort_by,
                     include_old: optional_bool(&args, "include_old").unwrap_or(false),
                     current_only: optional_bool(&args, "current_only").unwrap_or(true),
-                    format,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: optional_bool(&args, "include_snippet").unwrap_or(true),
                     similar_to_chunk_id: optional_i64(&args, "similar_to_chunk_id"),
@@ -4599,7 +4561,6 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
                 types.as_deref(),
                 optional_bool(&args, "include_old").unwrap_or(false),
                 optional_bool(&args, "current_only").unwrap_or(true),
-                output_format_arg(&args)?,
             )?
         }
         "get_document" => {
@@ -4623,11 +4584,10 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
                 GetDefinitionOptions {
                     context_doc_id: args.get("context_doc_id").and_then(|v| v.as_str()),
                     max_defs: optional_usize(&args, "max_defs").unwrap_or(5),
-                    format: output_format_arg(&args)?,
                 },
             )?
         }
-        "stats" => stats(output_format_arg(&args)?)?,
+        "stats" => stats()?,
         _ => bail!("unknown tool: {name}"),
     };
     Ok(json!({
@@ -4675,13 +4635,6 @@ fn optional_string_array(args: &JsonValue, name: &str) -> Result<Option<Vec<Stri
     Ok(Some(out))
 }
 
-fn output_format_arg(args: &JsonValue) -> Result<OutputFormat> {
-    match args.get("format").and_then(|v| v.as_str()).unwrap_or("json") {
-        "json" => Ok(OutputFormat::Json),
-        other => bail!("format must be \"json\"; got `{other}`"),
-    }
-}
-
 fn get_chunks_mcp(args: &JsonValue) -> Result<String> {
     let ids = args
         .get("chunk_ids")
@@ -4694,10 +4647,6 @@ fn get_chunks_mcp(args: &JsonValue) -> Result<String> {
                 .ok_or_else(|| anyhow!("chunk_ids must contain integers"))
         })
         .collect::<Result<Vec<_>>>()?;
-    // Validate the format arg so callers passing format=markdown see a clear
-    // error rather than a silently-accepted value; the JSON output path is the
-    // only remaining variant.
-    let _ = output_format_arg(args)?;
     get_chunks(
         &chunk_ids,
         GetChunksOptions {
@@ -5089,7 +5038,7 @@ fn load_cited_by(conn: &Connection, doc_id: &str) -> Result<(Vec<JsonValue>, i64
 fn server_instructions() -> String {
     // [SW-02] Instructions are generated from live corpus stats.
     // [SW-03] Missing/unreadable stats fall back to static init guidance.
-    match stats(OutputFormat::Json)
+    match stats()
         .ok()
         .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
     {
@@ -5892,7 +5841,6 @@ mod tests {
             sort_by: SortBy::Relevance,
             include_old: false,
             current_only: false,
-            format: OutputFormat::Json,
             max_per_doc: DEFAULT_MAX_PER_DOC,
             include_snippet: true,
             similar_to_chunk_id: None,
@@ -6010,7 +5958,6 @@ mod tests {
                 None,
                 true, // include_old (date filter doesn't apply since title query)
                 true, // current_only
-                OutputFormat::Json,
             )?;
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
             let doc_ids: Vec<&str> = parsed["hits"]
@@ -6036,7 +5983,6 @@ mod tests {
                 None,
                 true,
                 false, // current_only off
-                OutputFormat::Json,
             )?;
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
             let withdrawn_hit = parsed["hits"]
@@ -6101,7 +6047,6 @@ mod tests {
                 None,
                 false,
                 true,
-                OutputFormat::Json,
             )?;
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
             assert_eq!(parsed["hits"][0]["doc_id"], json!("PAC/19970038/203-50"));
@@ -6111,7 +6056,6 @@ mod tests {
                 None,
                 false,
                 true,
-                OutputFormat::Json,
             )?;
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
             assert_eq!(parsed["hits"][0]["doc_id"], json!("PAC/19970038/8-1"));
@@ -6155,7 +6099,6 @@ mod tests {
                 GetDefinitionOptions {
                     context_doc_id: Some("PAC/19970038/203-50"),
                     max_defs: 5,
-                    format: OutputFormat::Json,
                 },
             )?;
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
@@ -6223,7 +6166,6 @@ mod tests {
                 GetDefinitionOptions {
                     context_doc_id: Some("PAC/19860039/136"),
                     max_defs: 10,
-                    format: OutputFormat::Json,
                 },
             )?;
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
@@ -6257,7 +6199,6 @@ mod tests {
                 GetDefinitionOptions {
                     context_doc_id: None,
                     max_defs: 5,
-                    format: OutputFormat::Json,
                 },
             )
         });
@@ -6446,7 +6387,6 @@ mod tests {
                     sort_by: SortBy::Relevance,
                     include_old: true,
                     current_only: true,
-                    format: OutputFormat::Json,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
                     similar_to_chunk_id: None,
@@ -6484,7 +6424,6 @@ mod tests {
                     sort_by: SortBy::Relevance,
                     include_old: true,
                     current_only: false,
-                    format: OutputFormat::Json,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
                     similar_to_chunk_id: None,
@@ -6571,7 +6510,6 @@ mod tests {
                     sort_by: SortBy::Relevance,
                     include_old: false,
                     current_only: true,
-                    format: OutputFormat::Json,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
                     similar_to_chunk_id: None,
@@ -7307,7 +7245,6 @@ mod tests {
                     sort_by: SortBy::Relevance,
                     include_old: false,
                     current_only: true,
-                    format: OutputFormat::Json,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
                     similar_to_chunk_id: None,
