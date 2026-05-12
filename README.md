@@ -31,41 +31,96 @@ internal links/images contribute only useful visible text to search.
 
 ## Install
 
-Download the binary for your platform from the latest release:
+`ato-mcp` is shipped as a Rust binary — there is no `pip install ato-mcp`
+and no Python is needed for end users. The flow is:
 
-- Linux x64: `ato-mcp-x86_64-unknown-linux-gnu.tar.gz`
-- macOS Apple Silicon: `ato-mcp-aarch64-apple-darwin.tar.gz`
-- Windows x64: `ato-mcp-x86_64-pc-windows-msvc.zip`
+1. **Download the release binary** for your platform from the GitHub
+   releases page at `https://github.com/gunba/ato-mcp/releases/latest`.
 
-Linux example:
+   - Linux x64: `ato-mcp-x86_64-unknown-linux-gnu.tar.gz`
+   - macOS Apple Silicon: `ato-mcp-aarch64-apple-darwin.tar.gz`
+   - Windows x64: `ato-mcp-x86_64-pc-windows-msvc.zip`
 
-```bash
-mkdir -p ~/.local/bin
-tar -xzf ato-mcp-x86_64-unknown-linux-gnu.tar.gz -C ~/.local/bin ato-mcp
-ato-mcp init
-ato-mcp doctor
-ato-mcp stats
-```
+2. **Extract and put on `PATH`.**
 
-Windows: unzip `ato-mcp.exe` into a directory on `%PATH%`, then run:
+   Linux/macOS:
 
-```powershell
-ato-mcp.exe init
-ato-mcp.exe doctor
-ato-mcp.exe stats
-```
+   ```bash
+   mkdir -p ~/.local/bin
+   tar -xzf ato-mcp-*.tar.gz -C ~/.local/bin ato-mcp
+   ```
 
-`init` downloads `manifest.json` and document packs from the configured
-release URL. By default that is:
+   Windows: unzip `ato-mcp.exe` (and the bundled `onnxruntime.dll`) into a
+   directory on `%PATH%`.
 
-```text
-https://github.com/gunba/ato-mcp/releases/latest/download
-```
+3. **Run `ato-mcp init`** to download the corpus and embedding model:
 
-Override with `ATO_MCP_RELEASES_URL` for staging or an internal corporate
-mirror. The Rust client intentionally does not read GitHub token
-environment variables and does not shell out to `gh`. The embedding model
-source is resolved from `manifest.model.url` and verified before use.
+   ```bash
+   ato-mcp init
+   ```
+
+   This fetches `manifest.json`, the pack assets (~4 GB on first install),
+   and the EmbeddingGemma query encoder from the URL recorded in the
+   manifest. Expect 1–10 minutes on a typical home connection; longer
+   behind a corporate proxy (see below).
+
+4. **Verify with `ato-mcp doctor` and `ato-mcp stats`.** `doctor` checks
+   that every manifest-required file is present and intact; `stats`
+   reports the corpus version and prefix breakdown.
+
+5. **Wire into your MCP client** (Claude Code / Claude Desktop / Cursor /
+   Continue / any stdio MCP host — see next section).
+
+Only after `init` reports success should you wire the server into an MCP
+client. `ato-mcp serve` does not perform `init`; it expects an already-
+installed corpus and exits if one isn't present.
+
+### Enterprise / corporate environments
+
+The published binaries are unsigned today (no Authenticode / no notarised
+macOS bundle). On a managed endpoint expect one or more of the following
+to delay or block first run:
+
+- **EDR / endpoint protection** (Defender, CrowdStrike, SentinelOne,
+  Carbon Black, Sophos, …) may hold the binary in a cloud-sandbox queue
+  for minutes-to-hours before allowing execution, or quarantine it
+  outright. If `ato-mcp` disappears after extraction or fails to launch
+  with no error, check your endpoint console. IT typically resolves this
+  by either waiting out the analysis, adding a per-hash allow rule, or
+  flagging the binary as known-good.
+
+- **Windows SmartScreen / macOS Gatekeeper** will show an "unidentified
+  developer" or "unrecognized program" warning on the first launch.
+  Users without override privilege need IT to whitelist the executable
+  hash, or build from source on-prem.
+
+- **TLS-inspecting proxies** terminate and re-sign HTTPS. The Windows
+  binary uses `native-tls`/SChannel so it trusts the corporate root CA
+  in the OS certificate store automatically. The Linux/macOS binaries
+  use `rustls` with the built-in Mozilla bundle; if your proxy re-signs
+  with a private CA, set `SSL_CERT_FILE` to a bundle that includes that
+  CA before running `init` / `update`.
+
+- **Egress allow-list.** `init` and `update` fetch from two hosts:
+  `github.com` (release manifest + pack assets) and `huggingface.co`
+  (EmbeddingGemma model). Both need to be reachable. The release URL
+  base can be overridden with `ATO_MCP_RELEASES_URL` to point at an
+  internal mirror; the model URL is recorded in `manifest.model.url` and
+  can be redirected at release time with `--model-url`.
+
+- **No GitHub token needed.** `ato-mcp` deliberately does not read
+  `GITHUB_TOKEN` or shell out to `gh`. Public releases are fetched
+  anonymously. For private mirrors, expose them through a plain HTTPS
+  URL that doesn't require auth, or pre-stage the install via the
+  offline-bundle path documented under [Development](#development).
+
+If your team can't run unsigned binaries at all, build from source on a
+maintainer machine (`cargo build --release` from this repo) and
+distribute the resulting binary internally. Building from source is
+straightforward; signing the resulting artifact is the
+organisation-specific bit. Maintainer corpus rebuilds are a separate
+maintainer flow and not required for fresh installs — end users always
+consume pre-built corpus releases from GitHub.
 
 ## Wire Into MCP Clients
 
@@ -284,30 +339,29 @@ scripts/make-offline-bundle.sh ./release/ato-mcp-offline-bundle.tar.zst
 CI runs both the Rust binary checks and the Python maintainer test suite.
 Release binary assets are produced by `.github/workflows/release-binaries.yml`.
 
-## Corporate Windows Builds
+## Corporate Windows Builds from Source
 
-Windows release binaries built from this repo use the Windows system TLS stack
-(`native-tls`/SChannel), so HTTPS downloads trust corporate root CAs installed
-in the OS certificate store. The Windows release zip includes `onnxruntime.dll`
-next to `ato-mcp.exe`; the Windows build uses ORT dynamic loading to reduce the
-executable footprint and avoid requiring MSVC for local source builds.
+For from-source Windows builds (the binary release already bundles
+everything needed), a few extras matter on managed networks.
 
-For local Windows source builds, put Microsoft's `onnxruntime.dll` next to the
-built `ato-mcp.exe`, or set `ORT_DYLIB_PATH` to the DLL path before running
-`ato-mcp`.
+Microsoft's `onnxruntime.dll` is not vendored into the Cargo build. Put
+the DLL next to your built `ato-mcp.exe`, or set `ORT_DYLIB_PATH` to its
+path before running. The published Windows release zip already includes
+this DLL.
 
-If building from source behind a TLS-inspecting proxy, Cargo may fail revocation
-checks before it can fetch dependencies. Put this in `%USERPROFILE%\.cargo\config.toml`
-when your corporate proxy blocks CRL access:
+If building from source behind a TLS-inspecting proxy, Cargo may fail
+revocation checks before it can fetch dependencies. Put this in
+`%USERPROFILE%\.cargo\config.toml` when your corporate proxy blocks CRL
+access:
 
 ```toml
 [http]
 check-revoke = false
 ```
 
-Aggressive endpoint protection can still block unsigned binaries based on local
-policy. Building from source produces local-prevalence bytes, but a durable
-fleet-wide fix for published Windows artifacts requires Authenticode signing.
+End-user concerns (Authenticode signing, SmartScreen, EDR holds, proxy
+allow-listing) are covered in the [Enterprise / corporate
+environments](#enterprise--corporate-environments) subsection above.
 
 ## License
 
