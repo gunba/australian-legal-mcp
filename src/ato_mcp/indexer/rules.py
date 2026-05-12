@@ -43,36 +43,9 @@ Field outputs:
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Callable
-
-
-@dataclass
-class CitationPathCounters:
-    mailto_body_fired: int = 0
-    mailto_body_sole_source: int = 0
-    report_abbrev_year_fired: int = 0
-    markdown_case_header_fired: int = 0
-    docid_year2_fired: int = 0
-
-    def reset(self) -> None:
-        for f in fields(self):
-            setattr(self, f.name, 0)
-
-    def as_dict(self) -> dict[str, int]:
-        return {f.name: getattr(self, f.name) for f in fields(self)}
-
-
-_CITATION_COUNTERS = CitationPathCounters()
-
-
-def get_citation_path_counts() -> dict[str, int]:
-    return _CITATION_COUNTERS.as_dict()
-
-
-def reset_citation_path_counts() -> None:
-    _CITATION_COUNTERS.reset()
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +64,6 @@ class RuleInputs:
     # Parliamentary EM / regulation Explanatory Statement front-matter signals.
     # Populated only on docs whose <div id="Lawfront"> has the EM/ES shape;
     # consumed by the front-matter title composer. None / empty when absent.
-    front_matter_chamber: str | None = None
     front_matter_refs: tuple[str, ...] = ()
     front_matter_phrase: str | None = None
 
@@ -836,7 +808,6 @@ def _extract_case_h1(ins: RuleInputs) -> DerivedMetadata:
         old = _RE_OLD_REPORT.search(ins.body_head[:400])
         if old:
             year = int(old["year"])
-            _CITATION_COUNTERS.report_abbrev_year_fired += 1
 
     precise = _precise_date(ins.body_head[:600])
     return DerivedMetadata(
@@ -854,7 +825,6 @@ def _extract_case_h2(ins: RuleInputs) -> DerivedMetadata:
         old = _RE_OLD_REPORT.search(ins.body_head[:500])
         if old:
             year = int(old["year"])
-            _CITATION_COUNTERS.report_abbrev_year_fired += 1
     precise = _precise_date(ins.body_head[:600])
     return DerivedMetadata(
         title=name,
@@ -949,8 +919,6 @@ def _extract_legislation_section(ins: RuleInputs) -> DerivedMetadata:
         for line in _parse_mailto_body(ins.body_head):
             if _RE_ACT_TITLE.match(line):
                 act_name = line
-                _CITATION_COUNTERS.mailto_body_fired += 1
-                _CITATION_COUNTERS.mailto_body_sole_source += 1
                 break
 
     if act_name:
@@ -991,7 +959,6 @@ def _extract_historical_case(ins: RuleInputs) -> DerivedMetadata:
     hdr = _RE_CASE_HEADER_NAME.search(ins.body_head[:400])
     if hdr:
         name = " ".join(hdr["name"].split())
-        _CITATION_COUNTERS.markdown_case_header_fired += 1
     if name is None:
         for line in _parse_mailto_body(ins.body_head):
             if line.lower() in ("cases",):
@@ -1000,8 +967,6 @@ def _extract_historical_case(ins: RuleInputs) -> DerivedMetadata:
                 nm = re.sub(r"\s*-\s*\([^)]+\)\s*$", "", line).strip()
                 if nm and len(nm) < 200:
                     name = nm
-                    _CITATION_COUNTERS.mailto_body_fired += 1
-                    _CITATION_COUNTERS.mailto_body_sole_source += 1
                     break
     if name is None:
         for h in ins.headings[:4]:
@@ -1107,7 +1072,6 @@ def _extract_from_docid(ins: RuleInputs) -> tuple[str | None, int | None]:
     m = _DOCID_YEAR2_RE.match(body)
     if m:
         series = m.group(1)
-        _CITATION_COUNTERS.docid_year2_fired += 1
         return f"{series} {m['year']}/{m['num']}", 1900 + int(m["year"])
     return None, None
 
@@ -1251,7 +1215,3 @@ def _year_from_docid(ins: RuleInputs) -> int | None:
             return None
     return None
 
-
-def template_of(inputs: RuleInputs) -> Template:
-    """Expose the classification decision (used by tests and for debugging)."""
-    return classify(inputs)

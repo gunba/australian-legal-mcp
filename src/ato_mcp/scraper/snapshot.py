@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Sequence
 
 from .tree_crawler import SnapshotNode
 
@@ -16,13 +16,6 @@ class SnapshotMeta:
 	folder_count: int
 	link_count: int
 	root_query: str
-
-
-@dataclass
-class SnapshotDiff:
-	added: set[str]
-	removed: set[str]
-	changed: set[str]
 
 
 class SnapshotWriter:
@@ -57,32 +50,3 @@ class SnapshotWriter:
 		meta_path.write_text(json.dumps(asdict(meta), indent=2), encoding="utf-8")
 
 		return snapshot_dir, meta
-
-
-def diff_snapshots(old_file: Path | str, new_file: Path | str) -> SnapshotDiff:
-	# [SS-05] Compare two snapshots by canonical_id (or 'uid:<uid>' fallback when canonical_id absent) for added/removed/changed sets — basis for catch_up mode.
-	old_nodes = _load_node_map(Path(old_file))
-	new_nodes = _load_node_map(Path(new_file))
-
-	added_keys = set(new_nodes.keys()) - set(old_nodes.keys())
-	removed_keys = set(old_nodes.keys()) - set(new_nodes.keys())
-	changed_keys = {
-		key
-		for key in old_nodes.keys() & new_nodes.keys()
-		if old_nodes[key]["title"] != new_nodes[key]["title"]
-	}
-
-	return SnapshotDiff(added=added_keys, removed=removed_keys, changed=changed_keys)
-
-
-def _load_node_map(file_path: Path) -> dict[str, Mapping[str, str]]:
-	result: dict[str, Mapping[str, str]] = {}
-	with file_path.open("r", encoding="utf-8") as fh:
-		for line in fh:
-			record = json.loads(line)
-			key = record.get("canonical_id") or f"uid:{record['uid']}"
-			result[key] = {
-				"title": record.get("title", ""),
-				"canonical_id": key,
-			}
-	return result

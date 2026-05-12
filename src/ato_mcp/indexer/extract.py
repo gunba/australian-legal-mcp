@@ -22,7 +22,7 @@ import mimetypes
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from bs4 import BeautifulSoup
@@ -66,7 +66,6 @@ class ExtractedDoc:
     assets: list[ExtractedAsset] = field(default_factory=list)
     # Parliamentary EM / regulation Explanatory Statement front-matter signals.
     # See _collect_em_front_matter for the structural fingerprint these capture.
-    front_matter_chamber: str | None = None
     front_matter_refs: list[str] = field(default_factory=list)
     front_matter_phrase: str | None = None
 
@@ -93,47 +92,6 @@ class CurrencyInfo:
     replaces: str | None = None
 
 
-class _CurrencyCounters:
-    # Per-path detection tallies for currency extraction. ``path`` keys count
-    # how often each detection surface (alert panel / timeline table / prose)
-    # contributed any field for a document. ``<path>_only`` keys count how
-    # often that path was the sole contributor across all three fields.
-    def __init__(self) -> None:
-        self.counts: dict[str, int] = {
-            "alert": 0,
-            "timeline": 0,
-            "prose": 0,
-            "title_suffix": 0,
-            "alert_only": 0,
-            "timeline_only": 0,
-            "prose_only": 0,
-            "title_suffix_only": 0,
-        }
-
-    def record(self, paths: set[str]) -> None:
-        for path in paths:
-            self.counts[path] = self.counts.get(path, 0) + 1
-        if len(paths) == 1:
-            (sole,) = paths
-            key = f"{sole}_only"
-            self.counts[key] = self.counts.get(key, 0) + 1
-
-    def reset(self) -> None:
-        for key in self.counts:
-            self.counts[key] = 0
-
-
-_CURRENCY_COUNTERS = _CurrencyCounters()
-
-
-def get_currency_path_counts() -> dict[str, int]:
-    return dict(_CURRENCY_COUNTERS.counts)
-
-
-def reset_currency_path_counts() -> None:
-    _CURRENCY_COUNTERS.reset()
-
-
 def extract(
     html: str,
     *,
@@ -155,7 +113,7 @@ def extract(
     # Capture EM / Explanatory Statement front-matter BEFORE link rewriting.
     # The front-matter wrapper (#Lawfront) is a stable structural marker on
     # parliamentary EM and regulation ES pages.
-    fm_chamber, fm_refs, fm_phrase = _collect_em_front_matter(container)
+    fm_refs, fm_phrase = _collect_em_front_matter(container)
 
     # Capture "title headings" — consecutive leading headings before any body
     # content. On ATO rulings that gives h1=doc_type, h2=code, h3=subject.
@@ -189,13 +147,12 @@ def extract(
         heading_levels=heading_levels,
         anchors=anchors,
         assets=assets,
-        front_matter_chamber=fm_chamber,
         front_matter_refs=fm_refs,
         front_matter_phrase=fm_phrase,
     )
 
 
-def _collect_em_front_matter(container: Node) -> tuple[str | None, list[str], str | None]:
+def _collect_em_front_matter(container: Node) -> tuple[list[str], str | None]:
     """Capture parliamentary EM / regulation ES front-matter signals.
 
     Parliamentary Explanatory Memoranda (NEM) and regulation Explanatory
@@ -204,9 +161,7 @@ def _collect_em_front_matter(container: Node) -> tuple[str | None, list[str], st
     a leading h1. Without those signals downstream rules can't compose a
     title beyond the docid form.
 
-    Returns ``(chamber, refs, phrase)``:
-    - ``chamber``: ``"House of Representatives"`` / ``"Senate"`` if the first
-      direct ``<strong>`` child of the front-matter block is one of those.
+    Returns ``(refs, phrase)``:
     - ``refs``: text of every ``<strong>`` inside ``<div class="ref">``
       blocks under the front-matter, in document order.
     - ``phrase``: the first ``<p><strong>...</strong></p>`` whose text starts
@@ -214,21 +169,13 @@ def _collect_em_front_matter(container: Node) -> tuple[str | None, list[str], st
     """
     front = container.css_first("#Lawfront")
     if front is None:
-        return None, [], None
+        return [], None
 
-    chamber: str | None = None
     refs: list[str] = []
     phrase: str | None = None
-    first_strong_seen = False
 
     for child in front.iter(include_text=False):
         tag = (child.tag or "").lower()
-        if tag == "strong" and not first_strong_seen:
-            first_strong_seen = True
-            text = _text_norm(child.text(deep=True, separator=" ", strip=True))
-            if text.lower() in ("house of representatives", "senate"):
-                chamber = text
-            continue
         if tag == "div":
             cls = (child.attributes.get("class") or "").split()
             if "ref" in cls:
@@ -245,7 +192,7 @@ def _collect_em_front_matter(container: Node) -> tuple[str | None, list[str], st
                 if ptext.lower().startswith("explanatory "):
                     phrase = ptext
 
-    return chamber, refs, phrase
+    return refs, phrase
 
 
 def _leading_headings(container: Node) -> list[str]:
@@ -654,10 +601,6 @@ def _collect_anchors(node: Node) -> list[tuple[str, str]]:
     return out
 
 
-def heading_outline(headings: Iterable[str]) -> str:
-    return " › ".join(h for h in headings if h)
-
-
 # ---------------------------------------------------------------------------
 # Currency / supersession extraction (W2.2)
 #
@@ -981,10 +924,6 @@ def extract_currency(html: str) -> CurrencyInfo:
 
     Returns ``CurrencyInfo()`` (all None) on empty input or when no markers
     are present. Each field is filled independently — see ``CurrencyInfo``.
-
-    Detection paths are tracked in ``_CURRENCY_COUNTERS`` so the build
-    pipeline can audit how often each surface (alert / timeline / prose) was
-    the sole source of an answer.
     """
     if not html or not html.strip():
         return CurrencyInfo()
@@ -1025,9 +964,6 @@ def extract_currency(html: str) -> CurrencyInfo:
     if replaces is None and p_replaces is not None:
         replaces = p_replaces
         paths.add("prose")
-
-    if paths:
-        _CURRENCY_COUNTERS.record(paths)
 
     return CurrencyInfo(
         withdrawn_date=withdrawn_date,

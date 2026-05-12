@@ -713,7 +713,3 @@ def _table_row_split(
 
 def _sentence_split(text: str) -> list[str]:
     return [s.strip() for s in _SENT_RE.split(text) if s.strip()]
-
-
-def chunk_texts(chunks: Iterable[Chunk]) -> list[str]:
-    return [chunk.text for chunk in chunks]

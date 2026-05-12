@@ -14,7 +14,7 @@ from .constants import EXCLUDED_TITLES
 from .downloader import LinkDownloader
 from .pipeline import refresh_source
 from .reducer import SnapshotReducer
-from .snapshot import SnapshotDiff, SnapshotMeta, SnapshotWriter, diff_snapshots
+from .snapshot import SnapshotMeta, SnapshotWriter
 from .tree_crawler import AtoTreeCrawler, SnapshotNode
 from .whats_new import DedupedLinkIndex, WhatsNewFetcher, build_pending_record
 
@@ -25,13 +25,11 @@ __all__ = [
     "DedupedLinkIndex",
     "EXCLUDED_TITLES",
     "LinkDownloader",
-    "SnapshotDiff",
     "SnapshotMeta",
     "SnapshotNode",
     "SnapshotReducer",
     "SnapshotWriter",
     "WhatsNewFetcher",
     "build_pending_record",
-    "diff_snapshots",
     "refresh_source",
 ]

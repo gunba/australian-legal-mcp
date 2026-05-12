@@ -146,7 +146,6 @@ class PreparedDoc:
     content_hash: str
     metadata_signature: str
     headings_text: str
-    anchors: list[tuple[str, str]]
     html: str
     assets: list[PreparedAsset]
     chunks: list[PreparedChunk]
@@ -220,7 +219,7 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
     if args.unsafe_fast_sqlite:
         _apply_unsafe_fast_sqlite_pragmas(conn)
 
-    model_id = _effective_model_id(args)
+    model_id = args.model_id
     store_db.set_meta(conn, "embedding_model_id", model_id)
     store_db.set_meta(conn, "index_version", _today_version())
 
@@ -799,10 +798,6 @@ def _reset_fresh_outputs(out_dir: Path, db_path: Path) -> None:
         shutil.rmtree(asset_dir)
 
 
-def _effective_model_id(args: BuildArgs) -> str:
-    return args.model_id
-
-
 def _apply_unsafe_fast_sqlite_pragmas(conn) -> None:
     conn.execute("PRAGMA journal_mode = OFF")
     conn.execute("PRAGMA synchronous = OFF")
@@ -834,12 +829,10 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
     has_content = status == "success"
     headings: list[str] = []
     heading_levels: list[int] = []
-    anchors: list[tuple[str, str]] = []
     title: str | None = None
     html: str | None = None
     clean_html = ""
     assets: list[PreparedAsset] = []
-    front_matter_chamber: str | None = None
     front_matter_refs: tuple[str, ...] = ()
     front_matter_phrase: str | None = None
 
@@ -851,8 +844,6 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
             clean_html = extracted.html
             headings = extracted.headings
             heading_levels = extracted.heading_levels
-            anchors = extracted.anchors
-            front_matter_chamber = extracted.front_matter_chamber
             front_matter_refs = tuple(extracted.front_matter_refs)
             front_matter_phrase = extracted.front_matter_phrase
             assets = [
@@ -898,7 +889,6 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
             body_head=body_text[:3000] if body_text else "",
             category=category,
             pub_date=pub_date,
-            front_matter_chamber=front_matter_chamber,
             front_matter_refs=front_matter_refs,
             front_matter_phrase=front_matter_phrase,
         )
@@ -957,7 +947,6 @@ def _prepare_one(item: tuple[Path, dict]) -> Prepared:
         content_hash=content_hash,
         metadata_signature=metadata_signature,
         headings_text=" ".join(headings),
-        anchors=anchors,
         html=clean_html,
         assets=assets,
         chunks=chunks,
@@ -1647,7 +1636,6 @@ def _synthetic_anchor_doc(doc_id: str, refs: list[anchors_mod.AnchorRef]) -> Pre
         content_hash="",
         metadata_signature="",
         headings_text="",
-        anchors=[],
         html="",
         assets=[],
         chunks=[],

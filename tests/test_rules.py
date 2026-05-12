@@ -339,7 +339,6 @@ def test_em_section_page_uses_front_matter_composition():
             "Outline of chapter",
         ),
         heading_levels=(2, 3),
-        front_matter_chamber="House of Representatives",
         front_matter_refs=(
             "Tax Laws Amendment (Research and Development) Bill 2010",
         ),
@@ -433,7 +432,6 @@ def test_ref_fallback_when_only_refs():
         doc_id="SRS/19770128/00001",
         headings=(),
         heading_levels=(),
-        front_matter_chamber="House of Representatives",
         front_matter_refs=(
             "Income Tax (Rates) Amendment Bill (No. 2) 1977",
             "Income Tax (Rates) Amendment Act (No. 2) 1977",
@@ -453,7 +451,6 @@ def test_em_phrase_still_wins_over_h2():
             "Outline of chapter",
         ),
         heading_levels=(2, 3),
-        front_matter_chamber="House of Representatives",
         front_matter_refs=(
             "Tax Laws Amendment (Research and Development) Bill 2010",
         ),

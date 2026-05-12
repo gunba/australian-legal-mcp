@@ -328,7 +328,6 @@ def test_extract_records_em_front_matter() -> None:
     </div>
     """
     doc = extract(html)
-    assert doc.front_matter_chamber == "House of Representatives"
     assert doc.front_matter_refs == ["Some Bill 2024"]
     assert doc.front_matter_phrase == "Explanatory Memorandum"
 
@@ -363,14 +362,13 @@ def test_extract_no_em_front_matter_returns_none() -> None:
     </div>
     """
     doc = extract(html)
-    assert doc.front_matter_chamber is None
     assert doc.front_matter_refs == []
     assert doc.front_matter_phrase is None
 
 
 def test_extract_em_front_matter_no_chamber_for_regulation_es() -> None:
-    """Regulation Explanatory Statements (EXN/EXM/...) skip the chamber
-    block — front_matter_chamber is None but refs and phrase populate."""
+    """Regulation Explanatory Statements (EXN/EXM/...) lack the parliamentary
+    chamber block; refs and phrase still populate."""
     html = """
     <div id="Lawcontents">
         <div id="Lawfront">
@@ -383,7 +381,6 @@ def test_extract_em_front_matter_no_chamber_for_regulation_es() -> None:
     </div>
     """
     doc = extract(html)
-    assert doc.front_matter_chamber is None
     assert doc.front_matter_refs == ["Some Regulations 2000"]
     assert doc.front_matter_phrase == "Explanatory Statement"
 

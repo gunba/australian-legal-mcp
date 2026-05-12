@@ -10,7 +10,7 @@ import hashlib
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import orjson
 from pydantic import BaseModel, Field
@@ -233,8 +233,3 @@ def doc_ref_matches(old: DocRef, new: DocRef) -> bool:
         and old.offset == new.offset
         and old.length == new.length
     )
-
-
-def canonical_json(obj: Any) -> bytes:
-    """Deterministic JSON for hashing/signing."""
-    return orjson.dumps(obj, option=orjson.OPT_SORT_KEYS)

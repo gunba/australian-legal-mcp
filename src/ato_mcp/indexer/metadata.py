@@ -245,7 +245,6 @@ _METADATA_SIGNATURE_KEYS = (
     "title",
     "type",
     "date",
-    "status",
     "withdrawn_date",
     "superseded_by",
     "replaces",
