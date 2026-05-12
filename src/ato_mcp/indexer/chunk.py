@@ -570,11 +570,18 @@ def _pack_chunks(blocks: list[_Block], *, max_tokens: int) -> list[Chunk]:
     ord_counter = 0
     current_text: list[str] = []
     current_def: list[str] = []
-    current_tokens = 0
+    # Track raw word count, not summed `approx_tokens(block.text)`. The
+    # per-block `int(words * 1.3)` truncation rounds down per block; the sum
+    # of rounded values is up to one token short per block versus
+    # `approx_tokens` of the joined text. With enough small blocks the
+    # produced chunk lands a handful of tokens over `max_tokens`. Word counts
+    # are additive across whitespace joins (`len("\n\n".join(b).split()) ==
+    # sum(len(b.split()))`), so accumulating words gives an exact projection.
+    current_words = 0
     current_anchor: str | None = None
 
     def flush() -> None:
-        nonlocal ord_counter, current_text, current_def, current_tokens, current_anchor
+        nonlocal ord_counter, current_text, current_def, current_words, current_anchor
         if not current_text:
             return
         text = "\n\n".join(current_text).strip()
@@ -590,11 +597,12 @@ def _pack_chunks(blocks: list[_Block], *, max_tokens: int) -> list[Chunk]:
         ord_counter += 1
         current_text = []
         current_def = []
-        current_tokens = 0
+        current_words = 0
         current_anchor = None
 
     for block in blocks:
-        block_tokens = approx_tokens(block.text)
+        block_words = len(block.text.split())
+        block_tokens = max(1, int(block_words * 1.3))
         if block_tokens > max_tokens:
             flush()
             for piece_text, piece_def in _split_oversize_block(block, max_tokens=max_tokens):
@@ -608,11 +616,12 @@ def _pack_chunks(blocks: list[_Block], *, max_tokens: int) -> list[Chunk]:
                 )
                 ord_counter += 1
             continue
-        if current_tokens + block_tokens > max_tokens and current_text:
+        projected_tokens = max(1, int((current_words + block_words) * 1.3))
+        if projected_tokens > max_tokens and current_text:
             flush()
         current_text.append(block.text)
         current_def.append(block.definition_text)
-        current_tokens += block_tokens
+        current_words += block_words
         if current_anchor is None and block.anchor is not None:
             current_anchor = block.anchor
 

@@ -103,6 +103,26 @@ def test_chunk_packs_within_max_tokens() -> None:
         assert approx_tokens(c.text) <= 200
 
 
+def test_chunk_packs_small_blocks_without_rounding_drift() -> None:
+    """Regression: many small blocks must not produce a chunk over max_tokens.
+
+    The packer previously summed per-block `approx_tokens` (each truncated to
+    int), so a chunk of N blocks could land up to N tokens over the cap
+    relative to `approx_tokens` of the joined text. Real-world docs hit this
+    with 5–30 tokens of drift. Construct a worst-case input where every
+    block loses a fractional token to truncation.
+    """
+    # 30 blocks × 4 words each: per-block approx_tokens=int(4*1.3)=5,
+    # sum=150; joined 120 words → approx_tokens=int(120*1.3)=156. With the
+    # bug, all 30 blocks pack into one 156-token chunk under max=155.
+    html = "".join(f"<p>{' '.join(['word'] * 4)}</p>" for _ in range(30))
+    chunks = chunk_html(html, max_tokens=155)
+    for c in chunks:
+        assert approx_tokens(c.text) <= 155, (
+            f"chunk over cap: tokens={approx_tokens(c.text)} cap=155"
+        )
+
+
 def test_chunk_no_chunk_exceeds_embedder_limit() -> None:
     """Default chunker output must never exceed the embedder's truncation point."""
     html = """
