@@ -191,7 +191,7 @@ def _walk(
             continue
         # Combine adjacent <dt> + <dd> into a single block.
         if tag == "dt":
-            _flush_inline(inline_parts, inline_anchors, blocks, referenced_anchors)
+            _flush_inline(inline_parts, inline_anchors, blocks)
             block = _render_dt_dd_pair(
                 child, referenced_anchors, definition_markers=definition_markers,
             )
@@ -202,7 +202,7 @@ def _walk(
         if tag in _HEADING_TAGS:
             # Inline-render heading as its own block. Skip when heading text
             # equals the doc's root title (front-matter echo).
-            _flush_inline(inline_parts, inline_anchors, blocks, referenced_anchors)
+            _flush_inline(inline_parts, inline_anchors, blocks)
             heading_text = _normalise_text(
                 _inline_text(child, referenced_anchors, definition_markers=definition_markers)
             )
@@ -222,14 +222,14 @@ def _walk(
             child = child.next
             continue
         if _is_atomic_block(child):
-            _flush_inline(inline_parts, inline_anchors, blocks, referenced_anchors)
+            _flush_inline(inline_parts, inline_anchors, blocks)
             block = _render_block(child, referenced_anchors, definition_markers=definition_markers)
             if block:
                 blocks.append(block)
             child = child.next
             continue
         if _contains_structural_child(child):
-            _flush_inline(inline_parts, inline_anchors, blocks, referenced_anchors)
+            _flush_inline(inline_parts, inline_anchors, blocks)
             _walk(
                 child,
                 blocks,
@@ -245,7 +245,7 @@ def _walk(
         if anchor:
             inline_anchors.append(anchor)
         child = child.next
-    _flush_inline(inline_parts, inline_anchors, blocks, referenced_anchors)
+    _flush_inline(inline_parts, inline_anchors, blocks)
 
 
 def _advance_past_dt_dd(dt: Node) -> Node | None:
@@ -293,7 +293,6 @@ def _flush_inline(
     parts: list[str],
     anchors: list[str],
     blocks: list[_Block],
-    referenced_anchors: set[str],
 ) -> None:
     text = _normalise_text("".join(parts))
     parts.clear()

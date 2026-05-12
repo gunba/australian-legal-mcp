@@ -704,9 +704,9 @@ def test_build_small_index(sample_pages_dir: Path, tmp_path: Path, monkeypatch) 
         row = conn.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()
         assert row["n"] >= 0
 
-        # W2.1: the embedder must receive title + heading_path + text, not
-        # bare chunk text. We inspect at least one captured input string and
-        # check that it carries the document title (which is also stored in
+        # The embedder must receive title + text, not bare chunk text. We
+        # inspect at least one captured input string and check that it
+        # carries the document title (which is also stored in
         # documents.title) somewhere in its prefix.
         if captured_texts:
             titles = {row[0] for row in conn.execute("SELECT title FROM documents").fetchall()}

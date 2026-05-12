@@ -9,8 +9,6 @@ INSERT OR REPLACE INTO documents
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
-DELETE_DOCUMENT = "DELETE FROM documents WHERE doc_id = ?"
-
 INSERT_CHUNK = """
 INSERT INTO chunks (doc_id, ord, anchor, text)
 VALUES (?, ?, ?, ?)
@@ -35,11 +33,6 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 
 INSERT_TITLE_FTS = """
 INSERT INTO title_fts (doc_id, title, headings) VALUES (?, ?, ?)
-"""
-
-DELETE_TITLE_FTS_BY_DOC = """
-INSERT INTO title_fts (title_fts, doc_id, title, headings)
-  SELECT 'delete', doc_id, title, headings FROM title_fts WHERE doc_id = ?
 """
 
 INSERT_VEC = "INSERT INTO chunk_embeddings(chunk_id, embedding) VALUES (?, ?)"
@@ -67,10 +60,3 @@ VALUES (?, ?, ?)
 """
 
 DELETE_ALL_CITATIONS = "DELETE FROM citations"
-
-SELECT_CHUNKS_FOR_DOC = """
-SELECT chunk_id, ord, anchor, text
-FROM chunks WHERE doc_id = ? ORDER BY ord ASC
-"""
-
-SELECT_DOCUMENT = "SELECT * FROM documents WHERE doc_id = ?"

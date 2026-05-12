@@ -39,7 +39,6 @@ def _record(doc_id: str) -> dict:
         "chunks": [
             {
                 "ord": 0,
-                "heading_path": "Root › Section 1",
                 "anchor": "s1",
                 "text": "Hello world chunk for " + doc_id,
                 "embedding_b64": encode_embedding(b"\x00" * 256),

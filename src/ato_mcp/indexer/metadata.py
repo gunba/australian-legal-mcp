@@ -85,7 +85,7 @@ def parse_docid(canonical_id: str) -> tuple[str | None, str | None]:
     return segments[0].upper(), None
 
 
-def category_for_docid(canonical_id: str) -> str:
+def category_for_docid(_canonical_id: str) -> str:
     """Always returns ``Other_ATO_documents``.
 
     The historical hand-maintained prefix-to-category map has been removed;

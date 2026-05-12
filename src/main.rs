@@ -253,13 +253,10 @@ fn main() -> Result<()> {
             format,
         } => {
             let types = empty_vec_as_none(types);
-            // C3: construct a transient ServerState so the CLI's `search`
-            // call exercises the same reranker path the MCP server does.
-            // Without this, `ato-mcp search ... --format json` reports
-            // `ranking.reranker_used: false` even when the reranker model
-            // is installed, and a maintainer running latency benchmarks
-            // would measure RRF only — silently invalidating the numbers.
-            // Mirrors the transient `encode_query_embedding` pattern below.
+            // Construct a transient ServerState so the CLI's `search` call
+            // exercises the same reranker path the MCP server does. Without
+            // this, the CLI runs RRF-only and a maintainer benchmarking
+            // latency would silently miss the cross-encoder cost.
             let (out, _state) = search_cli(
                 &query,
                 SearchOptions {
@@ -836,9 +833,9 @@ struct CandidateMeta {
     doc_id: String,
     /// True when this chunk's plaintext is short (< 100 chars) and the
     /// chunk sits at the start of the document — typically a stub
-    /// preamble that crowds out more useful chunks. Without a separate
-    /// heading_path column we approximate "intro" as ord == 0 with short
-    /// text, which still correctly demotes the leading stub chunks.
+    /// preamble that crowds out more useful chunks. We approximate "intro"
+    /// as ord == 0 with short text, which correctly demotes the leading
+    /// stub chunks.
     is_intro: bool,
 }
 
@@ -1885,7 +1882,7 @@ fn load_hit(
 ) -> Result<Option<Hit>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT c.chunk_id, c.doc_id, c.ord, c.anchor, c.text,
+        SELECT c.chunk_id, c.doc_id, c.anchor, c.text,
                d.type, d.title, d.date,
                d.withdrawn_date, d.superseded_by, d.replaces,
                d.has_in_doc_links, d.has_related_docs, d.has_history
@@ -2378,7 +2375,6 @@ fn format_document_response(
     } else {
         (remaining, None)
     };
-    let returned_chars = slice.chars().count();
     let next_call = next_offset.map(|next| {
         let suffix = if as_html { ", as_html=true" } else { "" };
         format!(
@@ -2389,17 +2385,24 @@ fn format_document_response(
             suffix,
         )
     });
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "total_chars".to_string(),
+        JsonValue::Number(serde_json::Number::from(total_chars as u64)),
+    );
+    if next_offset.is_some() {
+        meta.insert("truncated".to_string(), JsonValue::Bool(true));
+        if let Some(call) = next_call.as_ref() {
+            meta.insert(
+                "next_call".to_string(),
+                JsonValue::String(call.to_string()),
+            );
+        }
+    }
     Ok(serde_json::to_string_pretty(&json!({
         "document": doc,
         "text": slice,
-        "meta": {
-            "as_html": as_html,
-            "total_chars": total_chars,
-            "from_char": start_char,
-            "returned_chars": returned_chars,
-            "truncated": next_offset.is_some(),
-            "next_call": next_call,
-        },
+        "meta": meta,
     }))?)
 }
 
@@ -2467,7 +2470,6 @@ struct DefinitionSource {
     source_type: String,
     scope: Option<String>,
     anchor: Option<String>,
-    ord: i64,
     canonical_url: String,
 }
 
@@ -2576,7 +2578,6 @@ fn get_definition(term: &str, opts: GetDefinitionOptions<'_>) -> Result<String> 
                     source_type: row.get("source_type")?,
                     scope: row.get("scope")?,
                     anchor: row.get("anchor")?,
-                    ord: row.get("ord")?,
                 },
             })
         })?
@@ -4726,7 +4727,6 @@ struct HydratedChunk {
     doc_type: String,
     title: String,
     date: Option<String>,
-    ord: i64,
     anchor: Option<String>,
     canonical_url: String,
     text: String,
@@ -4797,26 +4797,33 @@ fn get_chunks(chunk_ids: &[i64], opts: GetChunksOptions) -> Result<String> {
     let next_call = truncated_at.as_ref().map(|chunk| {
         format!("get_chunks(chunk_ids=[{}])", chunk.chunk_id)
     });
-    let returned = out.len();
-    Ok(serde_json::to_string_pretty(&json!({
-        "requested_chunk_ids": chunk_ids,
-        "context": {
+    let mut meta = serde_json::Map::new();
+    if truncated_at.is_some() {
+        meta.insert("truncated".to_string(), JsonValue::Bool(true));
+        if let Some(call) = next_call.as_ref() {
+            meta.insert(
+                "next_call".to_string(),
+                JsonValue::String(call.to_string()),
+            );
+        }
+    }
+    let mut response = serde_json::Map::new();
+    response.insert(
+        "requested_chunk_ids".to_string(),
+        serde_json::to_value(&chunk_ids)?,
+    );
+    response.insert(
+        "context".to_string(),
+        json!({
             "before": opts.before,
             "after": opts.after,
-        },
-        "chunks": out,
-        "meta": {
-            "returned": returned,
-            "returned_chars": returned_chars,
-            "truncated": truncated_at.is_some(),
-            "truncated_at": truncated_at.as_ref().map(|chunk| json!({
-                "chunk_id": chunk.chunk_id,
-                "doc_id": chunk.doc_id,
-                "ord": chunk.ord,
-            })),
-            "next_call": next_call,
-        },
-    }))?)
+        }),
+    );
+    response.insert("chunks".to_string(), serde_json::to_value(&out)?);
+    if !meta.is_empty() {
+        response.insert("meta".to_string(), JsonValue::Object(meta));
+    }
+    Ok(serde_json::to_string_pretty(&JsonValue::Object(response))?)
 }
 
 fn load_chunks_by_ord_range(
@@ -4827,7 +4834,7 @@ fn load_chunks_by_ord_range(
 ) -> Result<Vec<HydratedChunk>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT c.chunk_id, c.doc_id, c.ord, c.anchor, c.text,
+        SELECT c.chunk_id, c.doc_id, c.anchor, c.text,
                d.type, d.title, d.date
         FROM chunks c
         JOIN documents d ON d.doc_id = c.doc_id
@@ -4843,14 +4850,13 @@ fn load_chunks_by_ord_range(
             row.get::<_, String>("type")?,
             row.get::<_, String>("title")?,
             row.get::<_, Option<String>>("date")?,
-            row.get::<_, i64>("ord")?,
             row.get::<_, Option<String>>("anchor")?,
             row.get::<_, Vec<u8>>("text")?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (chunk_id, doc_id, doc_type, title, date, ord, anchor, text_blob) = row?;
+        let (chunk_id, doc_id, doc_type, title, date, anchor, text_blob) = row?;
         out.push(HydratedChunk {
             chunk_id,
             requested: false,
@@ -4858,7 +4864,6 @@ fn load_chunks_by_ord_range(
             doc_type,
             title,
             date,
-            ord,
             anchor,
             canonical_url: canonical_url(&doc_id),
             text: decompress_text(text_blob)?,
@@ -5090,7 +5095,7 @@ fn server_instructions() -> String {
         .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
     {
         Some(s) => format!(
-            "ATO legal corpus. Documents: {}, chunks: {}. Index: {}. Navigate via search → get_chunks: search returns slim hits (chunk_id, doc_id, anchor, optional snippet); get_chunks fetches bodies by chunk_id with before/after ordinal neighbours within the same doc. doc_scope accepts a single full doc_id for in-doc search or \"<PREFIX>/%\" for a family (see stats). Default search excludes Edited_private_advice, withdrawn rulings, and content dated before {} except legislation; override with current_only=false and include_old=true. Slim hits surface has_in_doc_links / has_related_docs / has_history flags when calling get_doc_anchors(doc_id) would yield useful navigation entries. Historical (point-in-time) versions of documents are not stored as separate rows; get_doc_anchors lists them as {{doc_id, pit, date}} entries so an agent can fetch the older URL externally.",
+            "ATO legal corpus. Documents: {}, chunks: {}. Index: {}. Navigate via search → get_chunks: search returns slim hits (chunk_id, doc_id, anchor, optional snippet); get_chunks fetches bodies by chunk_id with before/after ordinal neighbours within the same doc. doc_scope accepts a single full doc_id for in-doc search or \"<PREFIX>/%\" for a family (see stats). Default search excludes Edited_private_advice, withdrawn rulings, and content dated before {} except legislation; override with current_only=false and include_old=true. Pass `similar_to_chunk_id` on search to find chunks semantically close to one you already have (skips query encoding, vector-only, excludes the seed). Slim hits surface has_in_doc_links / has_related_docs / has_history flags when calling get_doc_anchors(doc_id) would yield useful navigation entries. get_doc_anchors also returns `cited_by`: other documents whose chunks carry a [doc:X] marker pointing at the target (capped at 100, ordered by source date DESC, with `cited_by_total` when truncated). Historical (point-in-time) versions of documents are not stored as separate rows; get_doc_anchors lists them as {{doc_id, pit, date, url}} entries so an agent can fetch the older URL externally.",
             s["documents"].as_i64().unwrap_or(0),
             s["chunks"].as_i64().unwrap_or(0),
             s["index_version"].as_str().unwrap_or("?"),
