@@ -84,9 +84,9 @@ DEFAULT_MAX_TOKENS = EMBED_MAX_TOKENS
 # Bump when chunker output for the SAME source HTML would differ in a way
 # that the incremental-reuse path needs to detect — e.g. new inline-marker
 # format, new atomic-block rules, tighter oversize fallback. The build's
-# wholesale-reuse branch refuses to carry chunks from prior pack records
-# whose stored chunker_format_version doesn't match this constant, forcing
-# a re-extract+re-chunk under the current rules.
+# [IB-21] wholesale-reuse branch refuses to carry chunks from prior pack
+# records whose stored chunker_format_version doesn't match this constant,
+# forcing a re-extract+re-chunk under the current rules.
 CHUNKER_FORMAT_VERSION = 2
 
 
@@ -569,7 +569,7 @@ def _pack_chunks(blocks: list[_Block], *, max_tokens: int) -> list[Chunk]:
     ord_counter = 0
     current_text: list[str] = []
     current_def: list[str] = []
-    # Track raw word count, not summed `approx_tokens(block.text)`. The
+    # [IB-22] Track raw word count, not summed `approx_tokens(block.text)`. The
     # per-block `int(words * 1.3)` truncation rounds down per block; the sum
     # of rounded values is up to one token short per block versus
     # `approx_tokens` of the joined text. With enough small blocks the

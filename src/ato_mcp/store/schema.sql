@@ -100,7 +100,7 @@ CREATE TABLE IF NOT EXISTS document_assets (
 );
 CREATE INDEX IF NOT EXISTS idx_assets_doc ON document_assets(doc_id);
 
--- [SL-05] doc_anchors stores in-doc navigation, sister-doc references,
+-- [SL-10] doc_anchors stores in-doc navigation, sister-doc references,
 -- and historical-version pointers extracted from <a href> markup at
 -- build time. Surfaced through the get_doc_anchors MCP tool.
 CREATE TABLE IF NOT EXISTS doc_anchors (
@@ -115,11 +115,11 @@ CREATE TABLE IF NOT EXISTS doc_anchors (
 );
 CREATE INDEX IF NOT EXISTS idx_doc_anchors_doc ON doc_anchors(doc_id);
 
--- Reverse-citation index, derived from chunk text. Every `[doc:X]` marker
--- in a chunk becomes one (source_chunk_id, source_doc_id, target_doc_id)
--- row, deduplicated per (chunk, target). Surfaced via get_doc_anchors as
--- a `cited_by` array. Built at the tail of every build/update so it stays
--- in sync with chunks.
+-- [SL-11] Reverse-citation index, derived from chunk text. Every `[doc:X]`
+-- marker in a chunk becomes one (source_chunk_id, source_doc_id,
+-- target_doc_id) row, deduplicated per (chunk, target). Surfaced via
+-- get_doc_anchors as a `cited_by` array. Built at the tail of every
+-- build/update so it stays in sync with chunks.
 CREATE TABLE IF NOT EXISTS citations (
     source_chunk_id  INTEGER NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
     source_doc_id    TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,

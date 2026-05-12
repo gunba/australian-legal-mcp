@@ -1883,6 +1883,9 @@ _DOC_MARKER_RE = re.compile(r"\[doc:([^\s\]@]+)")
 
 
 def _derive_citations(conn) -> None:
+    # [IB-20] Streams chunks.text in batches, regex-extracts [doc:X] markers,
+    # batch-inserts into citations (PiT/view qualifiers collapse to base
+    # doc_id; self-citations skipped). Idempotent: clears + repopulates.
     """Rebuild the citations table from inline `[doc:X]` markers in chunk text.
 
     Cheap relative to a corpus build (single pass over chunks, zstd

@@ -943,7 +943,7 @@ fn search(
     );
     // [MT-02] k is clamped, first-stage recall is widened, then candidates dedupe per document.
     let internal_limit = std::cmp::max(k * 5, 50);
-    // `similar_to_chunk_id` short-circuits semantic encode: load the seed
+    // [MT-16] `similar_to_chunk_id` short-circuits semantic encode: load the seed
     // chunk's stored embedding and use it as the query vector. Force
     // vector-only mode (no BM25 stage — no real query text to rank against).
     let similar_seed: Option<(i64, [i8; EMBEDDING_DIM])> = match opts.similar_to_chunk_id {
@@ -4983,7 +4983,7 @@ fn get_doc_anchors(doc_id: &str) -> Result<String> {
     Ok(serde_json::to_string_pretty(&JsonValue::Object(response))?)
 }
 
-/// Per-doc cap on the `cited_by` array surfaced by `get_doc_anchors`. The
+/// [MT-17] Per-doc cap on the `cited_by` array surfaced by `get_doc_anchors`. The
 /// most heavily-cited docs (ITAA 1997 s 8-1, Pt IVA, ...) have thousands of
 /// citers and would otherwise dominate the response. Order by source date
 /// DESC so the agent sees the most recent citations first; the total count
