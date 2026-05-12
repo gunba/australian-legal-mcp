@@ -505,40 +505,20 @@ def build(args: BuildArgs) -> Manifest:
                 prev_ref = prev_docs.get(item.doc_id)
                 prev_pack_path: Path | None = None
                 prev_record: dict | None = None
-                prev_recipe_hash: str | None = None
+                chunks_unchanged = False
                 if prev_ref is not None and prev_ref.pack_sha8 in prev_pack_info:
                     prev_pack_path = _locate_previous_pack_path(
                         prev_ref, args.previous_manifest, prev_pack_info
                     )
-                    if prev_pack_path is not None:
-                        # Optimization: when the manifest's stored hash already
-                        # matches the new-recipe item.content_hash, the manifest
-                        # was emitted by a build that used the current recipe.
-                        # Trust the stored value and skip the prev_record load
-                        # for this fast-path equality check; load lazily below
-                        # when the branch actually needs the record bytes.
-                        if prev_ref.content_hash == item.content_hash:
-                            prev_recipe_hash = prev_ref.content_hash
-                        else:
-                            prev_record = read_record(
-                                prev_pack_path, prev_ref.offset, prev_ref.length
-                            )
-                            prev_recipe_hash = (
-                                _record_content_hash_under_current_recipe(prev_record)
-                            )
-
-                chunks_unchanged = (
-                    prev_ref is not None
-                    and prev_recipe_hash is not None
-                    and prev_recipe_hash == item.content_hash
-                )
-
-                # If chunks_unchanged was decided via the manifest fast-path,
-                # we still need the actual pack record bytes for branches 1/2.
-                if chunks_unchanged and prev_record is None and prev_pack_path is not None:
-                    prev_record = read_record(
-                        prev_pack_path, prev_ref.offset, prev_ref.length
-                    )
+                    if prev_pack_path is not None and prev_ref.content_hash == item.content_hash:
+                        # Manifest hash matches the freshly-computed item hash:
+                        # the previous build emitted the same chunks under the
+                        # same recipe. Load the pack record so branches 1/2 can
+                        # reuse its bytes.
+                        chunks_unchanged = True
+                        prev_record = read_record(
+                            prev_pack_path, prev_ref.offset, prev_ref.length
+                        )
 
                 # Branch 1: wholesale slot reuse — content + metadata both unchanged.
                 if (
@@ -1083,54 +1063,6 @@ def _record_metadata_signature(record: dict) -> str:
             "replaces": record.get("replaces"),
             "pack_format_version": record.get("pack_format_version"),
         }
-    )
-
-
-def _record_content_hash_under_current_recipe(record: dict) -> str | None:
-    """Recompute content_hash for a previous pack record using the current
-    recipe, from the record's own stored html / assets / chunks.
-
-    Bridges the recipe change: previous corpora built with the legacy recipe
-    (which mixed title / doc_type / pub_date / status into the hash) cannot
-    be matched against new-recipe hashes computed in ``_prepare_one``. By
-    rehashing straight from the pack record's stored chunks we sidestep the
-    legacy stored value — the pack record IS the source of truth for what
-    chunks exist on disk.
-
-    Returns ``None`` when the record's ``chunker_format_version`` is missing
-    or stale, when the record doesn't carry the fields needed for a recompute,
-    or when the recompute fails. ``None`` short-circuits Branch 1 (wholesale
-    reuse) and Branch 2 (metadata-refresh), forcing the doc to Branch 3 (full
-    re-extract + re-embed). Use the version gate to retire old chunks whose
-    shape no longer matches the current chunker output (e.g. oversize chunks
-    the new word-window fallback would now cap).
-    """
-    stored_version = record.get("chunker_format_version")
-    if stored_version != chunk_mod.CHUNKER_FORMAT_VERSION:
-        return None
-    clean_html = record.get("html")
-    if not clean_html:
-        return None
-    chunks = record.get("chunks")
-    assets = record.get("assets")
-    if chunks is None or assets is None:
-        return None
-    asset_hashes = "\n".join(
-        f"{a.get('asset_ref', '')}:{a.get('sha256', '')}" for a in assets
-    )
-    chunk_fingerprint = "\n".join(
-        "\t".join(
-            (
-                str(c.get("ord", "")),
-                c.get("anchor") or "",
-                c.get("text") or "",
-            )
-        )
-        for c in chunks
-    )
-    return meta_mod.content_hash(
-        f"{clean_html}\n{asset_hashes}\n{chunk_fingerprint}",
-        {},
     )
 
 

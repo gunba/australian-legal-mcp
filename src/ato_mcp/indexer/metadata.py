@@ -62,41 +62,28 @@ def category_from_path(payload_path: str | None) -> str:
 def category_for_record(canonical_id: str, payload_path: str | None) -> str:
     category = category_from_path(payload_path)
     if category in {"Unknown", "whats_new"}:
-        return category_for_docid(canonical_id)
+        return OTHER_CATEGORY
     return category
 
 
-def parse_docid(canonical_id: str) -> tuple[str | None, str | None]:
-    """Return ``(prefix, doc_type_name)``. Prefix is the uppercased first
-    segment of the docid (e.g. ``TR`` from ``TR/TR20243/NAT/ATO/00001``).
-
-    The second tuple element is preserved for backwards compatibility with
-    callers that destructure the return value, but is now always ``None``:
-    human-readable doc-type names are not derived from a hand-maintained
-    prefix map. Surfaces that need prefix descriptions read them from the
-    Rust ``stats`` tool, which derives them from corpus titles.
+def parse_docid(canonical_id: str) -> str | None:
+    """Return the uppercased first segment of the docid (e.g. ``TR`` from
+    ``TR/TR20243/NAT/ATO/00001``), or ``None`` when no docid can be extracted.
     """
     docid = _extract_docid_path(canonical_id)
     if not docid:
-        return None, None
+        return None
     segments = [s for s in docid.split("/") if s]
     if not segments:
-        return None, None
-    return segments[0].upper(), None
+        return None
+    return segments[0].upper()
 
 
-def category_for_docid(_canonical_id: str) -> str:
-    """Always returns ``Other_ATO_documents``.
-
-    The historical hand-maintained prefix-to-category map has been removed;
-    ``category_for_record`` still routes documents whose payload paths name a
-    real category (e.g. ``payloads/Public_rulings/...``) into that bucket. For
-    What's New entries and unknown payload paths there is no source-derived
-    category signal at this layer, so everything falls into the catch-all
-    bucket and downstream consumers can rebucket using the corpus-derived
-    prefix breakdown from the Rust ``stats`` tool.
-    """
-    return "Other_ATO_documents"
+# Catch-all bucket for documents without a source-derived category signal
+# at this layer (What's New entries, unknown payload paths). Downstream
+# consumers can rebucket using the corpus-derived prefix breakdown from
+# the Rust ``stats`` tool.
+OTHER_CATEGORY = "Other_ATO_documents"
 
 
 _YEAR_RE = re.compile(r"(?:19|20)\d{2}")
@@ -124,12 +111,12 @@ def representative_path_from_docid(
     """Derive a ``representative_path`` for the downloader using the docid alone.
 
     Shape: ``[category, heading?, year?, title]``. The category segment is
-    always ``Other_ATO_documents`` because the hand-maintained prefix map has
+    always ``OTHER_CATEGORY`` because the hand-maintained prefix map has
     been removed; the second segment is the source-derived ``heading`` from
     the What's New page when available, which is enough to keep What's New
     downloads grouped sensibly without inventing a doc-type taxonomy.
     """
-    category = category_for_docid(canonical_id)
+    category = OTHER_CATEGORY
     year = year_for_docid(canonical_id)
     segments = [category]
     if heading:
@@ -225,17 +212,13 @@ def human_code_for_doc_id(doc_id: str) -> str | None:
     return None
 
 
-def content_hash(text: str, metadata: dict[str, Any] | None = None) -> str:
+def content_hash(text: str) -> str:
     """Stable hash of the chunk-deriving text only.
 
-    ``metadata`` is accepted for backward compatibility with existing callers
-    but is intentionally ignored. Title / doc_type / pub_date / status changes
-    no longer perturb ``content_hash`` because they don't affect the chunks
-    or their embeddings — equality of ``content_hash`` is the gate for
-    "chunks+embeddings are byte-reusable from the previous pack". Row-level
-    metadata equality is checked separately via ``metadata_signature``.
+    Equality of ``content_hash`` is the gate for "chunks+embeddings are
+    byte-reusable from the previous pack". Row-level metadata equality is
+    checked separately via ``metadata_signature``.
     """
-    del metadata
     h = hashlib.sha256()
     h.update(text.encode("utf-8", errors="replace"))
     return "sha256:" + h.hexdigest()
