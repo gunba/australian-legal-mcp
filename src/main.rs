@@ -4755,7 +4755,7 @@ fn get_chunks(chunk_ids: &[i64], opts: GetChunksOptions) -> Result<String> {
     let mut response = serde_json::Map::new();
     response.insert(
         "requested_chunk_ids".to_string(),
-        serde_json::to_value(&chunk_ids)?,
+        serde_json::to_value(chunk_ids)?,
     );
     response.insert(
         "context".to_string(),
