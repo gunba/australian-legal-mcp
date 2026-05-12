@@ -23,8 +23,8 @@ Hybrid BM25+vector search, slim hits, RRF fusion, recency boost, session-scoped 
 - [MT-05 L1395] Hybrid mode fuses BM25 and vector results via Reciprocal Rank Fusion with K=60: each result contributes 1/(K+rank+1) per ranker, scores summed across rankers.
 - [MT-01 L1719] MCP stdio keeps one ServerState per process; SemanticRuntime and the reranker are loaded lazily and reused for subsequent tools/calls within that server process.
 - [MT-14 L2195] search_titles bm25-ranks against title_fts (title + collected headings) — independent of chunks and the SeenTracker; the default exclusions for EPA and old non-legislation match search.
-- [MT-07 L4688] get_chunks fetches exact chunk ids from search results, can include before/after ordinal neighbours, deduplicates overlapping requested ranges, and emits next_call when max_chars truncates context.
-- [MT-17 L4986] get_doc_anchors response carries a cited_by array of {doc_id, title, type, date} sourced from the citations table, ordered by source date DESC, capped at CITED_BY_LIMIT=100. When the cap truncates, cited_by_total reports the full distinct-source count so the agent knows the magnitude; both fields gracefully no-op (empty array, no total) on corpora that predate the citations table.
+- [MT-07 L4695] get_chunks fetches exact chunk ids from search results, can include before/after ordinal neighbours, deduplicates overlapping requested ranges, and emits next_call when max_chars truncates context.
+- [MT-17 L4993] get_doc_anchors response carries a cited_by array of {doc_id, title, type, date} sourced from the citations table, ordered by source date DESC, capped at CITED_BY_LIMIT=100. When the cap truncates, cited_by_total reports the full distinct-source count so the agent knows the magnitude; both fields gracefully no-op (empty array, no total) on corpora that predate the citations table.
 
 ## Rust Output Formatters
 JSON output for hits, document outline + section + full renderers.
@@ -37,9 +37,9 @@ FastMCP tool registration, instructions builder from corpus stats, opportunistic
 
 - [SW-04 L1720] ServerState lazily loads SemanticRuntime on first semantic query and resolves the reranker state once; reranker load failures disable reranking for the rest of that server process.
 - [SW-05 L2842] prefix_breakdown is corpus-derived: per-prefix doc counts plus a sample title used as the description. Replaces the hand-maintained prefix-to-doc-type map; surfaced via stats() so agents discover the canonical `doc_scope="<PREFIX>/%"` filter idiom for every prefix in the corpus.
-- [SW-02 L5039] Server instructions are built dynamically at start time from corpus stats (doc count, chunk count, type breakdown, meta keys), so the agent sees up-to-date corpus shape without restart-time configuration.
-- [SW-03 L5040] server_instructions is built from stats(OutputFormat::Json); if stats cannot be read, the server returns a static instruction telling the user to run ato-mcp init instead of crashing.
-- [SW-01 L5057] Eight MCP tools are exposed by tool_descriptors/call_tool: search, search_titles, get_document, get_chunks, get_definition, get_asset, get_doc_anchors, and stats.
+- [SW-02 L5096] Server instructions are built dynamically at start time from corpus stats (doc count, chunk count, type breakdown, meta keys), so the agent sees up-to-date corpus shape without restart-time configuration.
+- [SW-03 L5097] server_instructions is built from stats(OutputFormat::Json); if stats cannot be read, the server returns a static instruction telling the user to run ato-mcp init instead of crashing.
+- [SW-01 L5114] Eight MCP tools are exposed by tool_descriptors/call_tool: search, search_titles, get_document, get_chunks, get_definition, get_asset, get_doc_anchors, and stats.
   - The surface stays small and explicit; unsupported tools fail through the normal tools/call error path.
 
 ## Rust Update Mechanism
@@ -49,8 +49,9 @@ End-user update flow: manifest diff, pack fetch, in-place SQLite patch applicati
 - [UM-06 L2954] Rollback path copies backups/ato.db.prev back over the live DB; failed delta updates also restore the backup before returning the error.
 - [UM-01 L3079] Single-writer guard: apply_update takes the app LOCK file before apply_update_locked and releases it afterwards; serve/search paths open read-only DB connections and do not take the writer lock.
 - [UM-05 L3183] Delta update flow: diff manifests, optionally promote to whole-corpus rebuild/backfill, fetch changed/added pack records, mutate SQLite in one transaction, verify semantic install, then write installed_manifest.json last.
-- [UM-03 L3453] Fetch helpers resolve local paths, file://, manifest-relative assets, HTTP(S), and hf:// model/reranker URLs; downloaded model, reranker, and pack bytes are sha256-verified when the manifest provides a hash.
-- [UM-04 L3789] fetch helpers intentionally don't read GitHub token env vars and don't shell out to gh — private release assets must be exposed through an approved mirror or installed from a local/offline bundle. This keeps the end-user runtime credential-free.
+- [UM-07 L3297,5000] apply_update_locked calls derive_citations at its tail to repopulate the citations table after the chunks DELETE+INSERT cycle. The FK ON DELETE CASCADE on citations.source_chunk_id wipes prior rows when changed chunks are deleted; without the derive step the local install ships with an empty citations table after every update. Idempotent: clears + repopulates by streaming chunks.text once and regex-extracting [doc:X] markers.
+- [UM-03 L3460] Fetch helpers resolve local paths, file://, manifest-relative assets, HTTP(S), and hf:// model/reranker URLs; downloaded model, reranker, and pack bytes are sha256-verified when the manifest provides a hash.
+- [UM-04 L3796] fetch helpers intentionally don't read GitHub token env vars and don't shell out to gh — private release assets must be exposed through an approved mirror or installed from a local/offline bundle. This keeps the end-user runtime credential-free.
 
 ## CLI Commands
 Typer command surface, end-user vs maintainer split, defaults and global excludes.

@@ -3294,6 +3294,13 @@ fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
             set_meta(&tx, "reranker_model_id", &reranker.id)?;
         }
         set_meta(&tx, "last_update_at", &Utc::now().to_rfc3339())?;
+        // [UM-07] citations is a derived index of `[doc:X]` markers in
+        // chunks.text. When apply_update rewrites changed chunks, the FK
+        // ON DELETE CASCADE wipes the corresponding citation rows; the
+        // newly-inserted chunks have no citations yet. Re-derive at the
+        // tail so the table stays in sync without requiring a separate
+        // maintenance command.
+        derive_citations(&tx)?;
         verify_semantic_install(&tx, &new_manifest)?;
         Ok(())
     })();
@@ -4989,6 +4996,56 @@ fn get_doc_anchors(doc_id: &str) -> Result<String> {
 /// DESC so the agent sees the most recent citations first; the total count
 /// lives on `cited_by_total` when truncation occurs.
 const CITED_BY_LIMIT: usize = 100;
+
+/// [UM-07] Streams `chunks.text` once, regex-extracts every `[doc:X]` marker
+/// (PiT / view qualifiers collapse to the base doc_id), and INSERT OR
+/// IGNORE-batches into `citations`. Idempotent: clears first.
+///
+/// Called from `apply_update_locked` so end-user installs stay in sync
+/// after a corpus update — the apply_update path rewrites chunks via
+/// DELETE+INSERT, which cascades through the FK ON DELETE CASCADE on
+/// `citations.source_chunk_id` and wipes the previously-derived rows.
+fn derive_citations(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "citations")? {
+        return Ok(());
+    }
+    static DOC_MARKER_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = DOC_MARKER_RE
+        .get_or_init(|| Regex::new(r"\[doc:([^\s\]@]+)").expect("valid regex"));
+
+    conn.execute("DELETE FROM citations", [])?;
+    let mut select = conn.prepare("SELECT chunk_id, doc_id, text FROM chunks")?;
+    let mut insert = conn.prepare(
+        "INSERT OR IGNORE INTO citations (source_chunk_id, source_doc_id, target_doc_id) \
+         VALUES (?, ?, ?)",
+    )?;
+    let rows = select.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
+    })?;
+    let mut total: u64 = 0;
+    for row in rows {
+        let (chunk_id, doc_id, blob) = row?;
+        let text = decompress_text(blob)?;
+        let mut seen = std::collections::HashSet::new();
+        for cap in re.captures_iter(&text) {
+            let target = &cap[1];
+            if target == doc_id {
+                continue;
+            }
+            if !seen.insert(target.to_string()) {
+                continue;
+            }
+            insert.execute(params![chunk_id, &doc_id, target])?;
+            total += 1;
+        }
+    }
+    eprintln!("citations: derived {total} rows post-update");
+    Ok(())
+}
 
 fn load_cited_by(conn: &Connection, doc_id: &str) -> Result<(Vec<JsonValue>, i64)> {
     // Gracefully no-op on older corpora that predate the citations table.
@@ -7817,6 +7874,63 @@ mod tests {
         let err = load_chunk_embedding(&conn, 99999).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("no stored embedding"), "unexpected error: {msg}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_derive_citations_extracts_doc_markers() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        insert_doc(&conn, "SRC")?;
+        insert_doc(&conn, "T1")?;
+        insert_doc(&conn, "T2")?;
+        // chunk text exercises: base marker, PiT-qualified marker (must
+        // collapse to base), view-qualified marker (must collapse to base),
+        // self-citation (must be skipped), and repeated marker (deduped
+        // per-chunk).
+        insert_chunk(
+            &conn,
+            10,
+            "SRC",
+            0,
+            "see [doc:T1] and [doc:T2@19960320000001] and [doc:T2 view=HISTFT] and [doc:SRC] and [doc:T1]",
+        )?;
+        // pre-populate with stale rows so we can confirm clear + repopulate
+        conn.execute(
+            "INSERT INTO citations(source_chunk_id, source_doc_id, target_doc_id) VALUES (?, ?, ?)",
+            params![10_i64, "SRC", "STALE"],
+        )?;
+
+        derive_citations(&conn)?;
+
+        let rows: Vec<(i64, String, String)> = conn
+            .prepare("SELECT source_chunk_id, source_doc_id, target_doc_id FROM citations ORDER BY target_doc_id")?
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // Stale row gone; T1 deduped to one entry; T2 base extracted twice
+        // but INSERT OR IGNORE keeps one row; SRC self-citation excluded.
+        assert_eq!(
+            rows,
+            vec![
+                (10, "SRC".to_string(), "T1".to_string()),
+                (10, "SRC".to_string(), "T2".to_string()),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_derive_citations_handles_missing_table() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        conn.execute("DROP TABLE citations", [])?;
+        // Should no-op without erroring.
+        derive_citations(&conn)?;
         Ok(())
     }
 
