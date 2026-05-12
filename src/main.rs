@@ -192,11 +192,30 @@ enum SortBy {
     Recency,
 }
 
+impl SortBy {
+    fn as_str(self) -> &'static str {
+        match self {
+            SortBy::Relevance => "relevance",
+            SortBy::Recency => "recency",
+        }
+    }
+}
+
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum SearchMode {
     Hybrid,
     Vector,
     Keyword,
+}
+
+impl SearchMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            SearchMode::Hybrid => "hybrid",
+            SearchMode::Vector => "vector",
+            SearchMode::Keyword => "keyword",
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -449,11 +468,6 @@ fn open_read() -> Result<Connection> {
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     enforce_db_schema_version(&conn)?;
     Ok(conn)
-}
-
-fn open_write() -> Result<Connection> {
-    let path = db_path()?;
-    open_write_at(&path)
 }
 
 fn open_write_at(path: &Path) -> Result<Connection> {
@@ -1211,26 +1225,11 @@ fn load_candidate_meta(
     Ok(out)
 }
 
-fn search_mode_name(mode: SearchMode) -> &'static str {
-    match mode {
-        SearchMode::Hybrid => "hybrid",
-        SearchMode::Vector => "vector",
-        SearchMode::Keyword => "keyword",
-    }
-}
-
-fn sort_by_name(sort_by: SortBy) -> &'static str {
-    match sort_by {
-        SortBy::Relevance => "relevance",
-        SortBy::Recency => "recency",
-    }
-}
-
 fn search_next_call(query: &str, k: usize, opts: &SearchOptions<'_>) -> String {
     let mut args = vec![
         format!("query={}", mcp_string(query)),
         format!("k={k}"),
-        format!("mode=\"{}\"", search_mode_name(opts.mode)),
+        format!("mode=\"{}\"", opts.mode.as_str()),
     ];
     if let Some(types) = opts.types {
         let rendered = types
@@ -1250,7 +1249,7 @@ fn search_next_call(query: &str, k: usize, opts: &SearchOptions<'_>) -> String {
         args.push(format!("doc_scope={}", mcp_string(doc_scope)));
     }
     if !matches!(opts.sort_by, SortBy::Relevance) {
-        args.push(format!("sort_by=\"{}\"", sort_by_name(opts.sort_by)));
+        args.push(format!("sort_by=\"{}\"", opts.sort_by.as_str()));
     }
     if opts.include_old {
         args.push("include_old=true".to_string());
@@ -2556,7 +2555,7 @@ fn get_definition(term: &str, opts: GetDefinitionOptions<'_>) -> Result<String> 
     let mut stmt = conn.prepare(
         r#"
         SELECT definition_id, term, doc_id, source_title, source_type, scope,
-               anchor, ord, body
+               anchor, body
         FROM definitions
         WHERE norm_term = ? AND source_type = ?
         ORDER BY doc_id, ord, term
@@ -3021,16 +3020,13 @@ struct Manifest {
     schema_version: i64,
     index_version: String,
     created_at: String,
-    #[serde(default)]
     min_client_version: String,
     model: ModelInfo,
-    /// Optional cross-encoder reranker. Older v1/v2 manifests omit this; the
-    /// runtime degrades gracefully to RRF-only ranking when absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional cross-encoder reranker. Manifests without one degrade
+    /// gracefully to RRF-only ranking.
+    #[serde(skip_serializing_if = "Option::is_none")]
     reranker: Option<ModelInfo>,
-    #[serde(default)]
     documents: Vec<DocRef>,
-    #[serde(default)]
     packs: Vec<PackInfo>,
 }
 
@@ -3297,7 +3293,7 @@ fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
         );
     }
 
-    let conn = open_write()?;
+    let conn = open_write_at(&db_path()?)?;
     init_db(&conn)?;
 
     let backup = backups_dir()?.join("ato.db.prev");
@@ -4878,8 +4874,11 @@ struct DocumentAssetOut {
     doc_id: String,
     source_path: String,
     relative_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     media_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     alt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     title: Option<String>,
     sha256: String,
     bytes: i64,
