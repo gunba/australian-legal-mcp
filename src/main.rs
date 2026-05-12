@@ -275,6 +275,7 @@ fn main() -> Result<()> {
                     format,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
+                    similar_to_chunk_id: None,
                 },
             )?;
             println!("{}", out);
@@ -583,6 +584,14 @@ fn init_db(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_doc_anchors_doc ON doc_anchors(doc_id);
 
+        CREATE TABLE IF NOT EXISTS citations (
+            source_chunk_id  INTEGER NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+            source_doc_id    TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+            target_doc_id    TEXT NOT NULL,
+            PRIMARY KEY (source_chunk_id, target_doc_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_citations_target ON citations(target_doc_id);
+
         CREATE TABLE IF NOT EXISTS chunk_embeddings (
             chunk_id   INTEGER PRIMARY KEY REFERENCES chunks(chunk_id) ON DELETE CASCADE,
             embedding  BLOB NOT NULL CHECK(length(embedding) = 256)
@@ -813,6 +822,12 @@ struct SearchOptions<'a> {
     /// that intend to follow up with `get_chunks` save the BM25-windowed
     /// snippet text and the highlight markup pass.
     include_snippet: bool,
+    /// When set, vector search uses this chunk's stored embedding as the
+    /// query vector and the input `query` string is ignored for the
+    /// semantic stage. Forces vector-only mode (no BM25 stage). The input
+    /// chunk is filtered out of results so the agent never sees their
+    /// seed chunk reflected back.
+    similar_to_chunk_id: Option<i64>,
 }
 
 /// Metadata required to rank and dedup candidate chunks across documents.
@@ -938,20 +953,48 @@ fn search(
     );
     // [MT-02] k is clamped, first-stage recall is widened, then candidates dedupe per document.
     let internal_limit = std::cmp::max(k * 5, 50);
-    let lexical_hits = if matches!(opts.mode, SearchMode::Hybrid | SearchMode::Keyword) {
+    // `similar_to_chunk_id` short-circuits semantic encode: load the seed
+    // chunk's stored embedding and use it as the query vector. Force
+    // vector-only mode (no BM25 stage — no real query text to rank against).
+    let similar_seed: Option<(i64, [i8; EMBEDDING_DIM])> = match opts.similar_to_chunk_id {
+        Some(seed_id) => {
+            ensure_vector_search_ready(&conn)?;
+            Some((seed_id, load_chunk_embedding(&conn, seed_id)?))
+        }
+        None => None,
+    };
+    let effective_mode = if similar_seed.is_some() {
+        SearchMode::Vector
+    } else {
+        opts.mode
+    };
+    let lexical_hits = if matches!(effective_mode, SearchMode::Hybrid | SearchMode::Keyword) {
         lexical_search(&conn, query, &filter, internal_limit)?
     } else {
         Vec::new()
     };
-    let mut ranked_hits = match opts.mode {
+    let mut ranked_hits = match effective_mode {
         SearchMode::Hybrid | SearchMode::Vector => {
             ensure_vector_search_ready(&conn)?;
-            let query_embedding = match server_state.as_mut() {
-                Some(state) => state.encode_query_embedding(query)?,
-                None => encode_query_embedding(query)?,
+            let query_embedding = if let Some((_, ref seed_vec)) = similar_seed {
+                *seed_vec
+            } else {
+                match server_state.as_mut() {
+                    Some(state) => state.encode_query_embedding(query)?,
+                    None => encode_query_embedding(query)?,
+                }
             };
             let vector_hits = vector_search(&conn, &query_embedding, &filter, internal_limit)?;
-            if matches!(opts.mode, SearchMode::Hybrid) {
+            // Filter the seed chunk out of its own similar-chunks results.
+            let vector_hits = if let Some((seed_id, _)) = similar_seed {
+                vector_hits
+                    .into_iter()
+                    .filter(|h| h.chunk_id != seed_id)
+                    .collect()
+            } else {
+                vector_hits
+            };
+            if matches!(effective_mode, SearchMode::Hybrid) {
                 rrf_fuse(&vector_hits, &lexical_hits)
             } else {
                 vector_hits
@@ -965,8 +1008,11 @@ fn search(
     // each ONNX inference is O(N) and the marginal hit past the first
     // few pages is dominated by first-stage recall. Tail candidates retain
     // their RRF order so they can still surface via `next_call` paging or
-    // recency sort.
-    if let Some(state) = server_state.as_mut() {
+    // recency sort. Skip rerank when the caller passed
+    // `similar_to_chunk_id` — there's no meaningful query string to use
+    // as the rerank pivot.
+    if similar_seed.is_none() {
+        if let Some(state) = server_state.as_mut() {
         let head_count = rerank_head_count(k, ranked_hits.len());
         if head_count > 0 {
             // Load text for the top-N candidates in one batch. We hold
@@ -1008,6 +1054,7 @@ fn search(
                 }
             }
         }
+    }
     }
 
     let frontier = match opts.sort_by {
@@ -1228,6 +1275,31 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
         |row| row.get(0),
     )?;
     Ok(exists != 0)
+}
+
+/// Load a chunk's stored int8 embedding from `chunk_embeddings`. Used by
+/// `similar_to_chunk_id` to bypass query encoding and run vector search
+/// directly against the seed chunk's vector.
+fn load_chunk_embedding(conn: &Connection, chunk_id: i64) -> Result<[i8; EMBEDDING_DIM]> {
+    let blob: Vec<u8> = conn
+        .query_row(
+            "SELECT embedding FROM chunk_embeddings WHERE chunk_id = ?",
+            [chunk_id],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("no stored embedding for chunk_id={chunk_id}"))?;
+    if blob.len() != EMBEDDING_DIM {
+        bail!(
+            "stored embedding for chunk_id={chunk_id} has wrong length: got {}, expected {}",
+            blob.len(),
+            EMBEDDING_DIM
+        );
+    }
+    let mut out = [0i8; EMBEDDING_DIM];
+    for (i, b) in blob.iter().enumerate() {
+        out[i] = *b as i8;
+    }
+    Ok(out)
 }
 
 fn ensure_vector_search_ready(conn: &Connection) -> Result<()> {
@@ -4516,6 +4588,7 @@ fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
                     format,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: optional_bool(&args, "include_snippet").unwrap_or(true),
+                    similar_to_chunk_id: optional_i64(&args, "similar_to_chunk_id"),
                 },
                 Some(state),
             )?
@@ -4574,6 +4647,10 @@ fn required_str<'a>(args: &'a JsonValue, name: &str) -> Result<&'a str> {
 
 fn optional_usize(args: &JsonValue, name: &str) -> Option<usize> {
     args.get(name).and_then(|v| v.as_u64()).map(|v| v as usize)
+}
+
+fn optional_i64(args: &JsonValue, name: &str) -> Option<i64> {
+    args.get(name).and_then(|v| v.as_i64())
 }
 
 fn optional_bool(args: &JsonValue, name: &str) -> Option<bool> {
@@ -4931,12 +5008,78 @@ fn get_doc_anchors(doc_id: &str) -> Result<String> {
             _ => {}
         }
     }
-    Ok(serde_json::to_string_pretty(&json!({
-        "doc_id": doc_id,
-        "in_doc": in_doc,
-        "related_docs": related_docs,
-        "historical_versions": historical_versions,
-    }))?)
+    let (cited_by, cited_by_total) = load_cited_by(&conn, doc_id)?;
+    let mut response = serde_json::Map::new();
+    response.insert("doc_id".to_string(), JsonValue::String(doc_id.to_string()));
+    response.insert("in_doc".to_string(), JsonValue::Array(in_doc));
+    response.insert("related_docs".to_string(), JsonValue::Array(related_docs));
+    response.insert(
+        "historical_versions".to_string(),
+        JsonValue::Array(historical_versions),
+    );
+    response.insert("cited_by".to_string(), JsonValue::Array(cited_by.clone()));
+    // Only surface the total when truncation actually hid citers — keeps
+    // the wire quiet for the common case where the agent is seeing the
+    // whole list.
+    if (cited_by_total as usize) > cited_by.len() {
+        response.insert(
+            "cited_by_total".to_string(),
+            JsonValue::Number(serde_json::Number::from(cited_by_total)),
+        );
+    }
+    Ok(serde_json::to_string_pretty(&JsonValue::Object(response))?)
+}
+
+/// Per-doc cap on the `cited_by` array surfaced by `get_doc_anchors`. The
+/// most heavily-cited docs (ITAA 1997 s 8-1, Pt IVA, ...) have thousands of
+/// citers and would otherwise dominate the response. Order by source date
+/// DESC so the agent sees the most recent citations first; the total count
+/// lives on `cited_by_total` when truncation occurs.
+const CITED_BY_LIMIT: usize = 100;
+
+fn load_cited_by(conn: &Connection, doc_id: &str) -> Result<(Vec<JsonValue>, i64)> {
+    // Gracefully no-op on older corpora that predate the citations table.
+    // The next maintainer build (or local `scripts/backfill-citations.py`)
+    // populates it; until then this tool just returns an empty list.
+    if !table_exists(conn, "citations")? {
+        return Ok((Vec::new(), 0));
+    }
+    let total: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT source_doc_id) FROM citations WHERE target_doc_id = ?",
+        [doc_id],
+        |row| row.get(0),
+    )?;
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT c.source_doc_id, d.title, d.type, d.date
+        FROM (
+            SELECT DISTINCT source_doc_id FROM citations WHERE target_doc_id = ?
+        ) c
+        JOIN documents d ON d.doc_id = c.source_doc_id
+        ORDER BY d.date DESC NULLS LAST, c.source_doc_id ASC
+        LIMIT ?
+        "#,
+    )?;
+    let rows = stmt.query_map(params![doc_id, CITED_BY_LIMIT as i64], |row| {
+        let id: String = row.get("source_doc_id")?;
+        let title: String = row.get("title")?;
+        let dtype: String = row.get("type")?;
+        let date: Option<String> = row.get("date")?;
+        Ok((id, title, dtype, date))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, title, dtype, date) = row?;
+        let mut entry = serde_json::Map::new();
+        entry.insert("doc_id".to_string(), JsonValue::String(id));
+        entry.insert("title".to_string(), JsonValue::String(title));
+        entry.insert("type".to_string(), JsonValue::String(dtype));
+        if let Some(d) = date {
+            entry.insert("date".to_string(), JsonValue::String(d));
+        }
+        out.push(JsonValue::Object(entry));
+    }
+    Ok((out, total))
 }
 
 fn server_instructions() -> String {
@@ -4966,7 +5109,7 @@ fn tool_descriptors() -> JsonValue {
     json!([
         {
             "name": "search",
-            "description": "Hybrid semantic+lexical search over chunks (chunk-level). Returns slim pointer hits (chunk_id, doc_id, anchor, optional snippet) — fetch bodies via get_chunks. doc_scope filters by full doc_id (in-doc search) or \"<PREFIX>/%\" (family). mode=keyword forces lexical-only; hybrid/vector require the semantic index. Set include_snippet=false when the caller will follow up with get_chunks. Slim hits include navigation hints: has_in_doc_links (doc has paragraph anchors / contents entries — call get_doc_anchors to navigate), has_related_docs (doc has companion documents like errata / addenda), has_history (doc has earlier point-in-time versions — get_doc_anchors lists their URLs).",
+            "description": "Hybrid semantic+lexical search over chunks (chunk-level). Returns slim pointer hits (chunk_id, doc_id, anchor, optional snippet) — fetch bodies via get_chunks. doc_scope filters by full doc_id (in-doc search) or \"<PREFIX>/%\" (family). mode=keyword forces lexical-only; hybrid/vector require the semantic index. Set include_snippet=false when the caller will follow up with get_chunks. Pass similar_to_chunk_id to find chunks semantically close to one the agent already has (skips query encoding, ignores `query`, forces vector-only mode, filters the seed chunk out of results). Slim hits include navigation hints: has_in_doc_links (doc has paragraph anchors / contents entries — call get_doc_anchors to navigate), has_related_docs (doc has companion documents like errata / addenda), has_history (doc has earlier point-in-time versions — get_doc_anchors lists their URLs).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4980,6 +5123,7 @@ fn tool_descriptors() -> JsonValue {
                     "sort_by": {"type": "string", "enum": ["relevance", "recency"]},
                     "include_old": {"type": "boolean"},
                     "current_only": {"type": "boolean", "description": "When true (default), excludes withdrawn rulings. Set false to include withdrawn material with a visible marker."},
+                    "similar_to_chunk_id": {"type": "integer", "description": "When set, use this chunk's stored embedding as the query vector (skips encoding `query`, forces mode=vector, excludes the seed chunk from results)."},
                     "include_snippet": {"type": "boolean", "description": "When true (default), each hit carries a BM25-windowed snippet. Set false to omit the snippet field entirely — useful when the caller will fetch full text via get_chunks."},
                     "format": {"type": "string", "enum": ["json"], "default": "json"}
                 },
@@ -5029,7 +5173,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_doc_anchors",
-            "description": "Return the navigation map for a document: in-doc anchors (paragraph references, contents-table entries), sister documents (errata, addenda, withdrawal notices), and historical versions (earlier point-in-time publications). Slim search hits surface `has_in_doc_links`, `has_related_docs`, or `has_history` when this tool would return useful entries — call it then to navigate. `in_doc` entries carry chunk_id (pass to get_chunks); `related_docs` carry doc_id (pass to search/get_document/get_chunks); `historical_versions` carry {doc_id, pit, date, url}. The corpus does not store historical content; use the `url` field with WebFetch to retrieve an older version when needed.",
+            "description": "Return the navigation map for a document: in-doc anchors (paragraph references, contents-table entries), sister documents (errata, addenda, withdrawal notices), historical versions (earlier point-in-time publications), and reverse citations (other documents whose chunks carry a [doc:X] marker pointing AT this doc). Slim search hits surface `has_in_doc_links`, `has_related_docs`, or `has_history` when this tool would return useful entries — call it then to navigate. `in_doc` entries carry chunk_id (pass to get_chunks); `related_docs` carry doc_id (pass to search/get_document/get_chunks); `historical_versions` carry {doc_id, pit, date, url}; `cited_by` carries [{doc_id, title, type, date}] ordered by source date DESC and capped at 100 — when more citers exist, `cited_by_total` reports the full count. The corpus does not store historical content; use the historical-version `url` field with WebFetch to retrieve an older version when needed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5747,6 +5891,7 @@ mod tests {
             format: OutputFormat::Json,
             max_per_doc: DEFAULT_MAX_PER_DOC,
             include_snippet: true,
+            similar_to_chunk_id: None,
         };
         let call = search_next_call("depreciation", 16, &opts);
         assert!(
@@ -6300,6 +6445,7 @@ mod tests {
                     format: OutputFormat::Json,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
+                    similar_to_chunk_id: None,
                 },
                 None,
             )?;
@@ -6337,6 +6483,7 @@ mod tests {
                     format: OutputFormat::Json,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
+                    similar_to_chunk_id: None,
                 },
                 None,
             )?;
@@ -6423,6 +6570,7 @@ mod tests {
                     format: OutputFormat::Json,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
+                    similar_to_chunk_id: None,
                 },
                 None,
             )?;
@@ -7158,6 +7306,7 @@ mod tests {
                     format: OutputFormat::Json,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
+                    similar_to_chunk_id: None,
                 },
             )
         });
@@ -7583,6 +7732,150 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "50-pair rerank took {elapsed:?}; check ONNX runtime config"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_doc_anchors_includes_cited_by() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        // Three docs cite TARGET. Two are 2024 dated (modern); one 2010.
+        // `cited_by` should order by date DESC.
+        insert_doc(&conn, "TARGET")?;
+        conn.execute(
+            "INSERT INTO documents(doc_id, type, title, downloaded_at, content_hash, pack_sha8, html, date) VALUES (?, 'Public_ruling', 'Citer 2024', ?, ?, '00000000', x'00', '2024-06-15')",
+            params!["CITER_2024A", Utc::now().to_rfc3339(), "h1"],
+        )?;
+        conn.execute(
+            "INSERT INTO documents(doc_id, type, title, downloaded_at, content_hash, pack_sha8, html, date) VALUES (?, 'Public_ruling', 'Citer 2024 B', ?, ?, '00000000', x'00', '2024-01-10')",
+            params!["CITER_2024B", Utc::now().to_rfc3339(), "h2"],
+        )?;
+        conn.execute(
+            "INSERT INTO documents(doc_id, type, title, downloaded_at, content_hash, pack_sha8, html, date) VALUES (?, 'Cases', 'Citer 2010', ?, ?, '00000000', x'00', '2010-02-02')",
+            params!["CITER_2010", Utc::now().to_rfc3339(), "h3"],
+        )?;
+        // One citing chunk per citer; TARGET is the citation target.
+        insert_chunk(&conn, 10, "CITER_2024A", 0, "see [doc:TARGET]")?;
+        insert_chunk(&conn, 11, "CITER_2024B", 0, "also [doc:TARGET]")?;
+        insert_chunk(&conn, 12, "CITER_2010", 0, "refer [doc:TARGET]")?;
+        conn.execute(
+            "INSERT INTO citations(source_chunk_id, source_doc_id, target_doc_id) VALUES (?, ?, ?)",
+            params![10_i64, "CITER_2024A", "TARGET"],
+        )?;
+        conn.execute(
+            "INSERT INTO citations(source_chunk_id, source_doc_id, target_doc_id) VALUES (?, ?, ?)",
+            params![11_i64, "CITER_2024B", "TARGET"],
+        )?;
+        conn.execute(
+            "INSERT INTO citations(source_chunk_id, source_doc_id, target_doc_id) VALUES (?, ?, ?)",
+            params![12_i64, "CITER_2010", "TARGET"],
+        )?;
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            let json_str = get_doc_anchors("TARGET")?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            let cited_by = parsed["cited_by"].as_array().unwrap();
+            assert_eq!(cited_by.len(), 3);
+            // Date-DESC order.
+            assert_eq!(cited_by[0]["doc_id"], json!("CITER_2024A"));
+            assert_eq!(cited_by[0]["date"], json!("2024-06-15"));
+            assert_eq!(cited_by[0]["title"], json!("Citer 2024"));
+            assert_eq!(cited_by[0]["type"], json!("Public_ruling"));
+            assert_eq!(cited_by[1]["doc_id"], json!("CITER_2024B"));
+            assert_eq!(cited_by[2]["doc_id"], json!("CITER_2010"));
+            // Total field omitted when no truncation occurred.
+            assert!(parsed.get("cited_by_total").is_none());
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_doc_anchors_cited_by_truncates_with_total() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        insert_doc(&conn, "POPULAR")?;
+        // Insert CITED_BY_LIMIT + 5 citers so truncation kicks in.
+        let count = CITED_BY_LIMIT + 5;
+        for i in 0..count {
+            let citer = format!("CITER_{:03}", i);
+            conn.execute(
+                "INSERT INTO documents(doc_id, type, title, downloaded_at, content_hash, pack_sha8, html, date) VALUES (?, 'Public_ruling', ?, ?, ?, '00000000', x'00', '2024-01-01')",
+                params![citer.clone(), format!("Citer {i}"), Utc::now().to_rfc3339(), format!("h{i}")],
+            )?;
+            insert_chunk(&conn, (1000 + i) as i64, &citer, 0, "[doc:POPULAR]")?;
+            conn.execute(
+                "INSERT INTO citations(source_chunk_id, source_doc_id, target_doc_id) VALUES (?, ?, ?)",
+                params![(1000 + i) as i64, citer, "POPULAR"],
+            )?;
+        }
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            let json_str = get_doc_anchors("POPULAR")?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            let cited_by = parsed["cited_by"].as_array().unwrap();
+            assert_eq!(cited_by.len(), CITED_BY_LIMIT);
+            assert_eq!(parsed["cited_by_total"], json!(count as i64));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_doc_anchors_cited_by_empty_when_no_table() -> Result<()> {
+        // Older corpora that predate the citations table should degrade
+        // gracefully — `cited_by` is just an empty array.
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        conn.execute("DROP TABLE IF EXISTS citations", [])?;
+        insert_doc(&conn, "NOCITES")?;
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            let json_str = get_doc_anchors("NOCITES")?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            let cited_by = parsed["cited_by"].as_array().unwrap();
+            assert!(cited_by.is_empty());
+            assert!(parsed.get("cited_by_total").is_none());
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_chunk_embedding_roundtrip() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        insert_doc(&conn, "EMB")?;
+        insert_chunk(&conn, 42, "EMB", 0, "body")?;
+        let mut bytes = vec![0u8; EMBEDDING_DIM];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i as i8).wrapping_mul(3) as u8;
+        }
+        conn.execute(
+            "INSERT INTO chunk_embeddings(chunk_id, embedding) VALUES (?, ?)",
+            params![42_i64, bytes.clone()],
+        )?;
+        let loaded = load_chunk_embedding(&conn, 42)?;
+        let expected: Vec<i8> = bytes.iter().map(|b| *b as i8).collect();
+        assert_eq!(loaded.to_vec(), expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_chunk_embedding_missing_chunk_errors() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        let err = load_chunk_embedding(&conn, 99999).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no stored embedding"), "unexpected error: {msg}");
         Ok(())
     }
 

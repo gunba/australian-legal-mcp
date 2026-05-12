@@ -19,6 +19,7 @@ import base64
 import json
 import logging
 import os
+import re
 import shutil
 import struct
 import time
@@ -42,9 +43,11 @@ from ..store.manifest import (
     save_update_summary,
 )
 from ..store.queries import (
+    DELETE_ALL_CITATIONS,
     INSERT_ASSET,
     INSERT_CHUNK,
     INSERT_CHUNK_FTS,
+    INSERT_CITATION,
     INSERT_DEFINITION,
     INSERT_DOC_ANCHOR,
     INSERT_DOCUMENT,
@@ -394,6 +397,7 @@ def _build_fresh_windowed(args: BuildArgs) -> Manifest:
         args.encode_batch_size,
         args.max_batch_tokens,
     )
+    _derive_citations(conn)
     _log_currency_summary(conn)
     return manifest
 
@@ -749,6 +753,7 @@ def build(args: BuildArgs) -> Manifest:
         args.encode_batch_size,
         args.max_batch_tokens,
     )
+    _derive_citations(conn)
     _log_currency_summary(conn)
     return manifest
 
@@ -1949,6 +1954,69 @@ def _scan_packs_dir(packs_dir: Path) -> list[PackInfo]:
             )
         )
     return out
+
+
+# Pulls the base doc_id out of inline [doc:X] markers. Stops at the first
+# whitespace, `]`, or `@` so PiT-qualified (`[doc:X@PIT]`) and view-qualified
+# (`[doc:X view=HISTFT]`) markers all collapse to the base reference.
+_DOC_MARKER_RE = re.compile(r"\[doc:([^\s\]@]+)")
+
+
+def _derive_citations(conn) -> None:
+    """Rebuild the citations table from inline `[doc:X]` markers in chunk text.
+
+    Cheap relative to a corpus build (single pass over chunks, zstd
+    decompress + regex). Idempotent: clears and repopulates so a second
+    call doesn't double-insert. Skips self-citations so a chunk pointing
+    back at its own doc doesn't pollute the reverse-citation lookup.
+    """
+    try:
+        conn.execute(DELETE_ALL_CITATIONS)
+    except Exception:
+        # Older DB without the citations table; nothing to do. The runtime
+        # creates the table on next read; the next build will populate it.
+        return
+    dctx = zstd.ZstdDecompressor()
+    insert_batch: list[tuple[int, str, str]] = []
+    flush_size = 5000
+    total = 0
+    cur = conn.execute("SELECT chunk_id, doc_id, text FROM chunks")
+    while True:
+        rows = cur.fetchmany(2000)
+        if not rows:
+            break
+        for chunk_id, doc_id, raw in rows:
+            text = _zstd_decompress_text(raw, dctx)
+            targets = set(_DOC_MARKER_RE.findall(text))
+            targets.discard(doc_id)
+            for target in targets:
+                insert_batch.append((chunk_id, doc_id, target))
+        if len(insert_batch) >= flush_size:
+            conn.executemany(INSERT_CITATION, insert_batch)
+            total += len(insert_batch)
+            insert_batch.clear()
+    if insert_batch:
+        conn.executemany(INSERT_CITATION, insert_batch)
+        total += len(insert_batch)
+    distinct_targets = conn.execute(
+        "SELECT COUNT(DISTINCT target_doc_id) FROM citations"
+    ).fetchone()[0]
+    LOGGER.info(
+        "citations: derived %d rows (%d distinct cited docs)",
+        total,
+        distinct_targets,
+    )
+
+
+def _zstd_decompress_text(blob: bytes, dctx: zstd.ZstdDecompressor) -> str:
+    """Decompress a chunk-text BLOB regardless of frame header.
+
+    Maintainer Python builds use frames with content size; the Rust runtime
+    writes streaming frames (no content size) when it materialises chunks
+    from a pack on `update`. Use the streaming reader so both shapes load.
+    """
+    import io
+    return dctx.stream_reader(io.BytesIO(blob)).read().decode("utf-8")
 
 
 def _log_currency_summary(conn) -> None:

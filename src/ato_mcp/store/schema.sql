@@ -115,6 +115,19 @@ CREATE TABLE IF NOT EXISTS doc_anchors (
 );
 CREATE INDEX IF NOT EXISTS idx_doc_anchors_doc ON doc_anchors(doc_id);
 
+-- Reverse-citation index, derived from chunk text. Every `[doc:X]` marker
+-- in a chunk becomes one (source_chunk_id, source_doc_id, target_doc_id)
+-- row, deduplicated per (chunk, target). Surfaced via get_doc_anchors as
+-- a `cited_by` array. Built at the tail of every build/update so it stays
+-- in sync with chunks.
+CREATE TABLE IF NOT EXISTS citations (
+    source_chunk_id  INTEGER NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+    source_doc_id    TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+    target_doc_id    TEXT NOT NULL,
+    PRIMARY KEY (source_chunk_id, target_doc_id)
+);
+CREATE INDEX IF NOT EXISTS idx_citations_target ON citations(target_doc_id);
+
 CREATE TABLE IF NOT EXISTS chunk_embeddings (
     chunk_id   INTEGER PRIMARY KEY REFERENCES chunks(chunk_id) ON DELETE CASCADE,
     embedding  BLOB NOT NULL CHECK(length(embedding) = 256)

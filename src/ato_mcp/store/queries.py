@@ -56,6 +56,18 @@ SET has_in_doc_links = ?, has_related_docs = ?, has_history = ?
 WHERE doc_id = ?
 """
 
+# Citations: derived index of inline [doc:X] markers in chunk text. Built
+# at the tail of every full build / incremental update by scanning chunks
+# rather than from the extractor (the [doc:X] marker IS the resolved
+# cross-reference, so a chunk-text scan is exact and avoids re-walking
+# HTML).
+INSERT_CITATION = """
+INSERT OR IGNORE INTO citations (source_chunk_id, source_doc_id, target_doc_id)
+VALUES (?, ?, ?)
+"""
+
+DELETE_ALL_CITATIONS = "DELETE FROM citations"
+
 SELECT_CHUNKS_FOR_DOC = """
 SELECT chunk_id, ord, anchor, text
 FROM chunks WHERE doc_id = ? ORDER BY ord ASC
