@@ -44,7 +44,7 @@ def _binary_version_from_cargo_toml() -> str:
             value = value.strip().strip('"')
             if value:
                 return value
-    return "0.6.9"
+    return "0.7.0"
 
 
 # `min_client_version` is read from Cargo.toml at build time so corpus

@@ -1,6 +1,6 @@
 [package]
 name = "ato-mcp"
-version = "0.6.9"
+version = "0.7.0"
 edition = "2021"
 license = "MIT"
 description = "Standalone MCP server for the Australian Taxation Office legal corpus"
