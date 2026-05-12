@@ -132,7 +132,6 @@ dependencies = [
  "dirs",
  "flate2",
  "fs2",
- "ndarray",
  "ort",
  "predicates",
  "rand 0.8.6",

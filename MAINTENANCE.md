@@ -221,10 +221,10 @@ Watch for:
 
 `ato-mcp search "..."` from the CLI runs the same `search()` code path the
 MCP server does, including the cross-encoder reranker when its model files
-are installed under `live/`. JSON output reports `ranking.reranker_used:
-true` in that case (and `false` otherwise — typically when `--release` was
-shipped without `--reranker-bundle`, or when `ATO_MCP_DISABLE_RERANKER=1`
-is set in the environment).
+are installed under `live/`. The reranker reorders results internally; its
+state is not surfaced on the wire (per the project's wire-hygiene rule),
+but `ATO_MCP_DISABLE_RERANKER=1` in the environment disables it for the
+process.
 
 This means CLI latency benchmarks reflect production behaviour. To
 A/B compare RRF-only vs. reranker-on, run the same query twice with and

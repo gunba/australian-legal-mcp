@@ -16,7 +16,6 @@ venv/
 .codex/agent-proofs-AGENTS-snippet.md
 .DS_Store
 /tmp/
-scratch/
 # ML model weights and build outputs — too large for git.
 models/
 release/

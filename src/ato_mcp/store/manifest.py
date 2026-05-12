@@ -15,12 +15,8 @@ from typing import Any, Optional
 import orjson
 from pydantic import BaseModel, Field
 
-# Manifest format/schema version. Bump alongside any binary release that
-# adds NEW required fields the older binary doesn't tolerate. v3 (released
-# alongside ato-mcp 0.6.0) adds the optional `reranker: ModelInfo` field;
-# older binaries decoding a v3 manifest still parse fine (Rust's `Manifest`
-# struct uses `#[serde(default)]` on all the new fields), but their separate
-# `schema_version > MAX_SUPPORTED_SCHEMA_VERSION` check catches them earlier.
+# Manifest format version. Bump alongside any binary release that adds new
+# required fields the older binary doesn't tolerate.
 MANIFEST_SCHEMA_VERSION = 4
 
 
