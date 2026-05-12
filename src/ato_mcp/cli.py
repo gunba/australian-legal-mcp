@@ -46,7 +46,7 @@ def _maybe_reexec_with_nvidia_libs() -> None:
 
 @app.command("refresh-source")
 def refresh_source(
-    mode: str = typer.Option("incremental", help="incremental | full | catch_up"),
+    mode: str = typer.Option("incremental", help="incremental | full"),
     output_dir: Path = typer.Option(Path("./ato_pages"), help="Destination for payloads/."),
     # [CC-05] refresh-source defaults to ./ato_pages; build-index requires --pages-dir pointing at a populated ato_pages/. Stages independently re-runnable — same pages dir can feed multiple builds.
     links_file: Optional[Path] = typer.Option(None, help="deduped_links.jsonl for incremental mode."),
@@ -57,19 +57,25 @@ def refresh_source(
              "Default 0.5 s = ~2 req/sec. Drop to 1.0 for a slower/safer rate.",
     ),
     verbose: bool = typer.Option(False, help="Emit downloader status snapshots."),
-    root_query: str = typer.Option(
-        "Mode=type&Action=initialise",
-        help="Tree root. Override to scope catch_up to a subtree.",
-    ),
-    max_nodes: Optional[int] = typer.Option(None, help="Cap for debugging."),
 ) -> None:
-    """Maintainer: scrape the ATO site into ``ato_pages/``."""
+    """Maintainer: scrape the ATO site into ``ato_pages/``.
+
+    Two modes:
+
+    - ``incremental``: pull the ATO ``What's new`` feed and refresh matching
+      payloads. Covers the rolling 2-3 week window the feed exposes.
+    - ``full``: run the whole crawl + reduce + download pipeline. Takes hours;
+      intended for monthly full rebuilds.
+
+    For ``catch_up`` (diff missing canonical_ids against an existing index and
+    download only those), use the dedicated ``ato-mcp catch-up`` subcommand.
+    """
     from .scraper import refresh_source as run_refresh
     from .util.power import maybe_reexec_with_sleep_inhibitor
 
-    if mode not in {"incremental", "full", "catch_up"}:
+    if mode not in {"incremental", "full"}:
         raise typer.BadParameter(
-            f"mode must be one of incremental | full | catch_up (got {mode!r})"
+            f"mode must be one of incremental | full (got {mode!r})"
         )
 
     maybe_reexec_with_sleep_inhibitor(f"ato-mcp source refresh ({mode})")
@@ -81,18 +87,8 @@ def refresh_source(
         max_workers=max_workers,
         request_interval=request_interval,
         verbose_progress=verbose,
-        root_query=root_query,
-        max_nodes=max_nodes,
     )
     typer.echo(f"refresh-source complete: mode={result.mode} output={result.output_dir}")
-    if result.catch_up_summary is not None:
-        s = result.catch_up_summary
-        typer.echo(
-            f"catch-up: {s.missing} missing of {s.total_current_links} current "
-            f"(existing={s.existing_canonical_ids}); downloaded={s.downloaded}"
-        )
-        for cat, n in s.by_category.items():
-            typer.echo(f"  {n:6d}  {cat}")
 
 
 @app.command("catch-up")
