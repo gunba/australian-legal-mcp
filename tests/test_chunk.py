@@ -44,6 +44,27 @@ def test_chunk_inline_renders_emphasis() -> None:
     assert "*italic*" in text
 
 
+def test_chunk_nested_strong_em_emits_clean_triple_asterisk_marker() -> None:
+    """Regression: ATO dictionary HTML has ``<strong><em>TERM</em>\\n</strong>``
+    with trailing whitespace inside the strong wrapper. Without stripping, the
+    chunker emitted ``***TERM* **`` (final asterisks separated by whitespace)
+    and the definition_text path double-wrapped to ``****TERM****`` (4
+    asterisks each side). Neither matched the ``\\*\\*\\*…\\*\\*\\*`` term
+    regex in ``definitions.py`` and the corpus shipped with 13 definitions
+    instead of thousands. Both renders must produce ``***TERM***`` cleanly so
+    the extractor finds every dictionary entry."""
+    html = """<p><strong><em>effective life</em>
+    </strong>
+    <br>has the meaning given by subsection 40-95(7).</p>"""
+    chunks = chunk_html(html)
+    assert chunks
+    assert "***effective life***" in chunks[0].text
+    # And the dedicated definition_text path (the one the extractor reads)
+    # carries the same clean marker — pack-side test confirms.
+    defn = chunks[0].definition_text or chunks[0].text
+    assert "***effective life***" in defn
+
+
 def test_chunk_blockquote_emits_quote_prefix() -> None:
     html = "<blockquote>Court found that the entity was a resident.</blockquote>"
     chunks = chunk_html(html)
@@ -175,7 +196,12 @@ def test_chunk_anchor_marker_skipped_when_unreferenced() -> None:
     assert "[anchor:unused]" not in text
 
 
-def test_chunk_text_is_plain_and_definition_markers_are_build_only() -> None:
+def test_chunk_text_is_plain_no_html_attributes_leak() -> None:
+    """chunk.text carries no raw HTML attribute syntax — data-doc-id and
+    asset alt-text fall back to inline `[doc:X]` / `[asset:X]` markers.
+    The dictionary-term marker `***term***` is allowed in chunk.text (it
+    falls out naturally from the inline strong+em rendering) and is what
+    the definition extractor reads."""
     html = """
 <h1>Definitions</h1>
 <p><strong><em>corporate tax rate</em></strong> means the rate of tax.</p>
@@ -184,14 +210,13 @@ def test_chunk_text_is_plain_and_definition_markers_are_build_only() -> None:
 """
     chunks = chunk_html(html)
     text = "\n\n".join(chunk.text for chunk in chunks)
-    definition_text = "\n\n".join(chunk.definition_text or "" for chunk in chunks)
 
     assert "data-doc-id" not in text
     assert "section 995-1 [doc:PAC/19970038/995-1]" in text
     assert "[asset:ato-image://DOC/0]" in text
     assert "[image: Formula diagram]" not in text
     assert "Formula diagram" not in text
-    assert "***corporate tax rate***" in definition_text
+    assert "***corporate tax rate***" in text
 
 
 def test_br_newline_survives_normalisation() -> None:

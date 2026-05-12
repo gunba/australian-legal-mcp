@@ -87,7 +87,7 @@ DEFAULT_MAX_TOKENS = EMBED_MAX_TOKENS
 # [IB-21] wholesale-reuse branch refuses to carry chunks from prior pack
 # records whose stored chunker_format_version doesn't match this constant,
 # forcing a re-extract+re-chunk under the current rules.
-CHUNKER_FORMAT_VERSION = 2
+CHUNKER_FORMAT_VERSION = 3
 
 
 @dataclass
@@ -457,20 +457,16 @@ def _inline_text(
         return _RAW_TEXT_WS_RE.sub(" ", node.text() or "")
     if tag in {"strong", "b"}:
         if definition_markers and _is_definition_term_node(node):
-            term = _normalise_text(
-                _inline_text_children(node, referenced_anchors, definition_markers=False)
-            )
+            term = _normalise_text(node.text(deep=True, separator=" ", strip=True) or "")
             return f"***{term}***" if term else ""
-        inner = _inline_text_children(node, referenced_anchors, definition_markers=definition_markers)
-        return f"**{inner}**" if inner.strip() else inner
+        inner = _inline_text_children(node, referenced_anchors, definition_markers=definition_markers).strip()
+        return f"**{inner}**" if inner else ""
     if tag in {"em", "i"}:
         if definition_markers and _is_definition_term_node(node):
-            term = _normalise_text(
-                _inline_text_children(node, referenced_anchors, definition_markers=False)
-            )
+            term = _normalise_text(node.text(deep=True, separator=" ", strip=True) or "")
             return f"***{term}***" if term else ""
-        inner = _inline_text_children(node, referenced_anchors, definition_markers=definition_markers)
-        return f"*{inner}*" if inner.strip() else inner
+        inner = _inline_text_children(node, referenced_anchors, definition_markers=definition_markers).strip()
+        return f"*{inner}*" if inner else ""
     if tag == "a":
         # Cross-doc link → [doc:X] (with @PiT suffix when present).
         doc_id = node.attributes.get("data-doc-id")
