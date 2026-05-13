@@ -1,0 +1,12 @@
+[Unit]
+Description=ATO MCP server (HTTP transport)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/ato-mcp serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

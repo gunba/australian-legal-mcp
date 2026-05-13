@@ -19,8 +19,9 @@ use sha2::{Digest, Sha256};
 use simsimd::SpatialSimilarity as _;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, Cursor, Read, Write};
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
 use url::Url;
@@ -96,8 +97,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the MCP stdio server.
+    /// Run the MCP HTTP server (long-lived daemon).
     Serve {},
+    /// Pick a port and persist HTTP config; prints the MCP client config to paste.
+    InstallHttp {
+        /// Override the auto-picked port (rare).
+        #[arg(long)]
+        port: Option<u16>,
+        /// Suppress the MCP config block (only write http.json).
+        #[arg(long)]
+        quiet: bool,
+    },
     /// Download or refresh the local corpus.
     Update {
         #[arg(long)]
@@ -209,8 +219,9 @@ fn main() -> Result<()> {
                     .flatten(),
                 ..Default::default()
             };
-            serve(state)
+            serve(Arc::new(state))
         }
+        Command::InstallHttp { port, quiet } => install_http(port, !quiet),
         Command::Update { manifest_url } => {
             let url = manifest_url.unwrap_or_else(default_manifest_url);
             let stats = apply_update(&url)?;
@@ -376,6 +387,54 @@ fn db_path() -> Result<PathBuf> {
 
 fn installed_manifest_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("installed_manifest.json"))
+}
+
+fn http_config_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("http.json"))
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct HttpConfig {
+    bind: String,
+    port: u16,
+}
+
+impl HttpConfig {
+    fn load() -> Result<Option<Self>> {
+        let p = http_config_path()?;
+        if !p.exists() {
+            return Ok(None);
+        }
+        let raw =
+            fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
+        let cfg: Self = serde_json::from_str(&raw)
+            .with_context(|| format!("parsing {}", p.display()))?;
+        Ok(Some(cfg))
+    }
+
+    fn save(&self) -> Result<()> {
+        let p = http_config_path()?;
+        let raw = serde_json::to_string_pretty(self)?;
+        fs::write(&p, raw).with_context(|| format!("writing {}", p.display()))?;
+        Ok(())
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}:{}/mcp", self.bind, self.port)
+    }
+}
+
+/// Bind 127.0.0.1:0, ask the OS for a free port in the ephemeral range,
+/// release the socket, and return the chosen port. The port is not held
+/// across the function so a tight race with another process can still claim
+/// it; `serve()` then errors at bind time and the user can re-run install.
+fn pick_free_port() -> Result<u16> {
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .context("binding 127.0.0.1:0 to discover a free port")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
 }
 
 fn lock_path() -> Result<PathBuf> {
@@ -904,7 +963,7 @@ fn rerank_head_count(k: usize, candidate_count: usize) -> usize {
 fn search(
     query: &str,
     opts: SearchOptions<'_>,
-    mut server_state: Option<&mut ServerState>,
+    server_state: Option<&ServerState>,
 ) -> Result<String> {
     let conn = open_read()?;
     let k = opts.k.clamp(1, MAX_K);
@@ -946,7 +1005,7 @@ fn search(
             let query_embedding = if let Some((_, ref seed_vec)) = similar_seed {
                 *seed_vec
             } else {
-                match server_state.as_mut() {
+                match server_state {
                     Some(state) => state.encode_query_embedding(query)?,
                     None => encode_query_embedding(query)?,
                 }
@@ -979,7 +1038,7 @@ fn search(
     // `similar_to_chunk_id` — there's no meaningful query string to use
     // as the rerank pivot.
     if similar_seed.is_none() && !matches!(effective_mode, SearchMode::Keyword) {
-        if let Some(state) = server_state.as_mut() {
+        if let Some(state) = server_state {
         let head_count = rerank_head_count(k, ranked_hits.len());
         if head_count > 0 {
             // Load text for the top-N candidates in one batch. We hold
@@ -1071,8 +1130,8 @@ fn search(
 }
 
 fn search_cli(query: &str, opts: SearchOptions<'_>) -> Result<(String, ServerState)> {
-    let mut state = ServerState::default();
-    let out = search(query, opts, Some(&mut state))?;
+    let state = ServerState::default();
+    let out = search(query, opts, Some(&state))?;
     Ok((out, state))
 }
 
@@ -1693,21 +1752,27 @@ enum RerankerState {
     Disabled,
 }
 
-// [MT-01] MCP stdio keeps one ServerState per process and reuses lazy runtimes.
+// [MT-01] HTTP transport keeps one ServerState shared across worker threads.
+// Lazy slots use Mutex<Option<_>> for the embedding runtime and Mutex<RerankerState>
+// for the reranker so concurrent requests can drive the load-once state machine
+// without `&mut self`. Search-time inference holds the lock for the duration of
+// the ONNX call (~10s of ms per query); read-only tools (search_titles,
+// get_document, get_chunks, get_definition, stats) run fully concurrently.
 // [SW-04] SemanticRuntime/reranker load once; failed reranker loads disable reranking for the session.
 #[derive(Default)]
 struct ServerState {
-    semantic_runtime: Option<SemanticRuntime>,
-    reranker_state: RerankerState,
+    semantic_runtime: Mutex<Option<SemanticRuntime>>,
+    reranker_state: Mutex<RerankerState>,
     update_notice: Option<UpdateAvailability>,
 }
 
 impl ServerState {
-    fn encode_query_embedding(&mut self, query: &str) -> Result<[i8; EMBEDDING_DIM]> {
-        if self.semantic_runtime.is_none() {
-            self.semantic_runtime = Some(SemanticRuntime::load()?);
+    fn encode_query_embedding(&self, query: &str) -> Result<[i8; EMBEDDING_DIM]> {
+        let mut guard = self.semantic_runtime.lock().expect("semantic_runtime mutex");
+        if guard.is_none() {
+            *guard = Some(SemanticRuntime::load()?);
         }
-        self.semantic_runtime
+        guard
             .as_mut()
             .expect("semantic runtime was just initialized")
             .encode_query(query)
@@ -1717,7 +1782,7 @@ impl ServerState {
     /// reranker is unavailable (env-var disabled, model files missing, or
     /// previously failed to load) so the caller falls back to RRF.
     fn rerank_candidates(
-        &mut self,
+        &self,
         query: &str,
         candidates: &[(i64, &str)],
     ) -> Result<Option<Vec<(i64, f64)>>> {
@@ -1725,15 +1790,16 @@ impl ServerState {
             // Once disabled (via env var or model-load failure), the
             // reranker stays disabled for the rest of this server session
             // — no per-request retry. Restart the server to re-enable.
-            self.reranker_state = RerankerState::Disabled;
+            *self.reranker_state.lock().expect("reranker_state mutex") = RerankerState::Disabled;
             return Ok(None);
         }
         if candidates.is_empty() {
             return Ok(Some(Vec::new()));
         }
+        let mut state = self.reranker_state.lock().expect("reranker_state mutex");
         // Drive the state machine. We replace `Pending` once and never
         // again — failed loads stick at `Disabled`.
-        if matches!(self.reranker_state, RerankerState::Pending) {
+        if matches!(*state, RerankerState::Pending) {
             let model_present = reranker_model_path().map(|p| p.exists()).unwrap_or(false);
             let tokenizer_present = reranker_tokenizer_path()
                 .map(|p| p.exists())
@@ -1743,21 +1809,21 @@ impl ServerState {
                     "ato-mcp: reranker model files not present (model={}, tokenizer={}); falling back to RRF for the rest of this session",
                     model_present, tokenizer_present
                 );
-                self.reranker_state = RerankerState::Disabled;
+                *state = RerankerState::Disabled;
                 return Ok(None);
             }
             match Reranker::load() {
-                Ok(r) => self.reranker_state = RerankerState::Loaded(Box::new(r)),
+                Ok(r) => *state = RerankerState::Loaded(Box::new(r)),
                 Err(err) => {
                     eprintln!(
                         "ato-mcp: failed to load reranker ({err}); falling back to RRF for the rest of this session"
                     );
-                    self.reranker_state = RerankerState::Disabled;
+                    *state = RerankerState::Disabled;
                     return Ok(None);
                 }
             }
         }
-        match &mut self.reranker_state {
+        match &mut *state {
             RerankerState::Loaded(r) => Ok(Some(r.rerank(query, candidates)?)),
             RerankerState::Disabled => Ok(None),
             // Unreachable: we just ensured Pending was resolved above.
@@ -4318,33 +4384,124 @@ fn decode_embedding_b64(value: &str) -> Result<Vec<u8>> {
     Ok(embedding)
 }
 
-fn serve(mut state: ServerState) -> Result<()> {
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let parsed: serde_json::Result<JsonValue> = serde_json::from_str(&line);
-        let response = match parsed {
-            Ok(message) => handle_rpc(message, &mut state),
-            Err(err) => Some(json_rpc_error(
-                JsonValue::Null,
-                -32700,
-                &format!("parse error: {err}"),
-            )),
-        };
-        if let Some(response) = response {
-            serde_json::to_writer(&mut stdout, &response)?;
-            stdout.write_all(b"\n")?;
-            stdout.flush()?;
-        }
+fn serve(state: Arc<ServerState>) -> Result<()> {
+    let cfg = HttpConfig::load()?.ok_or_else(|| {
+        anyhow!(
+            "HTTP config not found at {}. Run `ato-mcp install-http` first to pick a port.",
+            http_config_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<data dir>/http.json".to_string())
+        )
+    })?;
+    let addr = format!("{}:{}", cfg.bind, cfg.port);
+    let server = tiny_http::Server::http(&addr).map_err(|e| {
+        anyhow!(
+            "bind {addr}: {e}. If the port is already in use, re-run `ato-mcp install-http --port <free-port>`."
+        )
+    })?;
+    eprintln!("ato-mcp listening on {}", cfg.url());
+
+    for request in server.incoming_requests() {
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || {
+            if let Err(err) = handle_http(request, &state) {
+                eprintln!("ato-mcp http handler error: {err}");
+            }
+        });
     }
     Ok(())
 }
 
-fn handle_rpc(message: JsonValue, state: &mut ServerState) -> Option<JsonValue> {
+fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<()> {
+    use tiny_http::{Header, Method, Response};
+
+    let path = request
+        .url()
+        .split('?')
+        .next()
+        .unwrap_or("/")
+        .to_string();
+    let is_mcp = path == "/mcp" || path == "/mcp/";
+
+    if !is_mcp {
+        let resp = Response::from_string("not found").with_status_code(404);
+        return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
+    }
+    if !matches!(request.method(), Method::Post) {
+        let resp = Response::from_string("method not allowed")
+            .with_status_code(405)
+            .with_header(Header::from_bytes(&b"Allow"[..], &b"POST"[..]).unwrap());
+        return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
+    }
+
+    let mut body = String::new();
+    request
+        .as_reader()
+        .read_to_string(&mut body)
+        .context("reading request body")?;
+
+    let response_json: Option<JsonValue> = match serde_json::from_str::<JsonValue>(&body) {
+        Ok(message) => handle_rpc(message, state),
+        Err(err) => Some(json_rpc_error(
+            JsonValue::Null,
+            -32700,
+            &format!("parse error: {err}"),
+        )),
+    };
+
+    // MCP notifications (no id) produce no response; reply 204 so the
+    // client knows the request was accepted.
+    let Some(value) = response_json else {
+        let resp = Response::from_string("").with_status_code(204);
+        return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
+    };
+
+    let body = serde_json::to_string(&value)?;
+    let resp = Response::from_string(body).with_header(
+        Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
+    );
+    request.respond(resp).map_err(|e| anyhow!("respond: {e}"))?;
+    Ok(())
+}
+
+fn install_http(port_override: Option<u16>, print_config: bool) -> Result<()> {
+    let cfg = match (HttpConfig::load()?, port_override) {
+        (Some(existing), None) => existing,
+        _ => {
+            let port = match port_override {
+                Some(p) => p,
+                None => pick_free_port()?,
+            };
+            let cfg = HttpConfig {
+                bind: "127.0.0.1".to_string(),
+                port,
+            };
+            cfg.save()?;
+            cfg
+        }
+    };
+    if print_config {
+        let url = cfg.url();
+        println!("ato-mcp will listen on {url}");
+        println!("Config written to {}", http_config_path()?.display());
+        println!();
+        println!("Claude Code:");
+        println!("  claude mcp add --scope user --transport http ato {url}");
+        println!();
+        println!("Claude Desktop (claude_desktop_config.json):");
+        let block = json!({
+            "mcpServers": {
+                "ato": { "type": "http", "url": url }
+            }
+        });
+        println!("{}", serde_json::to_string_pretty(&block)?);
+        println!();
+        println!("Start the daemon with: ato-mcp serve");
+    }
+    Ok(())
+}
+
+fn handle_rpc(message: JsonValue, state: &ServerState) -> Option<JsonValue> {
     if message.is_array() {
         let responses: Vec<JsonValue> = message
             .as_array()
@@ -4362,7 +4519,7 @@ fn handle_rpc(message: JsonValue, state: &mut ServerState) -> Option<JsonValue> 
     }
 }
 
-fn handle_single_rpc(message: JsonValue, state: &mut ServerState) -> Option<JsonValue> {
+fn handle_single_rpc(message: JsonValue, state: &ServerState) -> Option<JsonValue> {
     let id = message.get("id").cloned();
     let Some(method) = message.get("method").and_then(|m| m.as_str()) else {
         return id.map(|id| json_rpc_error(id, -32600, "invalid request"));
@@ -4400,7 +4557,7 @@ fn json_rpc_error(id: JsonValue, code: i64, message: &str) -> JsonValue {
     })
 }
 
-fn call_tool(params: JsonValue, state: &mut ServerState) -> Result<JsonValue> {
+fn call_tool(params: JsonValue, state: &ServerState) -> Result<JsonValue> {
     let name = params
         .get("name")
         .and_then(|v| v.as_str())
@@ -7428,7 +7585,7 @@ mod tests {
         // inherit the kill-switch.
         let prev = std::env::var("ATO_MCP_DISABLE_RERANKER").ok();
         std::env::set_var("ATO_MCP_DISABLE_RERANKER", "1");
-        let mut state = ServerState::default();
+        let state = ServerState::default();
         let candidates: Vec<(i64, &str)> = vec![(1, "doc one"), (2, "doc two")];
         let result = state
             .rerank_candidates("query", &candidates)
@@ -7438,7 +7595,7 @@ mod tests {
             "ATO_MCP_DISABLE_RERANKER=1 must short-circuit to RRF"
         );
         // After the env-toggle path runs, state should be Disabled.
-        assert!(matches!(state.reranker_state, RerankerState::Disabled));
+        assert!(matches!(*state.reranker_state.lock().unwrap(), RerankerState::Disabled));
         if let Some(p) = prev {
             std::env::set_var("ATO_MCP_DISABLE_RERANKER", p);
         } else {
@@ -7459,11 +7616,11 @@ mod tests {
             // reranker.onnx nor reranker_tokenizer.json do.
             assert!(!reranker_model_path()?.exists());
             assert!(!reranker_tokenizer_path()?.exists());
-            let mut state = ServerState::default();
+            let state = ServerState::default();
             let candidates: Vec<(i64, &str)> = vec![(1, "alpha"), (2, "beta")];
             let result = state.rerank_candidates("q", &candidates)?;
             assert!(result.is_none(), "missing model -> Ok(None)");
-            assert!(matches!(state.reranker_state, RerankerState::Disabled));
+            assert!(matches!(*state.reranker_state.lock().unwrap(), RerankerState::Disabled));
             // Second call must NOT re-attempt load — Disabled is sticky.
             let result2 = state.rerank_candidates("q", &candidates)?;
             assert!(result2.is_none());
@@ -7486,12 +7643,12 @@ mod tests {
             // but the loader bails — this simulates a corrupted download.
             fs::write(reranker_model_path()?, b"not really an onnx model")?;
             fs::write(reranker_tokenizer_path()?, b"not really a tokenizer json")?;
-            let mut state = ServerState::default();
+            let state = ServerState::default();
             let candidates: Vec<(i64, &str)> = vec![(1, "alpha")];
             // First call: load attempt triggers, fails, transitions to Disabled.
             let result = state.rerank_candidates("q", &candidates)?;
             assert!(result.is_none(), "failed load -> Ok(None)");
-            assert!(matches!(state.reranker_state, RerankerState::Disabled));
+            assert!(matches!(*state.reranker_state.lock().unwrap(), RerankerState::Disabled));
             // Second call: still Disabled, no retry.
             let result2 = state.rerank_candidates("q", &candidates)?;
             assert!(result2.is_none());
@@ -7508,7 +7665,7 @@ mod tests {
         let _lock = TEST_DB_LOCK.lock().unwrap();
         let env_prev = std::env::var("ATO_MCP_DISABLE_RERANKER").ok();
         std::env::remove_var("ATO_MCP_DISABLE_RERANKER");
-        let mut state = ServerState::default();
+        let state = ServerState::default();
         // Empty candidates short-circuit before the load path so we get
         // Some(empty) and never touch the model files.
         let result = state.rerank_candidates("q", &[]).expect("ok");
@@ -7540,7 +7697,7 @@ mod tests {
             // would also disable us via missing-files in this test env).
             // The empty-candidates short-circuit only runs AFTER the env
             // gate, so this still tells us the gate didn't fire.
-            let mut state = ServerState::default();
+            let state = ServerState::default();
             let out = state
                 .rerank_candidates("q", &[])
                 .expect("rerank_candidates returns Ok for empty input");
@@ -7551,7 +7708,7 @@ mod tests {
                  falsy/unknown values should leave reranker eligible"
             );
             assert!(
-                !matches!(state.reranker_state, RerankerState::Disabled),
+                !matches!(*state.reranker_state.lock().unwrap(), RerankerState::Disabled),
                 "state must stay Pending for ATO_MCP_DISABLE_RERANKER={value:?}"
             );
         }
@@ -7605,7 +7762,7 @@ mod tests {
 
         let (json_str, state) = result?;
         assert!(
-            matches!(state.reranker_state, RerankerState::Pending),
+            matches!(*state.reranker_state.lock().unwrap(), RerankerState::Pending),
             "keyword search should stay lexical-only and avoid touching the reranker"
         );
         let parsed: serde_json::Value = serde_json::from_str(&json_str)?;

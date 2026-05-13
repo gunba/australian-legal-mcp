@@ -54,11 +54,13 @@ and no Python is needed for end users. The flow is:
    directory on `%PATH%`.
 
 3. **Wire `ato-mcp serve` into your MCP client** (Claude Code / Claude
-   Desktop / Cursor / Continue / any stdio MCP host — see next section).
-   On first use, the MCP server tells the assistant that the corpus has
-   not been installed yet and asks the user to run `ato-mcp update` in
-   their terminal. The download is ~4 GB and takes 1–10 minutes on a
-   typical home connection (longer behind a corporate proxy — see
+   Desktop / Cursor / Continue / any HTTP MCP host — see next section).
+   `ato-mcp` is an HTTP MCP server: one long-lived daemon, every client
+   session connects over `127.0.0.1`. On first use, the MCP server tells
+   the assistant that the corpus has not been installed yet and asks the
+   user to run `ato-mcp update` in their terminal. The download is ~4 GB
+   and takes 1–10 minutes on a typical home connection (longer behind a
+   corporate proxy — see
    [Enterprise / corporate environments](#enterprise--corporate-environments)).
    After it completes, restart the MCP client so it picks up the new
    corpus.
@@ -115,10 +117,35 @@ consume pre-built corpus releases from GitHub.
 
 ## Wire Into MCP Clients
 
+`ato-mcp` runs as an HTTP MCP server on `127.0.0.1`. Pick a free port
+once with `install-http`, then point your MCP client at the resulting
+URL.
+
+```bash
+ato-mcp install-http
+# Prints something like:
+#   ato-mcp will listen on http://127.0.0.1:51234/mcp
+#   Config written to ~/.local/share/ato-mcp/http.json
+#
+#   Claude Code:
+#     claude mcp add --scope user --transport http ato http://127.0.0.1:51234/mcp
+#
+#   Claude Desktop (claude_desktop_config.json):
+#     { "mcpServers": { "ato": { "type": "http", "url": "http://127.0.0.1:51234/mcp" } } }
+#
+#   Start the daemon with: ato-mcp serve
+```
+
+Start the daemon and leave it running. On Linux the included
+`systemd/ato-mcp-serve.service` keeps it alive across logins
+(`cp systemd/ato-mcp-serve.service ~/.config/systemd/user/ &&
+systemctl --user enable --now ato-mcp-serve`). On Windows, run
+`ato-mcp serve` from the Startup folder or via Task Scheduler at logon.
+
 Claude Code:
 
 ```bash
-claude mcp add --scope user ato -- ato-mcp serve
+claude mcp add --scope user --transport http ato http://127.0.0.1:51234/mcp
 claude mcp list
 ```
 
@@ -128,21 +155,22 @@ Claude Desktop:
 {
   "mcpServers": {
     "ato": {
-      "command": "ato-mcp",
-      "args": ["serve"]
+      "type": "http",
+      "url": "http://127.0.0.1:51234/mcp"
     }
   }
 }
 ```
 
-Cursor, Continue, and other stdio MCP clients use the same command:
-
-```text
-ato-mcp serve
-```
+Cursor, Continue, and other HTTP MCP clients use the same URL. The port
+is chosen once at install time and persisted to
+`~/.local/share/ato-mcp/http.json` (macOS:
+`~/Library/Application Support/ato-mcp/http.json`; Windows:
+`%APPDATA%\ato-mcp\http.json`). To pick a new port, re-run
+`ato-mcp install-http --port <free-port>`.
 
 `serve` starts immediately from whatever local corpus is present and never
-downloads on the MCP hot path, so it cannot trip stdio client spawn timeouts
+downloads on the MCP hot path, so it cannot trip MCP client connect timeouts
 on slow or TLS-inspecting corporate networks. When a newer corpus index has
 been published, the server tells the assistant via `initialize` instructions
 and the assistant asks the user to run `ato-mcp update`. `ATO_MCP_OFFLINE=1`
