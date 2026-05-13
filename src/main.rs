@@ -2924,25 +2924,19 @@ fn doc_id_from_ato_link(target: &str) -> Option<(String, Option<String>, Option<
     for (k, v) in parsed.query_pairs() {
         let key_lc = k.to_ascii_lowercase();
         match key_lc.as_str() {
-            "docid" | "locid" => {
-                if raw.is_none() {
-                    raw = Some(v.into_owned());
+            "docid" | "locid" if raw.is_none() => {
+                raw = Some(v.into_owned());
+            }
+            "pit" if pit.is_none() => {
+                let s = v.trim().to_string();
+                if !s.is_empty() {
+                    pit = Some(s);
                 }
             }
-            "pit" => {
-                if pit.is_none() {
-                    let s = v.trim().to_string();
-                    if !s.is_empty() {
-                        pit = Some(s);
-                    }
-                }
-            }
-            "db" => {
-                if view.is_none() {
-                    let s = v.trim().to_ascii_uppercase();
-                    if ATO_KNOWN_VIEWS.iter().any(|kv| *kv == s) {
-                        view = Some(s);
-                    }
+            "db" if view.is_none() => {
+                let s = v.trim().to_ascii_uppercase();
+                if ATO_KNOWN_VIEWS.iter().any(|kv| *kv == s) {
+                    view = Some(s);
                 }
             }
             _ => {}
@@ -2956,25 +2950,19 @@ fn doc_id_from_ato_link(target: &str) -> Option<(String, Option<String>, Option<
                 for (k, v) in url::form_urlencoded::parse(frag_query.as_bytes()) {
                     let key_lc = k.to_ascii_lowercase();
                     match key_lc.as_str() {
-                        "docid" | "locid" => {
-                            if raw.is_none() {
-                                raw = Some(v.into_owned());
+                        "docid" | "locid" if raw.is_none() => {
+                            raw = Some(v.into_owned());
+                        }
+                        "pit" if pit.is_none() => {
+                            let s = v.trim().to_string();
+                            if !s.is_empty() {
+                                pit = Some(s);
                             }
                         }
-                        "pit" => {
-                            if pit.is_none() {
-                                let s = v.trim().to_string();
-                                if !s.is_empty() {
-                                    pit = Some(s);
-                                }
-                            }
-                        }
-                        "db" => {
-                            if view.is_none() {
-                                let s = v.trim().to_ascii_uppercase();
-                                if ATO_KNOWN_VIEWS.iter().any(|kv| *kv == s) {
-                                    view = Some(s);
-                                }
+                        "db" if view.is_none() => {
+                            let s = v.trim().to_ascii_uppercase();
+                            if ATO_KNOWN_VIEWS.iter().any(|kv| *kv == s) {
+                                view = Some(s);
                             }
                         }
                         _ => {}
