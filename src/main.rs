@@ -203,10 +203,12 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve {} => {
-            let mut state = ServerState::default();
-            state.update_notice = check_for_update_availability(&default_manifest_url())
-                .ok()
-                .flatten();
+            let state = ServerState {
+                update_notice: check_for_update_availability(&default_manifest_url())
+                    .ok()
+                    .flatten(),
+                ..Default::default()
+            };
             serve(state)
         }
         Command::Update { manifest_url } => {
