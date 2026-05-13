@@ -262,9 +262,8 @@ fn main() -> Result<()> {
         } => {
             let types = empty_vec_as_none(types);
             // Construct a transient ServerState so the CLI's `search` call
-            // exercises the same reranker path the MCP server does. Without
-            // this, the CLI runs RRF-only and a maintainer benchmarking
-            // latency would silently miss the cross-encoder cost.
+            // reuses the same lazy semantic/reranker runtimes the MCP server
+            // does for modes that need them.
             let (out, _state) = search_cli(
                 &query,
                 SearchOptions {
@@ -7278,7 +7277,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_search_invokes_reranker_state_machine() -> Result<()> {
+    fn cli_keyword_search_skips_reranker_state_machine() -> Result<()> {
         let _lock = TEST_DB_LOCK.lock().unwrap();
         let env_prev = std::env::var("ATO_MCP_DISABLE_RERANKER").ok();
         std::env::remove_var("ATO_MCP_DISABLE_RERANKER");
@@ -7320,8 +7319,8 @@ mod tests {
 
         let (json_str, state) = result?;
         assert!(
-            matches!(state.reranker_state, RerankerState::Disabled),
-            "CLI search should pass ServerState into search; missing model files then disable the reranker"
+            matches!(state.reranker_state, RerankerState::Pending),
+            "keyword search should stay lexical-only and avoid touching the reranker"
         );
         let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
         assert_eq!(parsed["hits"][0]["doc_id"], json!("DOC_CLI_RERANK"));
