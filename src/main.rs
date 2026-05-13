@@ -2729,50 +2729,270 @@ fn strip_history_ui_controls(doc: &mut scraper::Html) {
     }
 }
 
-/// Walk the cleaned tree and emit a paragraph-aware plain-text rendering.
-/// Block-level tags introduce newlines; inline tags don't. Whitespace is
-/// collapsed within paragraphs but paragraph breaks are preserved so the
-/// agent gets legible structure (not a single wall of text and not a
-/// noisy soup of stray line breaks from inline elements).
+/// Walk the cleaned tree and emit text with inline markdown markers, ported
+/// from src/ato_mcp/indexer/chunk.py:_inline_text + html_to_text. Block-level
+/// tags introduce paragraph breaks. Inline tags emit:
+///   <a> with an ATO docid in href: "text [doc:X]" (with @PiT / view= when
+///     present) — ported from chunk.py:_inline_text and
+///     extract.py:_doc_id_from_ato_link.
+///   <strong>/<b>: **text**
+///   <em>/<i>:     *text*
+///   <h1>-<h6>:    "# text" / "## text" / ... on their own line
+///   <br>:         newline
 fn subtree_text(doc: &scraper::Html) -> String {
+    let mut buf = String::new();
+    for root_child in doc.tree.root().children() {
+        render_node(root_child, &mut buf);
+    }
+    normalise_paragraph_breaks(&buf)
+}
+
+fn render_node(node: ego_tree::NodeRef<scraper::Node>, buf: &mut String) {
     use scraper::Node as ScraperNode;
+
     const BLOCK_TAGS: &[&str] = &[
         "p", "div", "section", "article", "header", "footer", "main", "aside",
         "table", "tr", "thead", "tbody", "tfoot", "td", "th", "caption",
         "ul", "ol", "li", "dl", "dt", "dd",
-        "h1", "h2", "h3", "h4", "h5", "h6",
-        "hr", "br", "pre", "blockquote",
+        "hr", "pre", "blockquote",
     ];
-    let mut buf = String::new();
-    fn walk(node: ego_tree::NodeRef<scraper::Node>, buf: &mut String, block_tags: &[&str]) {
-        match node.value() {
-            ScraperNode::Text(t) => {
-                buf.push_str(&t.text);
-            }
-            ScraperNode::Element(el) => {
-                let tag = el.name();
-                let is_block = block_tags.contains(&tag);
-                if is_block && !buf.ends_with('\n') && !buf.is_empty() {
-                    buf.push('\n');
-                }
-                for child in node.children() {
-                    walk(child, buf, block_tags);
-                }
-                if is_block && !buf.ends_with('\n') {
-                    buf.push('\n');
+
+    match node.value() {
+        ScraperNode::Text(t) => {
+            // Collapse internal whitespace; preserve content.
+            let raw: &str = &t.text;
+            let mut last_ws = buf.chars().last().is_none_or(|c| c == '\n');
+            for c in raw.chars() {
+                if c.is_whitespace() {
+                    if !last_ws {
+                        buf.push(' ');
+                        last_ws = true;
+                    }
+                } else {
+                    buf.push(c);
+                    last_ws = false;
                 }
             }
-            _ => {
-                for child in node.children() {
-                    walk(child, buf, block_tags);
+        }
+        ScraperNode::Element(el) => {
+            let tag = el.name();
+            match tag {
+                "br" => {
+                    buf.push('\n');
+                }
+                "strong" | "b" => {
+                    let inner = render_inner_string(node).trim().to_string();
+                    if !inner.is_empty() {
+                        buf.push_str("**");
+                        buf.push_str(&inner);
+                        buf.push_str("**");
+                    }
+                }
+                "em" | "i" => {
+                    let inner = render_inner_string(node).trim().to_string();
+                    if !inner.is_empty() {
+                        buf.push('*');
+                        buf.push_str(&inner);
+                        buf.push('*');
+                    }
+                }
+                "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                    if !buf.ends_with('\n') && !buf.is_empty() {
+                        buf.push('\n');
+                    }
+                    let level = tag[1..].parse::<usize>().unwrap_or(1).clamp(1, 6);
+                    let inner = render_inner_string(node).trim().to_string();
+                    if !inner.is_empty() {
+                        for _ in 0..level {
+                            buf.push('#');
+                        }
+                        buf.push(' ');
+                        buf.push_str(&inner);
+                        buf.push('\n');
+                    }
+                }
+                "a" => {
+                    let href = el.attr("href").unwrap_or("");
+                    let data_doc_id = el.attr("data-doc-id");
+                    let resolved = if let Some(id) = data_doc_id {
+                        Some((
+                            id.to_string(),
+                            el.attr("data-pit").map(|s| s.to_string()),
+                            el.attr("data-view").map(|s| s.to_string()),
+                        ))
+                    } else if !href.is_empty() {
+                        doc_id_from_ato_link(href)
+                    } else {
+                        None
+                    };
+                    let inner = render_inner_string(node).trim().to_string();
+                    if let Some((doc_id, pit, view)) = resolved {
+                        let mut marker = format!("[doc:{doc_id}");
+                        if let Some(p) = pit.as_ref().filter(|s| !s.is_empty()) {
+                            marker.push('@');
+                            marker.push_str(p);
+                        }
+                        if let Some(v) = view.as_ref().filter(|s| !s.is_empty()) {
+                            marker.push_str(" view=");
+                            marker.push_str(v);
+                        }
+                        marker.push(']');
+                        if !inner.is_empty() {
+                            buf.push_str(&inner);
+                            buf.push(' ');
+                        }
+                        buf.push_str(&marker);
+                    } else if !inner.is_empty() {
+                        buf.push_str(&inner);
+                    }
+                }
+                _ if BLOCK_TAGS.contains(&tag) => {
+                    if !buf.ends_with('\n') && !buf.is_empty() {
+                        buf.push('\n');
+                    }
+                    for child in node.children() {
+                        render_node(child, buf);
+                    }
+                    if !buf.ends_with('\n') {
+                        buf.push('\n');
+                    }
+                }
+                _ => {
+                    for child in node.children() {
+                        render_node(child, buf);
+                    }
+                }
+            }
+        }
+        _ => {
+            for child in node.children() {
+                render_node(child, buf);
+            }
+        }
+    }
+}
+
+fn render_inner_string(node: ego_tree::NodeRef<scraper::Node>) -> String {
+    let mut inner = String::new();
+    for child in node.children() {
+        render_node(child, &mut inner);
+    }
+    inner
+}
+
+// ATO URL parsing — port of extract.py:_doc_id_from_ato_link and helpers.
+// We accept either ato.gov.au hosts or any URL whose path contains one of the
+// ATO doc path hints. Recognised query params (case-insensitive): docid, locid,
+// PiT, db. Recognised db values: HISTFT (amendment-history view).
+const ATO_DOC_PATH_HINTS: &[&str] = &[
+    "/law/view/document",
+    "/law/view/view.htm",
+    "/law/view.htm",
+    "/atolaw/view.htm",
+    "/view.htm",
+];
+const ATO_KNOWN_VIEWS: &[&str] = &["HISTFT"];
+
+fn doc_id_from_ato_link(target: &str) -> Option<(String, Option<String>, Option<String>)> {
+    let mut t = target.trim();
+    if t.starts_with('<') && t.ends_with('>') && t.len() >= 2 {
+        t = &t[1..t.len() - 1];
+    }
+    if let Some(idx) = t.find(' ') {
+        t = &t[..idx];
+    }
+    // ATO often serves relative URLs in its own pages (e.g. href="/law/view/document?LocID=...").
+    // url::Url::parse rejects those, so prepend the public origin to make
+    // parsing succeed; the host check below still treats both absolute and
+    // relative ATO paths consistently.
+    let parsed = if t.starts_with('/') {
+        let base = url::Url::parse("https://www.ato.gov.au").ok()?;
+        base.join(t).ok()?
+    } else {
+        url::Url::parse(t).ok()?
+    };
+    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    let path_lower = parsed.path().to_ascii_lowercase();
+    let is_ato_host = host.ends_with("ato.gov.au");
+    let has_ato_path = ATO_DOC_PATH_HINTS
+        .iter()
+        .any(|hint| path_lower.contains(hint));
+    if !(is_ato_host || has_ato_path) {
+        return None;
+    }
+    let (mut raw, mut pit, mut view) = (None, None, None);
+    for (k, v) in parsed.query_pairs() {
+        let key_lc = k.to_ascii_lowercase();
+        match key_lc.as_str() {
+            "docid" | "locid" => {
+                if raw.is_none() {
+                    raw = Some(v.into_owned());
+                }
+            }
+            "pit" => {
+                if pit.is_none() {
+                    let s = v.trim().to_string();
+                    if !s.is_empty() {
+                        pit = Some(s);
+                    }
+                }
+            }
+            "db" => {
+                if view.is_none() {
+                    let s = v.trim().to_ascii_uppercase();
+                    if ATO_KNOWN_VIEWS.iter().any(|kv| *kv == s) {
+                        view = Some(s);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // SPA-style URLs hide the doc id in the fragment after a `?`.
+    if raw.is_none() {
+        if let Some(frag) = parsed.fragment() {
+            if let Some(qpos) = frag.find('?') {
+                let frag_query = &frag[qpos + 1..];
+                for (k, v) in url::form_urlencoded::parse(frag_query.as_bytes()) {
+                    let key_lc = k.to_ascii_lowercase();
+                    match key_lc.as_str() {
+                        "docid" | "locid" => {
+                            if raw.is_none() {
+                                raw = Some(v.into_owned());
+                            }
+                        }
+                        "pit" => {
+                            if pit.is_none() {
+                                let s = v.trim().to_string();
+                                if !s.is_empty() {
+                                    pit = Some(s);
+                                }
+                            }
+                        }
+                        "db" => {
+                            if view.is_none() {
+                                let s = v.trim().to_ascii_uppercase();
+                                if ATO_KNOWN_VIEWS.iter().any(|kv| *kv == s) {
+                                    view = Some(s);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
     }
-    for root_child in doc.tree.root().children() {
-        walk(root_child, &mut buf, BLOCK_TAGS);
+    let raw = raw?;
+    // SPA category links carry a trailing `?` flag — drop those entirely.
+    if raw.ends_with('?') {
+        return None;
     }
-    normalise_paragraph_breaks(&buf)
+    let doc_id = raw.trim().trim_matches('"').to_string();
+    if doc_id.is_empty() || !doc_id.contains('/') {
+        return None;
+    }
+    Some((doc_id, pit, view))
 }
 
 fn normalise_ws(s: &str) -> String {
