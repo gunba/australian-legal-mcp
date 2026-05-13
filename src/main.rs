@@ -71,6 +71,10 @@ const RERANK_PAIR_MAX_TOKENS: usize = 512;
 const DEFAULT_MAX_PER_DOC: usize = 2;
 const HARD_MAX_PER_DOC: usize = 3;
 const RERANKER_HF_MODEL_PATH: &str = "onnx/model_quantized.onnx";
+// Avoid expensive online transformer graph rewrites on every fresh CLI/MCP
+// process. The ONNX models are shipped pre-quantized; Level1 keeps cheap
+// semantics-preserving cleanup without the high startup cost of Level2/All.
+const ONLINE_MODEL_OPTIMIZATION_LEVEL: GraphOptimizationLevel = GraphOptimizationLevel::Level1;
 
 // SimSIMD's Rust 5.x trait wires `i8::dot` through `simsimd_cos_i8`
 // (cosine distance), which is not what the ranking pipeline expects.
@@ -470,7 +474,7 @@ fn open_write_at(path: &Path) -> Result<Connection> {
 
 /// Reject DBs whose stored `meta.schema_version` doesn't match what this
 /// binary supports. A missing entry is treated as a corrupt/incomplete
-/// install — refuse with a recovery hint rather than silently operating
+/// install â€” refuse with a recovery hint rather than silently operating
 /// on a DB that may be missing required tables/indexes.
 fn enforce_db_schema_version(conn: &Connection) -> Result<()> {
     // [CC-04] DB compatibility is fail-fast; the Rust runtime does not run Python-era migrations.
@@ -765,7 +769,7 @@ struct Hit {
     chunk_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     next_call: Option<String>,
-    /// W2.2 currency markers — only serialised when set so JSON output for
+    /// W2.2 currency markers â€” only serialised when set so JSON output for
     /// in-force docs stays clean.
     #[serde(skip_serializing_if = "Option::is_none")]
     withdrawn_date: Option<String>,
@@ -773,7 +777,7 @@ struct Hit {
     superseded_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     replaces: Option<String>,
-    /// Navigation hint flags — only serialised when set (so a doc with no
+    /// Navigation hint flags â€” only serialised when set (so a doc with no
     /// matching anchors keeps the slim hit clean). `Some(true)` tells the
     /// agent to call `get_doc_anchors(doc_id)` to navigate.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -808,7 +812,7 @@ struct SearchOptions<'a> {
     /// `HARD_MAX_PER_DOC`. NOT exposed in the MCP tool descriptor for
     /// Wave 1 (would inflate the public surface).
     max_per_doc: usize,
-    /// When false, hit serialization omits the `snippet` field — callers
+    /// When false, hit serialization omits the `snippet` field â€” callers
     /// that intend to follow up with `get_chunks` save the BM25-windowed
     /// snippet text and the highlight markup pass.
     include_snippet: bool,
@@ -825,7 +829,7 @@ struct SearchOptions<'a> {
 struct CandidateMeta {
     doc_id: String,
     /// True when this chunk's plaintext is short (< 100 chars) and the
-    /// chunk sits at the start of the document — typically a stub
+    /// chunk sits at the start of the document â€” typically a stub
     /// preamble that crowds out more useful chunks. We approximate "intro"
     /// as ord == 0 with short text, which correctly demotes the leading
     /// stub chunks.
@@ -835,7 +839,7 @@ struct CandidateMeta {
 /// Group candidate `(chunk_id, score)` entries by `doc_id`, demote
 /// intros, and emit at most `max_per_doc` chunks per document until `k`
 /// is reached. Per-document score is the max of the top three chunk
-/// scores within that document. Pure function — no DB access — so it
+/// scores within that document. Pure function â€” no DB access â€” so it
 /// can be tested in isolation.
 fn dedup_per_doc(
     ranked: Vec<VectorHit>,
@@ -899,7 +903,7 @@ fn dedup_per_doc(
     docs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // Single pass: take up to `cap` chunks from each doc in score order
-    // until we hit `k`. We do not back-fill beyond the cap — the user
+    // until we hit `k`. We do not back-fill beyond the cap â€” the user
     // wants per-doc diversity to be a hard constraint, not a soft one.
     // Callers that need more chunks from the same doc should follow up
     // with `get_chunks` / `get_document`.
@@ -945,7 +949,7 @@ fn search(
     let internal_limit = std::cmp::max(k * 5, 50);
     // [MT-16] `similar_to_chunk_id` short-circuits semantic encode: load the seed
     // chunk's stored embedding and use it as the query vector. Force
-    // vector-only mode (no BM25 stage — no real query text to rank against).
+    // vector-only mode (no BM25 stage â€” no real query text to rank against).
     let similar_seed: Option<(i64, [i8; EMBEDDING_DIM])> = match opts.similar_to_chunk_id {
         Some(seed_id) => {
             ensure_vector_search_ready(&conn)?;
@@ -999,9 +1003,9 @@ fn search(
     // few pages is dominated by first-stage recall. Tail candidates retain
     // their RRF order so they can still surface via `next_call` paging or
     // recency sort. Skip rerank when the caller passed
-    // `similar_to_chunk_id` — there's no meaningful query string to use
+    // `similar_to_chunk_id` â€” there's no meaningful query string to use
     // as the rerank pivot.
-    if similar_seed.is_none() {
+    if similar_seed.is_none() && !matches!(effective_mode, SearchMode::Keyword) {
         if let Some(state) = server_state.as_mut() {
         let head_count = rerank_head_count(k, ranked_hits.len());
         if head_count > 0 {
@@ -1062,7 +1066,7 @@ fn search(
         if let Some(hit) = load_hit(&conn, ranked_hit.chunk_id, query, opts.include_snippet)? {
             // First-stage RRF / reranker scores drive `deduped` ordering;
             // we just iterate in that order. Internal scores never reach
-            // the agent — results are presented sorted by relevance.
+            // the agent â€” results are presented sorted by relevance.
             records.push(hit);
         }
     }
@@ -1480,7 +1484,7 @@ impl SemanticRuntime {
 
         let session = Session::builder()
             .map_err(|err| anyhow!("creating ONNX Runtime session: {err}"))?
-            .with_optimization_level(GraphOptimizationLevel::All)
+            .with_optimization_level(ONLINE_MODEL_OPTIMIZATION_LEVEL)
             .map_err(|err| anyhow!("configuring ONNX Runtime session: {err}"))?
             .commit_from_file(model_path()?)
             .map_err(|err| anyhow!("loading ONNX model: {err}"))?;
@@ -1570,7 +1574,7 @@ impl Reranker {
 
         let session = Session::builder()
             .map_err(|err| anyhow!("creating reranker ONNX Runtime session: {err}"))?
-            .with_optimization_level(GraphOptimizationLevel::All)
+            .with_optimization_level(ONLINE_MODEL_OPTIMIZATION_LEVEL)
             .map_err(|err| anyhow!("configuring reranker ONNX Runtime session: {err}"))?
             .commit_from_file(reranker_model_path()?)
             .map_err(|err| anyhow!("loading reranker ONNX model: {err}"))?;
@@ -1683,7 +1687,7 @@ fn extract_rerank_logits(shape: &[i64], data: &[f32], batch: usize) -> Result<Ve
         [b, 1] if *b as usize == batch => Ok(data[..batch].to_vec()),
         [b, d] if *b as usize == batch && *d as usize >= 1 => {
             // Some reranker exports emit `[batch, 2]` (positive/negative
-            // logits). Take the positive class only — index 1 is the
+            // logits). Take the positive class only â€” index 1 is the
             // standard convention for ms-marco rerankers.
             let dims = *d as usize;
             let positive = if dims == 1 { 0 } else { 1 };
@@ -1706,7 +1710,7 @@ enum RerankerState {
     /// `rerank_candidates` call.
     #[default]
     Pending,
-    /// Cross-encoder loaded and ready. Boxed so the enum stays small —
+    /// Cross-encoder loaded and ready. Boxed so the enum stays small â€”
     /// `Reranker` owns an ONNX `Session` and a `Tokenizer`, both of
     /// which are large enough that an unboxed variant would inflate
     /// every `RerankerState` instance.
@@ -1746,7 +1750,7 @@ impl ServerState {
         if env_truthy("ATO_MCP_DISABLE_RERANKER") {
             // Once disabled (via env var or model-load failure), the
             // reranker stays disabled for the rest of this server session
-            // — no per-request retry. Restart the server to re-enable.
+            // â€” no per-request retry. Restart the server to re-enable.
             self.reranker_state = RerankerState::Disabled;
             return Ok(None);
         }
@@ -1754,7 +1758,7 @@ impl ServerState {
             return Ok(Some(Vec::new()));
         }
         // Drive the state machine. We replace `Pending` once and never
-        // again — failed loads stick at `Disabled`.
+        // again â€” failed loads stick at `Disabled`.
         if matches!(self.reranker_state, RerankerState::Pending) {
             let model_present = reranker_model_path().map(|p| p.exists()).unwrap_or(false);
             let tokenizer_present = reranker_tokenizer_path()
@@ -1908,7 +1912,7 @@ fn load_hit(
 }
 
 /// Tokenize a query into the same lowercase word forms used by [`fts_query`]
-/// — short tokens are dropped to match FTS5's behaviour and to keep BM25
+/// â€” short tokens are dropped to match FTS5's behaviour and to keep BM25
 /// from being dominated by stopwords.
 fn snippet_query_terms(query: &str) -> Vec<String> {
     let re = Regex::new(r"[A-Za-z0-9']+(?:-[A-Za-z0-9']+)*").expect("valid regex");
@@ -1921,7 +1925,7 @@ fn snippet_query_terms(query: &str) -> Vec<String> {
 /// Score a window of `window_words` lowercase tokens against `query_terms`
 /// using a self-IDF BM25 (the chunk *is* the corpus). Self-IDF is enough
 /// to rank windows because rare-in-chunk terms are exactly what we want
-/// the snippet to contain — no need to consult the global statistics.
+/// the snippet to contain â€” no need to consult the global statistics.
 fn bm25_score_window(
     window_words: &[&str],
     query_terms: &[String],
@@ -1973,7 +1977,7 @@ fn highlight_snippet(text: &str, query: &str, max_chars: usize) -> String {
     }
     let query_terms = snippet_query_terms(query);
     if query_terms.is_empty() {
-        // No tokens worth ranking against — fall back to the document's
+        // No tokens worth ranking against â€” fall back to the document's
         // opening fragment.
         return trim_chars(&cleaned, max_chars);
     }
@@ -2867,22 +2871,22 @@ fn stats() -> Result<String> {
     Ok(serde_json::to_string_pretty(&payload)?)
 }
 
-/// Per-prefix corpus breakdown — doc_id-prefix counts plus a sample-title
+/// Per-prefix corpus breakdown â€” doc_id-prefix counts plus a sample-title
 /// description. Replaces the hand-maintained prefix-to-doc-type yaml: the only
 /// signal we trust is the corpus itself.
 ///
 /// The description is the leading segment of the first sample title (the part
-/// before ` — ` when present, otherwise the full title), since titles for many
+/// before ` â€” ` when present, otherwise the full title), since titles for many
 /// ATO doc types don't carry a doc-type label at all (cases, sections, etc.).
 fn collect_prefix_breakdown(conn: &rusqlite::Connection) -> Result<Vec<JsonValue>> {
     // Single-pass window function: partition by docid prefix, compute count
     // + pick one representative title per prefix. Replaces N+1 selects that
-    // each ran an UPPER(title) LIKE sort over thousands of rows — that
+    // each ran an UPPER(title) LIKE sort over thousands of rows â€” that
     // pattern stalled MCP `initialize` on large corpora.
     //
     // Title preference: when a prefix has at least one title that doesn't
     // start with the docid form ("EXM ADEBB74A"), prefer the composed one
-    // ("Explanatory Memorandum — …"). Title scan is case-sensitive — ATO
+    // ("Explanatory Memorandum â€” â€¦"). Title scan is case-sensitive â€” ATO
     // docid-form titles are always uppercase, so dropping UPPER() saves a
     // per-row case fold without changing results.
     let mut stmt = conn.prepare(
@@ -2938,7 +2942,7 @@ fn collect_prefix_breakdown(conn: &rusqlite::Connection) -> Result<Vec<JsonValue
     Ok(entries)
 }
 
-/// Take the part before the first ` — ` em-dash separator if present, else the
+/// Take the part before the first ` â€” ` em-dash separator if present, else the
 /// full title. ATO ruling titles use that separator to delimit the citation;
 /// for other doc types the title is already the cleanest description we have.
 fn description_from_title(title: &str) -> String {
@@ -3194,7 +3198,7 @@ fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
 
     ensure_model(&new_manifest, &manifest_context, &staging)?;
     // Reranker is optional and best-effort. Failures here log to stderr
-    // but never abort an otherwise-successful corpus update — search
+    // but never abort an otherwise-successful corpus update â€” search
     // falls back to RRF when the cross-encoder isn't available.
     if new_manifest.reranker.is_some() {
         if let Err(err) = ensure_reranker(&new_manifest, &manifest_context, &staging) {
@@ -3986,9 +3990,9 @@ fn install_hf_embedding_model(repo: &str, revision: &str, staging: &Path) -> Res
 /// if the local files match the manifest's sha256 we skip the download.
 ///
 /// Two download shapes are accepted:
-///   1. `hf://owner/repo[@revision]` — fetch `onnx/model_quantized.onnx` +
+///   1. `hf://owner/repo[@revision]` â€” fetch `onnx/model_quantized.onnx` +
 ///      `tokenizer.json` from the Hugging Face mirror, sha-verify the model.
-///   2. Any other URL — treated as a tar.zst bundle (the EmbeddingGemma
+///   2. Any other URL â€” treated as a tar.zst bundle (the EmbeddingGemma
 ///      pattern). The bundle MUST contain `reranker.onnx` AND
 ///      `reranker_tokenizer.json` at the archive root. The bundle's
 ///      sha256 is verified against `manifest.reranker.sha256`.
@@ -4271,7 +4275,7 @@ fn insert_record(
     )?;
     write_record_assets(conn, record, asset_root)?;
     // Heading text now lives inside chunk.text (rendered inline by the
-    // chunker). title_fts headings column carries an empty string — the
+    // chunker). title_fts headings column carries an empty string â€” the
     // title alone is the BM25 signal.
     conn.execute(
         "INSERT INTO title_fts (doc_id, title, headings) VALUES (?, ?, ?)",
@@ -4953,7 +4957,7 @@ fn get_doc_anchors(doc_id: &str) -> Result<String> {
                             entry.insert("date".to_string(), JsonValue::String(date));
                         }
                         // Fully-qualified URL the agent can WebFetch directly.
-                        // Historical content is not stored locally — agents
+                        // Historical content is not stored locally â€” agents
                         // requesting the older version follow this URL.
                         entry.insert(
                             "url".to_string(),
@@ -4978,7 +4982,7 @@ fn get_doc_anchors(doc_id: &str) -> Result<String> {
         JsonValue::Array(historical_versions),
     );
     response.insert("cited_by".to_string(), JsonValue::Array(cited_by.clone()));
-    // Only surface the total when truncation actually hid citers — keeps
+    // Only surface the total when truncation actually hid citers â€” keeps
     // the wire quiet for the common case where the agent is seeing the
     // whole list.
     if (cited_by_total as usize) > cited_by.len() {
@@ -5002,7 +5006,7 @@ const CITED_BY_LIMIT: usize = 100;
 /// IGNORE-batches into `citations`. Idempotent: clears first.
 ///
 /// Called from `apply_update_locked` so end-user installs stay in sync
-/// after a corpus update — the apply_update path rewrites chunks via
+/// after a corpus update â€” the apply_update path rewrites chunks via
 /// DELETE+INSERT, which cascades through the FK ON DELETE CASCADE on
 /// `citations.source_chunk_id` and wipes the previously-derived rows.
 fn derive_citations(conn: &Connection) -> Result<()> {
@@ -5100,7 +5104,7 @@ fn server_instructions() -> String {
         .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
     {
         Some(s) => format!(
-            "ATO legal corpus. Documents: {}, chunks: {}. Index: {}. Navigate via search → get_chunks: search returns slim hits (chunk_id, doc_id, anchor, optional snippet); get_chunks fetches bodies by chunk_id with before/after ordinal neighbours within the same doc. doc_scope accepts a single full doc_id for in-doc search or \"<PREFIX>/%\" for a family (see stats). Default search excludes Edited_private_advice, withdrawn rulings, and content dated before {} except legislation; override with current_only=false and include_old=true. Pass `similar_to_chunk_id` on search to find chunks semantically close to one you already have (skips query encoding, vector-only, excludes the seed). Slim hits surface has_in_doc_links / has_related_docs / has_history flags when calling get_doc_anchors(doc_id) would yield useful navigation entries. get_doc_anchors also returns `cited_by`: other documents whose chunks carry a [doc:X] marker pointing at the target (capped at 100, ordered by source date DESC, with `cited_by_total` when truncated). Historical (point-in-time) versions of documents are not stored as separate rows; get_doc_anchors lists them as {{doc_id, pit, date, url}} entries so an agent can fetch the older URL externally.",
+            "ATO legal corpus. Documents: {}, chunks: {}. Index: {}. Navigate via search â†’ get_chunks: search returns slim hits (chunk_id, doc_id, anchor, optional snippet); get_chunks fetches bodies by chunk_id with before/after ordinal neighbours within the same doc. doc_scope accepts a single full doc_id for in-doc search or \"<PREFIX>/%\" for a family (see stats). Default search excludes Edited_private_advice, withdrawn rulings, and content dated before {} except legislation; override with current_only=false and include_old=true. Pass `similar_to_chunk_id` on search to find chunks semantically close to one you already have (skips query encoding, vector-only, excludes the seed). Slim hits surface has_in_doc_links / has_related_docs / has_history flags when calling get_doc_anchors(doc_id) would yield useful navigation entries. get_doc_anchors also returns `cited_by`: other documents whose chunks carry a [doc:X] marker pointing at the target (capped at 100, ordered by source date DESC, with `cited_by_total` when truncated). Historical (point-in-time) versions of documents are not stored as separate rows; get_doc_anchors lists them as {{doc_id, pit, date, url}} entries so an agent can fetch the older URL externally.",
             s["documents"].as_i64().unwrap_or(0),
             s["chunks"].as_i64().unwrap_or(0),
             s["index_version"].as_str().unwrap_or("?"),
@@ -5119,7 +5123,7 @@ fn tool_descriptors() -> JsonValue {
     json!([
         {
             "name": "search",
-            "description": "Hybrid semantic+lexical search over chunks (chunk-level). Returns slim pointer hits (chunk_id, doc_id, anchor, optional snippet) — fetch bodies via get_chunks. doc_scope filters by full doc_id (in-doc search) or \"<PREFIX>/%\" (family). mode=keyword forces lexical-only; hybrid/vector require the semantic index. Set include_snippet=false when the caller will follow up with get_chunks. Pass similar_to_chunk_id to find chunks semantically close to one the agent already has (skips query encoding, ignores `query`, forces vector-only mode, filters the seed chunk out of results). Slim hits include navigation hints: has_in_doc_links (doc has paragraph anchors / contents entries — call get_doc_anchors to navigate), has_related_docs (doc has companion documents like errata / addenda), has_history (doc has earlier point-in-time versions — get_doc_anchors lists their URLs).",
+            "description": "Hybrid semantic+lexical search over chunks (chunk-level). Returns slim pointer hits (chunk_id, doc_id, anchor, optional snippet) â€” fetch bodies via get_chunks. doc_scope filters by full doc_id (in-doc search) or \"<PREFIX>/%\" (family). mode=keyword forces lexical-only; hybrid/vector require the semantic index. Set include_snippet=false when the caller will follow up with get_chunks. Pass similar_to_chunk_id to find chunks semantically close to one the agent already has (skips query encoding, ignores `query`, forces vector-only mode, filters the seed chunk out of results). Slim hits include navigation hints: has_in_doc_links (doc has paragraph anchors / contents entries â€” call get_doc_anchors to navigate), has_related_docs (doc has companion documents like errata / addenda), has_history (doc has earlier point-in-time versions â€” get_doc_anchors lists their URLs).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5134,7 +5138,7 @@ fn tool_descriptors() -> JsonValue {
                     "include_old": {"type": "boolean"},
                     "current_only": {"type": "boolean", "description": "When true (default), excludes withdrawn rulings. Set false to include withdrawn material with a visible marker."},
                     "similar_to_chunk_id": {"type": "integer", "description": "When set, use this chunk's stored embedding as the query vector (skips encoding `query`, forces mode=vector, excludes the seed chunk from results)."},
-                    "include_snippet": {"type": "boolean", "description": "When true (default), each hit carries a BM25-windowed snippet. Set false to omit the snippet field entirely — useful when the caller will fetch full text via get_chunks."},
+                    "include_snippet": {"type": "boolean", "description": "When true (default), each hit carries a BM25-windowed snippet. Set false to omit the snippet field entirely â€” useful when the caller will fetch full text via get_chunks."},
                     "format": {"type": "string", "enum": ["json"], "default": "json"}
                 },
                 "required": ["query"]
@@ -5142,7 +5146,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "search_titles",
-            "description": "Title-only search returning doc-level hits (no chunk_id). Use search for chunk-level results. Accepts exact doc_id and ATO document-link lookup. Hits include navigation hints (has_in_doc_links, has_related_docs, has_history) — call get_doc_anchors(doc_id) to navigate.",
+            "description": "Title-only search returning doc-level hits (no chunk_id). Use search for chunk-level results. Accepts exact doc_id and ATO document-link lookup. Hits include navigation hints (has_in_doc_links, has_related_docs, has_history) â€” call get_doc_anchors(doc_id) to navigate.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5158,7 +5162,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_document",
-            "description": "Fetch a full document by doc_id. Default body is plaintext joined from chunks (carries [doc:X] cross-reference and [asset:X] image markers); as_html=true returns cleaned source HTML with data-doc-id and data-asset-ref attributes. Pagination via from_char/max_chars. Prefer search → get_chunks for in-doc reading; this is the full-doc escape hatch.",
+            "description": "Fetch a full document by doc_id. Default body is plaintext joined from chunks (carries [doc:X] cross-reference and [asset:X] image markers); as_html=true returns cleaned source HTML with data-doc-id and data-asset-ref attributes. Pagination via from_char/max_chars. Prefer search â†’ get_chunks for in-doc reading; this is the full-doc escape hatch.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5183,7 +5187,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_doc_anchors",
-            "description": "Return the navigation map for a document: in-doc anchors (paragraph references, contents-table entries), sister documents (errata, addenda, withdrawal notices), historical versions (earlier point-in-time publications), and reverse citations (other documents whose chunks carry a [doc:X] marker pointing AT this doc). Slim search hits surface `has_in_doc_links`, `has_related_docs`, or `has_history` when this tool would return useful entries — call it then to navigate. `in_doc` entries carry chunk_id (pass to get_chunks); `related_docs` carry doc_id (pass to search/get_document/get_chunks); `historical_versions` carry {doc_id, pit, date, url}; `cited_by` carries [{doc_id, title, type, date}] ordered by source date DESC and capped at 100 — when more citers exist, `cited_by_total` reports the full count. The corpus does not store historical content; use the historical-version `url` field with WebFetch to retrieve an older version when needed.",
+            "description": "Return the navigation map for a document: in-doc anchors (paragraph references, contents-table entries), sister documents (errata, addenda, withdrawal notices), historical versions (earlier point-in-time publications), and reverse citations (other documents whose chunks carry a [doc:X] marker pointing AT this doc). Slim search hits surface `has_in_doc_links`, `has_related_docs`, or `has_history` when this tool would return useful entries â€” call it then to navigate. `in_doc` entries carry chunk_id (pass to get_chunks); `related_docs` carry doc_id (pass to search/get_document/get_chunks); `historical_versions` carry {doc_id, pit, date, url}; `cited_by` carries [{doc_id, title, type, date}] ordered by source date DESC and capped at 100 â€” when more citers exist, `cited_by_total` reports the full count. The corpus does not store historical content; use the historical-version `url` field with WebFetch to retrieve an older version when needed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5298,7 +5302,7 @@ mod tests {
         // the snippet helper no longer produces a heading prefix.
         assert!(snippet.contains("R&D"));
         assert!(
-            !snippet.contains(" — "),
+            !snippet.contains(" â€” "),
             "snippet should not carry a heading prefix delimiter, got: {snippet}"
         );
     }
@@ -5770,7 +5774,7 @@ mod tests {
         );
         assert!(!snippet.is_empty(), "snippet should not be empty");
         assert!(
-            !snippet.contains(" — "),
+            !snippet.contains(" â€” "),
             "snippet should not carry a heading prefix, got: {snippet}"
         );
     }
@@ -6008,7 +6012,7 @@ mod tests {
         drop(conn);
 
         with_data_dir(dir.path(), || -> Result<()> {
-            // Default: current_only=true → withdrawn doc filtered out.
+            // Default: current_only=true â†’ withdrawn doc filtered out.
             let json_str = search_titles(
                 "depreciation",
                 10,
@@ -6032,7 +6036,7 @@ mod tests {
                 "withdrawn doc should be filtered out by default; got: {doc_ids:?}"
             );
 
-            // current_only=false → withdrawn doc returned with marker visible
+            // current_only=false â†’ withdrawn doc returned with marker visible
             // in JSON via the dedicated field.
             let json_str = search_titles(
                 "depreciation",
@@ -6294,8 +6298,8 @@ mod tests {
     // Earlier currency-filter tests used the
     // manual `insert_doc_full` seeder, which writes `withdrawn_date` /
     // `superseded_by` / `replaces` directly. The production code path is
-    // `apply_update_locked → insert_docs_from_packs → read_record_from_pack_bytes
-    // → insert_record`, and the bug they didn't catch was: PackRecord didn't
+    // `apply_update_locked â†’ insert_docs_from_packs â†’ read_record_from_pack_bytes
+    // â†’ insert_record`, and the bug they didn't catch was: PackRecord didn't
     // declare those fields, serde silently dropped them, and the INSERT SQL
     // didn't bind them either. End result: every ingested row had NULL
     // currency columns and `current_only=true` never excluded anything.
@@ -6386,7 +6390,7 @@ mod tests {
             length: 0,
         };
 
-        // Production insert path — DO NOT swap for `insert_doc_full`.
+        // Production insert path â€” DO NOT swap for `insert_doc_full`.
         insert_record(
             &conn,
             &withdrawn_record,
@@ -6430,7 +6434,7 @@ mod tests {
         drop(conn);
 
         with_data_dir(dir.path(), || -> Result<()> {
-            // current_only=true (default) → withdrawn doc must be excluded.
+            // current_only=true (default) â†’ withdrawn doc must be excluded.
             // Use Keyword mode so the test doesn't need the embedding model.
             let json_str = search(
                 "depreciation",
@@ -6464,10 +6468,10 @@ mod tests {
             assert!(
                 !doc_ids.contains(&"TR_2018_WITHDRAWN"),
                 "withdrawn doc must be excluded by current_only=true; got: {doc_ids:?} \
-                 — this is the C1 canary: PackRecord lost the currency fields"
+                 â€” this is the C1 canary: PackRecord lost the currency fields"
             );
 
-            // current_only=false → both docs returned, withdrawn one carries
+            // current_only=false â†’ both docs returned, withdrawn one carries
             // its currency markers through the JSON shape.
             let json_str = search(
                 "depreciation",
@@ -6596,9 +6600,9 @@ mod tests {
         insert_doc_with_nav_flags(&conn, "DOC_ANCHORS", 1, 1, 1)?;
         // One chunk to satisfy the in_doc target_chunk_id reference.
         insert_chunk(&conn, 100, "DOC_ANCHORS", 0, "body")?;
-        // Sister and history docs — referenced as targets but only need
+        // Sister and history docs â€” referenced as targets but only need
         // documents rows for FK integrity (doc_anchors.target_doc_id is
-        // not a FK, so unreferenced is fine — but we'll insert anyway).
+        // not a FK, so unreferenced is fine â€” but we'll insert anyway).
         conn.execute(
             "INSERT INTO doc_anchors(doc_id, ord, kind, label, target_chunk_id, target_doc_id, target_pit) VALUES (?, ?, 'in_doc', 'Section A', ?, NULL, NULL)",
             params!["DOC_ANCHORS", 0_i64, 100_i64],
@@ -7175,7 +7179,7 @@ mod tests {
             let result = state.rerank_candidates("q", &candidates)?;
             assert!(result.is_none(), "missing model -> Ok(None)");
             assert!(matches!(state.reranker_state, RerankerState::Disabled));
-            // Second call must NOT re-attempt load — Disabled is sticky.
+            // Second call must NOT re-attempt load â€” Disabled is sticky.
             let result2 = state.rerank_candidates("q", &candidates)?;
             assert!(result2.is_none());
             Ok(())
@@ -7194,7 +7198,7 @@ mod tests {
         let dir = tempdir()?;
         with_data_dir(dir.path(), || -> Result<()> {
             // Plant garbage file contents so the path-exists check passes
-            // but the loader bails — this simulates a corrupted download.
+            // but the loader bails â€” this simulates a corrupted download.
             fs::write(reranker_model_path()?, b"not really an onnx model")?;
             fs::write(reranker_tokenizer_path()?, b"not really a tokenizer json")?;
             let mut state = ServerState::default();
@@ -7233,7 +7237,7 @@ mod tests {
     //
     // env_truthy() is the gate for ATO_MCP_DISABLE_RERANKER. Anything other
     // than the recognised truthy spellings (`1`, `true`, `TRUE`, `yes`,
-    // `YES`, `on`, `ON`) is a no-op — including the empty string, `0`,
+    // `YES`, `on`, `ON`) is a no-op â€” including the empty string, `0`,
     // `false`, and unusual spellings like `True` (mixed-case Python style).
     // A regression here would silently disable the reranker for users who
     // copied an env-var template and left a benign value in place.
@@ -7393,7 +7397,7 @@ mod tests {
     // ----- I3: slim Hit JSON surface ---------------------------------------
     //
     // The slim Hit contract (MT-04 + MT-04-slim) hides internal scoring from
-    // the agent — no `score`, no `ord`, no `ranking` block, no
+    // the agent â€” no `score`, no `ord`, no `ranking` block, no
     // `reranker_score`. Pins the JSON shape so a future refactor can't
     // reintroduce internal-metric leakage.
 
@@ -7435,7 +7439,7 @@ mod tests {
     // ----- I3: dedup behaviour at the mixed-scale boundary ------------------
     //
     // The dedup pass picks the BEST chunk per doc, where "best" means the
-    // single highest score — there is no tail-sum aggregation. This test
+    // single highest score â€” there is no tail-sum aggregation. This test
     // pins that contract: a doc with one barely-positive head chunk must
     // still beat a doc with multiple weaker tail chunks, IFF that head
     // chunk's individual score is higher than every tail chunk's individual
@@ -7450,14 +7454,14 @@ mod tests {
     //   - per-doc max selection produces deterministic ordering
     //
     // If a future implementation adds tail-sum aggregation, this test will
-    // still pass (the strong head doc still wins on max) — that's correct
+    // still pass (the strong head doc still wins on max) â€” that's correct
     // and intentional. If a future change instead capriciously promotes
     // weak head over strong tail, this catches it at the boundary.
 
     #[test]
     fn reranker_dedup_handles_mixed_scale_boundary() {
         // Build 50 strong head hits across 10 docs (5 chunks per doc),
-        // sigmoid scores in [0.30, 0.95] descending — interleaved so doc
+        // sigmoid scores in [0.30, 0.95] descending â€” interleaved so doc
         // ordering isn't a sort-stable accident.
         let mut hits: Vec<VectorHit> = Vec::with_capacity(60);
         for i in 0..50 {
@@ -7504,7 +7508,7 @@ mod tests {
         }
 
         // Frontier 11 (just enough to cover the 10 head docs + the tail
-        // doc). max_per_doc=1 so each doc contributes exactly one chunk —
+        // doc). max_per_doc=1 so each doc contributes exactly one chunk â€”
         // confirming each head doc earns its slot via per-doc max, and the
         // weak tail doc still appears LAST despite having more candidate
         // chunks than any individual head doc.
@@ -7543,7 +7547,7 @@ mod tests {
         assert!(
             pos >= 10,
             "DOC_TAIL_ONLY should rank below all 10 head docs; \
-             got position {pos}/{} — implementation may have started \
+             got position {pos}/{} â€” implementation may have started \
              promoting weak-head over strong-tail (regression)",
             deduped.len()
         );
@@ -7620,7 +7624,7 @@ mod tests {
         let m = sample_manifest(3, "0.6.0");
         assert!(m.reranker.is_none());
         let json_str = serde_json::to_string(&m)?;
-        // skip_serializing_if drops the key entirely when None — Python
+        // skip_serializing_if drops the key entirely when None â€” Python
         // side relies on this so v2 manifests round-trip identically.
         assert!(
             !json_str.contains("reranker"),
@@ -7644,7 +7648,7 @@ mod tests {
     #[test]
     fn extract_rerank_logits_picks_positive_class_for_two_class_output() {
         // Some MS-MARCO exports emit `[batch, 2]` (negative, positive).
-        // We must take index 1 — the positive class.
+        // We must take index 1 â€” the positive class.
         let logits = extract_rerank_logits(&[2, 2], &[0.1, 0.9, 0.2, 0.8], 2).unwrap();
         assert_eq!(logits, vec![0.9, 0.8]);
     }
@@ -7663,7 +7667,7 @@ mod tests {
     }
 
     /// Integration test: actually load the reranker model and score a
-    /// small batch. Skipped automatically when no model is installed —
+    /// small batch. Skipped automatically when no model is installed â€”
     /// CI without a reranker bundle will simply log "skipped" rather
     /// than fail.
     #[test]
@@ -7826,7 +7830,7 @@ mod tests {
     #[test]
     fn test_get_doc_anchors_cited_by_empty_when_no_table() -> Result<()> {
         // Older corpora that predate the citations table should degrade
-        // gracefully — `cited_by` is just an empty array.
+        // gracefully â€” `cited_by` is just an empty array.
         let _lock = TEST_DB_LOCK.lock().unwrap();
         let (dir, _db) = make_test_db()?;
         let conn = open_write_at(&dir.path().join("live/ato.db"))?;
@@ -7935,6 +7939,6 @@ mod tests {
     }
 
     // Tests that touch the global data dir env var cannot run in
-    // parallel — serialise them through a single mutex.
+    // parallel â€” serialise them through a single mutex.
     static TEST_DB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
