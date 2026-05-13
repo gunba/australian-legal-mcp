@@ -53,9 +53,9 @@ fn start_daemon(data_dir: &std::path::Path) -> Result<Daemon> {
         .ok_or_else(|| anyhow!("http.json missing port"))?;
     let url = format!("http://127.0.0.1:{port}/mcp");
 
-    // Spawn `serve`, capture stderr, and wait for the readiness line.
+    // Spawn `daemon`, capture stderr, and wait for the readiness line.
     let mut child = Command::new(bin_path())
-        .arg("serve")
+        .arg("daemon")
         .env("ATO_MCP_DATA_DIR", data_dir)
         // Don't let the daemon try to phone home for an update banner — it
         // would add latency and external dep on github.com.
@@ -63,7 +63,7 @@ fn start_daemon(data_dir: &std::path::Path) -> Result<Daemon> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .context("spawning serve")?;
+        .context("spawning daemon")?;
 
     let stderr = child
         .stderr
@@ -78,7 +78,7 @@ fn start_daemon(data_dir: &std::path::Path) -> Result<Daemon> {
         if n == 0 {
             // EOF before readiness — daemon crashed.
             let _ = child.wait();
-            return Err(anyhow!("serve exited before emitting readiness line"));
+            return Err(anyhow!("daemon exited before emitting readiness line"));
         }
         if line.contains(&needle) {
             break;

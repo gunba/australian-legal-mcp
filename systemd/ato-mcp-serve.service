@@ -1,10 +1,10 @@
 [Unit]
-Description=ATO MCP server (HTTP transport)
+Description=ATO MCP server (HTTP daemon)
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/ato-mcp serve
+ExecStart=%h/.local/bin/ato-mcp daemon
 Restart=on-failure
 RestartSec=5
 

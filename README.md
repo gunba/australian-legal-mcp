@@ -54,13 +54,17 @@ and no Python is needed for end users. The flow is:
    directory on `%PATH%`.
 
 3. **Wire `ato-mcp serve` into your MCP client** (Claude Code / Claude
-   Desktop / Cursor / Continue / any HTTP MCP host — see next section).
-   `ato-mcp` is an HTTP MCP server: one long-lived daemon, every client
-   session connects over `127.0.0.1`. On first use, the MCP server tells
-   the assistant that the corpus has not been installed yet and asks the
-   user to run `ato-mcp update` in their terminal. The download is ~4 GB
-   and takes 1–10 minutes on a typical home connection (longer behind a
-   corporate proxy — see
+   Desktop / Cursor / Codex / Continue / any stdio MCP host — see next
+   section). `ato-mcp serve` is a thin stdio shim: on first launch it
+   auto-spawns the persistent HTTP daemon in the background, then proxies
+   stdin/stdout to it. Every subsequent MCP session reuses the same
+   daemon, so the embedding model and corpus index only load once across
+   the whole machine. There is no daemon to start manually and no port
+   to remember. On first use, the MCP server tells the assistant that
+   the corpus has not been installed yet and asks the user to run
+   `ato-mcp update` in their terminal. The download is ~4 GB and takes
+   1–10 minutes on a typical home connection (longer behind a corporate
+   proxy — see
    [Enterprise / corporate environments](#enterprise--corporate-environments)).
    After it completes, restart the MCP client so it picks up the new
    corpus.
@@ -117,39 +121,68 @@ consume pre-built corpus releases from GitHub.
 
 ## Wire Into MCP Clients
 
-`ato-mcp` runs as an HTTP MCP server on `127.0.0.1`. Pick a free port
-once with `install-http`, then point your MCP client at the resulting
-URL.
-
-```bash
-ato-mcp install-http
-# Prints something like:
-#   ato-mcp will listen on http://127.0.0.1:51234/mcp
-#   Config written to ~/.local/share/ato-mcp/http.json
-#
-#   Claude Code:
-#     claude mcp add --scope user --transport http ato http://127.0.0.1:51234/mcp
-#
-#   Claude Desktop (claude_desktop_config.json):
-#     { "mcpServers": { "ato": { "type": "http", "url": "http://127.0.0.1:51234/mcp" } } }
-#
-#   Start the daemon with: ato-mcp serve
-```
-
-Start the daemon and leave it running. On Linux the included
-`systemd/ato-mcp-serve.service` keeps it alive across logins
-(`cp systemd/ato-mcp-serve.service ~/.config/systemd/user/ &&
-systemctl --user enable --now ato-mcp-serve`). On Windows, run
-`ato-mcp serve` from the Startup folder or via Task Scheduler at logon.
+`ato-mcp serve` is a stdio MCP entry point — the same shape Claude
+Code, Cursor, Codex, and Continue expect. Internally it's a thin shim
+that auto-launches a persistent HTTP daemon in the background and
+proxies stdin/stdout to it. The first MCP session on the machine spawns
+the daemon; every subsequent session reuses it. There is nothing to
+start manually and no port to configure.
 
 Claude Code:
 
 ```bash
-claude mcp add --scope user --transport http ato http://127.0.0.1:51234/mcp
+claude mcp add --scope user ato -- ato-mcp serve
 claude mcp list
 ```
 
 Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "ato": {
+      "command": "ato-mcp",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+Codex (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.ato]
+command = "ato-mcp"
+args = ["serve"]
+```
+
+Cursor, Continue, and other stdio MCP clients use the same command.
+
+The shim handles daemon lifecycle automatically:
+
+- First `ato-mcp serve` call picks a free port in the ephemeral range,
+  persists it to `~/.local/share/ato-mcp/http.json` (macOS:
+  `~/Library/Application Support/ato-mcp/http.json`; Windows:
+  `%APPDATA%\ato-mcp\http.json`), and spawns the HTTP daemon detached
+  from the shim process.
+- Subsequent shims detect the live daemon and proxy to it directly.
+- If the daemon dies, the next request transparently re-spawns it.
+- Concurrent shim launches are serialised through
+  `<data_dir>/spawn.lock` so two parallel sessions don't race the bind.
+
+For the always-on systemd / launchd shape, see `systemd/README.md` —
+that lets the daemon come up at login so the first MCP request never
+pays spawn cost. It's optional; the shim works the same without it.
+
+### Advanced: connect directly over HTTP
+
+Power users who want to bypass the shim (for example, an MCP client
+that natively speaks Streamable HTTP, or a remote tunnel) can talk to
+the daemon directly. Pick or read the port and point the client at it:
+
+```bash
+ato-mcp install-http                    # prints the URL and config block
+```
 
 ```json
 {
@@ -162,15 +195,11 @@ Claude Desktop:
 }
 ```
 
-Cursor, Continue, and other HTTP MCP clients use the same URL. The port
-is chosen once at install time and persisted to
-`~/.local/share/ato-mcp/http.json` (macOS:
-`~/Library/Application Support/ato-mcp/http.json`; Windows:
-`%APPDATA%\ato-mcp\http.json`). To pick a new port, re-run
-`ato-mcp install-http --port <free-port>`.
+In this mode you also need the daemon running independently — either
+`ato-mcp daemon` in a terminal or the systemd unit.
 
 `serve` starts immediately from whatever local corpus is present and never
-downloads on the MCP hot path, so it cannot trip MCP client connect timeouts
+downloads on the MCP hot path, so it cannot trip stdio client spawn timeouts
 on slow or TLS-inspecting corporate networks. When a newer corpus index has
 been published, the server tells the assistant via `initialize` instructions
 and the assistant asks the user to run `ato-mcp update`. `ATO_MCP_OFFLINE=1`

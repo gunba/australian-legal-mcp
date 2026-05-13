@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use simsimd::SpatialSimilarity as _;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Cursor, Read};
+use std::io::{BufRead, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -97,8 +97,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the MCP HTTP server (long-lived daemon).
+    /// stdio MCP shim. Auto-spawns the HTTP daemon on first use and proxies
+    /// stdin/stdout to it. This is what MCP clients (Claude Code, Cursor, …)
+    /// launch — no manual daemon management required.
     Serve {},
+    /// Run the long-lived HTTP MCP daemon directly. Bypasses the stdio
+    /// shim — use this for systemd / launchd / Scheduled Task setups, or
+    /// when an MCP client connects over HTTP transport.
+    Daemon {},
     /// Pick a port and persist HTTP config; prints the MCP client config to paste.
     InstallHttp {
         /// Override the auto-picked port (rare).
@@ -212,14 +218,15 @@ impl SearchMode {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve {} => {
+        Command::Serve {} => serve_stdio_shim(),
+        Command::Daemon {} => {
             let state = ServerState {
                 update_notice: check_for_update_availability(&default_manifest_url())
                     .ok()
                     .flatten(),
                 ..Default::default()
             };
-            serve(Arc::new(state))
+            daemon(Arc::new(state))
         }
         Command::InstallHttp { port, quiet } => install_http(port, !quiet),
         Command::Update { manifest_url } => {
@@ -410,6 +417,40 @@ impl HttpConfig {
         let cfg: Self = serde_json::from_str(&raw)
             .with_context(|| format!("parsing {}", p.display()))?;
         Ok(Some(cfg))
+    }
+
+    /// Return the existing config or pick a free port and persist a new one.
+    /// Used by both the shim (auto-init on first run) and the daemon itself
+    /// so the user never has to call `install-http` for the auto-managed
+    /// path to work. Serialised against concurrent creators via the spawn
+    /// lock so two parallel shims don't write conflicting ports.
+    fn load_or_init() -> Result<Self> {
+        if let Some(cfg) = Self::load()? {
+            return Ok(cfg);
+        }
+        let lock_path = spawn_lock_path()?;
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("opening {}", lock_path.display()))?;
+        lock_file
+            .lock_exclusive()
+            .with_context(|| format!("locking {}", lock_path.display()))?;
+        // Re-check after acquiring the lock — another writer may have
+        // initialised the config while we were waiting.
+        if let Some(cfg) = Self::load()? {
+            return Ok(cfg);
+        }
+        let cfg = Self {
+            bind: "127.0.0.1".to_string(),
+            port: pick_free_port()?,
+        };
+        cfg.save()?;
+        drop(lock_file);
+        Ok(cfg)
     }
 
     fn save(&self) -> Result<()> {
@@ -4384,15 +4425,214 @@ fn decode_embedding_b64(value: &str) -> Result<Vec<u8>> {
     Ok(embedding)
 }
 
-fn serve(state: Arc<ServerState>) -> Result<()> {
-    let cfg = HttpConfig::load()?.ok_or_else(|| {
-        anyhow!(
-            "HTTP config not found at {}. Run `ato-mcp install-http` first to pick a port.",
-            http_config_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "<data dir>/http.json".to_string())
-        )
-    })?;
+fn spawn_lock_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("spawn.lock"))
+}
+
+fn daemon_log_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("daemon.log"))
+}
+
+/// Cheap liveness check — returns true iff a request to the configured URL
+/// gets a JSON-RPC parse error back (i.e. the daemon is up and willing to
+/// reject malformed bodies). Any HTTP success on /mcp signals a live daemon
+/// because the endpoint always responds to POSTs.
+fn ping_daemon(url: &str) -> bool {
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    client
+        .post(url)
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+/// Spawn `ato-mcp daemon` as a detached background process and block until
+/// it prints its readiness line on stderr. The child:
+///   * runs in its own process group / detached so SIGINT to the shim doesn't kill it
+///   * inherits no stdin/stdout (null), so it survives shim teardown
+///   * pipes stderr to us only for the readiness handshake; afterwards we
+///     drain the rest into the daemon log file on a background thread so the
+///     pipe never fills and the daemon keeps running.
+fn spawn_daemon_detached(cfg: &HttpConfig) -> Result<()> {
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe().context("locating ato-mcp binary")?;
+    let mut cmd = Command::new(&exe);
+    cmd.arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    // Detach so the child survives the shim's exit and isn't in our process
+    // group (so Ctrl-C / SIGTERM to the shim doesn't propagate).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS = 0x00000008
+        cmd.creation_flags(0x00000008);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawning {}", exe.display()))?;
+
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("daemon stderr not captured"))?;
+    let needle = format!("listening on {}", cfg.url());
+    let mut reader = std::io::BufReader::new(stderr);
+    let mut line = String::new();
+    let mut early_lines = String::new();
+    loop {
+        line.clear();
+        let n = reader
+            .read_line(&mut line)
+            .context("reading daemon readiness")?;
+        if n == 0 {
+            // Daemon exited before readiness. Try to surface what it said.
+            let _ = child.wait();
+            if early_lines.is_empty() {
+                bail!("daemon exited before becoming ready");
+            }
+            bail!("daemon exited before becoming ready: {}", early_lines.trim());
+        }
+        if line.contains(&needle) {
+            break;
+        }
+        early_lines.push_str(&line);
+    }
+
+    // Daemon is up. Drain the rest of its stderr into the log file on a
+    // background thread so the pipe buffer never fills.
+    if let Ok(log_path) = daemon_log_path() {
+        std::thread::spawn(move || {
+            if let Ok(mut log) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = reader.get_mut().read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    let _ = log.write_all(&buf[..n]);
+                }
+            }
+        });
+    }
+
+    // We intentionally drop `child` here so the OS reparents it; the
+    // detached process keeps running.
+    std::mem::forget(child);
+    Ok(())
+}
+
+/// Ensure a daemon is running at the configured URL, spawning one if not.
+/// Serialised across concurrent shim invocations via an exclusive file lock
+/// so two parallel sessions don't race on the bind.
+fn ensure_daemon_running(cfg: &HttpConfig) -> Result<()> {
+    if ping_daemon(&cfg.url()) {
+        return Ok(());
+    }
+    let lock_path = spawn_lock_path()?;
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+    lock_file
+        .lock_exclusive()
+        .with_context(|| format!("locking {}", lock_path.display()))?;
+    // Recheck after acquiring the lock — another shim may have spawned the
+    // daemon while we were waiting for the lock.
+    if !ping_daemon(&cfg.url()) {
+        spawn_daemon_detached(cfg)?;
+    }
+    // Lock releases on drop.
+    drop(lock_file);
+    Ok(())
+}
+
+/// MCP stdio shim: zero-config front-end that auto-starts the HTTP daemon
+/// and proxies stdin/stdout to it. This is what MCP clients launch — they
+/// never see HTTP, the daemon, or its port; the user never starts anything
+/// manually.
+fn serve_stdio_shim() -> Result<()> {
+    let cfg = HttpConfig::load_or_init()?;
+    ensure_daemon_running(&cfg)?;
+
+    let url = cfg.url();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .context("building HTTP client")?;
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let response = match post_to_daemon(&client, &url, &line) {
+            Ok(r) => r,
+            Err(_) => {
+                // Daemon may have died mid-session. Try once to bring it
+                // back and retry the request.
+                ensure_daemon_running(&cfg)?;
+                post_to_daemon(&client, &url, &line)?
+            }
+        };
+        if let Some(body) = response {
+            stdout.write_all(body.as_bytes())?;
+            stdout.write_all(b"\n")?;
+            stdout.flush()?;
+        }
+    }
+    Ok(())
+}
+
+fn post_to_daemon(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    body: &str,
+) -> Result<Option<String>> {
+    let resp = client
+        .post(url)
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()?;
+    let status = resp.status();
+    if status.as_u16() == 204 {
+        // Notification — no body to forward.
+        return Ok(None);
+    }
+    let text = resp.text()?;
+    if !status.is_success() {
+        bail!("daemon returned HTTP {status}: {text}");
+    }
+    Ok(Some(text))
+}
+
+fn daemon(state: Arc<ServerState>) -> Result<()> {
+    let cfg = HttpConfig::load_or_init()?;
     let addr = format!("{}:{}", cfg.bind, cfg.port);
     let server = tiny_http::Server::http(&addr).map_err(|e| {
         anyhow!(

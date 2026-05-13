@@ -6,19 +6,27 @@ required.
 
 ## Run the MCP daemon
 
-`ato-mcp` is an HTTP MCP server: one long-lived process, every Claude
-session connects over localhost. Pick a port and start the daemon:
+`ato-mcp` ships as a one-process design: the daemon runs the HTTP MCP
+server, and the `ato-mcp serve` stdio shim that MCP clients launch
+auto-spawns it on first use. You don't have to run anything yourself
+unless you want the daemon up before any client connects.
+
+Most users can skip this section entirely — Claude Code / Cursor /
+Codex launch `ato-mcp serve` themselves and the shim handles
+everything.
+
+If you want the daemon up at login (faster first-request latency, no
+spawn during MCP startup), install the service unit:
 
 ```bash
-ato-mcp install-http              # picks a free port, prints the MCP config
 cp ato-mcp-serve.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now ato-mcp-serve.service
 systemctl --user status ato-mcp-serve.service
 ```
 
-`install-http` writes `~/.local/share/ato-mcp/http.json` and prints the
-exact URL to paste into your Claude Code / Claude Desktop MCP config.
+The daemon picks a free port the first time it (or the shim) runs and
+persists it to `~/.local/share/ato-mcp/http.json`.
 
 ## End-user install (pulls the latest release weekly)
 
