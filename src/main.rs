@@ -173,6 +173,16 @@ enum Command {
         #[arg(long)]
         from_char: Option<usize>,
     },
+    /// Fetch a document from ATO's live website and print its text.
+    FetchExternalDoc {
+        doc_id: String,
+        #[arg(long)]
+        pit: Option<String>,
+        #[arg(long)]
+        view: Option<String>,
+        #[arg(long, default_value_t = false)]
+        as_html: bool,
+    },
     /// Fetch compact statutory definitions for a term.
     GetDefinition {
         term: String,
@@ -335,6 +345,18 @@ fn main() -> Result<()> {
                         max_defs,
                     },
                 )?
+            );
+            Ok(())
+        }
+        Command::FetchExternalDoc {
+            doc_id,
+            pit,
+            view,
+            as_html,
+        } => {
+            println!(
+                "{}",
+                fetch_external_doc(&doc_id, pit.as_deref(), view.as_deref(), as_html)?
             );
             Ok(())
         }
@@ -2379,9 +2401,12 @@ fn get_document(doc_id: &str, opts: GetDocumentOptions) -> Result<String> {
     let Some(doc) = doc else {
         return Ok(format!(
             "_Document `{}` is not in the local corpus._\n\n\
-             The ATO addresses it at <{}>. If a `[doc:X]` marker in chunk text \
-             points at an id we don't index (subdivisions, paragraph-level refs, \
-             footnote pointers, etc.), fetch that URL from the web instead.",
+             Call `fetch_external_doc(doc_id=\"{}\")` to retrieve it from \
+             ATO's live website (<{}>). `[doc:X]` markers in chunk text \
+             frequently point at ids the corpus doesn't index — subdivisions, \
+             paragraph-level refs, footnote pointers, historical PiT views — \
+             and fetch_external_doc is how you follow them.",
+            doc_id,
             doc_id,
             canonical_url(doc_id),
         ));
@@ -2465,6 +2490,329 @@ fn format_document_response(
         "text": slice,
         "meta": meta,
     }))?)
+}
+
+// ----- External fetch (live ATO scrape) -----
+//
+// Ported subset of src/ato_mcp/indexer/extract.py: pick_container, strip_noise,
+// strip_history_ui_controls, html_to_text. Used at runtime to follow [doc:X]
+// markers whose target id isn't in the local corpus (subdivisions, paragraph
+// refs, footnote pointers, historical PiT views). The full Python pipeline
+// remains the build-time path; this is the minimum-viable subset that returns
+// legible plain text to an agent.
+
+const ATO_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+const ATO_USER_AGENT: &str = concat!(
+    "Mozilla/5.0 (compatible; ato-mcp/",
+    env!("CARGO_PKG_VERSION"),
+    "; +https://github.com/gunba/ato-mcp)"
+);
+// Containers ATO has used over the years. First match wins; falls back to
+// <main>/<body> if none match. Mirrors extract.py:_pick_container.
+const ATO_CONTAINER_SELECTORS: &[&str] = &[
+    "#LawContent",
+    "#lawContents",
+    "#LawContents",
+    "#contents",
+];
+// Strip these wholesale before any text extraction. Mirrors extract.py:_strip_noise.
+const ATO_NOISE_SELECTORS: &[&str] = &[
+    "script",
+    "style",
+    "noscript",
+    "template",
+    "nav",
+    "#LawMiniMenuHeader",
+    ".minimenu",
+    ".minimenu-bar",
+];
+// History-toggle UI labels — case-insensitive match on text-node content and
+// img title/alt attributes. Mirrors extract.py:_HISTORY_UI_LABELS.
+const ATO_HISTORY_UI_LABELS: &[&str] = &[
+    "view history note",
+    "hide history note",
+    "view history reference",
+    "hide history reference",
+];
+
+fn fetch_external_doc(
+    doc_id: &str,
+    pit: Option<&str>,
+    view: Option<&str>,
+    as_html: bool,
+) -> Result<String> {
+    let mut url = format!(
+        "https://www.ato.gov.au/law/view/document?docid={}",
+        doc_id
+    );
+    if let Some(p) = pit.filter(|s| !s.is_empty()) {
+        url.push_str(&format!("&PiT={}", p));
+    }
+    if let Some(v) = view.filter(|s| !s.is_empty()) {
+        url.push_str(&format!("&db={}", v));
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(ATO_USER_AGENT)
+        .timeout(ATO_FETCH_TIMEOUT)
+        // ATO's public URL bounces some doc forms (subdivisions, division
+        // index pages) to an internal hostname we can't resolve. Disable
+        // automatic redirect-following so we can detect this and report
+        // cleanly rather than failing with a confusing DNS error.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("building HTTP client")?;
+    let resp = client
+        .get(&url)
+        .send()
+        .with_context(|| format!("fetching {url}"))?;
+    let status = resp.status();
+    if status.is_redirection() {
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("<unknown>")
+            .to_string();
+        bail!(
+            "ATO redirected `{}` to `{}` — that target is on ATO's internal \
+             SPA and is not directly fetchable from outside their network. \
+             Try a more specific id (e.g. an indexed section) or search the \
+             local corpus for the surrounding context instead.",
+            url,
+            location
+        );
+    }
+    if !status.is_success() {
+        bail!("ATO returned HTTP {status} for {url}");
+    }
+    let html = resp.text().context("reading response body")?;
+    let cleaned = clean_ato_html(&html);
+    if cleaned.html.trim().is_empty() {
+        bail!(
+            "no content container found in ATO response for {url} — page \
+             structure may have changed"
+        );
+    }
+    if as_html {
+        Ok(serde_json::to_string_pretty(&json!({
+            "doc_id": doc_id,
+            "canonical_url": url,
+            "html": cleaned.html,
+            "title": cleaned.title,
+        }))?)
+    } else {
+        Ok(serde_json::to_string_pretty(&json!({
+            "doc_id": doc_id,
+            "canonical_url": url,
+            "text": cleaned.text,
+            "title": cleaned.title,
+        }))?)
+    }
+}
+
+struct CleanedAtoDoc {
+    html: String,
+    text: String,
+    title: Option<String>,
+}
+
+fn clean_ato_html(html: &str) -> CleanedAtoDoc {
+    use scraper::{Html, Selector};
+
+    let doc = Html::parse_document(html);
+
+    // Browser tab title (for hint / display).
+    let title_selector = Selector::parse("title").unwrap();
+    let raw_title = doc
+        .select(&title_selector)
+        .next()
+        .map(|n| n.text().collect::<String>());
+    let title = raw_title.map(|t| normalise_ws(&t)).filter(|t| !t.is_empty());
+
+    // Pick container — first match wins; fallback to <main> then <body>.
+    let container_html = pick_container_html(&doc);
+    let Some(container_html) = container_html else {
+        return CleanedAtoDoc {
+            html: String::new(),
+            text: String::new(),
+            title,
+        };
+    };
+
+    // Re-parse the picked container so we can strip noise within just that subtree.
+    let mut subdoc = Html::parse_fragment(&container_html);
+    strip_noise(&mut subdoc);
+    strip_history_ui_controls(&mut subdoc);
+
+    let cleaned_html = subdoc.root_element().html();
+    let cleaned_text = subtree_text(&subdoc);
+    CleanedAtoDoc {
+        html: cleaned_html,
+        text: cleaned_text,
+        title,
+    }
+}
+
+fn pick_container_html(doc: &scraper::Html) -> Option<String> {
+    use scraper::Selector;
+    for sel_str in ATO_CONTAINER_SELECTORS {
+        if let Ok(sel) = Selector::parse(sel_str) {
+            if let Some(node) = doc.select(&sel).next() {
+                return Some(node.html());
+            }
+        }
+    }
+    for sel_str in &["main", "body"] {
+        if let Ok(sel) = Selector::parse(sel_str) {
+            if let Some(node) = doc.select(&sel).next() {
+                return Some(node.html());
+            }
+        }
+    }
+    None
+}
+
+fn strip_noise(doc: &mut scraper::Html) {
+    use ego_tree::NodeId;
+    use scraper::Selector;
+    let mut to_remove: Vec<NodeId> = Vec::new();
+    for sel_str in ATO_NOISE_SELECTORS {
+        if let Ok(sel) = Selector::parse(sel_str) {
+            for el in doc.select(&sel) {
+                to_remove.push(el.id());
+            }
+        }
+    }
+    for id in to_remove {
+        if let Some(mut node) = doc.tree.get_mut(id) {
+            node.detach();
+        }
+    }
+}
+
+fn strip_history_ui_controls(doc: &mut scraper::Html) {
+    use ego_tree::NodeId;
+    use scraper::{Node as ScraperNode, Selector};
+
+    // Pass 1: strip <img> whose title or alt matches a history-UI label.
+    let img_sel = Selector::parse("img").unwrap();
+    let mut img_remove: Vec<NodeId> = Vec::new();
+    for el in doc.select(&img_sel) {
+        let val = el.value();
+        let title = val.attr("title").unwrap_or("").trim().to_lowercase();
+        let alt = val.attr("alt").unwrap_or("").trim().to_lowercase();
+        if ATO_HISTORY_UI_LABELS.iter().any(|l| *l == title || *l == alt) {
+            img_remove.push(el.id());
+        }
+    }
+    for id in img_remove {
+        if let Some(mut node) = doc.tree.get_mut(id) {
+            node.detach();
+        }
+    }
+
+    // Pass 2: strip text nodes whose content is exactly a history-UI label.
+    let mut text_remove: Vec<NodeId> = Vec::new();
+    for node_ref in doc.tree.nodes() {
+        if let ScraperNode::Text(text) = node_ref.value() {
+            let trimmed = text.trim().to_lowercase();
+            if ATO_HISTORY_UI_LABELS.iter().any(|l| *l == trimmed) {
+                text_remove.push(node_ref.id());
+            }
+        }
+    }
+    for id in text_remove {
+        if let Some(mut node) = doc.tree.get_mut(id) {
+            node.detach();
+        }
+    }
+}
+
+/// Walk the cleaned tree and emit a paragraph-aware plain-text rendering.
+/// Block-level tags introduce newlines; inline tags don't. Whitespace is
+/// collapsed within paragraphs but paragraph breaks are preserved so the
+/// agent gets legible structure (not a single wall of text and not a
+/// noisy soup of stray line breaks from inline elements).
+fn subtree_text(doc: &scraper::Html) -> String {
+    use scraper::Node as ScraperNode;
+    const BLOCK_TAGS: &[&str] = &[
+        "p", "div", "section", "article", "header", "footer", "main", "aside",
+        "table", "tr", "thead", "tbody", "tfoot", "td", "th", "caption",
+        "ul", "ol", "li", "dl", "dt", "dd",
+        "h1", "h2", "h3", "h4", "h5", "h6",
+        "hr", "br", "pre", "blockquote",
+    ];
+    let mut buf = String::new();
+    fn walk(node: ego_tree::NodeRef<scraper::Node>, buf: &mut String, block_tags: &[&str]) {
+        match node.value() {
+            ScraperNode::Text(t) => {
+                buf.push_str(&t.text);
+            }
+            ScraperNode::Element(el) => {
+                let tag = el.name();
+                let is_block = block_tags.contains(&tag);
+                if is_block && !buf.ends_with('\n') && !buf.is_empty() {
+                    buf.push('\n');
+                }
+                for child in node.children() {
+                    walk(child, buf, block_tags);
+                }
+                if is_block && !buf.ends_with('\n') {
+                    buf.push('\n');
+                }
+            }
+            _ => {
+                for child in node.children() {
+                    walk(child, buf, block_tags);
+                }
+            }
+        }
+    }
+    for root_child in doc.tree.root().children() {
+        walk(root_child, &mut buf, BLOCK_TAGS);
+    }
+    normalise_paragraph_breaks(&buf)
+}
+
+fn normalise_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_ws = true;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !prev_ws {
+                out.push(' ');
+            }
+            prev_ws = true;
+        } else {
+            out.push(c);
+            prev_ws = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn normalise_paragraph_breaks(s: &str) -> String {
+    // Within each line, collapse runs of whitespace to one space.
+    // Between lines, allow at most one blank line.
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut last_blank = false;
+    for line in s.split('\n') {
+        let collapsed = normalise_ws(line);
+        if collapsed.is_empty() {
+            if !last_blank && !out_lines.is_empty() {
+                out_lines.push(String::new());
+            }
+            last_blank = true;
+        } else {
+            out_lines.push(collapsed);
+            last_blank = false;
+        }
+    }
+    while out_lines.last().is_some_and(|l| l.is_empty()) {
+        out_lines.pop();
+    }
+    out_lines.join("\n")
 }
 
 #[derive(Debug, Serialize)]
@@ -4890,6 +5238,15 @@ fn call_tool(params: JsonValue, state: &ServerState) -> Result<JsonValue> {
             )?
         }
         "stats" => stats()?,
+        "fetch_external_doc" => {
+            let doc_id = required_str(&args, "doc_id")?;
+            fetch_external_doc(
+                doc_id,
+                args.get("pit").and_then(|v| v.as_str()),
+                args.get("view").and_then(|v| v.as_str()),
+                optional_bool(&args, "as_html").unwrap_or(false),
+            )?
+        }
         _ => bail!("unknown tool: {name}"),
     };
     Ok(json!({
@@ -5648,6 +6005,20 @@ fn tool_descriptors() -> JsonValue {
                 "properties": {
                     "format": {"type": "string", "enum": ["json"], "default": "json"}
                 }
+            }
+        },
+        {
+            "name": "fetch_external_doc",
+            "description": "Fetch a document FROM ATO's live website by doc_id and return its cleaned content. Use this when get_document tells you a referenced [doc:X] marker isn't in the local corpus — typically subdivisions (PAC/<act>/SDiv*), paragraph-level references (PAC/<act>/<section>(N)), footnote pointers (.../fpN), or historical PiT-qualified pointers. URL is https://www.ato.gov.au/law/view/document?docid=<doc_id>[&PiT=<pit>][&db=<view>]. Default returns plaintext from the legal content container (nav chrome, scripts, history-toggle UI stripped); as_html=true returns the cleaned HTML. Network-dependent and slower than local corpus tools — prefer search/get_document for anything indexed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "doc_id": {"type": "string"},
+                    "pit": {"type": "string", "description": "Optional PiT timestamp (e.g. 99991231235958 for current view)."},
+                    "view": {"type": "string", "description": "Optional db= view qualifier (e.g. HISTFT for amendment-history view)."},
+                    "as_html": {"type": "boolean", "description": "When true, return the cleaned HTML; default plaintext."}
+                },
+                "required": ["doc_id"]
             }
         }
     ])

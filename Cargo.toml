@@ -25,6 +25,8 @@ sha2 = "0.10"
 simsimd = "5"
 tar = "0.4"
 tiny_http = "0.12"
+scraper = "0.20"
+ego_tree = { package = "ego-tree", version = "0.6" }
 tempfile = "3.15"
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 url = "2.5"
