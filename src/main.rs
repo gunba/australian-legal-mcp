@@ -5095,6 +5095,119 @@ fn load_cited_by(conn: &Connection, doc_id: &str) -> Result<(Vec<JsonValue>, i64
     Ok((out, total))
 }
 
+const ATO_MCP_USE_INSTRUCTIONS: &str = r##"## ATO MCP Use Instructions
+
+Use the ATO MCP as the primary retrieval layer for Australian tax research involving ATO-administered law, rulings, determinations, ATO IDs, practice statements, guidance, and related interpretive material. Treat it as an authority-finding and context-retrieval tool, not as a calculator or final legal reasoner.
+
+The MCP is strongest for:
+- Australian income tax, GST, FBT, PAYG, superannuation, consolidation, losses, CGT, R&D tax incentive, and ATO administrative guidance.
+- Locating legislation, rulings, determinations, ATO IDs, practice statements, tax guidance, related documents, cited-by material, and document history links.
+- Finding relevant law by section number, phrase, ruling identifier, or tax concept.
+
+The MCP may need external supplementation for:
+- Tax treaty existence and treaty rates.
+- Annual thresholds, rates, and indexed amounts where the relevant year matters.
+- Treasury explanatory memoranda, bills, second reading speeches, non-ATO regulator materials, TPB/TASA material, court judgments, or state taxes.
+- Historical point-in-time versions where the MCP only exposes links to older versions rather than storing the old text itself.
+
+### Tool Surface
+
+1. `search`
+- Use this first for chunk-level retrieval.
+- Returns slim search hits such as `chunk_id`, `doc_id`, anchor/title metadata, snippets, and flags showing whether related navigation may be useful.
+- Search works best with section numbers, defined terms, ruling IDs, and exact tax phrases.
+- Default search is current-focused and excludes some older, withdrawn, private, or non-current material.
+- Use `doc_scope` to restrict search to one document ID, or a prefix pattern like `<PREFIX>/%` for a document family.
+- Use `current_only=false` and `include_old=true` when old, withdrawn, transitional, repealed, or historical material may matter.
+- Use `similar_to_chunk_id` after finding a good chunk to locate semantically similar chunks without writing a new query.
+
+2. `get_chunks`
+- Use this after `search` to retrieve the actual text of promising hits.
+- Fetch by `chunk_id`.
+- Request neighbouring chunks before and after the hit when statutory context, exceptions, calculation steps, examples, or notes may matter.
+- Do not rely on snippets alone for final conclusions.
+
+3. `get_doc_anchors`
+- Use this when a hit indicates related navigation is available, or when the issue depends on document structure.
+- Retrieves useful document anchors and navigation entries.
+- Also surfaces related documents, history links, and `cited_by` documents where available.
+- Use this to move from a single chunk to surrounding sections, related rulings, amendments, explanatory links, or later materials citing the document.
+
+### Standard Research Workflow
+
+1. Start with targeted searches.
+Prefer searches like `s 25-90 foreign branch income deduction`, `Subdivision 768-G active foreign business asset percentage`, `TR 2008/7 royalty withholding tax`, or `GIC deduction incurred after 1 July 2025`. Avoid relying only on broad natural-language searches like "is this deductible?"
+
+2. Open the best chunks.
+Use `get_chunks` on multiple promising hits. Include neighbouring chunks where the answer may depend on nearby exceptions, formulas, definitions, or notes.
+
+3. Follow the document structure.
+If the result has document anchors, history, related docs, or cited-by flags, call `get_doc_anchors`. Tax answers often depend on adjacent provisions or related interpretive material.
+
+4. Confirm the full rule, not just the headline rule.
+For each issue, check the operative rule, exceptions, definitions, timing rule, calculation method, rounding rule, transitional or commencement rule, interaction with other regimes, and administrative guidance where relevant.
+
+5. For quantitative issues, retrieve the calculation provision.
+Do not calculate from memory after finding only a general explanation. Confirm the statutory formula, rounding convention, caps, thresholds, rate year, and ordering rules.
+
+6. For historical or date-sensitive issues, deliberately widen the search.
+Use `current_only=false` and `include_old=true` where transitional provisions, commencement dates, historical thresholds or rates, repealed law, old ATO IDs, withdrawn guidance, acquisition dates, joining times, loss years, income years, or FBT years matter.
+
+7. For multi-step regimes, search each step separately.
+This is especially important for consolidation, tax losses, R&D tax incentive, CGT cost base modifications, foreign income / NANE rules, franking, debt/equity rules, withholding tax, GST input tax credit limits, and FBT exemptions and taxable value calculations.
+
+8. For multiple-choice or issue-spotting tasks, test each plausible answer.
+Search the concepts behind each suspicious option. Do not stop after proving one option sounds right; there may be a more specific rule.
+
+### Reliability Rules
+
+- Never cite a search snippet as authority. Retrieve the chunk text first.
+- Never assume the first relevant hit is the controlling rule.
+- If a provision has a formula, retrieve the formula.
+- If a rule has a date, retrieve the commencement or transitional material.
+- If an amount depends on a year, verify the threshold or rate for that exact year.
+- If the MCP result is current law but the facts are historical, explicitly check whether historical law or transitional treatment matters.
+- If the MCP does not clearly answer an issue, say so and use official external sources where appropriate.
+
+### External Source Fallback
+
+Use official sources first when the MCP is insufficient:
+- ATO website and ATO legal database.
+- Treasury, Federal Register of Legislation, explanatory memoranda, and bills.
+- TPB for tax agent services / Code of Professional Conduct material.
+- Official treaty databases or Treasury treaty pages for double tax agreements.
+- Court or tribunal databases for case law.
+
+When using external sources, prefer primary or official materials over commentary.
+
+### Good Search Habits
+
+Prefer searches like:
+- `s 8-1 incurred presently existing liability`
+- `s 110-45 Division 43 cost base reduction`
+- `s 110-37 indexation cost base reduction`
+- `s 23AH deduction foreign branch income`
+- `s 25-90 debt deduction NANE income`
+- `Subdivision 768-G active foreign business asset percentage rounding`
+- `s 355-480 associate R&D payment`
+- `s 355-315 balancing adjustment R&D`
+- `s 701-30 non-membership period`
+- `s 716-850 threshold gross up`
+- `CGT event L4 allocable cost amount excess`
+- `franking benchmark rule underfranking debit`
+
+After finding a strong chunk, use `similar_to_chunk_id` to find neighbouring interpretive materials or related provisions that may not share the same wording.
+
+### Output Discipline
+
+When answering from MCP research:
+- State the rule and the source type relied on.
+- Apply the rule to the facts.
+- Identify unresolved assumptions, especially dates, thresholds, rates, or calculation conventions.
+- Separate legal conclusion from arithmetic.
+- For material calculations, show the formula and inputs.
+- Do not overstate certainty where the MCP produced nearby but not decisive authority."##;
+
 fn server_instructions() -> String {
     // [SW-02] Instructions are generated from live corpus stats.
     // [SW-03] Missing/unreadable stats fall back to static init guidance.
@@ -5103,13 +5216,17 @@ fn server_instructions() -> String {
         .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
     {
         Some(s) => format!(
-            "ATO legal corpus. Documents: {}, chunks: {}. Index: {}. Navigate via search → get_chunks: search returns slim hits (chunk_id, doc_id, anchor, optional snippet); get_chunks fetches bodies by chunk_id with before/after ordinal neighbours within the same doc. doc_scope accepts a single full doc_id for in-doc search or \"<PREFIX>/%\" for a family (see stats). Default search excludes Edited_private_advice, withdrawn rulings, and content dated before {} except legislation; override with current_only=false and include_old=true. Pass `similar_to_chunk_id` on search to find chunks semantically close to one you already have (skips query encoding, vector-only, excludes the seed). Slim hits surface has_in_doc_links / has_related_docs / has_history flags when calling get_doc_anchors(doc_id) would yield useful navigation entries. get_doc_anchors also returns `cited_by`: other documents whose chunks carry a [doc:X] marker pointing at the target (capped at 100, ordered by source date DESC, with `cited_by_total` when truncated). Historical (point-in-time) versions of documents are not stored as separate rows; get_doc_anchors lists them as {{doc_id, pit, date, url}} entries so an agent can fetch the older URL externally.",
+            "ATO legal corpus. Documents: {}, chunks: {}. Index: {}. Default search excludes Edited_private_advice, withdrawn rulings, and content dated before {} except legislation; override with current_only=false and include_old=true.\n\n{}",
             s["documents"].as_i64().unwrap_or(0),
             s["chunks"].as_i64().unwrap_or(0),
             s["index_version"].as_str().unwrap_or("?"),
             OLD_CONTENT_CUTOFF,
+            ATO_MCP_USE_INSTRUCTIONS,
         ),
-        None => "ATO legal corpus. Run `ato-mcp init` before serving.".to_string(),
+        None => format!(
+            "ATO legal corpus. Run `ato-mcp init` before serving.\n\n{}",
+            ATO_MCP_USE_INSTRUCTIONS
+        ),
     }
 }
 
