@@ -2377,7 +2377,14 @@ fn get_document(doc_id: &str, opts: GetDocumentOptions) -> Result<String> {
     let conn = open_read()?;
     let doc = load_document_row(&conn, doc_id)?;
     let Some(doc) = doc else {
-        return Ok(format!("_Document not found: `{}`_", doc_id));
+        return Ok(format!(
+            "_Document `{}` is not in the local corpus._\n\n\
+             The ATO addresses it at <{}>. If a `[doc:X]` marker in chunk text \
+             points at an id we don't index (subdivisions, paragraph-level refs, \
+             footnote pointers, etc.), fetch that URL from the web instead.",
+            doc_id,
+            canonical_url(doc_id),
+        ));
     };
     let body = if opts.as_html {
         load_document_html(&conn, &doc.doc_id)?.unwrap_or_default()
