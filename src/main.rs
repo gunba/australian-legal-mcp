@@ -97,17 +97,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the MCP stdio server.
-    Serve {
-        /// Check for corpus updates before starting the MCP stdio loop.
-        #[arg(long)]
-        check_update: bool,
-    },
-    /// First-run install of the corpus into the local data directory.
-    Init {
-        #[arg(long)]
-        manifest_url: Option<String>,
-    },
-    /// Apply a manifest delta to the local corpus.
+    Serve {},
+    /// Download or refresh the local corpus.
     Update {
         #[arg(long)]
         manifest_url: Option<String>,
@@ -211,25 +202,12 @@ impl SearchMode {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { check_update } => {
-            if serve_should_check_update(check_update) {
-                update_before_serve()?;
-            } else {
-                ensure_installed_db()?;
-            }
-            serve()
-        }
-        Command::Init { manifest_url } => {
-            let url = manifest_url.unwrap_or_else(default_manifest_url);
-            let stats = apply_update(&url)?;
-            println!(
-                "init complete: +{} ~{} -{} ({:.1} MB downloaded)",
-                stats.added,
-                stats.changed,
-                stats.removed,
-                stats.bytes_downloaded as f64 / 1_000_000.0
-            );
-            Ok(())
+        Command::Serve {} => {
+            let mut state = ServerState::default();
+            state.update_notice = check_for_update_availability(&default_manifest_url())
+                .ok()
+                .flatten();
+            serve(state)
         }
         Command::Update { manifest_url } => {
             let url = manifest_url.unwrap_or_else(default_manifest_url);
@@ -378,12 +356,6 @@ fn live_dir() -> Result<PathBuf> {
     Ok(path)
 }
 
-fn live_assets_root() -> Result<PathBuf> {
-    let path = live_dir()?;
-    fs::create_dir_all(path.join("assets"))?;
-    Ok(path)
-}
-
 fn staging_dir() -> Result<PathBuf> {
     let path = data_dir()?.join("staging");
     fs::create_dir_all(&path)?;
@@ -441,7 +413,7 @@ fn open_read() -> Result<Connection> {
     let path = db_path()?;
     if !path.exists() {
         bail!(
-            "no live DB found at {}; run `ato-mcp init` first",
+            "no live DB found at {}; run `ato-mcp update` first",
             path.display()
         );
     }
@@ -479,12 +451,12 @@ fn enforce_db_schema_version(conn: &Connection) -> Result<()> {
     // [CC-04] DB compatibility is fail-fast; the Rust runtime does not run Python-era migrations.
     if !table_exists(conn, "meta")? {
         bail!(
-            "no schema_version metadata; corpus may be corrupt or incomplete; run `ato-mcp init`"
+            "no schema_version metadata; corpus may be corrupt or incomplete; run `ato-mcp update`"
         );
     }
     match get_meta(conn, "schema_version")? {
         None => bail!(
-            "no schema_version metadata; corpus may be corrupt or incomplete; run `ato-mcp init`"
+            "no schema_version metadata; corpus may be corrupt or incomplete; run `ato-mcp update`"
         ),
         Some(value) => {
             let parsed: u32 = value
@@ -1725,6 +1697,7 @@ enum RerankerState {
 struct ServerState {
     semantic_runtime: Option<SemanticRuntime>,
     reranker_state: RerankerState,
+    update_notice: Option<UpdateAvailability>,
 }
 
 impl ServerState {
@@ -3086,31 +3059,6 @@ fn apply_update(manifest_url: &str) -> Result<UpdateStats> {
     result
 }
 
-fn update_before_serve() -> Result<()> {
-    // [CC-02] serve only checks for updates when explicitly opted in, and falls back to the installed DB if that update fails.
-    let url = default_manifest_url();
-    match apply_update(&url) {
-        Ok(stats) => {
-            eprintln!(
-                "ato-mcp serve: update complete (+{} ~{} -{}, {:.2} MB downloaded)",
-                stats.added,
-                stats.changed,
-                stats.removed,
-                stats.bytes_downloaded as f64 / 1_000_000.0
-            );
-            Ok(())
-        }
-        Err(err) => {
-            if db_path()?.exists() {
-                eprintln!("ato-mcp serve: update failed; serving installed corpus: {err}");
-                Ok(())
-            } else {
-                Err(err).context("ato-mcp serve could not install the corpus before startup")
-            }
-        }
-    }
-}
-
 fn env_truthy(name: &str) -> bool {
     std::env::var(name)
         .map(|value| {
@@ -3122,23 +3070,15 @@ fn env_truthy(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn serve_should_check_update(check_update: bool) -> bool {
-    !env_truthy("ATO_MCP_OFFLINE") && (check_update || env_truthy("ATO_MCP_AUTO_UPDATE"))
-}
-
-fn ensure_installed_db() -> Result<()> {
-    if db_path()?.exists() {
-        Ok(())
-    } else {
-        bail!("no live DB found; run `ato-mcp init` before serving offline")
-    }
-}
-
 /// Reject a manifest whose `schema_version` exceeds what this binary knows
 /// how to ingest, or whose `min_client_version` is newer than the
 /// currently-running binary.
 fn enforce_manifest_compatibility(manifest: &Manifest) -> Result<()> {
-    // [CC-03] init/update and opted-in serve startup checks share manifest compatibility gates through apply_update.
+    // [CC-03] `ato-mcp update` and the `serve` startup availability probe
+    // both gate on this — incompatible manifests/summaries are surfaced as
+    // an upgrade-the-binary error from `update`, and silently suppressed
+    // from the probe so the agent never points the user at an action that
+    // could not succeed.
     let schema_version = manifest.schema_version;
     if schema_version < 0 {
         bail!("manifest schema_version is negative ({schema_version}); manifest is malformed");
@@ -3183,7 +3123,12 @@ fn cmp_dotted_version(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
-    // [UM-05] Delta updates mutate SQLite transactionally, verify, then write installed_manifest last.
+    // [UM-05] Update flow: short-circuit via update.json summary when the
+    // installed manifest still matches; otherwise rebuild the live DB
+    // wholesale through a staging file and atomic rename. There is no
+    // in-place delete+insert path — full rebuild on a fresh SQLite file
+    // is faster than mutating the live multi-GB DB and avoids FK cascades
+    // wiping the citations table mid-update.
     let manifest_context = UrlContext::from_manifest_url(manifest_url);
     if let Some(stats) = try_skip_update_from_summary(manifest_url, &manifest_context)? {
         return Ok(stats);
@@ -3193,7 +3138,6 @@ fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
         .with_context(|| format!("fetching manifest from {manifest_url}"))?;
     let new_manifest: Manifest = serde_json::from_slice(&manifest_bytes)?;
     enforce_manifest_compatibility(&new_manifest)?;
-    let old_manifest = load_installed_manifest()?;
 
     ensure_model(&new_manifest, &manifest_context, &staging)?;
     // Reranker is optional and best-effort. Failures here log to stderr
@@ -3205,138 +3149,20 @@ fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
         }
     }
 
-    let db = db_path()?;
-    let had_existing_db = db.exists();
-    let (added, mut changed, removed) = diff_manifests(old_manifest.as_ref(), &new_manifest);
-    let rebuild_for_schema = if had_existing_db {
-        live_db_requires_rebuild(&db)?
-    } else {
-        false
-    };
-    let rebuild_for_missing_manifest = had_existing_db && old_manifest.is_none();
-    let rebuild_for_replacement = whole_corpus_replacement(
-        old_manifest.as_ref(),
+    // Cheap stats-only diff for the human-readable "+a ~c -r" CLI line.
+    // No code path branches on the result — the rebuild always replaces
+    // the live DB wholesale.
+    let old_manifest = load_installed_manifest()?;
+    let (added, changed, removed) = diff_manifests(old_manifest.as_ref(), &new_manifest);
+
+    rebuild_live_db_from_manifest(
         &new_manifest,
-        &added,
-        &changed,
-        &removed,
-    );
-    let semantic_backfill = if had_existing_db
-        && !rebuild_for_schema
-        && !rebuild_for_missing_manifest
-        && !rebuild_for_replacement
-    {
-        let conn = open_read()?;
-        semantic_backfill_required(&conn, &new_manifest)?
-    } else {
-        false
-    };
-    if semantic_backfill {
-        let added_ids = added
-            .iter()
-            .map(|doc| doc.doc_id.as_str())
-            .collect::<HashSet<_>>();
-        changed = new_manifest
-            .documents
-            .iter()
-            .filter(|doc| !added_ids.contains(doc.doc_id.as_str()))
-            .cloned()
-            .collect();
-    }
-
-    if !had_existing_db
-        || rebuild_for_schema
-        || rebuild_for_missing_manifest
-        || semantic_backfill
-        || rebuild_for_replacement
-    {
-        return rebuild_live_db_from_manifest(
-            &new_manifest,
-            &manifest_context,
-            manifest_bytes.len() as u64,
-            added.len(),
-            changed.len(),
-            removed.len(),
-        );
-    }
-
-    let conn = open_write_at(&db_path()?)?;
-    init_db(&conn)?;
-
-    let backup = backups_dir()?.join("ato.db.prev");
-    if had_existing_db {
-        fs::copy(&db, &backup)?;
-    }
-
-    let mut bytes_downloaded = manifest_bytes.len() as u64;
-    let tx = conn.unchecked_transaction()?;
-    let apply_result = (|| -> Result<()> {
-        for doc_id in &removed {
-            delete_doc(&tx, doc_id)?;
-        }
-        for doc in &changed {
-            delete_doc(&tx, &doc.doc_id)?;
-        }
-
-        let docs_to_insert = added
-            .iter()
-            .chain(changed.iter())
-            .cloned()
-            .collect::<Vec<_>>();
-        insert_docs_from_packs(
-            &tx,
-            &new_manifest,
-            &manifest_context,
-            &docs_to_insert,
-            &mut bytes_downloaded,
-            &live_assets_root()?,
-        )?;
-        set_meta(&tx, "index_version", &new_manifest.index_version)?;
-        set_meta(&tx, "embedding_model_id", &new_manifest.model.id)?;
-        if let Some(reranker) = &new_manifest.reranker {
-            set_meta(&tx, "reranker_model_id", &reranker.id)?;
-        }
-        set_meta(&tx, "last_update_at", &Utc::now().to_rfc3339())?;
-        // [UM-07] citations is a derived index of `[doc:X]` markers in
-        // chunks.text. When apply_update rewrites changed chunks, the FK
-        // ON DELETE CASCADE wipes the corresponding citation rows; the
-        // newly-inserted chunks have no citations yet. Re-derive at the
-        // tail so the table stays in sync without requiring a separate
-        // maintenance command.
-        derive_citations(&tx)?;
-        verify_semantic_install(&tx, &new_manifest)?;
-        Ok(())
-    })();
-
-    if let Err(err) = apply_result {
-        tx.rollback()?;
-        if backup.exists() {
-            fs::copy(&backup, db_path()?)?;
-        }
-        return Err(err);
-    }
-    tx.commit()?;
-    let manifest_json = serde_json::to_vec_pretty(&new_manifest)?;
-    fs::write(installed_manifest_path()?, manifest_json)?;
-    Ok(UpdateStats {
-        added: added.len(),
-        changed: changed.len(),
-        removed: removed.len(),
-        bytes_downloaded,
-    })
-}
-
-fn whole_corpus_replacement(
-    old: Option<&Manifest>,
-    new_manifest: &Manifest,
-    added: &[DocRef],
-    changed: &[DocRef],
-    removed: &[String],
-) -> bool {
-    old.is_some()
-        && removed.is_empty()
-        && !new_manifest.documents.is_empty()
-        && added.len() + changed.len() == new_manifest.documents.len()
+        &manifest_context,
+        manifest_bytes.len() as u64,
+        added.len(),
+        changed.len(),
+        removed.len(),
+    )
 }
 
 fn live_db_requires_rebuild(path: &Path) -> Result<bool> {
@@ -3389,6 +3215,10 @@ fn rebuild_live_db_from_manifest(
             set_meta(&tx, "reranker_model_id", &reranker.id)?;
         }
         set_meta(&tx, "last_update_at", &Utc::now().to_rfc3339())?;
+        // [UM-07] citations is a derived index of `[doc:X]` markers in
+        // chunks.text. Newly-inserted chunks carry no citation rows; derive
+        // them at the tail so the live DB always ships a populated table.
+        derive_citations(&tx)?;
         verify_semantic_install(&tx, manifest)?;
         Ok(())
     })();
@@ -3493,10 +3323,6 @@ fn insert_docs_from_packs(
     Ok(())
 }
 
-fn semantic_backfill_required(conn: &Connection, manifest: &Manifest) -> Result<bool> {
-    semantic_backfill_required_for_model(conn, &manifest.model.id)
-}
-
 fn semantic_backfill_required_for_model(conn: &Connection, model_id: &str) -> Result<bool> {
     if !model_id.starts_with("embeddinggemma") {
         return Ok(false);
@@ -3577,6 +3403,83 @@ fn try_skip_update_from_summary(
         changed: 0,
         removed: 0,
         bytes_downloaded: summary_bytes.len() as u64,
+    }))
+}
+
+/// Notice surfaced to the agent via `server_instructions` when the
+/// published corpus is newer than the installed one. Constructed only
+/// when an update is genuinely available; the field carries the newly
+/// published `index_version` so the agent can mention it to the user.
+struct UpdateAvailability {
+    available_index_version: String,
+}
+
+fn http_probe_client() -> Result<Client> {
+    // Tight budget: this client runs synchronously inside `serve` startup.
+    // A slow network must not stall the MCP stdio loop — `serve` falls
+    // through to no-notice if the probe doesn't complete in time.
+    Ok(Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(5))
+        .build()?)
+}
+
+fn fetch_bytes_probe(url_or_path: &str, context: &UrlContext) -> Result<Vec<u8>> {
+    if let Some(path) = local_path_from_urlish(url_or_path) {
+        return Ok(fs::read(path)?);
+    }
+    if let Some(dir) = &context.manifest_dir {
+        if let Some(name) = url_or_path.rsplit('/').next() {
+            for candidate in [dir.join(name), dir.join("packs").join(name)] {
+                if candidate.exists() {
+                    return Ok(fs::read(candidate)?);
+                }
+            }
+        }
+    }
+    let client = http_probe_client()?;
+    let mut resp = client.get(url_or_path).send()?.error_for_status()?;
+    let mut out = Vec::new();
+    resp.copy_to(&mut out)?;
+    Ok(out)
+}
+
+/// Non-mutating availability probe. Returns `Some(UpdateAvailability)` only
+/// when (a) an installed manifest is present, (b) the published `update.json`
+/// is reachable inside the probe timeout, (c) it parses, (d) this binary can
+/// still ingest it, and (e) its fingerprint does not match the installed
+/// corpus. Every other case collapses to `Ok(None)` — no error path that
+/// could stall serve startup. A published index that requires a newer binary
+/// also returns `None` rather than emitting an "update available" notice the
+/// user could not act on; the next manual `ato-mcp update` will surface the
+/// real upgrade-the-binary error.
+fn check_for_update_availability(manifest_url: &str) -> Result<Option<UpdateAvailability>> {
+    // [SW-06] Synchronous startup probe with a tight 5s budget; every failure
+    // path collapses to Ok(None) so a slow network cannot stall serve.
+    if env_truthy("ATO_MCP_OFFLINE") {
+        return Ok(None);
+    }
+    let Some(installed) = load_installed_manifest()? else {
+        return Ok(None);
+    };
+    let context = UrlContext::from_manifest_url(manifest_url);
+    let summary_url = update_summary_url_for_manifest(manifest_url);
+    let summary_bytes = match fetch_bytes_probe(&summary_url, &context) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
+    let summary: UpdateSummary = match serde_json::from_slice(&summary_bytes) {
+        Ok(summary) => summary,
+        Err(_) => return Ok(None),
+    };
+    if enforce_update_summary_compatibility(&summary).is_err() {
+        return Ok(None);
+    }
+    if installed_matches_update_summary(&installed, &summary).unwrap_or(false) {
+        return Ok(None);
+    }
+    Ok(Some(UpdateAvailability {
+        available_index_version: summary.index_version,
     }))
 }
 
@@ -3700,6 +3603,11 @@ fn reranker_installed_matches(info: &ModelInfo) -> Result<bool> {
         && fs::read_to_string(marker)?.trim() == info.sha256)
 }
 
+/// Compute the (added, changed, removed) doc-set difference between the
+/// installed manifest and a newly fetched one. The update flow always
+/// rebuilds the live DB wholesale; this counter exists only to render the
+/// "+a ~c -r" CLI summary printed by `ato-mcp update`. No code path
+/// branches on the result.
 fn diff_manifests(
     old: Option<&Manifest>,
     new: &Manifest,
@@ -4408,31 +4316,9 @@ fn decode_embedding_b64(value: &str) -> Result<Vec<u8>> {
     Ok(embedding)
 }
 
-fn delete_doc(conn: &Connection, doc_id: &str) -> Result<()> {
-    let chunk_ids = {
-        let mut stmt = conn.prepare("SELECT chunk_id FROM chunks WHERE doc_id = ?")?;
-        let rows = stmt
-            .query_map([doc_id], |row| row.get::<_, i64>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows
-    };
-    for chunk_id in chunk_ids {
-        conn.execute(
-            "DELETE FROM chunk_embeddings WHERE chunk_id = ?",
-            [chunk_id],
-        )?;
-        conn.execute("DELETE FROM chunks_fts WHERE rowid = ?", [chunk_id])?;
-    }
-    conn.execute("DELETE FROM title_fts WHERE doc_id = ?", [doc_id])?;
-    conn.execute("DELETE FROM chunks WHERE doc_id = ?", [doc_id])?;
-    conn.execute("DELETE FROM documents WHERE doc_id = ?", [doc_id])?;
-    Ok(())
-}
-
-fn serve() -> Result<()> {
+fn serve(mut state: ServerState) -> Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
-    let mut state = ServerState::default();
     for line in stdin.lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -4485,7 +4371,7 @@ fn handle_single_rpc(message: JsonValue, state: &mut ServerState) -> Option<Json
             "protocolVersion": "2025-06-18",
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "ato-mcp", "version": env!("CARGO_PKG_VERSION") },
-            "instructions": server_instructions(),
+            "instructions": server_instructions(state.update_notice.as_ref()),
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_descriptors() })),
@@ -5004,10 +4890,10 @@ const CITED_BY_LIMIT: usize = 100;
 /// (PiT / view qualifiers collapse to the base doc_id), and INSERT OR
 /// IGNORE-batches into `citations`. Idempotent: clears first.
 ///
-/// Called from `apply_update_locked` so end-user installs stay in sync
-/// after a corpus update — the apply_update path rewrites chunks via
-/// DELETE+INSERT, which cascades through the FK ON DELETE CASCADE on
-/// `citations.source_chunk_id` and wipes the previously-derived rows.
+/// Called at the tail of `rebuild_live_db_from_manifest`. The rebuild path
+/// bulk-inserts chunks into a fresh staging DB and then atomic-renames it
+/// over the live file; freshly-inserted chunks carry no citation rows, so
+/// every row must be derived here before the swap.
 fn derive_citations(conn: &Connection) -> Result<()> {
     if !table_exists(conn, "citations")? {
         return Ok(());
@@ -5208,10 +5094,10 @@ When answering from MCP research:
 - For material calculations, show the formula and inputs.
 - Do not overstate certainty where the MCP produced nearby but not decisive authority."##;
 
-fn server_instructions() -> String {
+fn server_instructions(update_notice: Option<&UpdateAvailability>) -> String {
     // [SW-02] Instructions are generated from live corpus stats.
-    // [SW-03] Missing/unreadable stats fall back to static init guidance.
-    match stats()
+    // [SW-03] Missing/unreadable stats fall back to static install guidance.
+    let body = match stats()
         .ok()
         .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
     {
@@ -5224,9 +5110,16 @@ fn server_instructions() -> String {
             ATO_MCP_USE_INSTRUCTIONS,
         ),
         None => format!(
-            "ATO legal corpus. Run `ato-mcp init` before serving.\n\n{}",
+            "ATO corpus is not yet installed on this machine. Tell the user to run `ato-mcp update` in their terminal to download the corpus (~4 GB, takes 5-10 min). After install completes, the MCP client should be restarted so this server picks up the new corpus.\n\n{}",
             ATO_MCP_USE_INSTRUCTIONS
         ),
+    };
+    match update_notice {
+        Some(notice) => format!(
+            "{body}\n\nA newer ATO corpus index is available (available: {}). Tell the user to run `ato-mcp update` in their terminal when convenient. The current MCP session will continue using the installed corpus until the update completes and the MCP client is restarted.",
+            notice.available_index_version
+        ),
+        None => body,
     }
 }
 
@@ -5703,35 +5596,6 @@ mod tests {
         result
     }
 
-    #[test]
-    fn serve_update_check_is_opt_in() {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let offline_prev = std::env::var("ATO_MCP_OFFLINE").ok();
-        let auto_prev = std::env::var("ATO_MCP_AUTO_UPDATE").ok();
-        std::env::remove_var("ATO_MCP_OFFLINE");
-        std::env::remove_var("ATO_MCP_AUTO_UPDATE");
-
-        assert!(!serve_should_check_update(false));
-        assert!(serve_should_check_update(true));
-
-        std::env::set_var("ATO_MCP_AUTO_UPDATE", "1");
-        assert!(serve_should_check_update(false));
-
-        std::env::set_var("ATO_MCP_OFFLINE", "1");
-        assert!(!serve_should_check_update(true));
-
-        if let Some(value) = offline_prev {
-            std::env::set_var("ATO_MCP_OFFLINE", value);
-        } else {
-            std::env::remove_var("ATO_MCP_OFFLINE");
-        }
-        if let Some(value) = auto_prev {
-            std::env::set_var("ATO_MCP_AUTO_UPDATE", value);
-        } else {
-            std::env::remove_var("ATO_MCP_AUTO_UPDATE");
-        }
-    }
-
     // ----- W1.5 manifest version guards -----
 
     #[test]
@@ -5842,7 +5706,7 @@ mod tests {
             let err = open_read().unwrap_err();
             let msg = err.to_string();
             assert!(
-                msg.contains("corrupt or incomplete") && msg.contains("ato-mcp init"),
+                msg.contains("corrupt or incomplete") && msg.contains("ato-mcp update"),
                 "expected corrupt/incomplete error with init hint, got: {msg}"
             );
             Ok(())
@@ -5941,6 +5805,215 @@ mod tests {
             documents: Vec::new(),
             packs: Vec::new(),
         }
+    }
+
+    // ----- serve startup: probe + server_instructions -----
+
+    #[test]
+    fn server_instructions_no_db_tells_user_to_run_update() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let data = tempdir()?;
+        with_data_dir(data.path(), || {
+            let text = server_instructions(None);
+            assert!(
+                text.contains("not yet installed"),
+                "missing not-installed prefix in: {text}"
+            );
+            assert!(
+                text.contains("ato-mcp update"),
+                "missing install command in: {text}"
+            );
+            assert!(
+                text.contains("4 GB"),
+                "missing size hint in: {text}"
+            );
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn server_instructions_appends_update_available_notice() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let data = tempdir()?;
+        with_data_dir(data.path(), || {
+            let notice = UpdateAvailability {
+                available_index_version: "2026.05.20".to_string(),
+            };
+            let text = server_instructions(Some(&notice));
+            assert!(
+                text.contains("newer ATO corpus index is available"),
+                "missing update notice in: {text}"
+            );
+            assert!(
+                text.contains("2026.05.20"),
+                "missing available index_version in: {text}"
+            );
+            assert!(
+                text.contains("ato-mcp update"),
+                "missing update command in: {text}"
+            );
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn check_for_update_availability_returns_none_when_offline() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let prev = std::env::var("ATO_MCP_OFFLINE").ok();
+        std::env::set_var("ATO_MCP_OFFLINE", "1");
+        let result =
+            check_for_update_availability("https://example.invalid/manifest.json");
+        if let Some(value) = prev {
+            std::env::set_var("ATO_MCP_OFFLINE", value);
+        } else {
+            std::env::remove_var("ATO_MCP_OFFLINE");
+        }
+        assert!(
+            result?.is_none(),
+            "offline probe must short-circuit before any network attempt"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn check_for_update_availability_returns_none_when_no_installed_manifest() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let data = tempdir()?;
+        let prev = std::env::var("ATO_MCP_OFFLINE").ok();
+        std::env::remove_var("ATO_MCP_OFFLINE");
+        let result = with_data_dir(data.path(), || {
+            check_for_update_availability("https://example.invalid/manifest.json")
+        });
+        if let Some(value) = prev {
+            std::env::set_var("ATO_MCP_OFFLINE", value);
+        }
+        assert!(
+            result?.is_none(),
+            "probe must return None when no installed manifest is present"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn check_for_update_availability_suppresses_incompatible_schema() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let data = tempdir()?;
+        let release = tempdir()?;
+        let release_dir = release.path();
+        let manifest_path = release_dir.join("manifest.json");
+
+        let installed = Manifest {
+            schema_version: MAX_SUPPORTED_MANIFEST_VERSION as i64,
+            index_version: "test-installed".to_string(),
+            created_at: "2026-05-04T00:00:00Z".to_string(),
+            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
+            model: ModelInfo {
+                id: "embeddinggemma-test".to_string(),
+                sha256: "installed-sha".to_string(),
+                size: 5,
+                url: "model-bundle.tar.zst".to_string(),
+                tokenizer_sha256: None,
+            },
+            reranker: None,
+            documents: Vec::new(),
+            packs: Vec::new(),
+        };
+        let summary = UpdateSummary {
+            schema_version: (MAX_SUPPORTED_MANIFEST_VERSION + 1) as i64,
+            index_version: "test-future".to_string(),
+            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
+            model: installed.model.clone(),
+            reranker: None,
+            document_count: 0,
+            pack_count: 0,
+            manifest_fingerprint: Some("future-fingerprint".to_string()),
+        };
+        fs::write(
+            release_dir.join("update.json"),
+            serde_json::to_vec_pretty(&summary)?,
+        )?;
+
+        let prev = std::env::var("ATO_MCP_OFFLINE").ok();
+        std::env::remove_var("ATO_MCP_OFFLINE");
+        let result = with_data_dir(data.path(), || -> Result<Option<UpdateAvailability>> {
+            fs::write(
+                installed_manifest_path()?,
+                serde_json::to_vec_pretty(&installed)?,
+            )?;
+            check_for_update_availability(manifest_path.to_str().expect("utf-8 path"))
+        });
+        if let Some(value) = prev {
+            std::env::set_var("ATO_MCP_OFFLINE", value);
+        }
+        assert!(
+            result?.is_none(),
+            "probe must suppress the notice when the published index requires a newer binary"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn check_for_update_availability_returns_none_when_already_current() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let data = tempdir()?;
+        let release = tempdir()?;
+        let release_dir = release.path();
+        let manifest_path = release_dir.join("manifest.json");
+        let model_sha = "current-probe-sha";
+        let manifest = Manifest {
+            schema_version: MAX_SUPPORTED_MANIFEST_VERSION as i64,
+            index_version: "test-probe-current".to_string(),
+            created_at: "2026-05-04T00:00:00Z".to_string(),
+            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
+            model: ModelInfo {
+                id: "embeddinggemma-test".to_string(),
+                sha256: model_sha.to_string(),
+                size: 5,
+                url: "model-bundle.tar.zst".to_string(),
+                tokenizer_sha256: None,
+            },
+            reranker: None,
+            documents: Vec::new(),
+            packs: Vec::new(),
+        };
+        let summary = UpdateSummary {
+            schema_version: manifest.schema_version,
+            index_version: manifest.index_version.clone(),
+            min_client_version: manifest.min_client_version.clone(),
+            model: manifest.model.clone(),
+            reranker: None,
+            document_count: 0,
+            pack_count: 0,
+            manifest_fingerprint: Some(manifest_fingerprint(&manifest)?),
+        };
+        fs::write(
+            release_dir.join("update.json"),
+            serde_json::to_vec_pretty(&summary)?,
+        )?;
+
+        let prev = std::env::var("ATO_MCP_OFFLINE").ok();
+        std::env::remove_var("ATO_MCP_OFFLINE");
+        let result = with_data_dir(data.path(), || -> Result<Option<UpdateAvailability>> {
+            let conn = open_write_at(&db_path()?)?;
+            init_db(&conn)?;
+            drop(conn);
+            fs::write(
+                installed_manifest_path()?,
+                serde_json::to_vec_pretty(&manifest)?,
+            )?;
+            fs::write(live_dir()?.join("model_quantized.onnx"), b"model")?;
+            fs::write(live_dir()?.join("tokenizer.json"), br#"{"version":"1.0"}"#)?;
+            fs::write(live_dir()?.join(".model.sha256"), model_sha)?;
+            check_for_update_availability(manifest_path.to_str().expect("utf-8 path"))
+        });
+        if let Some(value) = prev {
+            std::env::set_var("ATO_MCP_OFFLINE", value);
+        }
+        assert!(
+            result?.is_none(),
+            "probe must return None when installed corpus already matches the published summary"
+        );
+        Ok(())
     }
 
     // ===== Wave 2 ===========================================================
@@ -6904,6 +6977,100 @@ mod tests {
                 embeddings, 1,
                 "pack embedding_b64 should populate chunk_embeddings"
             );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Regression test for the empty-citations-table-after-full-rebuild bug.
+    /// `apply_update_locked` always routes through `rebuild_live_db_from_manifest`,
+    /// and that path must call `derive_citations` so the live DB ships a
+    /// populated `citations` table on every install.
+    #[test]
+    fn apply_update_locked_derives_citations_after_full_rebuild() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let data = tempdir()?;
+        let release = tempdir()?;
+        let release_dir = release.path();
+        let packs_dir = release_dir.join("packs");
+        fs::create_dir_all(&packs_dir)?;
+
+        let model_bundle = release_dir.join("model-bundle.tar.zst");
+        write_test_tar_zst(
+            &model_bundle,
+            &[
+                ("model_quantized.onnx", b"dummy onnx bytes"),
+                ("tokenizer.json", br#"{"version":"1.0","truncation":null}"#),
+            ],
+        )?;
+        let model_bundle_bytes = fs::read(&model_bundle)?;
+        let embedding_b64 =
+            base64::engine::general_purpose::STANDARD.encode(vec![0u8; EMBEDDING_DIM]);
+
+        let record = json!({
+            "doc_id": "DOC_CITATION_SOURCE",
+            "type": "Public_ruling",
+            "title": "Citation source",
+            "date": "2026-05-01",
+            "downloaded_at": "2026-05-01T00:00:00Z",
+            "content_hash": "citation-source-hash",
+            "html": "<div><p>See <a data-doc-id=\"DOC_CITATION_TARGET\">target</a>.</p></div>",
+            "assets": [],
+            "chunks": [{
+                "ord": 0,
+                "anchor": "ruling",
+                "text": "Refer to [doc:DOC_CITATION_TARGET] for details.",
+                "embedding_b64": embedding_b64
+            }]
+        });
+        let pack_bytes = encode_test_pack_record(&record)?;
+        fs::write(packs_dir.join("pack-citation.bin.zst"), &pack_bytes)?;
+
+        let manifest = Manifest {
+            schema_version: MAX_SUPPORTED_MANIFEST_VERSION as i64,
+            index_version: "test-citation".to_string(),
+            created_at: "2026-05-01T00:00:00Z".to_string(),
+            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
+            model: ModelInfo {
+                id: "embeddinggemma-test".to_string(),
+                sha256: sha256_hex(&model_bundle_bytes),
+                size: model_bundle_bytes.len() as u64,
+                url: "model-bundle.tar.zst".to_string(),
+                tokenizer_sha256: None,
+            },
+            reranker: None,
+            documents: vec![DocRef {
+                doc_id: "DOC_CITATION_SOURCE".to_string(),
+                content_hash: "citation-source-hash".to_string(),
+                pack_sha8: "citation".to_string(),
+                offset: 0,
+                length: pack_bytes.len() as u64,
+            }],
+            packs: vec![PackInfo {
+                sha8: "citation".to_string(),
+                sha256: sha256_hex(&pack_bytes),
+                size: pack_bytes.len() as u64,
+                url: "packs/pack-citation.bin.zst".to_string(),
+            }],
+        };
+        let manifest_path = release_dir.join("manifest.json");
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+
+        with_data_dir(data.path(), || -> Result<()> {
+            apply_update_locked(manifest_path.to_str().expect("utf-8 path"))?;
+            let conn = open_read()?;
+            let citations: i64 =
+                conn.query_row("SELECT COUNT(*) FROM citations", [], |row| row.get(0))?;
+            assert_eq!(
+                citations, 1,
+                "rebuild_live_db_from_manifest must call derive_citations so cited_by works"
+            );
+            let target: String = conn.query_row(
+                "SELECT target_doc_id FROM citations WHERE source_doc_id = ?",
+                ["DOC_CITATION_SOURCE"],
+                |row| row.get(0),
+            )?;
+            assert_eq!(target, "DOC_CITATION_TARGET");
             Ok(())
         })?;
         Ok(())

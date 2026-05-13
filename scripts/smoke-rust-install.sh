@@ -23,9 +23,9 @@ trap 'rm -rf "$WORKDIR"' EXIT
 export ATO_MCP_DATA_DIR="$WORKDIR/data"
 
 if [ -n "$MANIFEST_URL" ]; then
-  "$BIN" init --manifest-url "$MANIFEST_URL"
+  "$BIN" update --manifest-url "$MANIFEST_URL"
 else
-  "$BIN" init
+  "$BIN" update
 fi
 
 "$BIN" doctor

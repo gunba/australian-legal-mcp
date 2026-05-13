@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build a pre-populated Rust data directory as a tar.zst for air-gapped installs.
 #
-# This intentionally runs `ato-mcp init` against a local mirror of the release
+# This intentionally runs `ato-mcp update` against a local mirror of the release
 # manifest/packs/model bundle. That keeps the offline DB shape identical to a
 # normal Rust install, including chunk_embeddings.
 #
@@ -109,7 +109,7 @@ summary = {
 )
 PY
 
-ATO_MCP_DATA_DIR="$DATA_DIR" "$BIN" init --manifest-url "$MIRROR/manifest.json"
+ATO_MCP_DATA_DIR="$DATA_DIR" "$BIN" update --manifest-url "$MIRROR/manifest.json"
 ATO_MCP_DATA_DIR="$DATA_DIR" "$BIN" doctor
 
 python3 - "$DATA_DIR/live/ato.db" <<'PY'

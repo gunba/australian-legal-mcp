@@ -53,27 +53,18 @@ and no Python is needed for end users. The flow is:
    Windows: unzip `ato-mcp.exe` (and the bundled `onnxruntime.dll`) into a
    directory on `%PATH%`.
 
-3. **Run `ato-mcp init`** to download the corpus and embedding model:
+3. **Wire `ato-mcp serve` into your MCP client** (Claude Code / Claude
+   Desktop / Cursor / Continue / any stdio MCP host — see next section).
+   On first use, the MCP server tells the assistant that the corpus has
+   not been installed yet and asks the user to run `ato-mcp update` in
+   their terminal. The download is ~4 GB and takes 1–10 minutes on a
+   typical home connection (longer behind a corporate proxy — see
+   [Enterprise / corporate environments](#enterprise--corporate-environments)).
+   After it completes, restart the MCP client so it picks up the new
+   corpus.
 
-   ```bash
-   ato-mcp init
-   ```
-
-   This fetches `manifest.json`, the pack assets (~4 GB on first install),
-   and the EmbeddingGemma query encoder from the URL recorded in the
-   manifest. Expect 1–10 minutes on a typical home connection; longer
-   behind a corporate proxy (see below).
-
-4. **Verify with `ato-mcp doctor` and `ato-mcp stats`.** `doctor` checks
-   that every manifest-required file is present and intact; `stats`
-   reports the corpus version and prefix breakdown.
-
-5. **Wire into your MCP client** (Claude Code / Claude Desktop / Cursor /
-   Continue / any stdio MCP host — see next section).
-
-Only after `init` reports success should you wire the server into an MCP
-client. `ato-mcp serve` does not perform `init`; it expects an already-
-installed corpus and exits if one isn't present.
+You can also run `ato-mcp update` manually before wiring the server in;
+`ato-mcp doctor` and `ato-mcp stats` will verify the install.
 
 ### Enterprise / corporate environments
 
@@ -99,9 +90,9 @@ to delay or block first run:
   in the OS certificate store automatically. The Linux/macOS binaries
   use `rustls` with the built-in Mozilla bundle; if your proxy re-signs
   with a private CA, set `SSL_CERT_FILE` to a bundle that includes that
-  CA before running `init` / `update`.
+  CA before running `ato-mcp update`.
 
-- **Egress allow-list.** `init` and `update` fetch from two hosts:
+- **Egress allow-list.** `ato-mcp update` fetches from two hosts:
   `github.com` (release manifest + pack assets) and `huggingface.co`
   (EmbeddingGemma model). Both need to be reachable. The release URL
   base can be overridden with `ATO_MCP_RELEASES_URL` to point at an
@@ -150,11 +141,12 @@ Cursor, Continue, and other stdio MCP clients use the same command:
 ato-mcp serve
 ```
 
-`serve` starts from the installed local corpus and does not check for updates on
-the MCP hot path. This avoids stdio client spawn timeouts on slow or
-TLS-inspecting corporate networks. Use `ato-mcp update` explicitly, or opt in to
-a startup check with `ato-mcp serve --check-update` or `ATO_MCP_AUTO_UPDATE=1`.
-`ATO_MCP_OFFLINE=1` always disables startup update checks.
+`serve` starts immediately from whatever local corpus is present and never
+downloads on the MCP hot path, so it cannot trip stdio client spawn timeouts
+on slow or TLS-inspecting corporate networks. When a newer corpus index has
+been published, the server tells the assistant via `initialize` instructions
+and the assistant asks the user to run `ato-mcp update`. `ATO_MCP_OFFLINE=1`
+disables the update-availability probe entirely.
 
 ## Search Defaults
 
@@ -190,25 +182,27 @@ ato-mcp search "royalties withholding old cases" --include-old --types Cases
 
 ## Updates
 
-Run updates explicitly whenever you want to prefetch the latest published corpus
-or verify the install:
+`ato-mcp update` is the one command that both installs the corpus on a fresh
+machine and refreshes it later:
 
 ```bash
 ato-mcp update
 ato-mcp doctor
 ```
 
-The update path first checks the small `update.json` release summary. If the
-installed corpus, schema, model, and reranker already match, it exits without
-downloading the full manifest. When an update is needed, it downloads
-`manifest.json`, diffs the installed manifest against the new manifest,
-downloads only changed pack assets, mutates SQLite in one transaction, and
-writes `installed_manifest.json` last. If an update fails, the previous
-database snapshot is retained:
+Update first fetches the small `update.json` release summary. If the installed
+corpus, schema, model, and reranker still match, it exits without downloading
+the manifest. When anything has changed, it downloads `manifest.json`, fetches
+the pack assets, rebuilds the live SQLite database in a staging file, and
+atomically renames it over the live DB — leaving the previous database in
+`backups/ato.db.prev` for rollback:
 
 ```bash
 ato-mcp doctor --rollback
 ```
+
+While a server is already running, a newer index does not take effect until
+the MCP client is restarted, since `serve` loads the corpus once at startup.
 
 ## Data Directory
 
@@ -303,8 +297,8 @@ The Rust end-user runtime does not require a GPU; query embedding and reranking
 must continue to work on ordinary CPU-only laptops. The model is not uploaded to
 GitHub Releases; by default the manifest points at pinned Hugging Face
 EmbeddingGemma files, and the Rust client downloads and verifies them during
-`init`, `update`, or an opted-in `serve --check-update` startup check. Pass
-`--model-url` only for an approved mirror.
+`ato-mcp update`. The model URL can be redirected at release time as documented
+under [Enterprise / corporate environments](#enterprise--corporate-environments).
 Corpus releases must come from `build-index`; DB-derived repack scripts are not
 a supported release path. A full current corpus should use the current 64 MB
 pack target, which is about a dozen pack assets rather than dozens of small

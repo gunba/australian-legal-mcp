@@ -55,10 +55,15 @@ Python package on user machines.
    - macOS Apple Silicon: `ato-mcp-aarch64-apple-darwin.tar.gz`
    - Windows x64: `ato-mcp-x86_64-pc-windows-msvc.zip`
 2. Put `ato-mcp` / `ato-mcp.exe` on `PATH`.
-3. Run:
+3. Register `ato-mcp serve` with the MCP host (next section). On first use
+   the MCP server tells the agent that the corpus is not yet installed and
+   asks the user to run `ato-mcp update`. After download completes the user
+   restarts the MCP client.
+
+Manual one-shot install (terminal, no MCP client):
 
 ```bash
-ato-mcp init
+ato-mcp update
 ato-mcp doctor
 ato-mcp stats
 ```
@@ -161,6 +166,6 @@ assets.
 | Symptom | Fix |
 |---|---|
 | `ato-mcp: command not found` | Put the release binary on `PATH`. |
-| `init` cannot download release assets | Use a public release URL, an approved internal mirror, or an offline bundle. |
-| `doctor` reports zero documents | `init` did not complete; rerun after deleting the incomplete data dir. |
+| `update` cannot download release assets | Use a public release URL, an approved internal mirror, or an offline bundle. |
+| `doctor` reports zero documents | `update` did not complete; rerun after deleting the incomplete data dir. |
 | `search` returns no hits | Confirm `stats` shows `chunks > 0`; use `include_old=true` for older authorities. |
