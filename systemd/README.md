@@ -1,6 +1,6 @@
 # systemd user units for ato-mcp
 
-This folder ships systemd **user** timers. They install under
+This folder ships systemd **user** units. They install under
 `~/.config/systemd/user/` and run as your user account — no sudo
 required.
 
@@ -28,7 +28,7 @@ systemctl --user status ato-mcp-serve.service
 The daemon picks a free port the first time it (or the shim) runs and
 persists it to `~/.local/share/ato-mcp/http.json`.
 
-## End-user install (pulls the latest release weekly)
+## Auto-update the corpus weekly
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -44,29 +44,11 @@ Keep the user manager alive between logins:
 loginctl enable-linger "$USER"
 ```
 
-## Maintainer Install (Weekly Incremental Publish)
-
-Only install these on the machine you publish releases from. They
-refresh the ATO What's New feed, incrementally rebuild the corpus when the
-source changed, and push a new GitHub release.
-
-```bash
-cp ato-mcp-maintainer-*.service ato-mcp-maintainer-*.timer \
-   ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now ato-mcp-maintainer-weekly.timer
-```
-
-Edit the `Environment=` and `ExecStart=` lines in the maintainer service if
-your repo path, ato_pages path, model path, or optional model mirror URL
-differs from the defaults.
-
 ## Triggering manually
 
 ```bash
 systemctl --user start ato-mcp-serve.service
 systemctl --user start ato-mcp-update.service
-systemctl --user start ato-mcp-maintainer-weekly.service
 ```
 
 ## Checking results
@@ -76,6 +58,4 @@ systemctl --user status ato-mcp-serve.service
 journalctl --user -u ato-mcp-serve.service -n 50 --no-pager
 systemctl --user status ato-mcp-update.timer
 journalctl --user -u ato-mcp-update.service -n 50 --no-pager
-journalctl --user -u ato-mcp-maintainer-weekly.service -n 100 --no-pager
 ```
-

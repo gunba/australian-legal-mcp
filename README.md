@@ -6,10 +6,11 @@ Taxation Office legal corpus.
 `ato-mcp` is retrieval infrastructure, not tax advice. Always verify cited
 ATO material and apply professional judgment before relying on an answer.
 
-The installed server is a Rust binary. End users do not need Python, pip,
-pipx, uv, a compiler, `gh`, or an API key. The corpus is shipped as GitHub
-release assets, while the EmbeddingGemma query encoder is downloaded from the
-external URL recorded in the release manifest.
+The installed server is a single self-contained Rust binary. No Python,
+pip, pipx, uv, compiler, `gh`, or API key is required to run it. The
+corpus is shipped as GitHub release assets, while the EmbeddingGemma
+query encoder is downloaded from the external URL recorded in the
+release manifest.
 
 ## Tools
 
@@ -32,7 +33,7 @@ internal links/images contribute only useful visible text to search.
 ## Install
 
 `ato-mcp` is shipped as a Rust binary — there is no `pip install ato-mcp`
-and no Python is needed for end users. The flow is:
+and no Python is needed. The flow is:
 
 1. **Download the release binary** for your platform from the GitHub
    releases page at `https://github.com/gunba/ato-mcp/releases/latest`.
@@ -111,13 +112,10 @@ to delay or block first run:
   URL that doesn't require auth, or pre-stage the install via the
   offline-bundle path documented under [Development](#development).
 
-If your team can't run unsigned binaries at all, build from source on a
-maintainer machine (`cargo build --release` from this repo) and
-distribute the resulting binary internally. Building from source is
-straightforward; signing the resulting artifact is the
-organisation-specific bit. Maintainer corpus rebuilds are a separate
-maintainer flow and not required for fresh installs — end users always
-consume pre-built corpus releases from GitHub.
+If your team can't run unsigned binaries at all, build from source
+(`cargo build --release` from this repo) and distribute the resulting
+binary internally. Building from source is straightforward; signing the
+resulting artifact is the organisation-specific bit.
 
 ## Wire Into MCP Clients
 
@@ -287,90 +285,11 @@ ato-mcp/
 └── LOCK
 ```
 
-## Maintainer Workflow
-
-The Rust binary is the end-user product. Python remains maintainer tooling
-for scraping, metadata extraction, vector generation, pack building, and
-release publication.
-
-Local GPU release build:
-
-```bash
-python -m venv .venv
-.venv/bin/pip install -e '.[dev,gpu]'
-
-.venv/bin/ato-mcp refresh-source \
-  --mode incremental \
-  --output-dir /path/to/ato_pages
-
-LD_LIBRARY_PATH="$(find .venv/lib*/python3.*/site-packages/nvidia/ -maxdepth 2 -name lib -type d | tr '\n' ':')$LD_LIBRARY_PATH" \
-  .venv/bin/ato-mcp build-index \
-  --pages-dir /path/to/ato_pages \
-  --out-dir ./release \
-  --db-path ./release/ato.db \
-  --model-path ./models/embeddinggemma/onnx/model_quantized.onnx \
-  --tokenizer-path ./models/embeddinggemma/tokenizer.json \
-  --gpu
-
-.venv/bin/ato-mcp release \
-  --out-dir ./release \
-  --tag v0.3.0 \
-  --repo gunba/ato-mcp \
-  --model-dir ./models/embeddinggemma \
-  --overwrite
-```
-
-Run the incremental What's New refresh immediately before every release build.
-If it changes `ato_pages/index.jsonl`, rebuild from that refreshed source before
-publishing.
-
-`build-index` consumes local model files only to embed the corpus. Hosted model
-and reranker distribution metadata is resolved in the `release` step, not in the
-corpus build step.
-
-For faster local rebuilds while tuning extraction/chunking, use a smaller
-`--limit` smoke corpus first. `scripts/maintainer-sync.sh` also accepts
-`ATO_MCP_BUILD_WORKERS`, `ATO_MCP_WINDOW_DOCS`, `ATO_MCP_ENCODE_BATCH_SIZE`,
-`ATO_MCP_MAX_BATCH_TOKENS`, `ATO_MCP_CHECKPOINT_EVERY`,
-`ATO_MCP_PACK_TARGET_MB`, and
-`ATO_MCP_UNSAFE_FAST_SQLITE=1` for maintainer scratch builds. `--gpu` defaults
-to larger embedding batches than CPU, with a conservative padded-token cap for
-12 GB CUDA cards. Both fresh and previous-manifest builds
-use windowed, length-bucketed embedding batches; unchanged documents still reuse
-prior pack records. By default, full builds commit a resumable checkpoint every
-20,000 prepared records, so a later extractor or embed failure loses only the
-current window and a rerun skips already sealed documents. The build log prints
-per-window prepare/embed/write timing, token throughput, batch size, and
-approximate padded-token pressure so you can tune those values from evidence.
-
-Long maintainer runs automatically inhibit system sleep when the host provides
-`systemd-inhibit` or macOS `caffeinate`. `build-index` protects direct corpus
-rebuilds, and `scripts/maintainer-sync.sh` protects the full scrape, rebuild,
-and release flow. Set `ATO_MCP_ALLOW_SLEEP=1` only for short local checks where
-sleep prevention is unwanted.
-
-Release builds use EmbeddingGemma vectors and should run on the maintainer GPU.
-The Rust end-user runtime does not require a GPU; query embedding and reranking
-must continue to work on ordinary CPU-only laptops. The model is not uploaded to
-GitHub Releases; by default the manifest points at pinned Hugging Face
-EmbeddingGemma files, and the Rust client downloads and verifies them during
-`ato-mcp update`. The model URL can be redirected at release time as documented
-under [Enterprise / corporate environments](#enterprise--corporate-environments).
-Corpus releases must come from `build-index`; DB-derived repack scripts are not
-a supported release path. A full current corpus should use the current 64 MB
-pack target, which is about a dozen pack assets rather than dozens of small
-packs.
-Explicit `mode=keyword` is a query-time FTS mode, not an alternative corpus
-embedder. The optional `corpus release (gpu)` workflow targets a self-hosted
-runner labelled `gpu` and fails if `nvidia-smi` or ONNX Runtime's
-`CUDAExecutionProvider` is unavailable. It is not scheduled by default, so it
-does not spend hosted GPU minutes.
-
 ## Development
 
 ```bash
 cargo test --locked
-.venv/bin/pytest -q
+cargo clippy --all-targets --all-features --locked -- -D warnings
 ```
 
 Published corpus/install smoke test:
@@ -387,8 +306,9 @@ ATO_MCP_MODEL_BUNDLE=/path/to/embeddinggemma-bundle.tar.zst \
 scripts/make-offline-bundle.sh ./release/ato-mcp-offline-bundle.tar.zst
 ```
 
-CI runs both the Rust binary checks and the Python maintainer test suite.
-Release binary assets are produced by `.github/workflows/release-binaries.yml`.
+CI runs the Rust binary checks (build, clippy, tests) on every push.
+Release binary assets are produced by `.github/workflows/release-binaries.yml`
+on tags matching `v*`.
 
 ## Corporate Windows Builds from Source
 
