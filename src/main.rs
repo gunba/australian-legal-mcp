@@ -354,6 +354,41 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         max_defs: usize,
     },
+    /// Publish a corpus release to GitHub. Mirrors
+    /// src/ato_mcp/indexer/release.py:publish — rewrites manifest URLs to
+    /// release asset URLs, fixes embedding-model fields if they're
+    /// placeholder/GitHub-hosted, optionally signs the manifest with
+    /// minisign, then `gh release create` + `gh release upload`s
+    /// manifest.json + manifest.json.minisig + update.json + every pack.
+    PublishRelease {
+        #[arg(long)]
+        out_dir: PathBuf,
+        #[arg(long)]
+        tag: String,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        notes: Option<String>,
+        /// Force-overwrite existing release assets (`gh release upload --clobber`).
+        #[arg(long, default_value_t = false)]
+        overwrite: bool,
+        /// Override the embedding-model URL recorded in the manifest. Use
+        /// this when hosting the model bundle outside HuggingFace.
+        #[arg(long)]
+        model_url: Option<String>,
+        /// SHA256 hex of the embedding-model bundle when --model-url is used.
+        #[arg(long)]
+        model_sha256: Option<String>,
+        /// Size in bytes of the embedding-model bundle when --model-url is used.
+        #[arg(long)]
+        model_size: Option<u64>,
+        /// Filesystem path to a minisign secret key. When set, the manifest
+        /// is signed and the .minisig is uploaded alongside.
+        #[arg(long)]
+        sign_key: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -511,6 +546,29 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        Command::PublishRelease {
+            out_dir,
+            tag,
+            repo,
+            title,
+            notes,
+            overwrite,
+            model_url,
+            model_sha256,
+            model_size,
+            sign_key,
+        } => publish_release(PublishReleaseArgs {
+            out_dir,
+            tag,
+            repo,
+            title,
+            notes,
+            overwrite,
+            model_url,
+            model_sha256,
+            model_size,
+            sign_key,
+        }),
         Command::FetchExternalDoc {
             doc_id,
             pit,
@@ -7554,6 +7612,229 @@ fn manifest_fingerprint(manifest: &Manifest) -> Result<String> {
     });
     let bytes = serde_json::to_vec(&payload)?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+// ----- publish-release (port of src/ato_mcp/indexer/release.py:publish) -----
+
+const EMBEDDINGGEMMA_HF_URL: &str =
+    "https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX/resolve/main/model.tar.zst";
+const EMBEDDINGGEMMA_HF_SIZE: u64 = 329_781_810;
+
+struct PublishReleaseArgs {
+    out_dir: PathBuf,
+    tag: String,
+    repo: Option<String>,
+    title: Option<String>,
+    notes: Option<String>,
+    overwrite: bool,
+    model_url: Option<String>,
+    model_sha256: Option<String>,
+    model_size: Option<u64>,
+    sign_key: Option<PathBuf>,
+}
+
+fn is_placeholder_model_url(url: &str) -> bool {
+    let u = url.trim();
+    u.is_empty()
+        || u == "PENDING"
+        || u.contains("releases/download/PENDING")
+        || u.contains("placeholder")
+}
+
+fn is_github_url(url: &str) -> bool {
+    url.starts_with("https://github.com/") || url.starts_with("http://github.com/")
+}
+
+fn is_hf_url(url: &str) -> bool {
+    url.starts_with("https://huggingface.co/")
+        || url.starts_with("http://huggingface.co/")
+}
+
+fn publish_release(args: PublishReleaseArgs) -> Result<()> {
+    let manifest_path = args.out_dir.join("manifest.json");
+    let packs_dir = args.out_dir.join("packs");
+    if !manifest_path.exists() {
+        bail!("no manifest at {}", manifest_path.display());
+    }
+    if !packs_dir.exists() {
+        bail!("no packs/ dir at {}", packs_dir.display());
+    }
+
+    let mut pack_files: Vec<PathBuf> = fs::read_dir(&packs_dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.starts_with("pack-") && s.ends_with(".bin.zst"))
+        })
+        .collect();
+    pack_files.sort();
+    if pack_files.is_empty() {
+        bail!("no pack files found to upload");
+    }
+
+    let repo = args
+        .repo
+        .clone()
+        .or_else(|| std::env::var("GH_REPO").ok())
+        .ok_or_else(|| anyhow!("--repo required (or set $GH_REPO)"))?;
+
+    // Load manifest, fix model fields if necessary.
+    let raw = fs::read_to_string(&manifest_path)?;
+    let mut manifest: Manifest = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing {}", manifest_path.display()))?;
+
+    if manifest.model.id.starts_with("embeddinggemma") {
+        let explicit_model_url = args.model_url.is_some();
+        let mut model_url = args
+            .model_url
+            .clone()
+            .unwrap_or_else(|| manifest.model.url.clone());
+
+        let needs_default = is_placeholder_model_url(&model_url)
+            || (is_github_url(&model_url) && !explicit_model_url);
+
+        let (sha256, size) = if needs_default {
+            model_url = EMBEDDINGGEMMA_HF_URL.to_string();
+            (EMBEDDINGGEMMA_HF_FINGERPRINT.to_string(), EMBEDDINGGEMMA_HF_SIZE)
+        } else if is_hf_url(&model_url) {
+            (
+                args.model_sha256
+                    .clone()
+                    .or_else(|| Some(manifest.model.sha256.clone()))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| EMBEDDINGGEMMA_HF_FINGERPRINT.to_string()),
+                args.model_size
+                    .or(Some(manifest.model.size))
+                    .filter(|n| *n > 0)
+                    .unwrap_or(EMBEDDINGGEMMA_HF_SIZE),
+            )
+        } else {
+            if is_github_url(&model_url) {
+                bail!("EmbeddingGemma model bundles must not be hosted on GitHub");
+            }
+            let sha = args
+                .model_sha256
+                .clone()
+                .unwrap_or_else(|| manifest.model.sha256.clone());
+            let sz = args.model_size.unwrap_or(manifest.model.size);
+            (sha, sz)
+        };
+
+        if sha256.is_empty() || size == 0 {
+            bail!("EmbeddingGemma releases require model sha256 and size");
+        }
+        manifest.model.sha256 = sha256;
+        manifest.model.size = size;
+        manifest.model.url = model_url;
+    }
+
+    // Rewrite packs[].url in-place to GitHub release URLs.
+    for pack in &mut manifest.packs {
+        let filename = std::path::Path::new(&pack.url)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| pack.url.clone());
+        pack.url = format!(
+            "https://github.com/{repo}/releases/download/{tag}/{filename}",
+            tag = args.tag,
+        );
+    }
+
+    // Save updated manifest (sorted keys, indented).
+    let pretty = serde_json::to_vec_pretty(&manifest)?;
+    fs::write(&manifest_path, &pretty)?;
+
+    // Generate update.json (UpdateSummary) so end-users can probe quickly.
+    let summary = UpdateSummary {
+        schema_version: manifest.schema_version,
+        index_version: manifest.index_version.clone(),
+        min_client_version: manifest.min_client_version.clone(),
+        model: manifest.model.clone(),
+        reranker: manifest.reranker.clone(),
+        document_count: manifest.documents.len(),
+        pack_count: manifest.packs.len(),
+        manifest_fingerprint: Some(manifest_fingerprint(&manifest)?),
+    };
+    let summary_path = args.out_dir.join("update.json");
+    fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?)?;
+
+    // Sign manifest if --sign-key provided.
+    let mut artifacts: Vec<PathBuf> = vec![manifest_path.clone(), summary_path.clone()];
+    artifacts.extend(pack_files.iter().cloned());
+
+    if let Some(sign_key) = args.sign_key.as_deref() {
+        let sig_path = args
+            .out_dir
+            .join("manifest.json.minisig");
+        let status = std::process::Command::new("minisign")
+            .args([
+                "-S".as_ref(),
+                "-s".as_ref(),
+                sign_key.as_os_str(),
+                "-m".as_ref(),
+                manifest_path.as_os_str(),
+                "-x".as_ref(),
+                sig_path.as_os_str(),
+            ])
+            .status()
+            .context("running minisign (is it installed?)")?;
+        if !status.success() {
+            bail!("minisign signing failed (exit {:?})", status.code());
+        }
+        artifacts.insert(1, sig_path);
+    }
+
+    // Ensure release exists.
+    let view_status = std::process::Command::new("gh")
+        .args(["release", "view", &args.tag, "--repo", &repo])
+        .status()
+        .context("running gh release view (is the gh CLI installed?)")?;
+    if !view_status.success() {
+        eprintln!("creating release {}", args.tag);
+        let mut create = std::process::Command::new("gh");
+        create.args([
+            "release",
+            "create",
+            &args.tag,
+            "--repo",
+            &repo,
+            "--title",
+            args.title.as_deref().unwrap_or(&args.tag),
+        ]);
+        if let Some(notes) = args.notes.as_deref() {
+            create.args(["--notes", notes]);
+        } else {
+            create.arg("--generate-notes");
+        }
+        let st = create.status().context("running gh release create")?;
+        if !st.success() {
+            bail!("gh release create failed (exit {:?})", st.code());
+        }
+    }
+
+    // Upload artifacts.
+    let mut upload = std::process::Command::new("gh");
+    upload.args(["release", "upload", &args.tag, "--repo", &repo]);
+    for a in &artifacts {
+        upload.arg(a);
+    }
+    if args.overwrite {
+        upload.arg("--clobber");
+    }
+    let st = upload.status().context("running gh release upload")?;
+    if !st.success() {
+        bail!("gh release upload failed (exit {:?})", st.code());
+    }
+
+    eprintln!(
+        "ato-mcp publish-release: uploaded {} artifacts to {}@{}",
+        artifacts.len(),
+        repo,
+        args.tag,
+    );
+    Ok(())
 }
 
 fn model_info_matches(left: &ModelInfo, right: &ModelInfo) -> bool {

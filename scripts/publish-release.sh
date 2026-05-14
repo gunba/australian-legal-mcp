@@ -1,73 +1,58 @@
 #!/usr/bin/env bash
 # One-shot corpus publication. Binary assets are built by
 # .github/workflows/release-binaries.yml; this script uploads the corpus
-# manifest, update summary, and packs. Offline bundles are built explicitly
-# with scripts/make-offline-bundle.sh for air-gapped installs; publishing
-# them by default duplicates the pack assets.
+# manifest, update summary, and packs by shelling into the Rust binary's
+# `publish-release` subcommand.
 #
 # Prereqs:
 #   - build-index has finished; release/ contains packs/ and manifest.json
-#   - model at models/embeddinggemma/
+#   - target/release/ato-mcp built (or ATO_MCP_BIN points at one)
 #   - optional ATO_MCP_MODEL_URL for an approved model mirror
-#   - optional ATO_MCP_RERANKER_BUNDLE / ATO_MCP_RERANKER_URL for the reranker
-#     (defaults to models/reranker when present)
+#   - optional ATO_MCP_SIGN_KEY for manifest signing (minisign secret key)
 #   - gh authenticated for the maintainer account
 #
 # Usage:
-#   scripts/publish-release.sh v0.3.0
-#   scripts/publish-release.sh v0.3.0 gunba/ato-mcp
+#   scripts/publish-release.sh v0.8.0
+#   scripts/publish-release.sh v0.8.0 gunba/ato-mcp
 set -euo pipefail
 
 TAG="${1:?usage: publish-release.sh <tag> [owner/repo]}"
 REPO="${2:-${ATO_MCP_GH_REPO:-gunba/ato-mcp}}"
 REPO_DIR="${ATO_MCP_REPO_DIR:-$(pwd)}"
-VENV="${ATO_MCP_VENV:-$REPO_DIR/.venv}"
 RELEASE_DIR="${ATO_MCP_RELEASE_DIR:-$REPO_DIR/release}"
-MODEL_DIR="${ATO_MCP_MODEL_DIR:-$REPO_DIR/models/embeddinggemma}"
+ATO_MCP_BIN="${ATO_MCP_BIN:-$REPO_DIR/target/release/ato-mcp}"
 MODEL_URL="${ATO_MCP_MODEL_URL:-}"
-MODEL_URL_ARG=()
+MODEL_SHA256="${ATO_MCP_MODEL_SHA256:-}"
+MODEL_SIZE="${ATO_MCP_MODEL_SIZE:-}"
+SIGN_KEY="${ATO_MCP_SIGN_KEY:-}"
+
+if [ ! -x "$ATO_MCP_BIN" ]; then
+  echo "ato-mcp binary not found at $ATO_MCP_BIN" >&2
+  echo "Build it first: cargo build --release" >&2
+  exit 1
+fi
+
+EXTRA_ARGS=()
 if [ -n "$MODEL_URL" ]; then
-  MODEL_URL_ARG=(--model-url "$MODEL_URL")
+  EXTRA_ARGS+=(--model-url "$MODEL_URL")
 fi
-DEFAULT_RERANKER_BUNDLE="$REPO_DIR/models/reranker"
-RERANKER_BUNDLE="${ATO_MCP_RERANKER_BUNDLE:-}"
-if [[ -z "$RERANKER_BUNDLE" && -d "$DEFAULT_RERANKER_BUNDLE" ]]; then
-  RERANKER_BUNDLE="$DEFAULT_RERANKER_BUNDLE"
+if [ -n "$MODEL_SHA256" ]; then
+  EXTRA_ARGS+=(--model-sha256 "$MODEL_SHA256")
 fi
-RERANKER_ID="${ATO_MCP_RERANKER_ID:-}"
-RERANKER_URL="${ATO_MCP_RERANKER_URL:-}"
-RERANKER_SHA256="${ATO_MCP_RERANKER_SHA256:-}"
-RERANKER_SIZE="${ATO_MCP_RERANKER_SIZE:-}"
-RERANKER_TOKENIZER_SHA256="${ATO_MCP_RERANKER_TOKENIZER_SHA256:-}"
-RERANKER_ARGS=()
-if [ -n "$RERANKER_BUNDLE" ]; then
-  RERANKER_ARGS+=(--reranker-bundle "$RERANKER_BUNDLE")
+if [ -n "$MODEL_SIZE" ]; then
+  EXTRA_ARGS+=(--model-size "$MODEL_SIZE")
 fi
-if [ -n "$RERANKER_ID" ]; then
-  RERANKER_ARGS+=(--reranker-id "$RERANKER_ID")
-fi
-if [ -n "$RERANKER_URL" ]; then
-  RERANKER_ARGS+=(--reranker-url "$RERANKER_URL")
-fi
-if [ -n "$RERANKER_SHA256" ]; then
-  RERANKER_ARGS+=(--reranker-sha256 "$RERANKER_SHA256")
-fi
-if [ -n "$RERANKER_SIZE" ]; then
-  RERANKER_ARGS+=(--reranker-size "$RERANKER_SIZE")
-fi
-if [ -n "$RERANKER_TOKENIZER_SHA256" ]; then
-  RERANKER_ARGS+=(--reranker-tokenizer-sha256 "$RERANKER_TOKENIZER_SHA256")
+if [ -n "$SIGN_KEY" ]; then
+  EXTRA_ARGS+=(--sign-key "$SIGN_KEY")
 fi
 
 echo "=> uploading manifest, update summary, and packs"
-"$VENV/bin/ato-mcp" release \
-  --out-dir   "$RELEASE_DIR" \
-  --tag       "$TAG" \
-  --repo      "$REPO" \
-  --model-dir "$MODEL_DIR" \
-  "${MODEL_URL_ARG[@]}" \
-  "${RERANKER_ARGS[@]}" \
-  --overwrite
+"$ATO_MCP_BIN" publish-release \
+  --out-dir "$RELEASE_DIR" \
+  --tag     "$TAG" \
+  --repo    "$REPO" \
+  --overwrite \
+  "${EXTRA_ARGS[@]}"
 
 echo "=> promoting $TAG to latest"
 gh release edit "$TAG" --repo "$REPO" --latest --prerelease=false
