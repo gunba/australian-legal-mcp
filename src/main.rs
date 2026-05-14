@@ -408,9 +408,8 @@ fn main() -> Result<()> {
             doc_id,
             source_path,
         } => {
-            let _ = (doc_id, source_path); // reserved for future use
-            let html = match html_file {
-                Some(p) => fs::read_to_string(&p)
+            let html = match html_file.as_ref() {
+                Some(p) => fs::read_to_string(p)
                     .with_context(|| format!("reading {}", p.display()))?,
                 None => {
                     let mut s = String::new();
@@ -438,11 +437,21 @@ fn main() -> Result<()> {
             let title = composed_title.or(cleaned.title.clone());
             let anchors = extract_collect_anchors(&frag);
             let (fm_refs, fm_phrase) = extract_em_front_matter(&cleaned.html);
+            // Asset extraction when --doc-id and --source-path are both supplied.
+            let (final_html, assets) = if doc_id.is_some() && source_path.is_some() {
+                rewrite_images_html(
+                    &cleaned.html,
+                    doc_id.as_deref(),
+                    source_path.as_deref(),
+                )
+            } else {
+                (cleaned.html.clone(), Vec::new())
+            };
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "text": cleaned.text,
-                    "html": cleaned.html,
+                    "html": final_html,
                     "title": title,
                     "html_title": cleaned.title,
                     "headings": headings,
@@ -450,6 +459,7 @@ fn main() -> Result<()> {
                     "anchors": anchors,
                     "front_matter_refs": fm_refs,
                     "front_matter_phrase": fm_phrase,
+                    "assets": assets,
                 }))?
             );
             Ok(())
@@ -3580,6 +3590,219 @@ fn extract_currency(html: &str) -> CurrencyInfo {
         superseded_by,
         replaces,
     }
+}
+
+// ----- Image asset extraction (port of extract.py:_rewrite_images_html) -----
+//
+// Walks <img> tags in cleaned HTML, reads referenced files (src resolved
+// against source_path's parent), SHA256-hashes + base64-encodes them, emits
+// ExtractedAsset records and rewrites the HTML so each <img> becomes a
+// <span data-asset-ref="..." data-media-type="...">[image: alt]</span>.
+// Mirrors src/ato_mcp/indexer/extract.py:_rewrite_images_html.
+
+#[derive(Debug, Clone, Serialize)]
+struct ExtractedAsset {
+    asset_ref: String,
+    source_path: String,
+    relative_path: String,
+    media_type: Option<String>,
+    alt: Option<String>,
+    title: Option<String>,
+    sha256: String,
+    size: u64,
+    data_b64: String,
+}
+
+fn assets_url_encode_doc_id(doc_id: &str) -> String {
+    let mut out = String::with_capacity(doc_id.len() * 3);
+    for byte in doc_id.bytes() {
+        let c = byte as char;
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
+            out.push(c);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn assets_asset_ref(doc_id: &str, ordinal: u32) -> String {
+    format!("ato-image://{}/{}", assets_url_encode_doc_id(doc_id), ordinal)
+}
+
+fn assets_guess_media_type(src: &str) -> Option<String> {
+    let path = src.split('?').next().unwrap_or(src);
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase())?;
+    match ext.as_str() {
+        "png" => Some("image/png".to_string()),
+        "jpg" | "jpeg" => Some("image/jpeg".to_string()),
+        "gif" => Some("image/gif".to_string()),
+        "svg" => Some("image/svg+xml".to_string()),
+        "webp" => Some("image/webp".to_string()),
+        "bmp" => Some("image/bmp".to_string()),
+        "ico" => Some("image/vnd.microsoft.icon".to_string()),
+        _ => None,
+    }
+}
+
+fn assets_extension_from_media_type(mt: &Option<String>) -> &'static str {
+    match mt.as_deref() {
+        Some("image/png") => ".png",
+        Some("image/jpeg") => ".jpg",
+        Some("image/gif") => ".gif",
+        Some("image/svg+xml") => ".svg",
+        Some("image/webp") => ".webp",
+        Some("image/bmp") => ".bmp",
+        Some("image/vnd.microsoft.icon") => ".ico",
+        _ => ".bin",
+    }
+}
+
+fn assets_relative_path(data: &[u8], src: &str, media_type: &Option<String>) -> (String, String) {
+    let mut h = Sha256::new();
+    h.update(data);
+    let sha_full = h.finalize();
+    let sha = sha_full.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let path = src.split('?').next().unwrap_or(src);
+    let mut suffix = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| format!(".{}", s.to_lowercase()))
+        .unwrap_or_default();
+    if suffix.is_empty() || suffix.len() > 10 {
+        suffix = assets_extension_from_media_type(media_type).to_string();
+    }
+    (format!("assets/{}/{}{}", &sha[..2], sha, suffix), sha)
+}
+
+fn assets_resolve_path(source_path: Option<&Path>, src: &str) -> Option<PathBuf> {
+    let sp = source_path?;
+    if src.is_empty() {
+        return None;
+    }
+    // Skip URLs with scheme or absolute paths.
+    if src.starts_with('/') || src.contains("://") {
+        return None;
+    }
+    sp.parent().map(|p| p.join(src))
+}
+
+fn assets_text_norm(s: Option<&str>) -> Option<String> {
+    let raw = s.unwrap_or("");
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        None
+    } else {
+        Some(collapsed)
+    }
+}
+
+fn assets_html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Walk HTML for <img> tags, extract assets from referenced files, and
+/// produce (rewritten_html, assets) where every <img> becomes a <span>
+/// carrying the asset_ref + alt-text marker.
+fn rewrite_images_html(
+    html: &str,
+    doc_id: Option<&str>,
+    source_path: Option<&Path>,
+) -> (String, Vec<ExtractedAsset>) {
+    use base64::Engine as _;
+    let img_re = Regex::new(r#"(?is)<img\b([^>]*)>"#).unwrap();
+    let mut assets: Vec<ExtractedAsset> = Vec::new();
+    let mut image_ord: u32 = 0;
+    let rewritten = img_re
+        .replace_all(html, |caps: &regex::Captures| {
+            let attrs_str = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let alt = assets_text_norm(extract_attr(attrs_str, "alt"));
+            let title = assets_text_norm(extract_attr(attrs_str, "title"));
+            let label = alt.clone().or_else(|| title.clone()).unwrap_or_default();
+            if label.to_lowercase() == "exclamation" {
+                return String::new();
+            }
+            let src = assets_text_norm(extract_attr(attrs_str, "src")).unwrap_or_default();
+            let mut data: Option<Vec<u8>> = None;
+            if let Some(p) = assets_resolve_path(source_path, &src) {
+                if p.exists() {
+                    if let Ok(bytes) = fs::read(&p) {
+                        data = Some(bytes);
+                    }
+                }
+            }
+            let media_type = assets_guess_media_type(&src);
+            let mut asset_ref: Option<String> = None;
+            if let (Some(d), Some(did)) = (data.as_ref(), doc_id) {
+                let r = assets_asset_ref(did, image_ord);
+                let (relpath, sha) = assets_relative_path(d, &src, &media_type);
+                assets.push(ExtractedAsset {
+                    asset_ref: r.clone(),
+                    source_path: src.clone(),
+                    relative_path: relpath,
+                    media_type: media_type.clone(),
+                    alt: alt.clone(),
+                    title: title.clone(),
+                    sha256: sha,
+                    size: d.len() as u64,
+                    data_b64: base64::engine::general_purpose::STANDARD.encode(d),
+                });
+                asset_ref = Some(r);
+                image_ord += 1;
+            }
+            if asset_ref.is_none() && label.is_empty() {
+                return String::new();
+            }
+            let mut attrs: Vec<String> = Vec::new();
+            if let Some(r) = &asset_ref {
+                attrs.push(format!(r#"data-asset-ref="{}""#, assets_html_escape(r)));
+            }
+            if let Some(mt) = &media_type {
+                if asset_ref.is_some() {
+                    attrs.push(format!(r#"data-media-type="{}""#, assets_html_escape(mt)));
+                }
+            }
+            let text = if !label.is_empty() {
+                format!("[image: {label}]")
+            } else {
+                "[image]".to_string()
+            };
+            let attrs_joined = attrs.join(" ");
+            let space = if attrs_joined.is_empty() { "" } else { " " };
+            format!(
+                "<span{space}{attrs}>{text}</span>",
+                attrs = attrs_joined,
+                text = assets_html_escape(&text)
+            )
+        })
+        .into_owned();
+    (rewritten, assets)
+}
+
+fn extract_attr<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
+    // Match name="value" or name='value' or name=value (no quotes, up to whitespace).
+    // Case-insensitive on the name.
+    let pat = format!(r#"(?is)\b{}\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]*))"#, regex::escape(name));
+    let re = Regex::new(&pat).ok()?;
+    let caps = re.captures(attrs)?;
+    caps.get(1)
+        .or_else(|| caps.get(2))
+        .or_else(|| caps.get(3))
+        .map(|m| m.as_str())
 }
 
 fn fetch_external_doc(
