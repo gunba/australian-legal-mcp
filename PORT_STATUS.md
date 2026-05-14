@@ -15,13 +15,15 @@ line count before, what's in Rust now, and the wrapper status.
 | `src/ato_mcp/indexer/metadata.py` | 261 | ~89 | doc_id_for, parse_docid, year_for_docid, human_code_for_doc_id, extract_pub_date | 41/41 ✓ |
 
 CLI subcommands added: `extract`, `extract-anchors`, `extract-definitions`,
-`extract-currency`, `chunk-html`, `doc-meta`, `doc-id-from-link`, `pack-write`.
+`extract-currency`, `chunk-html`, `doc-meta`, `doc-id-from-link`, `pack-write`,
+`manifest-rewrite-urls`.
 
 ## Done — Rust impl, no Python wrapper yet
 
 | Function | Rust | Notes |
 |---|---|---|
 | `pack.py:PackWriter` | `write_pack` + `pack-write` CLI | Wrapper deferred — stateful API exposes refs/sha8 inside the with-block, doesn't subprocess cleanly. Lands with build.py rewrite. |
+| `release.py:rewrite_manifest_urls` | `manifest-rewrite-urls` CLI | One-shot — once publish-release.sh stops shelling into Python, this CLI replaces the call. |
 
 ## Pending — Python still unmodified
 
