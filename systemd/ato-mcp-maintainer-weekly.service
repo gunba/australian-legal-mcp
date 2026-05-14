@@ -1,0 +1,18 @@
+[Unit]
+Description=ato-mcp: maintainer weekly incremental release
+Documentation=https://github.com/gunba/ato-mcp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=ATO_MCP_REPO_DIR=%h/src/ato-mcp
+Environment=ATO_MCP_PAGES_DIR=%h/src/ato_pages
+Environment=ATO_MCP_MODEL_DIR=%h/src/ato-mcp/models/embeddinggemma
+Environment=ATO_MCP_GH_REPO=gunba/ato-mcp
+Environment=ATO_MCP_MODE=incremental
+ExecStart=%h/src/ato-mcp/scripts/maintainer-sync.sh
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=10800

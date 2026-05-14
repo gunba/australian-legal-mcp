@@ -1,0 +1,51 @@
+name: corpus release (gpu)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: corpus-release-gpu
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: gpu scrape, embed, release
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 720
+    env:
+      ATO_MCP_REPO_DIR: ${{ github.workspace }}
+      ATO_MCP_PAGES_DIR: ${{ github.workspace }}/../ato_pages
+      ATO_MCP_MODEL_DIR: ${{ github.workspace }}/models/embeddinggemma
+      ATO_MCP_GH_REPO: ${{ github.repository }}
+      ATO_MCP_MODE: incremental
+      ATO_MCP_RELEASE_TAG: index
+    steps:
+      - uses: actions/checkout@v6
+      - name: Require NVIDIA GPU
+        run: |
+          command -v nvidia-smi
+          nvidia-smi
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install maintainer package
+        run: |
+          python -m pip install --upgrade pip
+          python -m venv .venv
+          .venv/bin/pip install -e '.[dev,gpu]'
+      - name: Require CUDA execution provider
+        run: |
+          LIBS=$(find .venv/lib*/python*/site-packages/nvidia/ -maxdepth 2 -name lib -type d 2>/dev/null | tr '\n' ':' | sed 's/:$//')
+          export LD_LIBRARY_PATH="${LIBS:-}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          .venv/bin/python - <<'PY'
+          import onnxruntime as ort
+          providers = ort.get_available_providers()
+          print(providers)
+          if "CUDAExecutionProvider" not in providers:
+              raise SystemExit("CUDAExecutionProvider is not available")
+          PY
+      - name: Scrape, embed, publish
+        run: scripts/maintainer-sync.sh
