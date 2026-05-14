@@ -5296,7 +5296,8 @@ fn build_corpus(pages_dir: &Path, db_path: &Path, limit: Option<usize>) -> Resul
         )
         .context("INSERT documents")?;
 
-        // Insert chunks + embeddings.
+        // Insert chunks + embeddings + chunks_fts.
+        let mut chunk_ids: Vec<(i64, String, Option<String>)> = Vec::new();
         for chunk in &chunks {
             let zstd_text = zstd::stream::encode_all(
                 std::io::Cursor::new(chunk.text.as_bytes()),
@@ -5310,6 +5311,7 @@ fn build_corpus(pages_dir: &Path, db_path: &Path, limit: Option<usize>) -> Resul
             )
             .context("INSERT chunks")?;
             let chunk_id: i64 = conn.last_insert_rowid();
+            chunk_ids.push((chunk_id, chunk.text.clone(), chunk.anchor.clone()));
 
             let emb = state
                 .encode_query_embedding(&chunk.text)
@@ -5323,6 +5325,95 @@ fn build_corpus(pages_dir: &Path, db_path: &Path, limit: Option<usize>) -> Resul
                 rusqlite::params![chunk_id, bytes],
             )
             .context("INSERT chunk_embeddings")?;
+            // chunks_fts mirrors chunk text for BM25 lexical search.
+            conn.execute(
+                "INSERT INTO chunks_fts (rowid, text) VALUES (?1, ?2)",
+                rusqlite::params![chunk_id, chunk.text],
+            )
+            .context("INSERT chunks_fts")?;
+        }
+
+        // title_fts: concat headings into a searchable per-doc row.
+        let frag = scraper::Html::parse_fragment(&final_html);
+        let h_sel = scraper::Selector::parse("h1, h2, h3, h4, h5, h6").unwrap();
+        let headings_concat: Vec<String> = frag
+            .select(&h_sel)
+            .map(|h| anchors_node_text(h))
+            .filter(|s| !s.is_empty())
+            .collect();
+        let headings_text = headings_concat.join(" ");
+        conn.execute(
+            "INSERT INTO title_fts (doc_id, title, headings) VALUES (?1, ?2, ?3)",
+            rusqlite::params![doc_id, title, headings_text],
+        )
+        .context("INSERT title_fts")?;
+
+        // doc_anchors from extract_anchors(final_html, doc_id).
+        let anchor_refs = extract_anchors(&final_html, &doc_id);
+        for (anchor_ord, r) in (0_i64..).zip(anchor_refs) {
+            // For in_doc: resolve target_anchor → chunk_id by scanning
+            // chunk text for "[anchor:<X>]". For sister/history, no
+            // chunk-id lookup.
+            let target_chunk_id: Option<i64> = if r.kind == "in_doc" {
+                if let Some(name) = r.target_anchor.as_deref() {
+                    let marker = format!("[anchor:{name}]");
+                    chunk_ids
+                        .iter()
+                        .find(|(_id, text, _anchor)| text.contains(&marker))
+                        .map(|(id, _, _)| *id)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            conn.execute(
+                "INSERT INTO doc_anchors
+                    (doc_id, ord, kind, label, target_chunk_id, target_doc_id, target_pit)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    doc_id,
+                    anchor_ord,
+                    r.kind,
+                    r.label,
+                    target_chunk_id,
+                    r.target_doc_id,
+                    r.target_pit,
+                ],
+            )
+            .context("INSERT doc_anchors")?;
+        }
+
+        // definitions from extract_definitions over the chunks.
+        let def_chunks: Vec<DefinitionChunk> = chunks
+            .iter()
+            .map(|c| DefinitionChunk {
+                ord: c.ord,
+                anchor: c.anchor.clone(),
+                text: c.text.clone(),
+            })
+            .collect();
+        let defs = extract_definitions(&doc_id, &title, &doc_type, &def_chunks);
+        for d in defs {
+            conn.execute(
+                "INSERT OR REPLACE INTO definitions
+                    (definition_id, term, norm_term, doc_id, source_title,
+                     source_type, scope, anchor, ord, body)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    d.definition_id,
+                    d.term,
+                    d.norm_term,
+                    d.doc_id,
+                    d.source_title,
+                    d.source_type,
+                    d.scope,
+                    d.anchor,
+                    d.ord,
+                    d.body,
+                ],
+            )
+            .context("INSERT definitions")?;
         }
 
         processed += 1;
