@@ -31,6 +31,10 @@ const APP_NAME: &str = "ato-mcp";
 const DEFAULT_RELEASES_URL: &str = "https://github.com/gunba/ato-mcp/releases/latest/download";
 const DEFAULT_K: usize = 8;
 const MAX_K: usize = 50;
+/// Cap on the `title_hits` sidebar `search` returns alongside chunk hits.
+/// Direct doc_id / ATO-link matches always lead; the BM25 title remainder
+/// fills the rest.
+const TITLE_HITS_K: usize = 10;
 const SNIPPET_CHARS: usize = 280;
 const EMBEDDING_DIM: usize = 256;
 const MAX_TOKENS: usize = 1024;
@@ -143,19 +147,6 @@ enum Command {
         mode: SearchMode,
         #[arg(long, default_value = "relevance")]
         sort_by: SortBy,
-        #[arg(long)]
-        include_old: bool,
-        /// Include withdrawn / superseded rulings (default excludes them).
-        #[arg(long)]
-        include_withdrawn: bool,
-    },
-    /// Search document titles, plus exact doc_id / ATO document links.
-    SearchTitles {
-        query: String,
-        #[arg(short, long, default_value_t = 20)]
-        k: usize,
-        #[arg(long, value_delimiter = ',')]
-        types: Vec<String>,
         #[arg(long)]
         include_old: bool,
         /// Include withdrawn / superseded rulings (default excludes them).
@@ -576,26 +567,6 @@ fn main() -> Result<()> {
                 },
             )?;
             println!("{}", out);
-            Ok(())
-        }
-        Command::SearchTitles {
-            query,
-            k,
-            types,
-            include_old,
-            include_withdrawn,
-        } => {
-            let types = empty_vec_as_none(types);
-            println!(
-                "{}",
-                search_titles(
-                    &query,
-                    k,
-                    types.as_deref(),
-                    include_old,
-                    !include_withdrawn,
-                )?
-            );
             Ok(())
         }
         Command::GetDocument {
@@ -1935,8 +1906,21 @@ fn search(
             meta.insert("next_call".to_string(), json!(nc));
         }
     }
+
+    // Title-level hits — a parallel algorithm over the separate `title_fts`
+    // table, surfaced as a sidebar alongside the chunk `hits`. Reuses the
+    // same document filter so chunk and title queries stay consistently
+    // scoped. Skipped for `similar_to_chunk_id` (no real query text to
+    // BM25 against — `query` is ignored in that mode).
+    let title_hits: Vec<Hit> = if similar_seed.is_some() {
+        Vec::new()
+    } else {
+        collect_title_hits(&conn, query, TITLE_HITS_K, &filter)?
+    };
+
     let mut response = serde_json::Map::new();
     response.insert("hits".to_string(), json!(records));
+    response.insert("title_hits".to_string(), json!(title_hits));
     if !meta.is_empty() {
         response.insert("meta".to_string(), JsonValue::Object(meta));
     }
@@ -3043,26 +3027,21 @@ fn load_title_hit(conn: &Connection, doc_id: &str, filter: &SqlFilter) -> Result
     }
 }
 
-fn search_titles(
+/// Title-level hits for a query: exact doc_id / ATO-link lookups first,
+/// then BM25 over the separate `title_fts` table. A parallel algorithm to
+/// chunk search — `search` calls this to populate its `title_hits`
+/// sidebar. The caller supplies the connection and the already-built
+/// document filter so chunk and title queries stay consistently scoped.
+fn collect_title_hits(
+    conn: &Connection,
     query: &str,
     k: usize,
-    types: Option<&[String]>,
-    include_old: bool,
-    current_only: bool,
-) -> Result<String> {
-    // [MT-14] search_titles ranks title_fts independently and uses the same default filters.
-    let conn = open_read()?;
+    filter: &SqlFilter,
+) -> Result<Vec<Hit>> {
+    // [MT-14] Title hits rank title_fts independently and reuse the chunk
+    // query's document filter.
     let k = k.clamp(1, 100);
-    let filter = build_doc_filter(
-        "d",
-        types,
-        None,
-        None,
-        None,
-        include_old,
-        current_only,
-    );
-    let direct_hits = direct_title_hits(&conn, query, k, &filter)?;
+    let direct_hits = direct_title_hits(conn, query, k, filter)?;
     let where_filter = if filter.sql.is_empty() {
         String::new()
     } else {
@@ -3082,7 +3061,7 @@ fn search_titles(
         "#
     );
     let mut params_vec = vec![Value::Text(fts_query(query))];
-    params_vec.extend(filter.params);
+    params_vec.extend(filter.params.clone());
     params_vec.push(Value::Integer(k as i64 + 1));
 
     let mut stmt = conn.prepare(&sql)?;
@@ -3127,14 +3106,8 @@ fn search_titles(
         direct_hits.iter().map(|hit| hit.doc_id.clone()).collect();
     rows.retain(|hit| !direct_doc_ids.contains(&hit.doc_id));
     rows.splice(0..0, direct_hits);
-    let truncated = rows.len() > k;
     rows.truncate(k);
-    let mut response = serde_json::Map::new();
-    response.insert("hits".to_string(), json!(rows));
-    if truncated {
-        response.insert("meta".to_string(), json!({"truncated": true}));
-    }
-    Ok(serde_json::to_string_pretty(&JsonValue::Object(response))?)
+    Ok(rows)
 }
 
 struct GetDocumentOptions {
@@ -11643,17 +11616,6 @@ fn call_tool(params: JsonValue, state: &ServerState) -> Result<JsonValue> {
                 Some(state),
             )?
         }
-        "search_titles" => {
-            let query = required_str(&args, "query")?;
-            let types = optional_string_array(&args, "types")?;
-            search_titles(
-                query,
-                optional_usize(&args, "k").unwrap_or(20),
-                types.as_deref(),
-                optional_bool(&args, "include_old").unwrap_or(false),
-                optional_bool(&args, "current_only").unwrap_or(true),
-            )?
-        }
         "get_document" => {
             let doc_id = required_str(&args, "doc_id")?;
             get_document(
@@ -12336,7 +12298,7 @@ fn tool_descriptors() -> JsonValue {
     json!([
         {
             "name": "search",
-            "description": "Hybrid semantic+lexical search over chunks (chunk-level). Returns slim pointer hits (chunk_id, doc_id, anchor, optional snippet) — fetch bodies via get_chunks. doc_scope filters by full doc_id (in-doc search) or \"<PREFIX>/%\" (family). mode=keyword forces lexical-only; hybrid/vector require the semantic index. Set include_snippet=false when the caller will follow up with get_chunks. Pass similar_to_chunk_id to find chunks semantically close to one the agent already has (skips query encoding, ignores `query`, forces vector-only mode, filters the seed chunk out of results). Slim hits include navigation hints: has_in_doc_links (doc has paragraph anchors / contents entries — call get_doc_anchors to navigate), has_related_docs (doc has companion documents like errata / addenda), has_history (doc has earlier point-in-time versions — get_doc_anchors lists their URLs).",
+            "description": "Hybrid semantic+lexical search over the ATO corpus. Returns two parallel result arrays: `hits` — chunk-level pointer hits (chunk_id, doc_id, anchor, optional snippet); fetch bodies via get_chunks. `title_hits` — up to 10 document-level hits ranked by title (no chunk_id), including exact doc_id / ATO-document-link lookups; treat as a sidebar of strongly-matching whole documents. doc_scope filters by full doc_id (in-doc search) or \"<PREFIX>/%\" (family). mode=keyword forces lexical-only; hybrid/vector require the semantic index. Set include_snippet=false when the caller will follow up with get_chunks. Pass similar_to_chunk_id to find chunks semantically close to one the agent already has (skips query encoding, ignores `query`, forces vector-only mode, filters the seed chunk out of results, and returns no title_hits). Hits in both arrays include navigation hints: has_in_doc_links (doc has paragraph anchors / contents entries — call get_doc_anchors to navigate), has_related_docs (doc has companion documents like errata / addenda), has_history (doc has earlier point-in-time versions — get_doc_anchors lists their URLs).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -12350,24 +12312,8 @@ fn tool_descriptors() -> JsonValue {
                     "sort_by": {"type": "string", "enum": ["relevance", "recency"]},
                     "include_old": {"type": "boolean"},
                     "current_only": {"type": "boolean", "description": "When true (default), excludes withdrawn rulings. Set false to include withdrawn material with a visible marker."},
-                    "similar_to_chunk_id": {"type": "integer", "description": "When set, use this chunk's stored embedding as the query vector (skips encoding `query`, forces mode=vector, excludes the seed chunk from results)."},
+                    "similar_to_chunk_id": {"type": "integer", "description": "When set, use this chunk's stored embedding as the query vector (skips encoding `query`, forces mode=vector, excludes the seed chunk from results, returns no title_hits)."},
                     "include_snippet": {"type": "boolean", "description": "When true (default), each hit carries a BM25-windowed snippet. Set false to omit the snippet field entirely — useful when the caller will fetch full text via get_chunks."},
-                    "format": {"type": "string", "enum": ["json"], "default": "json"}
-                },
-                "required": ["query"]
-            }
-        },
-        {
-            "name": "search_titles",
-            "description": "Title-only search returning doc-level hits (no chunk_id). Use search for chunk-level results. Accepts exact doc_id and ATO document-link lookup. Hits include navigation hints (has_in_doc_links, has_related_docs, has_history) — call get_doc_anchors(doc_id) to navigate.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "k": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "types": {"type": "array", "items": {"type": "string"}},
-                    "include_old": {"type": "boolean"},
-                    "current_only": {"type": "boolean", "description": "When true (default), excludes withdrawn rulings. Set false to include withdrawn material with a visible marker."},
                     "format": {"type": "string", "enum": ["json"], "default": "json"}
                 },
                 "required": ["query"]
@@ -13380,10 +13326,10 @@ mod tests {
         Ok(())
     }
 
-    // ----- W2.4 integration: search filters out withdrawn docs by default -----
+    // ----- W2.4 integration: title hits filter out withdrawn docs by default -----
 
     #[test]
-    fn search_titles_excludes_withdrawn_by_default() -> Result<()> {
+    fn collect_title_hits_excludes_withdrawn_by_default() -> Result<()> {
         let _lock = TEST_DB_LOCK.lock().unwrap();
         let (dir, _db) = make_test_db()?;
         let conn = open_write_at(&dir.path().join("live/ato.db"))?;
@@ -13406,7 +13352,7 @@ mod tests {
             "INSERT INTO title_fts(doc_id, title, headings) VALUES (?, ?, '')",
             params!["DOC_WITHDRAWN", "depreciation effective life rulings"],
         )?;
-        // Update documents.title to match what title_fts holds (search_titles
+        // Update documents.title to match what title_fts holds (collect_title_hits
         // joins documents to fetch the displayed title back).
         conn.execute(
             "UPDATE documents SET title = ? WHERE doc_id = ?",
@@ -13419,21 +13365,11 @@ mod tests {
         drop(conn);
 
         with_data_dir(dir.path(), || -> Result<()> {
+            let conn = open_read()?;
             // Default: current_only=true → withdrawn doc filtered out.
-            let json_str = search_titles(
-                "depreciation",
-                10,
-                None,
-                true, // include_old (date filter doesn't apply since title query)
-                true, // current_only
-            )?;
-            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-            let doc_ids: Vec<&str> = parsed["hits"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|h| h["doc_id"].as_str().unwrap())
-                .collect();
+            let filter = build_doc_filter("d", None, None, None, None, true, true);
+            let hits = collect_title_hits(&conn, "depreciation", 10, &filter)?;
+            let doc_ids: Vec<&str> = hits.iter().map(|h| h.doc_id.as_str()).collect();
             assert!(
                 doc_ids.contains(&"DOC_CURRENT"),
                 "current doc should appear; got: {doc_ids:?}"
@@ -13443,31 +13379,22 @@ mod tests {
                 "withdrawn doc should be filtered out by default; got: {doc_ids:?}"
             );
 
-            // current_only=false → withdrawn doc returned with marker visible
-            // in JSON via the dedicated field.
-            let json_str = search_titles(
-                "depreciation",
-                10,
-                None,
-                true,
-                false, // current_only off
-            )?;
-            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-            let withdrawn_hit = parsed["hits"]
-                .as_array()
-                .unwrap()
+            // current_only=false → withdrawn doc returned with marker visible.
+            let filter = build_doc_filter("d", None, None, None, None, true, false);
+            let hits = collect_title_hits(&conn, "depreciation", 10, &filter)?;
+            let withdrawn_hit = hits
                 .iter()
-                .find(|h| h["doc_id"].as_str() == Some("DOC_WITHDRAWN"))
+                .find(|h| h.doc_id == "DOC_WITHDRAWN")
                 .expect("withdrawn doc should appear when current_only=false");
-            assert_eq!(withdrawn_hit["withdrawn_date"], json!("2023-06-15"));
-            assert_eq!(withdrawn_hit["superseded_by"], json!("TR 2024/1"));
+            assert_eq!(withdrawn_hit.withdrawn_date.as_deref(), Some("2023-06-15"));
+            assert_eq!(withdrawn_hit.superseded_by.as_deref(), Some("TR 2024/1"));
             Ok(())
         })?;
         Ok(())
     }
 
     #[test]
-    fn search_titles_prefers_direct_doc_id_hits() -> Result<()> {
+    fn collect_title_hits_prefers_direct_doc_id_hits() -> Result<()> {
         let _lock = TEST_DB_LOCK.lock().unwrap();
         let (dir, _db) = make_test_db()?;
         let conn = open_write_at(&dir.path().join("live/ato.db"))?;
@@ -13509,24 +13436,17 @@ mod tests {
         drop(conn);
 
         with_data_dir(dir.path(), || -> Result<()> {
-            let json_str = search_titles(
-                "PAC/19970038/203-50",
-                5,
-                None,
-                false,
-                true,
-            )?;
-            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-            assert_eq!(parsed["hits"][0]["doc_id"], json!("PAC/19970038/203-50"));
-            let json_str = search_titles(
+            let conn = open_read()?;
+            let filter = build_doc_filter("d", None, None, None, None, false, true);
+            let hits = collect_title_hits(&conn, "PAC/19970038/203-50", 5, &filter)?;
+            assert_eq!(hits[0].doc_id, "PAC/19970038/203-50");
+            let hits = collect_title_hits(
+                &conn,
                 "Income Tax Assessment Act 1997 s 8-1",
                 5,
-                None,
-                false,
-                true,
+                &filter,
             )?;
-            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-            assert_eq!(parsed["hits"][0]["doc_id"], json!("PAC/19970038/8-1"));
+            assert_eq!(hits[0].doc_id, "PAC/19970038/8-1");
             Ok(())
         })?;
         Ok(())
