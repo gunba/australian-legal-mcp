@@ -308,6 +308,24 @@ enum Command {
         #[arg(long)]
         input_file: Option<PathBuf>,
     },
+    /// Basic in-binary build orchestrator (early port of build.py).
+    /// Reads `pages_dir/index.jsonl` (one record per line, fields:
+    /// canonical_id + payload_path), runs each doc through the cleaning
+    /// pipeline + chunker + embedder in-process, and writes documents +
+    /// chunks + chunk_embeddings to the SQLite db_path.
+    /// MISSING from this version: pack file writing, manifest emission,
+    /// incremental reuse, resume-from-crash, asset persistence to disk,
+    /// definitions extraction, doc-anchors population. Those land in
+    /// follow-up commits as build.py is fully retired. For now this gives
+    /// a self-contained way to produce a basic corpus database.
+    Build {
+        #[arg(long)]
+        pages_dir: PathBuf,
+        #[arg(long)]
+        db_path: PathBuf,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Fetch compact statutory definitions for a term.
     GetDefinition {
         term: String,
@@ -846,6 +864,11 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&out)?);
             Ok(())
         }
+        Command::Build {
+            pages_dir,
+            db_path,
+            limit,
+        } => build_corpus(&pages_dir, &db_path, limit),
     }
 }
 
@@ -5131,6 +5154,146 @@ fn write_pack(
         "size": size,
         "refs": refs,
     }))
+}
+
+// ----- Build orchestrator (early port of src/ato_mcp/indexer/build.py) -----
+//
+// Walks pages_dir/index.jsonl, runs each doc through the cleaning + chunker
+// + embedder pipeline in-process, and writes documents + chunks +
+// chunk_embeddings rows. Missing vs Python: pack writing, manifest emission,
+// incremental reuse, resume, asset persistence, definitions extraction,
+// doc-anchors. Each lands in subsequent commits as build.py is fully retired.
+
+fn build_corpus(pages_dir: &Path, db_path: &Path, limit: Option<usize>) -> Result<()> {
+    use std::io::BufRead as _;
+
+    let index_path = pages_dir.join("index.jsonl");
+    let index_file = File::open(&index_path)
+        .with_context(|| format!("opening {}", index_path.display()))?;
+    let reader = std::io::BufReader::new(index_file);
+
+    let conn = open_write_at(db_path)
+        .with_context(|| format!("opening sqlite at {}", db_path.display()))?;
+
+    let state = ServerState::default();
+    let mut processed: usize = 0;
+
+    for line_res in reader.lines() {
+        if let Some(n) = limit {
+            if processed >= n {
+                break;
+            }
+        }
+        let line = line_res?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: JsonValue =
+            serde_json::from_str(&line).context("parsing index.jsonl line")?;
+        let canonical_id = record
+            .get("canonical_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("index record missing canonical_id"))?;
+        let payload_path_raw = record
+            .get("payload_path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("index record missing payload_path"))?;
+        let payload_path = pages_dir.join(payload_path_raw);
+
+        let html = fs::read_to_string(&payload_path).with_context(|| {
+            format!("reading payload {}", payload_path.display())
+        })?;
+        let doc_id = metadata_doc_id_for(canonical_id);
+        let doc_type = metadata_parse_docid(canonical_id).unwrap_or_default();
+
+        // Cleaning pipeline: clean_ato_html + image rewriting + named-anchor
+        // normalisation + link rewriting + attribute stripping. Mirrors the
+        // Python `extract.extract` order for the HTML output.
+        let cleaned = clean_ato_html(&html);
+        let (rewritten_html, _assets) = rewrite_images_html(
+            &cleaned.html,
+            Some(&doc_id),
+            Some(payload_path.as_path()),
+        );
+        let normalised = normalise_named_anchors(&rewritten_html);
+        let with_links = rewrite_links_html(&normalised);
+        let final_html = strip_attributes(&with_links);
+
+        // Title composition.
+        let leading = extract_leading_headings(&cleaned.html);
+        let composed_title = extract_compose_title(&leading);
+        let title = composed_title
+            .or(cleaned.title.clone())
+            .unwrap_or_else(|| canonical_id.to_string());
+
+        // Chunker.
+        let chunks = chunk_html(&final_html, Some(&title), EMBED_MAX_TOKENS);
+
+        // Insert documents row.
+        let now = chrono::Utc::now().to_rfc3339();
+        let content_hash = metadata_content_hash(&cleaned.text);
+        conn.execute(
+            "INSERT OR REPLACE INTO documents
+                (doc_id, type, title, date, downloaded_at, content_hash, pack_sha8,
+                 html, withdrawn_date, superseded_by, replaces,
+                 has_in_doc_links, has_related_docs, has_history)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            rusqlite::params![
+                doc_id,
+                doc_type,
+                title,
+                Option::<String>::None,
+                now,
+                content_hash,
+                "PENDING",
+                final_html,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                0_i64,
+                0_i64,
+                0_i64,
+            ],
+        )
+        .context("INSERT documents")?;
+
+        // Insert chunks + embeddings.
+        for chunk in &chunks {
+            let zstd_text = zstd::stream::encode_all(
+                std::io::Cursor::new(chunk.text.as_bytes()),
+                3,
+            )
+            .context("zstd-compressing chunk text")?;
+            conn.execute(
+                "INSERT INTO chunks (doc_id, ord, anchor, text)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![doc_id, chunk.ord, chunk.anchor, zstd_text],
+            )
+            .context("INSERT chunks")?;
+            let chunk_id: i64 = conn.last_insert_rowid();
+
+            let emb = state
+                .encode_query_embedding(&chunk.text)
+                .context("encoding chunk embedding")?;
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(emb.as_ptr() as *const u8, emb.len())
+            };
+            conn.execute(
+                "INSERT INTO chunk_embeddings (chunk_id, embedding)
+                 VALUES (?1, ?2)",
+                rusqlite::params![chunk_id, bytes],
+            )
+            .context("INSERT chunk_embeddings")?;
+        }
+
+        processed += 1;
+        if processed.is_multiple_of(50) {
+            eprintln!("ato-mcp build: processed {processed} docs");
+        }
+    }
+
+    eprintln!("ato-mcp build: done — {processed} docs written to {}", db_path.display());
+    Ok(())
 }
 
 fn fetch_external_doc(
