@@ -16,7 +16,7 @@ line count before, what's in Rust now, and the wrapper status.
 
 CLI subcommands added: `extract`, `extract-anchors`, `extract-definitions`,
 `extract-currency`, `chunk-html`, `doc-meta`, `doc-id-from-link`, `pack-write`,
-`manifest-rewrite-urls`.
+`manifest-rewrite-urls`, `bundle-model`, `ato-fetch-nodes`, `embed`.
 
 ## Done — Rust impl, no Python wrapper yet
 
@@ -24,6 +24,9 @@ CLI subcommands added: `extract`, `extract-anchors`, `extract-definitions`,
 |---|---|---|
 | `pack.py:PackWriter` | `write_pack` + `pack-write` CLI | Wrapper deferred — stateful API exposes refs/sha8 inside the with-block, doesn't subprocess cleanly. Lands with build.py rewrite. |
 | `release.py:rewrite_manifest_urls` | `manifest-rewrite-urls` CLI | One-shot — once publish-release.sh stops shelling into Python, this CLI replaces the call. |
+| `release.py:bundle_model` | `bundle-model` CLI | Same as above. |
+| `scraper/client.py:AtoBrowseClient.fetch_nodes` | `ato-fetch-nodes` CLI | First scraper primitive in Rust. Tree crawler / what's-new use this. |
+| `embed.model:EmbeddingModel.encode_query` (build path) | `embed` CLI | Batch text-to-int8 encoder. Build pipeline will pipe chunk text through this. |
 
 ## Pending — Python still unmodified
 
