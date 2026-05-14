@@ -1,225 +1,85 @@
-"""Doc-navigation extraction.
+"""Doc-navigation extraction via the Rust ato-mcp binary.
 
-Walks the cleaned HTML for a single doc and classifies every `<a href>` as:
+Thin Python subprocess wrapper. The classification logic for in_doc /
+sister / history anchor refs lives in src/main.rs (extract_anchors),
+including label resolution priority (sibling row cells, anchor's own
+text, default-date suffix), sentinel PiT handling, and dedup.
 
-- ``in_doc``: an anchor reference (#X) whose target ``<a name="X">`` or
-  ``[id="X"]`` lives elsewhere in the same doc. Surfaces as paragraph
-  navigation, ToC entries, footnote refs.
-- ``sister``: an external doc link (different doc_id, no PiT) — typically
-  errata, addenda, or related rulings.
-- ``history``: an external doc link to the same or another doc with a
-  ``PiT=<YYYYMMDDHHMMSS>`` timestamp — a historical (point-in-time) version.
-  We do not store historical content; the anchor row only records the BASE
-  doc_id and the timestamp so an agent can reconstruct the external URL if
-  they need to fetch the older version.
-
-Label resolution priority:
-1. If the anchor sits inside a `<tr>` whose other cells contain plain text:
-   use those sibling cells' text concatenated.
-2. Otherwise: use the anchor's own visible text.
-3. For history links: append/derive a date string from the PiT timestamp.
-
-This module deliberately does NOT depend on element class, id, or heading
-text. ATO is inconsistent on those; the URL shape and DOM ancestry are the
-stable signals.
-
-build.py post-processes the returned ``AnchorRef`` list:
-- ``in_doc`` refs: look up ``target_anchor`` in the chunk text for
-  ``[anchor:<target_anchor>]`` markers (emitted by the chunker) to find the
-  target chunk_id.
-- ``sister``/``history`` refs: ``target_doc_id`` (and ``target_pit``) are
-  recorded as-is.
+Public API preserved for tests/test_doc_anchors.py and build.py:
+- AnchorRef dataclass
+- extract_anchors(html, source_doc_id) -> list[AnchorRef]
+- anchor_target_to_chunk(anchor, chunk_texts) -> chunk_id | None
 """
 from __future__ import annotations
 
+import json
+import os
+import shutil
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable
-
-from selectolax.parser import HTMLParser, Node
-
-from .extract import _doc_id_from_ato_link
-
-# ATO uses sentinel PiT values to mean "current view" (99991231235958, "as
-# at end of time") and "earliest / original" (10010101000001, year 1001).
-# Both alias the live doc rather than identifying a real historical
-# version, so drop the PiT entirely when we see either.
-_SENTINEL_PITS = {"99991231235958", "10010101000001"}
 
 
 @dataclass(frozen=True)
 class AnchorRef:
     kind: str  # 'in_doc' | 'sister' | 'history'
     label: str
-    # in_doc: anchor name (resolved to chunk_id by build.py)
     target_anchor: str | None = None
-    # sister/history: target doc_id (always the BASE doc_id — historical
-    # versions are not stored as separate doc rows; the timestamp lives in
-    # ``target_pit``).
     target_doc_id: str | None = None
     target_pit: str | None = None
 
 
-def extract_anchors(html: str, *, source_doc_id: str) -> list[AnchorRef]:
-    """Return the list of navigation anchors for a single doc.
+def _ato_mcp_bin() -> str:
+    env = os.environ.get("ATO_MCP_BIN")
+    if env:
+        return env
+    on_path = shutil.which("ato-mcp")
+    if on_path:
+        return on_path
+    repo_release = Path(__file__).resolve().parents[3] / "target" / "release" / "ato-mcp"
+    if repo_release.is_file():
+        return str(repo_release)
+    raise RuntimeError(
+        "ato-mcp binary not found: set ATO_MCP_BIN, put it on PATH, or "
+        "build target/release/ato-mcp"
+    )
 
-    ``source_doc_id`` is the doc_id of the doc being extracted; used to
-    distinguish self-references (history) from sister docs.
-    """
+
+def extract_anchors(html: str, *, source_doc_id: str) -> list[AnchorRef]:
     if not html.strip():
         return []
-    tree = HTMLParser(html)
-    targets = _collect_anchor_targets(tree)
-    refs: list[AnchorRef] = []
-    seen: set[tuple[str, str, str | None, str | None]] = set()
-    for a in tree.css("a[href]"):
-        href = a.attributes.get("href") or ""
-        if href.startswith("#"):
-            target = href[1:]
-            if not target or target not in targets:
-                continue
-            label = _resolve_label(a)
-            key = ("in_doc", target, None, label)
-            if key in seen:
-                continue
-            seen.add(key)
-            refs.append(
-                AnchorRef(kind="in_doc", label=label, target_anchor=target)
-            )
-            continue
-        resolved = _doc_id_from_ato_link(href)
-        if not resolved:
-            continue
-        target_doc_id, pit, _view = resolved
-        # ATO navigation panels use sentinel PiT values that alias the live
-        # doc rather than a real historical version. Treat them as no-PiT
-        # links.
-        if pit in _SENTINEL_PITS:
-            pit = None
-        if pit:
-            # Historical version (same or other doc + PiT timestamp). The
-            # target_doc_id is the BASE doc_id; the timestamp travels in
-            # target_pit. We do not store historical content, so the
-            # anchor only points the agent at the URL they would fetch
-            # externally if they want the older version.
-            label = _resolve_label(a, default_date=_pit_to_date(pit))
-            key = ("history", target_doc_id, pit, label)
-            if key in seen:
-                continue
-            seen.add(key)
-            refs.append(
-                AnchorRef(
-                    kind="history",
-                    label=label,
-                    target_doc_id=target_doc_id,
-                    target_pit=pit,
-                )
-            )
-            continue
-        if target_doc_id == source_doc_id:
-            # Self-link without PiT — not a useful navigation entry.
-            continue
-        label = _resolve_label(a)
-        key = ("sister", target_doc_id, None, label)
-        if key in seen:
-            continue
-        seen.add(key)
-        refs.append(
+    proc = subprocess.run(
+        [_ato_mcp_bin(), "extract-anchors", "--source-doc-id", source_doc_id],
+        input=html,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"ato-mcp extract-anchors failed (exit {proc.returncode}): {proc.stderr.strip()}"
+        )
+    payload = json.loads(proc.stdout)
+    out: list[AnchorRef] = []
+    for entry in payload:
+        out.append(
             AnchorRef(
-                kind="sister",
-                label=label,
-                target_doc_id=target_doc_id,
+                kind=entry["kind"],
+                label=entry["label"],
+                target_anchor=entry.get("target_anchor"),
+                target_doc_id=entry.get("target_doc_id"),
+                target_pit=entry.get("target_pit"),
             )
         )
-    return refs
-
-
-def _collect_anchor_targets(tree: HTMLParser) -> set[str]:
-    """Return every `<a name="X">` and `[id="X"]` target name in the doc."""
-    targets: set[str] = set()
-    for a in tree.css("a[name]"):
-        name = a.attributes.get("name")
-        if name:
-            targets.add(name)
-    for el in tree.css("[id]"):
-        nid = el.attributes.get("id")
-        if nid:
-            targets.add(nid)
-    return targets
-
-
-def _resolve_label(a: Node, *, default_date: str | None = None) -> str:
-    """Best-effort label for an anchor.
-
-    Priority: sibling cells in the same <tr>, then the anchor's own text,
-    then the optional default_date (for history links with empty text).
-    """
-    own = (a.text(strip=True) or "").strip()
-    sibling_text = _sibling_cells_text(a)
-    parts: list[str] = []
-    if sibling_text:
-        parts.append(sibling_text)
-    if own and own not in parts:
-        parts.append(own)
-    label = " ".join(parts).strip()
-    if default_date:
-        if label:
-            label = f"{label} ({default_date})"
-        else:
-            label = default_date
-    return label or "(unnamed)"
-
-
-def _sibling_cells_text(a: Node) -> str:
-    """If the anchor lives in a <tr>, concatenate the OTHER cells' text."""
-    row = _ancestor(a, {"tr"})
-    if row is None:
-        return ""
-    own_cell_html = _ancestor_html(a, {"td", "th"})
-    parts: list[str] = []
-    for cell in row.css("td, th"):
-        # selectolax returns fresh Node objects per css() call so identity
-        # comparison doesn't work; compare serialised HTML instead.
-        if cell.html == own_cell_html:
-            continue
-        text = (cell.text(strip=True) or "").strip()
-        if text:
-            parts.append(text)
-    return " ".join(parts).strip()
-
-
-def _ancestor(node: Node, tags: set[str]) -> Node | None:
-    current: Node | None = node.parent
-    while current is not None:
-        if (current.tag or "").lower() in tags:
-            return current
-        current = current.parent
-    return None
-
-
-def _ancestor_html(node: Node, tags: set[str]) -> str | None:
-    """Return the HTML of the closest ancestor matching one of ``tags``."""
-    ancestor = _ancestor(node, tags)
-    return ancestor.html if ancestor is not None else None
-
-
-def _pit_to_date(pit: str) -> str:
-    """Convert a PiT timestamp (YYYYMMDDHHMMSS) to an ISO date YYYY-MM-DD.
-
-    Returns the raw value if it doesn't match the expected shape.
-    """
-    s = pit.strip()
-    if len(s) >= 8 and s[:8].isdigit():
-        return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
-    return s
+    return out
 
 
 def anchor_target_to_chunk(
     anchor: str, chunk_texts: Iterable[tuple[int, str]]
 ) -> int | None:
-    """Find the chunk_id whose text contains ``[anchor:<anchor>]``.
-
-    ``chunk_texts`` is an iterable of (chunk_id, text) for one doc.
-    """
+    """Find the chunk_id whose text contains [anchor:<anchor>]. Pure Python
+    helper — no subprocess needed because callers pass chunk text in-process."""
     marker = f"[anchor:{anchor}]"
     for chunk_id, text in chunk_texts:
         if marker in text:
