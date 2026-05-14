@@ -380,6 +380,24 @@ enum Command {
         #[arg(long)]
         out_dir: Option<PathBuf>,
     },
+    /// Download deduped ATO links to local payloads/<Category>/<slug>.html
+    /// + index.jsonl. Mirrors src/ato_mcp/scraper/downloader.py:LinkDownloader.
+    LinkDownload {
+        #[arg(long)]
+        deduped_links: PathBuf,
+        #[arg(long)]
+        out_dir: PathBuf,
+        #[arg(long, default_value = "https://www.ato.gov.au")]
+        base_url: String,
+        #[arg(long, default_value_t = 0.05)]
+        request_delay_seconds: f64,
+        #[arg(long, default_value_t = 4)]
+        max_workers: usize,
+        #[arg(long, default_value_t = 30.0)]
+        timeout_seconds: f64,
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
     /// Publish a corpus release to GitHub. Mirrors
     /// src/ato_mcp/indexer/release.py:publish — rewrites manifest URLs to
     /// release asset URLs, fixes embedding-model fields if they're
@@ -614,6 +632,23 @@ fn main() -> Result<()> {
             nodes_path,
             out_dir,
         } => snapshot_reduce(&nodes_path, out_dir.as_deref()),
+        Command::LinkDownload {
+            deduped_links,
+            out_dir,
+            base_url,
+            request_delay_seconds,
+            max_workers,
+            timeout_seconds,
+            force,
+        } => link_download(LinkDownloadArgs {
+            deduped_links,
+            out_dir,
+            base_url,
+            request_delay_seconds,
+            max_workers,
+            timeout_seconds,
+            force,
+        }),
         Command::FetchExternalDoc {
             doc_id,
             pit,
@@ -8232,6 +8267,384 @@ fn snapshot_reduce(nodes_path: &Path, output_dir: Option<&Path>) -> Result<()> {
         folder_records.len(),
         payload.len(),
         out_dir.display(),
+    );
+    Ok(())
+}
+
+// ----- link-download (port of src/ato_mcp/scraper/downloader.py) -----
+
+struct LinkDownloadArgs {
+    deduped_links: PathBuf,
+    out_dir: PathBuf,
+    base_url: String,
+    request_delay_seconds: f64,
+    max_workers: usize,
+    timeout_seconds: f64,
+    force: bool,
+}
+
+fn slug_for(text: &str, fallback: &str) -> String {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"[^A-Za-z0-9]+").unwrap());
+    let s = re.replace_all(text.trim(), "_");
+    let s = s.trim_matches('_').to_string();
+    let s = if s.is_empty() { fallback.to_string() } else { s };
+    s.chars().take(80).collect()
+}
+
+fn build_payload_path(out_dir: &Path, link: &JsonValue) -> PathBuf {
+    let payload_dir = out_dir.join("payloads");
+    let mut dir = payload_dir;
+    if let Some(seg) = link.get("representative_path").and_then(|v| v.as_array()) {
+        for s in seg.iter().filter_map(|v| v.as_str()) {
+            dir = dir.join(slug_for(s, "node"));
+        }
+    }
+    let canonical_id = link.get("canonical_id").and_then(|v| v.as_str()).unwrap_or("");
+    let filename = format!("{}.html", slug_for(canonical_id, "link"));
+    dir.join(filename)
+}
+
+fn extract_law_contents(html: &str) -> Option<String> {
+    use scraper::{Html, Selector};
+    let doc = Html::parse_document(html);
+    let sel = Selector::parse("article").ok()?;
+    let article = doc.select(&sel).next()?;
+    // Wrap children in <div id="lawContents">.
+    let mut inner = String::new();
+    for child in article.children() {
+        if let Some(eref) = scraper::ElementRef::wrap(child) {
+            inner.push_str(&eref.html());
+        } else if let Some(text) = child.value().as_text() {
+            inner.push_str(text);
+        }
+    }
+    Some(format!(r#"<div id="lawContents">{inner}</div>"#))
+}
+
+fn link_download(args: LinkDownloadArgs) -> Result<()> {
+    use std::io::BufRead as _;
+    use std::sync::{Arc, Mutex};
+
+    let payload_dir = args.out_dir.join("payloads");
+    let index_path = args.out_dir.join("index.jsonl");
+    fs::create_dir_all(&payload_dir)?;
+
+    // Load links.
+    let f = File::open(&args.deduped_links)
+        .with_context(|| format!("opening {}", args.deduped_links.display()))?;
+    let reader = std::io::BufReader::new(f);
+    let mut links: Vec<JsonValue> = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        links.push(serde_json::from_str(trimmed)?);
+    }
+    let total = links.len();
+    eprintln!("link-download: {total} links to consider");
+
+    // Load existing index for resumability.
+    let mut index: std::collections::HashMap<String, JsonValue> = std::collections::HashMap::new();
+    if index_path.exists() {
+        let f = File::open(&index_path)?;
+        let reader = std::io::BufReader::new(f);
+        for line in reader.lines() {
+            let line = line?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let rec: JsonValue = serde_json::from_str(trimmed)?;
+            if let Some(cid) = rec.get("canonical_id").and_then(|v| v.as_str()) {
+                index.insert(cid.to_string(), rec);
+            }
+        }
+    }
+    let initial_completed = index
+        .values()
+        .filter(|r| r.get("status").and_then(|v| v.as_str()) == Some("success"))
+        .count();
+    if initial_completed > 0 {
+        eprintln!("link-download: resuming with {initial_completed} previously completed");
+    }
+    let index = Arc::new(Mutex::new(index));
+
+    let client = Arc::new(
+        reqwest::blocking::Client::builder()
+            .user_agent(ATO_USER_AGENT)
+            .timeout(Duration::from_secs_f64(args.timeout_seconds))
+            .build()?,
+    );
+
+    let last_request = Arc::new(Mutex::new(
+        std::time::Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or_else(std::time::Instant::now),
+    ));
+    let request_delay = args.request_delay_seconds;
+
+    let work_queue: Arc<Mutex<Vec<JsonValue>>> = Arc::new(Mutex::new(links));
+    let stats_completed = Arc::new(std::sync::atomic::AtomicUsize::new(initial_completed));
+    let stats_errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stats_skipped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let index_writer = Arc::new(Mutex::new(
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&index_path)?,
+    ));
+
+    let mut handles = Vec::with_capacity(args.max_workers);
+    for worker_id in 0..args.max_workers {
+        let work_queue = Arc::clone(&work_queue);
+        let client = Arc::clone(&client);
+        let last_request = Arc::clone(&last_request);
+        let index = Arc::clone(&index);
+        let index_writer = Arc::clone(&index_writer);
+        let stats_completed = Arc::clone(&stats_completed);
+        let stats_errors = Arc::clone(&stats_errors);
+        let stats_skipped = Arc::clone(&stats_skipped);
+        let base_url = args.base_url.clone();
+        let out_dir = args.out_dir.clone();
+        let force = args.force;
+
+        handles.push(std::thread::spawn(move || -> Result<()> {
+            loop {
+                let link = {
+                    let mut q = work_queue.lock().unwrap();
+                    q.pop()
+                };
+                let Some(link) = link else { break };
+                let canonical_id = link
+                    .get("canonical_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let href = link.get("href").and_then(|v| v.as_str()).map(String::from);
+
+                let payload_path = build_payload_path(&out_dir, &link);
+
+                // Skip if already done.
+                if !force {
+                    let already_done = {
+                        let idx = index.lock().unwrap();
+                        idx.get(&canonical_id)
+                            .and_then(|r| r.get("status").and_then(|v| v.as_str()))
+                            == Some("success")
+                    };
+                    if already_done {
+                        stats_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                    if payload_path.exists() {
+                        // Orphan payload — emit synthetic success.
+                        let rel = payload_path
+                            .strip_prefix(&out_dir)
+                            .unwrap_or(&payload_path)
+                            .to_string_lossy()
+                            .to_string();
+                        let now = chrono::Utc::now().to_rfc3339();
+                        let rec = json!({
+                            "canonical_id": canonical_id,
+                            "href": href,
+                            "status": "success",
+                            "payload_path": rel,
+                            "assets": [],
+                            "error": null,
+                            "http_status": null,
+                            "downloaded_at": now,
+                        });
+                        {
+                            use std::io::Write as _;
+                            let mut idx = index.lock().unwrap();
+                            idx.insert(canonical_id.clone(), rec.clone());
+                            let mut w = index_writer.lock().unwrap();
+                            writeln!(w, "{}", serde_json::to_string(&rec)?)?;
+                        }
+                        stats_completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                }
+
+                // Rate limit.
+                if request_delay > 0.0 {
+                    let mut last = last_request.lock().unwrap();
+                    let now = std::time::Instant::now();
+                    let earliest = *last + Duration::from_secs_f64(request_delay);
+                    if earliest > now {
+                        std::thread::sleep(earliest - now);
+                        *last = earliest;
+                    } else {
+                        *last = now;
+                    }
+                }
+
+                let url = match href.as_deref() {
+                    Some(h) if h.starts_with('/') => format!("{}{}", base_url.trim_end_matches('/'), h),
+                    Some(h) => h.to_string(),
+                    None => {
+                        eprintln!("link-download w{worker_id}: missing href for {canonical_id}");
+                        stats_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                };
+
+                let resp = client.get(&url).send();
+                let (http_status, html) = match resp {
+                    Ok(r) => {
+                        let status = r.status();
+                        if !status.is_success() {
+                            eprintln!("link-download w{worker_id}: HTTP {status} for {canonical_id}");
+                            stats_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let now = chrono::Utc::now().to_rfc3339();
+                            let rec = json!({
+                                "canonical_id": canonical_id,
+                                "href": href,
+                                "status": "failed",
+                                "payload_path": null,
+                                "error": format!("HTTP {status}"),
+                                "http_status": status.as_u16(),
+                                "downloaded_at": now,
+                            });
+                            {
+                                use std::io::Write as _;
+                                let mut idx = index.lock().unwrap();
+                                idx.insert(canonical_id.clone(), rec.clone());
+                                let mut w = index_writer.lock().unwrap();
+                                writeln!(w, "{}", serde_json::to_string(&rec)?)?;
+                            }
+                            continue;
+                        }
+                        (status.as_u16(), r.text().unwrap_or_default())
+                    }
+                    Err(e) => {
+                        eprintln!("link-download w{worker_id}: failed {canonical_id}: {e}");
+                        stats_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let now = chrono::Utc::now().to_rfc3339();
+                        let rec = json!({
+                            "canonical_id": canonical_id,
+                            "href": href,
+                            "status": "failed",
+                            "payload_path": null,
+                            "error": e.to_string(),
+                            "http_status": null,
+                            "downloaded_at": now,
+                        });
+                        {
+                            use std::io::Write as _;
+                            let mut idx = index.lock().unwrap();
+                            idx.insert(canonical_id.clone(), rec.clone());
+                            let mut w = index_writer.lock().unwrap();
+                            writeln!(w, "{}", serde_json::to_string(&rec)?)?;
+                        }
+                        continue;
+                    }
+                };
+
+                let snippet = match extract_law_contents(&html) {
+                    Some(s) => s,
+                    None => {
+                        eprintln!("link-download w{worker_id}: missing lawContents for {canonical_id}");
+                        stats_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let now = chrono::Utc::now().to_rfc3339();
+                        let rec = json!({
+                            "canonical_id": canonical_id,
+                            "href": href,
+                            "status": "missing_content",
+                            "payload_path": null,
+                            "error": "lawContents div not found",
+                            "http_status": http_status,
+                            "downloaded_at": now,
+                        });
+                        {
+                            use std::io::Write as _;
+                            let mut idx = index.lock().unwrap();
+                            idx.insert(canonical_id.clone(), rec.clone());
+                            let mut w = index_writer.lock().unwrap();
+                            writeln!(w, "{}", serde_json::to_string(&rec)?)?;
+                        }
+                        continue;
+                    }
+                };
+
+                if let Some(parent) = payload_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&payload_path, &snippet)?;
+
+                let rel = payload_path
+                    .strip_prefix(&out_dir)
+                    .unwrap_or(&payload_path)
+                    .to_string_lossy()
+                    .to_string();
+                let now = chrono::Utc::now().to_rfc3339();
+                let rec = json!({
+                    "canonical_id": canonical_id,
+                    "href": href,
+                    "status": "success",
+                    "payload_path": rel,
+                    "assets": [],
+                    "error": null,
+                    "http_status": http_status,
+                    "downloaded_at": now,
+                });
+                {
+                    use std::io::Write as _;
+                    let mut idx = index.lock().unwrap();
+                    idx.insert(canonical_id.clone(), rec.clone());
+                    let mut w = index_writer.lock().unwrap();
+                    writeln!(w, "{}", serde_json::to_string(&rec)?)?;
+                }
+                let n = stats_completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n.is_multiple_of(50) {
+                    eprintln!(
+                        "link-download: {n}/{total} done (errors={}, skipped={})",
+                        stats_errors.load(std::sync::atomic::Ordering::Relaxed),
+                        stats_skipped.load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                }
+            }
+            Ok(())
+        }));
+    }
+
+    for h in handles {
+        h.join().expect("worker panic")?;
+    }
+
+    // Atomic rewrite of index.jsonl with sorted entries.
+    let idx = index.lock().unwrap();
+    let mut keys: Vec<&String> = idx.keys().collect();
+    keys.sort();
+    let tmp_path = index_path.with_extension("jsonl.tmp");
+    let mut tmp = File::create(&tmp_path)?;
+    for k in keys {
+        use std::io::Write as _;
+        writeln!(tmp, "{}", serde_json::to_string(&idx[k])?)?;
+    }
+    fs::rename(&tmp_path, &index_path)?;
+
+    // metadata.json.
+    let now = chrono::Utc::now().to_rfc3339();
+    let metadata = json!({
+        "links_file": args.deduped_links.to_string_lossy(),
+        "download_started_at": now,
+        "download_completed_at": now,
+        "total_links": total,
+        "completed_links": stats_completed.load(std::sync::atomic::Ordering::Relaxed),
+    });
+    fs::write(args.out_dir.join("metadata.json"), serde_json::to_vec_pretty(&metadata)?)?;
+
+    eprintln!(
+        "link-download: done — {} success, {} errors, {} skipped (out_dir={})",
+        stats_completed.load(std::sync::atomic::Ordering::Relaxed),
+        stats_errors.load(std::sync::atomic::Ordering::Relaxed),
+        stats_skipped.load(std::sync::atomic::Ordering::Relaxed),
+        args.out_dir.display(),
     );
     Ok(())
 }
