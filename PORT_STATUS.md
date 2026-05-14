@@ -16,7 +16,7 @@ line count before, what's in Rust now, and the wrapper status.
 
 CLI subcommands added: `extract`, `extract-anchors`, `extract-definitions`,
 `extract-currency`, `chunk-html`, `doc-meta`, `doc-id-from-link`, `pack-write`,
-`manifest-rewrite-urls`, `bundle-model`, `ato-fetch-nodes`, `embed`.
+`manifest-rewrite-urls`, `bundle-model`, `ato-fetch-nodes`, `embed`, `build`.
 
 ## Done — Rust impl, no Python wrapper yet
 
@@ -27,6 +27,7 @@ CLI subcommands added: `extract`, `extract-anchors`, `extract-definitions`,
 | `release.py:bundle_model` | `bundle-model` CLI | Same as above. |
 | `scraper/client.py:AtoBrowseClient.fetch_nodes` | `ato-fetch-nodes` CLI | First scraper primitive in Rust. Tree crawler / what's-new use this. |
 | `embed.model:EmbeddingModel.encode_query` (build path) | `embed` CLI | Batch text-to-int8 encoder. Build pipeline will pipe chunk text through this. |
+| `build.py` (basic flow) | `ato-mcp build` CLI | Walks index.jsonl, runs cleaning + chunker + embedder + writes documents/chunks/chunk_embeddings. **Deliberately incomplete** — missing pack writing, manifest emission, incremental reuse, resume, definitions, doc_anchors, FTS indexing, multi-process parallelism, asset persistence, rules engine. Foundation for retiring build.py. |
 
 ## Pending — Python still unmodified
 
