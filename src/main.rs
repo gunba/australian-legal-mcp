@@ -371,6 +371,15 @@ enum Command {
         #[arg(long)]
         max_nodes: Option<usize>,
     },
+    /// Reduce a snapshot to deduped_links.jsonl + dedup_summary.json +
+    /// redundant_paths.json + skip_data_urls.json. Mirrors
+    /// src/ato_mcp/scraper/reducer.py.
+    SnapshotReduce {
+        #[arg(long)]
+        nodes_path: PathBuf,
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+    },
     /// Publish a corpus release to GitHub. Mirrors
     /// src/ato_mcp/indexer/release.py:publish — rewrites manifest URLs to
     /// release asset URLs, fixes embedding-model fields if they're
@@ -601,6 +610,10 @@ fn main() -> Result<()> {
             request_interval_seconds,
             max_nodes,
         ),
+        Command::SnapshotReduce {
+            nodes_path,
+            out_dir,
+        } => snapshot_reduce(&nodes_path, out_dir.as_deref()),
         Command::FetchExternalDoc {
             doc_id,
             pit,
@@ -7922,6 +7935,303 @@ fn tree_crawl(
     eprintln!(
         "tree-crawl: captured {total_written} nodes (folders={folder_count}, links={link_count}) in {}",
         out_dir.display()
+    );
+    Ok(())
+}
+
+// ----- snapshot-reduce (port of src/ato_mcp/scraper/reducer.py) -----
+
+#[derive(Debug, Default)]
+struct CanonicalEntry {
+    canonical_id: String,
+    title: Option<String>,
+    href: Option<String>,
+    representative_path: Vec<String>,
+    occurrences: u64,
+    folder_occurrences: std::collections::HashSet<String>,
+    owner_folder: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct FolderRecord {
+    data_url: String,
+    title: Option<String>,
+    path: Vec<String>,
+    parent_data_url: Option<String>,
+    canonical_ids: std::collections::HashSet<String>,
+    owned_ids: std::collections::HashSet<String>,
+    redundant: bool,
+}
+
+fn is_better_path(candidate: &[String], incumbent: &[String]) -> bool {
+    if incumbent.is_empty() {
+        return true;
+    }
+    (candidate.len(), candidate) < (incumbent.len(), incumbent)
+}
+
+fn snapshot_reduce(nodes_path: &Path, output_dir: Option<&Path>) -> Result<()> {
+    use std::collections::{HashMap, HashSet};
+    use std::io::BufRead as _;
+
+    let out_dir = output_dir
+        .map(Path::to_path_buf)
+        .or_else(|| nodes_path.parent().map(Path::to_path_buf))
+        .ok_or_else(|| anyhow!("could not derive output dir"))?;
+    fs::create_dir_all(&out_dir)?;
+
+    let f = File::open(nodes_path)
+        .with_context(|| format!("opening {}", nodes_path.display()))?;
+    let reader = std::io::BufReader::new(f);
+
+    // node uid → (parent_uid, data_url)
+    let mut node_meta: HashMap<u64, (Option<u64>, Option<String>)> = HashMap::new();
+    let mut folder_records: HashMap<String, FolderRecord> = HashMap::new();
+    let mut folder_children: HashMap<Option<String>, HashSet<String>> = HashMap::new();
+    let mut canonical_entries: HashMap<String, CanonicalEntry> = HashMap::new();
+    let mut excluded_uids: HashSet<u64> = HashSet::new();
+    let mut excluded_counts: HashMap<String, u64> = HashMap::new();
+    let mut excluded_folder_urls: HashSet<String> = HashSet::new();
+
+    fn find_parent_folder(
+        mut uid: Option<u64>,
+        meta: &HashMap<u64, (Option<u64>, Option<String>)>,
+    ) -> Option<String> {
+        while let Some(u) = uid {
+            let m = meta.get(&u)?;
+            if let Some(url) = &m.1 {
+                return Some(url.clone());
+            }
+            uid = m.0;
+        }
+        None
+    }
+
+    let mut total_nodes: u64 = 0;
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let record: JsonValue = serde_json::from_str(trimmed)?;
+        let uid = record
+            .get("uid")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow!("node missing uid"))?;
+        let parent_uid = record.get("parent_uid").and_then(|v| v.as_u64());
+        let data_url = record
+            .get("data_url")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        node_meta.insert(uid, (parent_uid, data_url.clone()));
+
+        let title = record
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let title_excluded = scraper_is_excluded(&title);
+        let parent_excluded = parent_uid.is_some_and(|p| excluded_uids.contains(&p));
+        if title_excluded || parent_excluded {
+            excluded_uids.insert(uid);
+            *excluded_counts
+                .entry(if title.is_empty() { "(untitled)".into() } else { title.clone() })
+                .or_default() += 1;
+            if let Some(url) = &data_url {
+                excluded_folder_urls.insert(url.clone());
+            }
+            continue;
+        }
+
+        if let Some(url) = &data_url {
+            let parent_folder = find_parent_folder(parent_uid, &node_meta);
+            let entry = folder_records.entry(url.clone()).or_insert_with(|| FolderRecord {
+                data_url: url.clone(),
+                title: record.get("title").and_then(|v| v.as_str()).map(String::from),
+                path: record
+                    .get("path")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|p| p.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                parent_data_url: parent_folder.clone(),
+                ..Default::default()
+            });
+            entry.parent_data_url = parent_folder.clone();
+            folder_children.entry(parent_folder).or_default().insert(url.clone());
+        }
+
+        let node_type = record
+            .get("node_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let canonical_id_opt = record
+            .get("canonical_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        if node_type.contains("link") {
+            let Some(canonical_id) = canonical_id_opt else { continue };
+            let folder_url = data_url
+                .clone()
+                .or_else(|| find_parent_folder(parent_uid, &node_meta));
+            let Some(folder_url) = folder_url else { continue };
+            folder_records
+                .entry(folder_url.clone())
+                .or_insert_with(|| FolderRecord {
+                    data_url: folder_url.clone(),
+                    ..Default::default()
+                });
+            let path: Vec<String> = record
+                .get("path")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|p| p.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let title_str = record.get("title").and_then(|v| v.as_str()).map(String::from);
+            let href_str = record.get("href").and_then(|v| v.as_str()).map(String::from);
+
+            let entry = canonical_entries
+                .entry(canonical_id.clone())
+                .or_insert_with(|| CanonicalEntry {
+                    canonical_id: canonical_id.clone(),
+                    ..Default::default()
+                });
+            entry.occurrences += 1;
+            entry.folder_occurrences.insert(folder_url.clone());
+            if entry.href.is_none() {
+                entry.href = href_str;
+            }
+            if entry.title.is_none() {
+                entry.title = title_str.clone();
+            }
+            if entry.representative_path.is_empty()
+                || is_better_path(&path, &entry.representative_path)
+            {
+                entry.representative_path = path;
+                entry.title = title_str;
+                entry.owner_folder = Some(folder_url.clone());
+            }
+            folder_records
+                .entry(folder_url.clone())
+                .and_modify(|fr| {
+                    fr.canonical_ids.insert(canonical_id.clone());
+                });
+        }
+
+        total_nodes += 1;
+        if total_nodes.is_multiple_of(1000) {
+            eprintln!("snapshot-reduce: nodes={total_nodes}");
+        }
+    }
+
+    // Assign folder ownership.
+    for entry in canonical_entries.values() {
+        if let Some(owner) = &entry.owner_folder {
+            if let Some(rec) = folder_records.get_mut(owner) {
+                rec.owned_ids.insert(entry.canonical_id.clone());
+            }
+        }
+    }
+
+    // Mark redundant folders via DFS rooted at folders whose parent is None.
+    fn dfs(
+        folder_url: &str,
+        folder_records: &mut HashMap<String, FolderRecord>,
+        folder_children: &HashMap<Option<String>, HashSet<String>>,
+    ) -> bool {
+        let mut has_owned = folder_records
+            .get(folder_url)
+            .is_some_and(|r| !r.owned_ids.is_empty());
+        let children: Vec<String> = folder_children
+            .get(&Some(folder_url.to_string()))
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        for c in children {
+            if dfs(&c, folder_records, folder_children) {
+                has_owned = true;
+            }
+        }
+        if let Some(rec) = folder_records.get_mut(folder_url) {
+            rec.redundant = !has_owned;
+        }
+        has_owned
+    }
+    let roots: Vec<String> = folder_children
+        .get(&None)
+        .map(|s| s.iter().cloned().collect())
+        .unwrap_or_default();
+    for root in roots {
+        dfs(&root, &mut folder_records, &folder_children);
+    }
+
+    // Write deduped_links.jsonl + dedup_summary.json + redundant_paths.json + skip_data_urls.json.
+    let dedup_path = out_dir.join("deduped_links.jsonl");
+    let dedup_file = File::create(&dedup_path)?;
+    let mut dedup_writer = std::io::BufWriter::new(dedup_file);
+    let mut sorted_keys: Vec<&String> = canonical_entries.keys().collect();
+    sorted_keys.sort();
+    let mut total_occurrences: u64 = 0;
+    for k in &sorted_keys {
+        let entry = &canonical_entries[*k];
+        total_occurrences += entry.occurrences;
+        let row = json!({
+            "canonical_id": entry.canonical_id,
+            "href": entry.href,
+            "title": entry.title,
+            "representative_path": entry.representative_path,
+            "occurrences": entry.occurrences,
+            "folder_count": entry.folder_occurrences.len(),
+        });
+        use std::io::Write as _;
+        writeln!(dedup_writer, "{}", serde_json::to_string(&row)?)?;
+    }
+    dedup_writer.flush()?;
+
+    let mut excluded_urls_sorted: Vec<String> = excluded_folder_urls.iter().cloned().collect();
+    excluded_urls_sorted.sort();
+    let summary = json!({
+        "unique_links": canonical_entries.len(),
+        "total_occurrences": total_occurrences,
+        "excluded_titles": excluded_counts,
+        "excluded_folder_urls": excluded_urls_sorted,
+    });
+    fs::write(out_dir.join("dedup_summary.json"), serde_json::to_vec_pretty(&summary)?)?;
+
+    let mut redundant: Vec<&FolderRecord> = folder_records.values().filter(|r| r.redundant).collect();
+    redundant.sort_by(|a, b| (a.path.len(), &a.data_url).cmp(&(b.path.len(), &b.data_url)));
+    let payload: Vec<JsonValue> = redundant
+        .iter()
+        .map(|r| json!({
+            "data_url": r.data_url,
+            "title": r.title,
+            "path": r.path,
+            "parent_data_url": r.parent_data_url,
+            "canonical_id_count": r.canonical_ids.len(),
+            "owned_canonical_ids": r.owned_ids.len(),
+        }))
+        .collect();
+    fs::write(out_dir.join("redundant_paths.json"), serde_json::to_vec_pretty(&payload)?)?;
+
+    let mut all_skip: HashSet<String> = redundant.iter().map(|r| r.data_url.clone()).collect();
+    all_skip.extend(excluded_folder_urls.iter().cloned());
+    let mut skip_sorted: Vec<String> = all_skip.into_iter().collect();
+    skip_sorted.sort();
+    fs::write(out_dir.join("skip_data_urls.json"), serde_json::to_vec_pretty(&skip_sorted)?)?;
+
+    eprintln!(
+        "snapshot-reduce: {} unique links, {} folders, {} redundant; out={}",
+        canonical_entries.len(),
+        folder_records.len(),
+        payload.len(),
+        out_dir.display(),
     );
     Ok(())
 }
