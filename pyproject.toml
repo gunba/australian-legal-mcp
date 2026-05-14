@@ -4,32 +4,26 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ato-mcp"
-version = "0.6.9"
-description = "Local MCP server for the Australian Taxation Office legal database"
+version = "0.8.0"
+description = "Pytest fixtures + thin Python wrappers around the Rust ato-mcp binary. Production install is the Rust binary alone; this package exists only so maintainers can run pytest against the Rust output."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Jordan" }]
 keywords = ["mcp", "ato", "tax", "australia", "legal", "embeddings"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "typer>=0.12",
     "selectolax>=0.3.21",
-    "tokenizers>=0.20",
     "orjson>=3.10",
-    "zstandard>=0.22",
-    "platformdirs>=4",
     "pydantic>=2",
-    "numpy>=1.26",
     "requests>=2.31",
     "beautifulsoup4>=4.12",
-    "tqdm>=4.66",
 ]
 
 [project.urls]
@@ -42,25 +36,6 @@ dev = [
     "pytest>=8",
     "ruff>=0.5",
 ]
-# Maintainer-only embedding runtimes. End users run the Rust binary and never
-# load this Python package. Keep CPU and GPU extras separate: onnxruntime and
-# onnxruntime-gpu both ship the same ``onnxruntime`` module and clobber each
-# other when installed together.
-cpu = [
-    "onnxruntime>=1.20,<2",
-]
-gpu = [
-    "onnxruntime-gpu>=1.25,<2",
-    "nvidia-cublas-cu12>=12,<13",
-    "nvidia-cuda-nvrtc-cu12>=12,<13",
-    "nvidia-cuda-runtime-cu12>=12,<13",
-    "nvidia-cudnn-cu12>=9,<10",
-    "nvidia-cufft-cu12>=11,<12",
-    "nvidia-curand-cu12>=10,<11",
-]
-
-[project.scripts]
-ato-mcp = "ato_mcp.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ato_mcp"]
