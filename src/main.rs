@@ -326,6 +326,20 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Fetch the ATO "What's New" feed and return the deduped doc entries
+    /// as JSON. Mirrors src/ato_mcp/scraper/whats_new.py:WhatsNewFetcher.
+    WhatsNew {
+        #[arg(long, default_value = "https://www.ato.gov.au/law/view/whatsnew.htm?fid=whatsnew")]
+        url: String,
+        #[arg(long, default_value_t = 30.0)]
+        timeout_seconds: f64,
+    },
+    /// Normalise an ATO law/view/document href to its canonical relative
+    /// form (drops PiT, decodes percent-encoded docid, etc.). Mirrors
+    /// src/ato_mcp/scraper/whats_new.py:normalize_doc_href.
+    NormalizeDocHref {
+        href: String,
+    },
     /// Fetch compact statutory definitions for a term.
     GetDefinition {
         term: String,
@@ -869,6 +883,31 @@ fn main() -> Result<()> {
             db_path,
             limit,
         } => build_corpus(&pages_dir, &db_path, limit),
+        Command::WhatsNew {
+            url,
+            timeout_seconds,
+        } => {
+            let client = reqwest::blocking::Client::builder()
+                .user_agent(ATO_USER_AGENT)
+                .timeout(Duration::from_secs_f64(timeout_seconds))
+                .build()?;
+            let resp = client
+                .get(&url)
+                .send()
+                .with_context(|| format!("fetching {url}"))?;
+            let status = resp.status();
+            if !status.is_success() {
+                bail!("ATO whatsnew returned HTTP {status} for {url}");
+            }
+            let html = resp.text().context("reading whatsnew body")?;
+            let entries = parse_whats_new(&html, "https://www.ato.gov.au")?;
+            println!("{}", serde_json::to_string_pretty(&entries)?);
+            Ok(())
+        }
+        Command::NormalizeDocHref { href } => {
+            println!("{}", normalize_doc_href(&href));
+            Ok(())
+        }
     }
 }
 
@@ -5294,6 +5333,116 @@ fn build_corpus(pages_dir: &Path, db_path: &Path, limit: Option<usize>) -> Resul
 
     eprintln!("ato-mcp build: done — {processed} docs written to {}", db_path.display());
     Ok(())
+}
+
+// ----- What's New scraper (port of src/ato_mcp/scraper/whats_new.py) -----
+
+#[derive(Debug, Clone, Serialize)]
+struct WhatsNewEntry {
+    href: String,
+    title: String,
+    heading: Option<String>,
+}
+
+fn normalize_doc_href(href: &str) -> String {
+    if href.is_empty() {
+        return String::new();
+    }
+    // Try to parse as absolute URL; if relative, treat path/query directly.
+    let parsed = url::Url::parse(href).ok().or_else(|| {
+        url::Url::parse(&format!("https://www.ato.gov.au{href}")).ok()
+    });
+    let Some(parsed) = parsed else {
+        return href.to_string();
+    };
+    let mut path = parsed.path().to_string();
+    if !path.is_empty() && !path.starts_with('/') {
+        path = format!("/{path}");
+    }
+    let mut docid: Option<String> = None;
+    for (k, v) in parsed.query_pairs() {
+        if k.eq_ignore_ascii_case("docid") {
+            let raw = v.into_owned();
+            let trimmed = raw
+                .trim_matches(|c: char| c == '\'' || c == '"' || c == ' ')
+                .to_string();
+            if !trimmed.is_empty() {
+                docid = Some(trimmed);
+                break;
+            }
+        }
+    }
+    if let Some(id) = docid {
+        return format!("/law/view/document?docid={id}");
+    }
+    if let Some(q) = parsed.query() {
+        if !q.is_empty() {
+            return format!("{path}?{q}");
+        }
+    }
+    path
+}
+
+fn parse_whats_new(html: &str, base_url: &str) -> Result<Vec<WhatsNewEntry>> {
+    use scraper::{Node as SNode, Selector};
+    let doc = scraper::Html::parse_document(html);
+    let article_sel = Selector::parse("article").unwrap();
+    let Some(article) = doc.select(&article_sel).next() else {
+        bail!("whatsnew article block not found");
+    };
+    const HEADING_TAGS: &[&str] = &["h1", "h2", "h3", "h4", "h5"];
+    let mut entries: Vec<WhatsNewEntry> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut last_heading: Option<String> = None;
+    // Walk the article subtree in DOM order. Track the latest heading we
+    // encountered; emit an entry every time we hit a usable <a href>.
+    for node in article.descendants() {
+        if let Some(eref) = scraper::ElementRef::wrap(node) {
+            let tag = eref.value().name();
+            if HEADING_TAGS.contains(&tag) {
+                let t = anchors_node_text(eref);
+                last_heading = if t.is_empty() { None } else { Some(t) };
+                continue;
+            }
+            if tag == "a" {
+                let raw_href = match eref.value().attr("href") {
+                    Some(h) => h,
+                    None => continue,
+                };
+                let absolute = if raw_href.starts_with("http://")
+                    || raw_href.starts_with("https://")
+                {
+                    raw_href.to_string()
+                } else if raw_href.starts_with('/') {
+                    format!("{}{}", base_url.trim_end_matches('/'), raw_href)
+                } else {
+                    format!("{}/{}", base_url.trim_end_matches('/'), raw_href)
+                };
+                let canonical = normalize_doc_href(&absolute);
+                if !canonical.starts_with("/law/view/document") {
+                    continue;
+                }
+                if seen.contains(&canonical) {
+                    continue;
+                }
+                seen.insert(canonical.clone());
+                let title = anchors_node_text(eref);
+                let title = if title.is_empty() {
+                    canonical.clone()
+                } else {
+                    title
+                };
+                entries.push(WhatsNewEntry {
+                    href: canonical,
+                    title,
+                    heading: last_heading.clone(),
+                });
+            }
+        } else if let SNode::Text(_) = node.value() {
+            // Text nodes don't affect heading state.
+        }
+    }
+    Ok(entries)
 }
 
 fn fetch_external_doc(
