@@ -288,6 +288,17 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         level: i32,
     },
+    /// Fetch a node list from the ATO browse-content API. Mirrors
+    /// src/ato_mcp/scraper/client.py:AtoBrowseClient.fetch_nodes.
+    /// JSON out: [{...}, ...] (verbatim ATO response).
+    AtoFetchNodes {
+        /// Either a raw query string or "key=value,key=value,..." pairs.
+        query: String,
+        #[arg(long, default_value = "https://www.ato.gov.au/API/v1/law/lawservices/browse-content/")]
+        base_url: String,
+        #[arg(long, default_value_t = 30.0)]
+        timeout_seconds: f64,
+    },
     /// Fetch compact statutory definitions for a term.
     GetDefinition {
         term: String,
@@ -751,6 +762,44 @@ fn main() -> Result<()> {
                     "size": size,
                 }))?
             );
+            Ok(())
+        }
+        Command::AtoFetchNodes {
+            query,
+            base_url,
+            timeout_seconds,
+        } => {
+            // Build the URL — accept either a raw "key=value&key=value" query
+            // string or a "key=value,key=value" comma-form (same as Python
+            // accepts `Union[str, Dict[str, str]]`).
+            let query_string = if query.contains('=') && !query.contains('&') {
+                if query.contains(',') {
+                    query.replace(',', "&")
+                } else {
+                    query.clone()
+                }
+            } else {
+                query.trim_start_matches('?').to_string()
+            };
+            let url = if query_string.is_empty() {
+                base_url.clone()
+            } else {
+                format!("{}?{}", base_url.trim_end_matches('?'), query_string)
+            };
+            let client = reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs_f64(timeout_seconds))
+                .build()?;
+            let resp = client.get(&url).send().with_context(|| format!("fetching {url}"))?;
+            let status = resp.status();
+            if !status.is_success() {
+                bail!("ATO API returned HTTP {status} for {url}");
+            }
+            let body = resp.text().context("reading ATO API body")?;
+            let payload: JsonValue = serde_json::from_str(&body).context("parsing ATO API JSON")?;
+            if !payload.is_array() {
+                bail!("ATO response payload is not a list");
+            }
+            println!("{}", serde_json::to_string_pretty(&payload)?);
             Ok(())
         }
     }
