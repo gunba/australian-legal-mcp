@@ -2644,9 +2644,10 @@ fn clean_ato_html(html: &str) -> CleanedAtoDoc {
     let mut subdoc = Html::parse_fragment(&container_html);
     strip_noise(&mut subdoc);
     strip_history_ui_controls(&mut subdoc);
+    let referenced_anchors = collect_referenced_anchors(&subdoc);
 
     let cleaned_html = subdoc.root_element().html();
-    let cleaned_text = subtree_text(&subdoc);
+    let cleaned_text = subtree_text(&subdoc, &referenced_anchors);
     CleanedAtoDoc {
         html: cleaned_html,
         text: cleaned_text,
@@ -2729,25 +2730,63 @@ fn strip_history_ui_controls(doc: &mut scraper::Html) {
     }
 }
 
+fn collect_referenced_anchors(doc: &scraper::Html) -> std::collections::HashSet<String> {
+    use scraper::Selector;
+    let sel = Selector::parse("a[href]").unwrap();
+    let mut refs = std::collections::HashSet::new();
+    for el in doc.select(&sel) {
+        let href = el.value().attr("href").unwrap_or("");
+        if let Some(name) = href.strip_prefix('#') {
+            if !name.is_empty() {
+                refs.insert(name.to_string());
+            }
+        }
+    }
+    refs
+}
+
+fn has_descendant_with_tag(node: ego_tree::NodeRef<scraper::Node>, tags: &[&str]) -> bool {
+    use scraper::Node as ScraperNode;
+    for n in node.descendants() {
+        if let ScraperNode::Element(el) = n.value() {
+            if tags.contains(&el.name()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Walk the cleaned tree and emit text with inline markdown markers, ported
 /// from src/ato_mcp/indexer/chunk.py:_inline_text + html_to_text. Block-level
 /// tags introduce paragraph breaks. Inline tags emit:
 ///   <a> with an ATO docid in href: "text [doc:X]" (with @PiT / view= when
 ///     present) — ported from chunk.py:_inline_text and
 ///     extract.py:_doc_id_from_ato_link.
-///   <strong>/<b>: **text**
-///   <em>/<i>:     *text*
+///   <a name="X"> where X is referenced: "text [anchor:X]"
+///   any element with id="X" referenced (fallback): "text [anchor:X]"
+///   <span data-asset-ref="X">: "[asset:X]"
+///   <img alt="...">: "[image: alt]" when alt is non-empty, else dropped
+///   <strong>/<b> containing <em>/<i> (or vice versa): "***term***"
+///   <strong>/<b>: **text**, <em>/<i>: *text*
 ///   <h1>-<h6>:    "# text" / "## text" / ... on their own line
 ///   <br>:         newline
-fn subtree_text(doc: &scraper::Html) -> String {
+fn subtree_text(
+    doc: &scraper::Html,
+    referenced_anchors: &std::collections::HashSet<String>,
+) -> String {
     let mut buf = String::new();
     for root_child in doc.tree.root().children() {
-        render_node(root_child, &mut buf);
+        render_node(root_child, &mut buf, referenced_anchors);
     }
     normalise_paragraph_breaks(&buf)
 }
 
-fn render_node(node: ego_tree::NodeRef<scraper::Node>, buf: &mut String) {
+fn render_node(
+    node: ego_tree::NodeRef<scraper::Node>,
+    buf: &mut String,
+    referenced: &std::collections::HashSet<String>,
+) {
     use scraper::Node as ScraperNode;
 
     const BLOCK_TAGS: &[&str] = &[
@@ -2776,106 +2815,230 @@ fn render_node(node: ego_tree::NodeRef<scraper::Node>, buf: &mut String) {
         }
         ScraperNode::Element(el) => {
             let tag = el.name();
+
+            // Self-contained markers that fully consume the element first.
             match tag {
                 "br" => {
                     buf.push('\n');
+                    return;
                 }
+                "img" => {
+                    let alt = el.attr("alt").unwrap_or("").trim();
+                    if !alt.is_empty() {
+                        buf.push_str("[image: ");
+                        buf.push_str(alt);
+                        buf.push(']');
+                    }
+                    return;
+                }
+                "span" => {
+                    if let Some(asset_ref) = el.attr("data-asset-ref") {
+                        buf.push_str("[asset:");
+                        buf.push_str(asset_ref);
+                        buf.push(']');
+                        return;
+                    }
+                }
+                _ => {}
+            }
+
+            // Cross-doc <a> link rewriting and in-doc anchor target.
+            if tag == "a" {
+                let href = el.attr("href").unwrap_or("");
+                let data_doc_id = el.attr("data-doc-id");
+                let resolved = if let Some(id) = data_doc_id {
+                    Some((
+                        id.to_string(),
+                        el.attr("data-pit").map(|s| s.to_string()),
+                        el.attr("data-view").map(|s| s.to_string()),
+                    ))
+                } else if !href.is_empty() {
+                    doc_id_from_ato_link(href)
+                } else {
+                    None
+                };
+                let inner = render_inner_string(node, referenced).trim().to_string();
+                if let Some((doc_id, pit, view)) = resolved {
+                    let mut marker = format!("[doc:{doc_id}");
+                    if let Some(p) = pit.as_ref().filter(|s| !s.is_empty()) {
+                        marker.push('@');
+                        marker.push_str(p);
+                    }
+                    if let Some(v) = view.as_ref().filter(|s| !s.is_empty()) {
+                        marker.push_str(" view=");
+                        marker.push_str(v);
+                    }
+                    marker.push(']');
+                    if !inner.is_empty() {
+                        buf.push_str(&inner);
+                        buf.push(' ');
+                    }
+                    buf.push_str(&marker);
+                    return;
+                }
+                // In-doc anchor target via name=
+                if let Some(name) = el.attr("name") {
+                    if referenced.contains(name) {
+                        if !inner.is_empty() {
+                            buf.push_str(&inner);
+                            buf.push(' ');
+                        }
+                        buf.push_str("[anchor:");
+                        buf.push_str(name);
+                        buf.push(']');
+                        return;
+                    }
+                }
+                // Plain <a> with no recognised doc/anchor: emit the inner text.
+                if !inner.is_empty() {
+                    buf.push_str(&inner);
+                }
+                return;
+            }
+
+            // Definition term: <strong>/<b> containing <em>/<i> or vice versa.
+            let is_def_term = match tag {
+                "strong" | "b" => has_descendant_with_tag(node, &["em", "i"]),
+                "em" | "i" => has_descendant_with_tag(node, &["strong", "b"]),
+                _ => false,
+            };
+            if is_def_term {
+                let term = render_inner_string(node, referenced).trim().to_string();
+                if !term.is_empty() {
+                    buf.push_str("***");
+                    buf.push_str(&term);
+                    buf.push_str("***");
+                }
+                // Fall through to id-anchor check below for completeness.
+                if let Some(id) = el.attr("id") {
+                    if referenced.contains(id) {
+                        buf.push_str(" [anchor:");
+                        buf.push_str(id);
+                        buf.push(']');
+                    }
+                }
+                return;
+            }
+
+            match tag {
                 "strong" | "b" => {
-                    let inner = render_inner_string(node).trim().to_string();
+                    let inner = render_inner_string(node, referenced).trim().to_string();
                     if !inner.is_empty() {
                         buf.push_str("**");
                         buf.push_str(&inner);
                         buf.push_str("**");
                     }
+                    if let Some(id) = el.attr("id") {
+                        if referenced.contains(id) {
+                            buf.push_str(" [anchor:");
+                            buf.push_str(id);
+                            buf.push(']');
+                        }
+                    }
+                    return;
                 }
                 "em" | "i" => {
-                    let inner = render_inner_string(node).trim().to_string();
+                    let inner = render_inner_string(node, referenced).trim().to_string();
                     if !inner.is_empty() {
                         buf.push('*');
                         buf.push_str(&inner);
                         buf.push('*');
                     }
+                    if let Some(id) = el.attr("id") {
+                        if referenced.contains(id) {
+                            buf.push_str(" [anchor:");
+                            buf.push_str(id);
+                            buf.push(']');
+                        }
+                    }
+                    return;
                 }
                 "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                     if !buf.ends_with('\n') && !buf.is_empty() {
                         buf.push('\n');
                     }
                     let level = tag[1..].parse::<usize>().unwrap_or(1).clamp(1, 6);
-                    let inner = render_inner_string(node).trim().to_string();
+                    let inner = render_inner_string(node, referenced).trim().to_string();
                     if !inner.is_empty() {
                         for _ in 0..level {
                             buf.push('#');
                         }
                         buf.push(' ');
                         buf.push_str(&inner);
+                        if let Some(id) = el.attr("id") {
+                            if referenced.contains(id) {
+                                buf.push_str(" [anchor:");
+                                buf.push_str(id);
+                                buf.push(']');
+                            }
+                        }
                         buf.push('\n');
                     }
-                }
-                "a" => {
-                    let href = el.attr("href").unwrap_or("");
-                    let data_doc_id = el.attr("data-doc-id");
-                    let resolved = if let Some(id) = data_doc_id {
-                        Some((
-                            id.to_string(),
-                            el.attr("data-pit").map(|s| s.to_string()),
-                            el.attr("data-view").map(|s| s.to_string()),
-                        ))
-                    } else if !href.is_empty() {
-                        doc_id_from_ato_link(href)
-                    } else {
-                        None
-                    };
-                    let inner = render_inner_string(node).trim().to_string();
-                    if let Some((doc_id, pit, view)) = resolved {
-                        let mut marker = format!("[doc:{doc_id}");
-                        if let Some(p) = pit.as_ref().filter(|s| !s.is_empty()) {
-                            marker.push('@');
-                            marker.push_str(p);
-                        }
-                        if let Some(v) = view.as_ref().filter(|s| !s.is_empty()) {
-                            marker.push_str(" view=");
-                            marker.push_str(v);
-                        }
-                        marker.push(']');
-                        if !inner.is_empty() {
-                            buf.push_str(&inner);
-                            buf.push(' ');
-                        }
-                        buf.push_str(&marker);
-                    } else if !inner.is_empty() {
-                        buf.push_str(&inner);
-                    }
+                    return;
                 }
                 _ if BLOCK_TAGS.contains(&tag) => {
                     if !buf.ends_with('\n') && !buf.is_empty() {
                         buf.push('\n');
                     }
                     for child in node.children() {
-                        render_node(child, buf);
+                        render_node(child, buf, referenced);
                     }
-                    if !buf.ends_with('\n') {
+                    if let Some(id) = el.attr("id") {
+                        if referenced.contains(id) {
+                            // Append after content but before final newline.
+                            if buf.ends_with('\n') {
+                                buf.pop();
+                            }
+                            buf.push_str(" [anchor:");
+                            buf.push_str(id);
+                            buf.push(']');
+                            buf.push('\n');
+                        } else if !buf.ends_with('\n') {
+                            buf.push('\n');
+                        }
+                    } else if !buf.ends_with('\n') {
                         buf.push('\n');
                     }
+                    return;
                 }
-                _ => {
-                    for child in node.children() {
-                        render_node(child, buf);
+                _ => {}
+            }
+
+            // Fallback: id-as-anchor for inline elements that didn't match a special case.
+            if let Some(id) = el.attr("id") {
+                if referenced.contains(id) {
+                    let inner = render_inner_string(node, referenced).trim().to_string();
+                    if !inner.is_empty() {
+                        buf.push_str(&inner);
+                        buf.push(' ');
                     }
+                    buf.push_str("[anchor:");
+                    buf.push_str(id);
+                    buf.push(']');
+                    return;
                 }
+            }
+
+            // Default: just recurse.
+            for child in node.children() {
+                render_node(child, buf, referenced);
             }
         }
         _ => {
             for child in node.children() {
-                render_node(child, buf);
+                render_node(child, buf, referenced);
             }
         }
     }
 }
 
-fn render_inner_string(node: ego_tree::NodeRef<scraper::Node>) -> String {
+fn render_inner_string(
+    node: ego_tree::NodeRef<scraper::Node>,
+    referenced: &std::collections::HashSet<String>,
+) -> String {
     let mut inner = String::new();
     for child in node.children() {
-        render_node(child, &mut inner);
+        render_node(child, &mut inner, referenced);
     }
     inner
 }
