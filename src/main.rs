@@ -398,6 +398,31 @@ enum Command {
         #[arg(long, default_value_t = false)]
         force: bool,
     },
+    /// Compute the subset of dedup-style link records not already present
+    /// in an existing index.jsonl. Used by maintainer-sync.sh for both
+    /// incremental (input from `ato-mcp whats-new`) and catch_up
+    /// (input from `ato-mcp snapshot-reduce`'s deduped_links.jsonl).
+    /// Mirrors src/ato_mcp/scraper/pipeline.py:_run_whats_new
+    /// and pipeline.py:_run_catch_up's diff step.
+    ScrapeDiff {
+        /// Existing payloads index.jsonl. Each line has canonical_id;
+        /// any link already present here is skipped.
+        #[arg(long)]
+        index: PathBuf,
+        /// Source A (catch-up): a deduped_links.jsonl from snapshot-reduce.
+        #[arg(long)]
+        deduped: Option<PathBuf>,
+        /// Source B (incremental): pull What's New entries live and use them.
+        #[arg(long)]
+        whats_new_url: Option<String>,
+        /// Optional path-prefix segments prepended to each link's
+        /// representative_path. Used for scoped catch_up runs that don't
+        /// start from the absolute root.
+        #[arg(long)]
+        path_prefix: Option<String>,
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Publish a corpus release to GitHub. Mirrors
     /// src/ato_mcp/indexer/release.py:publish — rewrites manifest URLs to
     /// release asset URLs, fixes embedding-model fields if they're
@@ -649,6 +674,13 @@ fn main() -> Result<()> {
             timeout_seconds,
             force,
         }),
+        Command::ScrapeDiff {
+            index,
+            deduped,
+            whats_new_url,
+            path_prefix,
+            out,
+        } => scrape_diff(&index, deduped.as_deref(), whats_new_url.as_deref(), path_prefix.as_deref(), &out),
         Command::FetchExternalDoc {
             doc_id,
             pit,
@@ -8646,6 +8678,207 @@ fn link_download(args: LinkDownloadArgs) -> Result<()> {
         stats_skipped.load(std::sync::atomic::Ordering::Relaxed),
         args.out_dir.display(),
     );
+    Ok(())
+}
+
+// ----- scrape-diff (port of pipeline.py incremental + catch_up diff steps) -----
+
+fn representative_path_from_docid(canonical_id: &str, title: &str, heading: Option<&str>) -> Vec<String> {
+    // Mirrors src/ato_mcp/indexer/metadata.py:representative_path_from_docid.
+    // Falls back to ['Other'] when nothing better can be determined.
+    use scraper as _;
+    if let Some(category) = doc_id_top_category(canonical_id) {
+        let mut out = vec![category.to_string()];
+        if let Some(h) = heading {
+            if !h.is_empty() {
+                out.push(h.to_string());
+            }
+        }
+        if !title.is_empty() {
+            out.push(title.to_string());
+        }
+        return out;
+    }
+    vec!["Other".to_string()]
+}
+
+fn doc_id_top_category(canonical_id: &str) -> Option<&'static str> {
+    // Best-effort extraction of the top-level category from a canonical_id
+    // like /law/view/document?docid=CRP%2FCRP19%2FCR. The full Python
+    // version walks docid prefixes against a 200-row mapping table; this
+    // covers the dozen most common buckets the maintainer pipeline cares
+    // about. Anything unrecognised falls through to "Other" so the
+    // downloader still has a folder to write to.
+    let lower = canonical_id.to_ascii_lowercase();
+    if lower.contains("docid=cm") || lower.contains("docid=tr") || lower.contains("docid=tr%2f") {
+        return Some("Public_rulings");
+    }
+    if lower.contains("docid=psr") || lower.contains("docid=ps%20la") || lower.contains("docid=ps") {
+        return Some("Practice_statements");
+    }
+    if lower.contains("docid=pba") || lower.contains("docid=pbr") {
+        return Some("Edited_private_advice");
+    }
+    if lower.contains("docid=cr") || lower.contains("docid=crp") {
+        return Some("Cases");
+    }
+    if lower.contains("docid=mt") || lower.contains("docid=md") {
+        return Some("Public_rulings");
+    }
+    if lower.contains("docid=lct") || lower.contains("docid=ind") {
+        return Some("Public_rulings");
+    }
+    if lower.contains("docid=pak") || lower.contains("docid=pal") {
+        return Some("Legislation_and_supporting_material");
+    }
+    if lower.contains("docid=scd") || lower.contains("docid=scr") {
+        return Some("Cases");
+    }
+    if lower.contains("docid=otr") {
+        return Some("Public_rulings");
+    }
+    if lower.contains("docid=ato") {
+        return Some("Public_rulings");
+    }
+    None
+}
+
+fn load_canonical_ids(index_path: &Path) -> Result<std::collections::HashSet<String>> {
+    use std::io::BufRead as _;
+    let mut out = std::collections::HashSet::new();
+    if !index_path.exists() {
+        return Ok(out);
+    }
+    let f = File::open(index_path)?;
+    let reader = std::io::BufReader::new(f);
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let rec: JsonValue = serde_json::from_str(trimmed)?;
+        if let Some(cid) = rec.get("canonical_id").and_then(|v| v.as_str()) {
+            let normalised = normalize_doc_href(cid);
+            if !normalised.is_empty() {
+                out.insert(normalised);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn scrape_diff(
+    index_path: &Path,
+    deduped: Option<&Path>,
+    whats_new_url: Option<&str>,
+    path_prefix: Option<&str>,
+    out_path: &Path,
+) -> Result<()> {
+    use std::io::BufRead as _;
+    use std::io::Write as _;
+
+    let existing = load_canonical_ids(index_path)?;
+    eprintln!("scrape-diff: {} existing canonical IDs in {}", existing.len(), index_path.display());
+
+    let prefix_parts: Vec<String> = match path_prefix {
+        Some(p) => p.split('/').map(String::from).filter(|s| !s.is_empty()).collect(),
+        None => Vec::new(),
+    };
+
+    let out_file = File::create(out_path)?;
+    let mut out_writer = std::io::BufWriter::new(out_file);
+
+    let mut total: usize = 0;
+    let mut missing: usize = 0;
+    let mut by_category: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    if let Some(d) = deduped {
+        // Catch-up mode: diff a deduped_links.jsonl against the existing index.
+        let f = File::open(d)?;
+        let reader = std::io::BufReader::new(f);
+        for line in reader.lines() {
+            let line = line?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            total += 1;
+            let mut rec: JsonValue = serde_json::from_str(trimmed)?;
+            let cid = rec
+                .get("canonical_id")
+                .and_then(|v| v.as_str())
+                .map(normalize_doc_href)
+                .unwrap_or_default();
+            if cid.is_empty() || existing.contains(&cid) {
+                continue;
+            }
+            if !prefix_parts.is_empty() {
+                let mut new_path: Vec<JsonValue> =
+                    prefix_parts.iter().map(|s| JsonValue::String(s.clone())).collect();
+                if let Some(rep) = rec.get("representative_path").and_then(|v| v.as_array()) {
+                    new_path.extend(rep.iter().cloned());
+                }
+                rec["representative_path"] = JsonValue::Array(new_path);
+            }
+            let cat = rec
+                .get("representative_path")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|s| s.as_str())
+                .unwrap_or("(uncategorized)")
+                .to_string();
+            *by_category.entry(cat).or_insert(0) += 1;
+            writeln!(out_writer, "{}", serde_json::to_string(&rec)?)?;
+            missing += 1;
+        }
+    } else if let Some(url) = whats_new_url {
+        // Incremental mode: fetch What's New live, build pending records.
+        let client = reqwest::blocking::Client::builder()
+            .user_agent(ATO_USER_AGENT)
+            .timeout(Duration::from_secs(30))
+            .build()?;
+        let resp = client.get(url).send().with_context(|| format!("fetching {url}"))?;
+        if !resp.status().is_success() {
+            bail!("HTTP {} fetching {}", resp.status(), url);
+        }
+        let html = resp.text()?;
+        let entries = parse_whats_new(&html, "https://www.ato.gov.au")?;
+        for e in entries {
+            total += 1;
+            let cid = normalize_doc_href(&e.href);
+            if cid.is_empty() || existing.contains(&cid) {
+                continue;
+            }
+            let segments = representative_path_from_docid(&cid, &e.title, e.heading.as_deref());
+            let cat = segments.first().cloned().unwrap_or_else(|| "(uncategorized)".to_string());
+            *by_category.entry(cat).or_insert(0) += 1;
+            let rec = json!({
+                "canonical_id": cid,
+                "href": cid,
+                "title": e.title,
+                "representative_path": segments,
+                "occurrences": 1,
+                "folder_count": 1,
+            });
+            writeln!(out_writer, "{}", serde_json::to_string(&rec)?)?;
+            missing += 1;
+        }
+    } else {
+        bail!("scrape-diff: must pass either --deduped FILE or --whats-new-url URL");
+    }
+
+    out_writer.flush()?;
+    let mut sorted_cats: Vec<(String, usize)> = by_category.into_iter().collect();
+    sorted_cats.sort_by_key(|b| std::cmp::Reverse(b.1));
+    eprintln!(
+        "scrape-diff: {missing} missing of {total} candidates -> {} ({} categories)",
+        out_path.display(),
+        sorted_cats.len(),
+    );
+    for (cat, n) in sorted_cats.iter().take(10) {
+        eprintln!("  {n:>5} {cat}");
+    }
     Ok(())
 }
 
