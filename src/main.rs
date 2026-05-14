@@ -237,6 +237,12 @@ enum Command {
         #[arg(long, default_value_t = 1024)]
         max_tokens: usize,
     },
+    /// Derive metadata fields from an ATO canonical_id / doc_id. Mirrors
+    /// src/ato_mcp/indexer/metadata.py public helpers. JSON out:
+    /// {doc_id, type_prefix, year, human_code}.
+    DocMeta {
+        canonical_id: String,
+    },
     /// Fetch compact statutory definitions for a term.
     GetDefinition {
         term: String,
@@ -565,6 +571,22 @@ fn main() -> Result<()> {
             };
             let chunks = chunk_html(&html, root_title.as_deref(), max_tokens);
             println!("{}", serde_json::to_string_pretty(&chunks)?);
+            Ok(())
+        }
+        Command::DocMeta { canonical_id } => {
+            let doc_id = metadata_doc_id_for(&canonical_id);
+            let type_prefix = metadata_parse_docid(&canonical_id);
+            let year = metadata_year_for_docid(&canonical_id);
+            let human_code = metadata_human_code_for_doc_id(&doc_id);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "doc_id": doc_id,
+                    "type_prefix": type_prefix,
+                    "year": year,
+                    "human_code": human_code,
+                }))?
+            );
             Ok(())
         }
     }
@@ -4406,6 +4428,155 @@ fn chunk_html(html: &str, root_title: Option<&str>, max_tokens: usize) -> Vec<Ch
 }
 
 // ----- end chunker -----
+
+// ----- Metadata helpers (port of src/ato_mcp/indexer/metadata.py) -----
+
+#[allow(dead_code)]
+const METADATA_OTHER_CATEGORY: &str = "Other_ATO_documents";
+#[allow(dead_code)]
+const METADATA_PACK_FORMAT_VERSION: u32 = 2;
+
+fn metadata_extract_docid_path(canonical_id: &str) -> Option<String> {
+    let parsed = url::Url::parse(canonical_id).ok().or_else(|| {
+        url::Url::parse(&format!("https://placeholder/{canonical_id}")).ok()
+    })?;
+    for (k, v) in parsed.query_pairs() {
+        if k.eq_ignore_ascii_case("docid") {
+            let s = v.into_owned();
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+fn metadata_doc_id_for(canonical_id: &str) -> String {
+    metadata_extract_docid_path(canonical_id).unwrap_or_else(|| canonical_id.to_string())
+}
+
+fn metadata_parse_docid(canonical_id: &str) -> Option<String> {
+    let docid = metadata_extract_docid_path(canonical_id)?;
+    docid
+        .split('/')
+        .find(|s| !s.is_empty())
+        .map(|s| s.to_uppercase())
+}
+
+fn metadata_year_for_docid(canonical_id: &str) -> Option<String> {
+    let docid = metadata_extract_docid_path(canonical_id)?;
+    let year_re = Regex::new(r"(?:19|20)\d{2}").unwrap();
+    let segments: Vec<&str> = docid.split('/').filter(|s| !s.is_empty()).collect();
+    for seg in segments.iter().take(2) {
+        if let Some(m) = year_re.find(seg) {
+            return Some(m.as_str().to_string());
+        }
+    }
+    None
+}
+
+#[allow(dead_code)]
+fn metadata_extract_pub_date(text: &str) -> Option<String> {
+    let date_re = Regex::new(
+        r"(?i)\b(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})\b",
+    )
+    .unwrap();
+    let bound = std::cmp::min(text.len(), 2000);
+    let head = &text[..bound];
+    let m = date_re.captures(head)?;
+    let day: u32 = m.get(1)?.as_str().parse().ok()?;
+    let month_name = m.get(2)?.as_str().to_lowercase();
+    let year: u32 = m.get(3)?.as_str().parse().ok()?;
+    let month = currency_months().get(month_name.as_str()).copied()?;
+    Some(format!("{year:04}-{month:02}-{day:02}"))
+}
+
+fn metadata_human_code_for_doc_id(doc_id: &str) -> Option<String> {
+    let segments: Vec<&str> = doc_id.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() < 2 {
+        return None;
+    }
+    let body = segments[1];
+    // Year-series codes, longest-first to avoid prefix collisions.
+    let year_series: Vec<&str> = vec![
+        "SMSFRB", "SMSFR", "SMSFD", "GSTR", "GSTD", "FBTR", "WETR", "WETD",
+        "LCR", "SGR", "FTR", "PCG", "LCG", "PRR", "CLR", "COG", "TXD", "TPA",
+        "FBT", "CR", "PR", "TR", "TD", "MT", "TA", "LI", "LG", "WT",
+    ];
+    let alt = year_series.join("|");
+    // Modern 4-digit year form: TR20243 -> TR 2024/3
+    let re_y4 = Regex::new(&format!(r"^({alt})(\d{{4}})(D?)(\d+)$")).unwrap();
+    if let Some(c) = re_y4.captures(body) {
+        let series = c.get(1)?.as_str();
+        let year = c.get(2)?.as_str();
+        let draft = c.get(3)?.as_str();
+        let number = c.get(4)?.as_str();
+        return Some(format!("{series} {year}/{draft}{number}"));
+    }
+    // PS LA final
+    let re_psla = Regex::new(r"^PSLA(\d{4})(\d+)$").unwrap();
+    if let Some(c) = re_psla.captures(body) {
+        return Some(format!("PS LA {}/{}", c.get(1)?.as_str(), c.get(2)?.as_str()));
+    }
+    // PS LA draft
+    let re_psla_d = Regex::new(r"^PSD(\d{4})D?(\d+)$").unwrap();
+    if let Some(c) = re_psla_d.captures(body) {
+        return Some(format!("PS LA {}/D{}", c.get(1)?.as_str(), c.get(2)?.as_str()));
+    }
+    // ATO ID
+    let re_atoid = Regex::new(r"^(?:ATOID|AID)(\d{4})(\d+)$").unwrap();
+    if let Some(c) = re_atoid.captures(body) {
+        return Some(format!("ATO ID {}/{}", c.get(1)?.as_str(), c.get(2)?.as_str()));
+    }
+    // Legacy 2-digit-year form: TR9725 -> TR 97/25 (year starts with 8 or 9)
+    let re_y2 = Regex::new(&format!(r"^({alt})([89]\d)(\d+)$")).unwrap();
+    if let Some(c) = re_y2.captures(body) {
+        return Some(format!(
+            "{} {}/{}",
+            c.get(1)?.as_str(),
+            c.get(2)?.as_str(),
+            c.get(3)?.as_str()
+        ));
+    }
+    None
+}
+
+#[allow(dead_code)]
+fn metadata_content_hash(text: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(text.as_bytes());
+    let digest = h.finalize();
+    let hex = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    format!("sha256:{hex}")
+}
+
+#[allow(dead_code)]
+const METADATA_SIG_KEYS: &[&str] = &[
+    "title", "type", "date", "withdrawn_date", "superseded_by", "replaces",
+    "pack_format_version",
+];
+
+#[allow(dead_code)]
+fn metadata_signature(fields: &serde_json::Map<String, JsonValue>) -> String {
+    let mut h = Sha256::new();
+    for key in METADATA_SIG_KEYS {
+        let value = fields.get(*key);
+        h.update(b"\0");
+        h.update(key.as_bytes());
+        h.update(b"=");
+        if let Some(v) = value {
+            if !v.is_null() {
+                let s = match v {
+                    JsonValue::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                h.update(s.as_bytes());
+            }
+        }
+    }
+    let digest = h.finalize();
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 fn fetch_external_doc(
     doc_id: &str,
