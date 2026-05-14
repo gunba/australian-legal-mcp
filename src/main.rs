@@ -313,16 +313,22 @@ enum Command {
     /// canonical_id + payload_path), runs each doc through the cleaning
     /// pipeline + chunker + embedder in-process, and writes documents +
     /// chunks + chunk_embeddings to the SQLite db_path.
-    /// MISSING from this version: pack file writing, manifest emission,
-    /// incremental reuse, resume-from-crash, asset persistence to disk,
-    /// definitions extraction, doc-anchors population. Those land in
-    /// follow-up commits as build.py is fully retired. For now this gives
-    /// a self-contained way to produce a basic corpus database.
+    /// MISSING from this version vs build.py: incremental reuse from prior
+    /// pack, resume-from-crash, multi-process parallelism, rules-engine
+    /// classification. Currency extraction, navigation flags, citations
+    /// derivation, asset persistence, pack writing and manifest emission
+    /// all land here.
     Build {
         #[arg(long)]
         pages_dir: PathBuf,
         #[arg(long)]
         db_path: PathBuf,
+        /// Output directory for pack files, asset blobs, manifest.json. If
+        /// omitted, only the SQLite corpus DB is written (legacy mode).
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+        #[arg(long, default_value_t = 3)]
+        zstd_level: i32,
         #[arg(long)]
         limit: Option<usize>,
     },
@@ -881,8 +887,10 @@ fn main() -> Result<()> {
         Command::Build {
             pages_dir,
             db_path,
+            out_dir,
+            zstd_level,
             limit,
-        } => build_corpus(&pages_dir, &db_path, limit),
+        } => build_corpus(&pages_dir, &db_path, out_dir.as_deref(), zstd_level, limit),
         Command::WhatsNew {
             url,
             timeout_seconds,
@@ -5198,12 +5206,19 @@ fn write_pack(
 // ----- Build orchestrator (early port of src/ato_mcp/indexer/build.py) -----
 //
 // Walks pages_dir/index.jsonl, runs each doc through the cleaning + chunker
-// + embedder pipeline in-process, and writes documents + chunks +
-// chunk_embeddings rows. Missing vs Python: pack writing, manifest emission,
-// incremental reuse, resume, asset persistence, definitions extraction,
-// doc-anchors. Each lands in subsequent commits as build.py is fully retired.
+// + embedder pipeline in-process, writes documents + chunks +
+// chunk_embeddings + chunks_fts + title_fts + doc_anchors + definitions +
+// citations rows. Optionally writes pack files + asset blobs + manifest.json
+// to --out-dir. Missing vs build.py: incremental reuse, resume, parallelism,
+// rules-engine classification.
 
-fn build_corpus(pages_dir: &Path, db_path: &Path, limit: Option<usize>) -> Result<()> {
+fn build_corpus(
+    pages_dir: &Path,
+    db_path: &Path,
+    out_dir: Option<&Path>,
+    zstd_level: i32,
+    limit: Option<usize>,
+) -> Result<()> {
     use std::io::BufRead as _;
 
     let index_path = pages_dir.join("index.jsonl");
@@ -5214,8 +5229,20 @@ fn build_corpus(pages_dir: &Path, db_path: &Path, limit: Option<usize>) -> Resul
     let conn = open_write_at(db_path)
         .with_context(|| format!("opening sqlite at {}", db_path.display()))?;
 
+    if let Some(dir) = out_dir {
+        fs::create_dir_all(dir)
+            .with_context(|| format!("creating out_dir {}", dir.display()))?;
+        fs::create_dir_all(dir.join("packs"))?;
+        fs::create_dir_all(dir.join("assets"))?;
+    }
+
     let state = ServerState::default();
     let mut processed: usize = 0;
+
+    // Pack records collected for this build (when out_dir is set). Each
+    // record is the full doc payload (chunks + embeddings_b64) destined
+    // for `pack-<sha8>.bin.zst`.
+    let mut pack_records: Vec<(String, JsonValue)> = Vec::new();
 
     for line_res in reader.lines() {
         if let Some(n) = limit {
@@ -5245,11 +5272,9 @@ fn build_corpus(pages_dir: &Path, db_path: &Path, limit: Option<usize>) -> Resul
         let doc_id = metadata_doc_id_for(canonical_id);
         let doc_type = metadata_parse_docid(canonical_id).unwrap_or_default();
 
-        // Cleaning pipeline: clean_ato_html + image rewriting + named-anchor
-        // normalisation + link rewriting + attribute stripping. Mirrors the
-        // Python `extract.extract` order for the HTML output.
+        // Cleaning pipeline.
         let cleaned = clean_ato_html(&html);
-        let (rewritten_html, _assets) = rewrite_images_html(
+        let (rewritten_html, assets) = rewrite_images_html(
             &cleaned.html,
             Some(&doc_id),
             Some(payload_path.as_path()),
@@ -5257,6 +5282,9 @@ fn build_corpus(pages_dir: &Path, db_path: &Path, limit: Option<usize>) -> Resul
         let normalised = normalise_named_anchors(&rewritten_html);
         let with_links = rewrite_links_html(&normalised);
         let final_html = strip_attributes(&with_links);
+
+        // Currency / supersession from raw page HTML (alert + body scan).
+        let currency = extract_currency(&html);
 
         // Title composition.
         let leading = extract_leading_headings(&cleaned.html);
@@ -5268,9 +5296,18 @@ fn build_corpus(pages_dir: &Path, db_path: &Path, limit: Option<usize>) -> Resul
         // Chunker.
         let chunks = chunk_html(&final_html, Some(&title), EMBED_MAX_TOKENS);
 
-        // Insert documents row.
+        // Anchor refs (used for navigation flags + doc_anchors table).
+        let anchor_refs = extract_anchors(&final_html, &doc_id);
+        let has_in_doc_links = anchor_refs.iter().any(|r| r.kind == "in_doc");
+        let has_related_docs = anchor_refs.iter().any(|r| r.kind == "sister");
+        let has_history = anchor_refs.iter().any(|r| r.kind == "history");
+
         let now = chrono::Utc::now().to_rfc3339();
         let content_hash = metadata_content_hash(&cleaned.text);
+
+        // Pack sha8 placeholder; finalised after all docs processed.
+        let pack_placeholder = "PENDING".to_string();
+
         conn.execute(
             "INSERT OR REPLACE INTO documents
                 (doc_id, type, title, date, downloaded_at, content_hash, pack_sha8,
@@ -5284,24 +5321,26 @@ fn build_corpus(pages_dir: &Path, db_path: &Path, limit: Option<usize>) -> Resul
                 Option::<String>::None,
                 now,
                 content_hash,
-                "PENDING",
+                pack_placeholder,
                 final_html,
-                Option::<String>::None,
-                Option::<String>::None,
-                Option::<String>::None,
-                0_i64,
-                0_i64,
-                0_i64,
+                currency.withdrawn_date,
+                currency.superseded_by,
+                currency.replaces,
+                has_in_doc_links as i64,
+                has_related_docs as i64,
+                has_history as i64,
             ],
         )
         .context("INSERT documents")?;
 
-        // Insert chunks + embeddings + chunks_fts.
+        // Insert chunks + embeddings + chunks_fts; also collect a record
+        // entry for pack writing.
         let mut chunk_ids: Vec<(i64, String, Option<String>)> = Vec::new();
+        let mut chunk_records: Vec<JsonValue> = Vec::new();
         for chunk in &chunks {
             let zstd_text = zstd::stream::encode_all(
                 std::io::Cursor::new(chunk.text.as_bytes()),
-                3,
+                zstd_level,
             )
             .context("zstd-compressing chunk text")?;
             conn.execute(
@@ -5319,18 +5358,25 @@ fn build_corpus(pages_dir: &Path, db_path: &Path, limit: Option<usize>) -> Resul
             let bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(emb.as_ptr() as *const u8, emb.len())
             };
+            let emb_b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
             conn.execute(
                 "INSERT INTO chunk_embeddings (chunk_id, embedding)
                  VALUES (?1, ?2)",
                 rusqlite::params![chunk_id, bytes],
             )
             .context("INSERT chunk_embeddings")?;
-            // chunks_fts mirrors chunk text for BM25 lexical search.
             conn.execute(
                 "INSERT INTO chunks_fts (rowid, text) VALUES (?1, ?2)",
                 rusqlite::params![chunk_id, chunk.text],
             )
             .context("INSERT chunks_fts")?;
+
+            chunk_records.push(json!({
+                "ord": chunk.ord,
+                "anchor": chunk.anchor,
+                "text": chunk.text,
+                "embedding_b64": emb_b64,
+            }));
         }
 
         // title_fts: concat headings into a searchable per-doc row.
@@ -5338,7 +5384,7 @@ fn build_corpus(pages_dir: &Path, db_path: &Path, limit: Option<usize>) -> Resul
         let h_sel = scraper::Selector::parse("h1, h2, h3, h4, h5, h6").unwrap();
         let headings_concat: Vec<String> = frag
             .select(&h_sel)
-            .map(|h| anchors_node_text(h))
+            .map(anchors_node_text)
             .filter(|s| !s.is_empty())
             .collect();
         let headings_text = headings_concat.join(" ");
@@ -5348,12 +5394,8 @@ fn build_corpus(pages_dir: &Path, db_path: &Path, limit: Option<usize>) -> Resul
         )
         .context("INSERT title_fts")?;
 
-        // doc_anchors from extract_anchors(final_html, doc_id).
-        let anchor_refs = extract_anchors(&final_html, &doc_id);
-        for (anchor_ord, r) in (0_i64..).zip(anchor_refs) {
-            // For in_doc: resolve target_anchor → chunk_id by scanning
-            // chunk text for "[anchor:<X>]". For sister/history, no
-            // chunk-id lookup.
+        // doc_anchors.
+        for (anchor_ord, r) in (0_i64..).zip(anchor_refs.iter()) {
             let target_chunk_id: Option<i64> = if r.kind == "in_doc" {
                 if let Some(name) = r.target_anchor.as_deref() {
                     let marker = format!("[anchor:{name}]");
@@ -5384,7 +5426,7 @@ fn build_corpus(pages_dir: &Path, db_path: &Path, limit: Option<usize>) -> Resul
             .context("INSERT doc_anchors")?;
         }
 
-        // definitions from extract_definitions over the chunks.
+        // Definitions.
         let def_chunks: Vec<DefinitionChunk> = chunks
             .iter()
             .map(|c| DefinitionChunk {
@@ -5416,10 +5458,132 @@ fn build_corpus(pages_dir: &Path, db_path: &Path, limit: Option<usize>) -> Resul
             .context("INSERT definitions")?;
         }
 
+        // Asset persistence: write each image to <out_dir>/assets/<sha[:2]>/<sha>.bin.
+        if let Some(dir) = out_dir {
+            for asset in &assets {
+                let target = dir.join(&asset.relative_path);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                if !target.exists() || fs::metadata(&target)?.len() != asset.size {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(asset.data_b64.as_bytes())
+                        .context("decoding asset b64")?;
+                    fs::write(&target, &bytes)?;
+                }
+            }
+        }
+
+        // Pack record (in-memory; written at end of build).
+        if out_dir.is_some() {
+            pack_records.push((
+                doc_id.clone(),
+                json!({
+                    "doc_id": doc_id,
+                    "type": doc_type,
+                    "title": title,
+                    "date": Option::<String>::None,
+                    "downloaded_at": now,
+                    "content_hash": content_hash,
+                    "chunks": chunk_records,
+                    "assets": assets.iter().map(|a| json!({
+                        "asset_ref": a.asset_ref,
+                        "source_path": a.source_path,
+                        "relative_path": a.relative_path,
+                        "media_type": a.media_type,
+                        "alt": a.alt,
+                        "title": a.title,
+                        "sha256": a.sha256,
+                        "size": a.size,
+                    })).collect::<Vec<_>>(),
+                }),
+            ));
+        }
+
         processed += 1;
         if processed.is_multiple_of(50) {
             eprintln!("ato-mcp build: processed {processed} docs");
         }
+    }
+
+    // Citations: scan chunk text for [doc:X] markers, write reverse index.
+    eprintln!("ato-mcp build: deriving citations…");
+    derive_citations(&conn)?;
+
+    // Pack writing + manifest emission (when out_dir is set).
+    if let Some(dir) = out_dir {
+        eprintln!("ato-mcp build: writing pack ({} docs)…", pack_records.len());
+        let tmp_pack = dir.join("packs").join(".pack-writing.bin.zst.tmp");
+        let pack_meta = write_pack(
+            &tmp_pack,
+            zstd_level,
+            pack_records.into_iter().map(Ok),
+        )?;
+        let sha8 = pack_meta
+            .get("sha8")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("write_pack returned no sha8"))?
+            .to_string();
+        let final_pack = dir.join("packs").join(format!("pack-{sha8}.bin.zst"));
+        fs::rename(&tmp_pack, &final_pack)?;
+        // Backfill pack_sha8 + offsets/lengths into documents rows.
+        if let Some(refs) = pack_meta.get("refs").and_then(|v| v.as_array()) {
+            let mut update = conn.prepare(
+                "UPDATE documents SET pack_sha8 = ?1, pack_offset = ?2, pack_length = ?3
+                 WHERE doc_id = ?4",
+            )?;
+            for r in refs {
+                let did = r.get("doc_id").and_then(|v| v.as_str()).unwrap_or_default();
+                let off = r.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+                let len = r.get("length").and_then(|v| v.as_u64()).unwrap_or(0);
+                update.execute(rusqlite::params![sha8, off as i64, len as i64, did])?;
+            }
+        }
+
+        let pack_size = pack_meta.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+        let pack_sha256 = pack_meta
+            .get("sha256")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // Doc refs from pack_meta.refs.
+        let refs_for_manifest: Vec<JsonValue> = pack_meta
+            .get("refs")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| {
+                let did = r.get("doc_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let off = r.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+                let len = r.get("length").and_then(|v| v.as_u64()).unwrap_or(0);
+                json!({
+                    "doc_id": did,
+                    "pack_sha8": sha8,
+                    "offset": off,
+                    "length": len,
+                })
+            })
+            .collect();
+
+        let manifest = json!({
+            "format_version": 3,
+            "version": chrono::Utc::now().format("%Y%m%d").to_string(),
+            "embedding_model_sha8": null,
+            "packs": [{
+                "url": format!("packs/pack-{sha8}.bin.zst"),
+                "sha8": sha8,
+                "sha256": pack_sha256,
+                "size": pack_size,
+            }],
+            "docs": refs_for_manifest,
+            "categories": {},
+            "schema_version": 3,
+        });
+        let manifest_path = dir.join("manifest.json");
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+        eprintln!("ato-mcp build: wrote {}", manifest_path.display());
     }
 
     eprintln!("ato-mcp build: done — {processed} docs written to {}", db_path.display());
