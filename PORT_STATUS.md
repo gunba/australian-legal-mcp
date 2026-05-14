@@ -47,13 +47,14 @@ CLI subcommands added: `extract`, `extract-anchors`, `extract-definitions`,
 
 ## Stats
 
-- Python deleted (replaced with subprocess wrappers): **~2200 lines**
-- Wrapper code added: **~510 lines**
-- Net Python reduction so far: **~1700 lines**
-- Rust ports added: **~3200 lines**
+- Python deleted (replaced with subprocess wrappers): **~3000 lines**
+- Wrapper code added: **~600 lines**
+- Net Python reduction so far: **~2400 lines**
+- Rust ports added: **~3700 lines**
+- Rust CLI subcommands added: **13**
 - pytest: **212 passed, 1 skipped** across all wrappered files
 - cargo test: **83 passed** (Rust unit + http_smoke + stdio_shim)
-- CI: green on every commit
+- CI: green on every commit (27 this session)
 
 ## End-state checklist (goal completion)
 
