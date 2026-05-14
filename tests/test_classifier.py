@@ -38,20 +38,11 @@ def test_representative_path_falls_back_on_no_docid() -> None:
 
 
 def test_build_pending_record_uses_docid_classifier() -> None:
-    from ato_mcp.scraper.whats_new import WhatsNewEntry, build_pending_record
-
-    entry = WhatsNewEntry(
-        href="/law/view/document?docid=CLR/CR202612/NAT/ATO/00001",
-        title="CR 2026/12",
-        heading="Rulings",
-    )
-    record = build_pending_record(entry)
-    rep = record["representative_path"]
-    # First segment is the catch-all bucket; heading carries the source-derived
-    # grouping. The legacy ``payloads/whats_new`` bucket is not used.
-    assert rep[0] == OTHER_CATEGORY
-    assert "whats_new" not in rep
-    assert "Rulings" in rep
+    # build_pending_record was a Python helper in the now-deleted scraper
+    # module; the equivalent live in the Rust 'ato-mcp scrape-diff'
+    # subcommand. Skip the assertion since the Python pipeline is gone.
+    import pytest
+    pytest.skip("build_pending_record moved to the Rust ato-mcp scrape-diff CLI")
 
 
 def test_whats_new_payload_path_does_not_become_category() -> None:
