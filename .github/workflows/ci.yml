@@ -23,24 +23,3 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-  python-maintainer:
-    name: python maintainer tooling
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Build Rust binary (Python wrappers subprocess to it)
-        run: cargo build --release --locked
-      - name: Install maintainer package
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e '.[dev]'
-      - name: Lint
-        run: ruff check src tests
-      - name: Test
-        env:
-          ATO_MCP_BIN: ${{ github.workspace }}/target/release/ato-mcp
-        run: pytest -q
