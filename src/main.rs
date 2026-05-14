@@ -258,6 +258,17 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         level: i32,
     },
+    /// Rewrite the `packs[*].url` in a manifest.json to point at GitHub
+    /// release asset download URLs. Mirrors
+    /// src/ato_mcp/indexer/release.py:rewrite_manifest_urls.
+    ManifestRewriteUrls {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        tag: String,
+    },
     /// Fetch compact statutory definitions for a term.
     GetDefinition {
         term: String,
@@ -642,6 +653,35 @@ fn main() -> Result<()> {
             });
             let summary = write_pack(&out, level, records)?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
+            Ok(())
+        }
+        Command::ManifestRewriteUrls {
+            manifest,
+            repo,
+            tag,
+        } => {
+            let raw = fs::read_to_string(&manifest)
+                .with_context(|| format!("reading {}", manifest.display()))?;
+            let mut value: JsonValue = serde_json::from_str(&raw)
+                .with_context(|| format!("parsing {}", manifest.display()))?;
+            if let Some(packs) = value.get_mut("packs").and_then(|v| v.as_array_mut()) {
+                for pack in packs {
+                    if let Some(url) = pack.get("url").and_then(|v| v.as_str()) {
+                        let filename = std::path::Path::new(url)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(url)
+                            .to_string();
+                        let new_url = format!(
+                            "https://github.com/{repo}/releases/download/{tag}/{filename}"
+                        );
+                        pack["url"] = JsonValue::String(new_url);
+                    }
+                }
+            }
+            let pretty = serde_json::to_vec_pretty(&value)?;
+            fs::write(&manifest, pretty)
+                .with_context(|| format!("writing {}", manifest.display()))?;
             Ok(())
         }
     }
