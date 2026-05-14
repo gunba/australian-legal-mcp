@@ -298,14 +298,6 @@ Published corpus/install smoke test:
 ATO_MCP_MANIFEST_URL=https://.../manifest.json scripts/smoke-rust-install.sh
 ```
 
-Offline bundles are materialized through the Rust installer:
-
-```bash
-ATO_MCP_RELEASE_DIR=./release/index-2026.05.02 \
-ATO_MCP_MODEL_BUNDLE=/path/to/embeddinggemma-bundle.tar.zst \
-scripts/make-offline-bundle.sh ./release/ato-mcp-offline-bundle.tar.zst
-```
-
 CI runs the Rust binary checks (build, clippy, tests) on every push.
 Release binary assets are produced by `.github/workflows/release-binaries.yml`
 on tags matching `v*`.
