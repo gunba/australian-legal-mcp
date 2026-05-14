@@ -414,12 +414,35 @@ fn main() -> Result<()> {
                 }
             };
             let cleaned = clean_ato_html(&html);
+            // Title composition + heading collection + EM front-matter + anchors
+            // mirror the Python `extract.extract` return shape.
+            let frag = scraper::Html::parse_fragment(&cleaned.html);
+            let heading_sel = scraper::Selector::parse("h1, h2, h3, h4, h5, h6").unwrap();
+            let mut headings: Vec<String> = Vec::new();
+            let mut heading_levels: Vec<u32> = Vec::new();
+            for h in frag.select(&heading_sel) {
+                let text = anchors_node_text(h);
+                headings.push(text);
+                let lvl: u32 = h.value().name()[1..].parse().unwrap_or(0);
+                heading_levels.push(lvl);
+            }
+            let leading = extract_leading_headings(&cleaned.html);
+            let composed_title = extract_compose_title(&leading);
+            let title = composed_title.or(cleaned.title.clone());
+            let anchors = extract_collect_anchors(&frag);
+            let (fm_refs, fm_phrase) = extract_em_front_matter(&cleaned.html);
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "text": cleaned.text,
                     "html": cleaned.html,
-                    "title": cleaned.title,
+                    "title": title,
+                    "html_title": cleaned.title,
+                    "headings": headings,
+                    "heading_levels": heading_levels,
+                    "anchors": anchors,
+                    "front_matter_refs": fm_refs,
+                    "front_matter_phrase": fm_phrase,
                 }))?
             );
             Ok(())
@@ -3038,6 +3061,166 @@ fn extract_anchors(html: &str, source_doc_id: &str) -> Vec<AnchorRef> {
         });
     }
     refs
+}
+
+// ----- Title composition + EM front matter + anchor collection -----
+// Ports of src/ato_mcp/indexer/extract.py:
+//   _collect_anchors, _leading_headings, _compose_title,
+//   _collect_em_front_matter
+
+fn extract_collect_anchors(doc: &scraper::Html) -> Vec<(String, String)> {
+    use scraper::Selector;
+    let heading_sel = Selector::parse("h1, h2, h3, h4, h5, h6").unwrap();
+    let inner_a = Selector::parse("a").unwrap();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for heading in doc.select(&heading_sel) {
+        let mut anchor: Option<String> = heading
+            .value()
+            .attr("id")
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        if anchor.is_none() {
+            for a in heading.select(&inner_a) {
+                if let Some(name) = a.value().attr("name").or_else(|| a.value().attr("id")) {
+                    if !name.is_empty() {
+                        anchor = Some(name.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(a) = anchor {
+            let text = anchors_node_text(heading);
+            out.push((text, a));
+        }
+    }
+    out
+}
+
+fn extract_leading_headings(container_html: &str) -> Vec<String> {
+    use scraper::Selector;
+    let frag = scraper::Html::parse_fragment(container_html);
+    let heading_tags = ["h1", "h2", "h3", "h4", "h5", "h6"];
+    let nested_heading_sel = Selector::parse("h1, h2, h3, h4, h5, h6").unwrap();
+
+    let mut out: Vec<String> = Vec::new();
+    let mut dived = false;
+    // Walk direct children of the fragment root (which is a wrapper).
+    // scraper's parse_fragment wraps in a synthetic root; we need to find
+    // the "real" first-level container's children.
+    let root = frag.root_element();
+    let direct_children: Vec<_> = root
+        .children()
+        .filter_map(scraper::ElementRef::wrap)
+        .collect();
+    // If the root has a single element child, treat that as the container.
+    let walk_children: Vec<scraper::ElementRef> = if direct_children.len() == 1 {
+        direct_children[0]
+            .children()
+            .filter_map(scraper::ElementRef::wrap)
+            .collect()
+    } else {
+        direct_children
+    };
+    for child in walk_children {
+        let tag = child.value().name();
+        if heading_tags.contains(&tag) {
+            let text = anchors_node_text(child);
+            if !text.is_empty() {
+                out.push(text);
+            }
+            continue;
+        }
+        if dived {
+            break;
+        }
+        // Wrapper that only carries headings? Dive once.
+        let nested: Vec<_> = child.select(&nested_heading_sel).collect();
+        let non_heading_len = anchors_node_text(child).len();
+        if !nested.is_empty() && non_heading_len <= 800 {
+            for h in nested {
+                let t = anchors_node_text(h);
+                if !t.is_empty() {
+                    out.push(t);
+                }
+            }
+            dived = true;
+            continue;
+        }
+        if !anchors_node_text(child).is_empty() {
+            break;
+        }
+    }
+    out.into_iter().take(4).collect()
+}
+
+fn extract_compose_title(headings: &[String]) -> Option<String> {
+    let cleaned: Vec<String> = headings
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    if cleaned.len() == 1 {
+        return Some(cleaned[0].clone());
+    }
+    let mut out: Vec<String> = Vec::new();
+    for h in cleaned {
+        if let Some(last) = out.last() {
+            let h_lc = h.to_lowercase();
+            let last_lc = last.to_lowercase();
+            if last_lc.starts_with(&h_lc) || h_lc.starts_with(&last_lc) {
+                continue;
+            }
+        }
+        out.push(h);
+    }
+    Some(out.join(" — "))
+}
+
+fn extract_em_front_matter(container_html: &str) -> (Vec<String>, Option<String>) {
+    use scraper::Selector;
+    let frag = scraper::Html::parse_fragment(container_html);
+    let lawfront_sel = Selector::parse("#Lawfront").unwrap();
+    let Some(front) = frag.select(&lawfront_sel).next() else {
+        return (Vec::new(), None);
+    };
+    let strong_sel = Selector::parse("strong").unwrap();
+    let mut refs: Vec<String> = Vec::new();
+    let mut phrase: Option<String> = None;
+    for child in front.children().filter_map(scraper::ElementRef::wrap) {
+        let tag = child.value().name();
+        match tag {
+            "div" => {
+                let classes: Vec<&str> = child
+                    .value()
+                    .attr("class")
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .collect();
+                if classes.contains(&"ref") {
+                    if let Some(s) = child.select(&strong_sel).next() {
+                        let t = anchors_node_text(s);
+                        if !t.is_empty() {
+                            refs.push(t);
+                        }
+                    }
+                }
+            }
+            "p" if phrase.is_none() => {
+                if let Some(s) = child.select(&strong_sel).next() {
+                    let t = anchors_node_text(s);
+                    if t.to_lowercase().starts_with("explanatory ") {
+                        phrase = Some(t);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (refs, phrase)
 }
 
 fn fetch_external_doc(
