@@ -461,13 +461,15 @@ fn main() -> Result<()> {
                 (cleaned.html.clone(), Vec::new())
             };
             let normalised = normalise_named_anchors(&rewritten_html);
-            let final_html = strip_attributes(&normalised);
-            // Re-render text from the mutated HTML so [asset:X] markers
-            // (from rewrite_images_html spans) appear inline.
-            let final_doc = scraper::Html::parse_fragment(&final_html);
-            let referenced = collect_referenced_anchors(&final_doc);
-            let text = subtree_text(&final_doc, &referenced);
+            let with_links = rewrite_links_html(&normalised);
+            let final_html = strip_attributes(&with_links);
+            // Re-render text from the mutated HTML using the chunker's walker
+            // so [asset:X] markers (from rewrite_images_html spans) appear and
+            // tables render as pipe-separated rows — matches Python's
+            // chunk.html_to_text used by extract.extract().
+            let text = chunker_html_to_text(&final_html);
             // Headings + heading_levels + anchors are read AFTER mutations.
+            let final_doc = scraper::Html::parse_fragment(&final_html);
             let heading_sel = scraper::Selector::parse("h1, h2, h3, h4, h5, h6").unwrap();
             let mut headings: Vec<String> = Vec::new();
             let mut heading_levels: Vec<u32> = Vec::new();
@@ -4446,6 +4448,32 @@ fn chunk_html(html: &str, root_title: Option<&str>, max_tokens: usize) -> Vec<Ch
     chunker_pack(blocks, max_tokens)
 }
 
+/// Mirror of chunk.py:html_to_text — walks the doc into _Blocks (with empty
+/// referenced anchors) and joins block texts with `\n\n`. Used by the
+/// extract CLI's `text` field so the output matches Python's behaviour
+/// (table rows as pipe-separated, blockquote `> `, list items `- `, etc.)
+/// rather than the looser per-block-tag newlines that subtree_text emits.
+fn chunker_html_to_text(html: &str) -> String {
+    if html.trim().is_empty() {
+        return String::new();
+    }
+    let doc = scraper::Html::parse_fragment(html);
+    let referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let body_sel = scraper::Selector::parse("body").unwrap();
+    let walk_root = doc
+        .select(&body_sel)
+        .next()
+        .unwrap_or(doc.root_element());
+    let mut blocks: Vec<ChunkBlock> = Vec::new();
+    chunker_walk(walk_root, &mut blocks, &referenced, None);
+    blocks
+        .into_iter()
+        .filter(|b| !b.text.is_empty())
+        .map(|b| b.text)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 // ----- end chunker -----
 
 // ----- Metadata helpers (port of src/ato_mcp/indexer/metadata.py) -----
@@ -4595,6 +4623,43 @@ fn metadata_signature(fields: &serde_json::Map<String, JsonValue>) -> String {
     }
     let digest = h.finalize();
     digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Rewrite ATO doc-link `<a href="...">` tags to `<a data-doc-id="X" data-pit="..." data-view="...">`
+/// (and drop the original href). Mirrors src/ato_mcp/indexer/extract.py:_rewrite_links_html.
+/// Operates string-side over the cleaned HTML.
+fn rewrite_links_html(html: &str) -> String {
+    let a_re = Regex::new(r#"(?is)<a\b([^>]*)>"#).unwrap();
+    a_re
+        .replace_all(html, |caps: &regex::Captures| {
+            let attrs = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let Some(href) = extract_attr(attrs, "href") else {
+                return caps.get(0).unwrap().as_str().to_string();
+            };
+            // Try ATO doc-link parse.
+            if let Some((doc_id, pit, view)) = doc_id_from_ato_link(href) {
+                let href_re = Regex::new(r#"(?is)\s+href\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)"#).unwrap();
+                let stripped = href_re.replace_all(attrs, "").into_owned();
+                let mut new_attrs = stripped;
+                new_attrs.push_str(&format!(r#" data-doc-id="{}""#, assets_html_escape(&doc_id)));
+                if let Some(p) = pit {
+                    new_attrs.push_str(&format!(r#" data-pit="{}""#, assets_html_escape(&p)));
+                }
+                if let Some(v) = view {
+                    new_attrs.push_str(&format!(r#" data-view="{}""#, assets_html_escape(&v)));
+                }
+                return format!("<a{new_attrs}>");
+            }
+            // Non-ATO link: keep href cleaned (strip javascript:/data:).
+            let safe = href.trim();
+            if safe.is_empty() || Regex::new(r#"(?is)^\s*(?:javascript|data):"#).unwrap().is_match(safe) {
+                let href_re = Regex::new(r#"(?is)\s+href\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)"#).unwrap();
+                let stripped = href_re.replace_all(attrs, "").into_owned();
+                return format!("<a{stripped}>");
+            }
+            caps.get(0).unwrap().as_str().to_string()
+        })
+        .into_owned()
 }
 
 fn fetch_external_doc(
