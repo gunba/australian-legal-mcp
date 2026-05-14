@@ -199,6 +199,15 @@ enum Command {
         #[arg(long)]
         source_path: Option<PathBuf>,
     },
+    /// Extract definitions from a list of pre-chunked DefinitionChunks.
+    /// Reads JSON from --input-file (or stdin) of the shape
+    /// {doc_id, source_title, source_type, chunks: [{ord, anchor, text}, ...]}.
+    /// Writes a JSON array of Definition records to stdout.
+    /// Mirrors src/ato_mcp/indexer/definitions.py:extract_definitions.
+    ExtractDefinitions {
+        #[arg(long)]
+        input_file: Option<PathBuf>,
+    },
     /// Fetch compact statutory definitions for a term.
     GetDefinition {
         term: String,
@@ -402,6 +411,35 @@ fn main() -> Result<()> {
                     "title": cleaned.title,
                 }))?
             );
+            Ok(())
+        }
+        Command::ExtractDefinitions { input_file } => {
+            #[derive(Deserialize)]
+            struct Input {
+                doc_id: String,
+                source_title: String,
+                source_type: String,
+                chunks: Vec<DefinitionChunk>,
+            }
+            let raw = match input_file {
+                Some(p) => fs::read_to_string(&p)
+                    .with_context(|| format!("reading {}", p.display()))?,
+                None => {
+                    let mut s = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut s)
+                        .context("reading stdin")?;
+                    s
+                }
+            };
+            let input: Input = serde_json::from_str(&raw).context("parsing extract-definitions input")?;
+            let defs = extract_definitions(
+                &input.doc_id,
+                &input.source_title,
+                &input.source_type,
+                &input.chunks,
+            );
+            println!("{}", serde_json::to_string_pretty(&defs)?);
             Ok(())
         }
     }
@@ -2578,6 +2616,170 @@ const ATO_HISTORY_UI_LABELS: &[&str] = &[
     "view history reference",
     "hide history reference",
 ];
+
+// ----- Definition extraction (port of src/ato_mcp/indexer/definitions.py) -----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DefinitionChunk {
+    ord: i64,
+    anchor: Option<String>,
+    text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Definition {
+    definition_id: String,
+    term: String,
+    norm_term: String,
+    doc_id: String,
+    source_title: String,
+    source_type: String,
+    scope: Option<String>,
+    anchor: Option<String>,
+    ord: i64,
+    body: String,
+}
+
+fn defs_normalise_term(term: &str) -> String {
+    let t: String = term.replace("\\*", "*").replace("\\&", "&");
+    let t = t.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\r' | '\n' | ':' | '*'));
+    let mut out = String::with_capacity(t.len());
+    let mut last_ws = false;
+    for c in t.chars() {
+        if c.is_whitespace() {
+            if !last_ws {
+                out.push(' ');
+                last_ws = true;
+            }
+        } else {
+            out.push(c);
+            last_ws = false;
+        }
+    }
+    out.to_lowercase()
+}
+
+fn defs_clean_term(term: &str) -> String {
+    let s = term.replace('\n', " ");
+    let mut out = String::with_capacity(s.len());
+    let mut last_ws = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !last_ws {
+                out.push(' ');
+                last_ws = true;
+            }
+        } else {
+            out.push(c);
+            last_ws = false;
+        }
+    }
+    out.trim_matches(|c: char| matches!(c, ' ' | ':' | '*')).to_string()
+}
+
+fn defs_clean_body(body: &str) -> String {
+    let trimmed = body.trim();
+    // Collapse runs of 3+ newlines to two.
+    let re = Regex::new(r"\n{3,}").unwrap();
+    re.replace_all(trimmed, "\n\n").to_string()
+}
+
+fn defs_definition_id(doc_id: &str, ord: i64, term: &str, body: &str, offset: usize) -> String {
+    let mut h = Sha256::new();
+    h.update(doc_id.as_bytes());
+    h.update(b"\0");
+    h.update(ord.to_string().as_bytes());
+    h.update(b"\0");
+    h.update(offset.to_string().as_bytes());
+    h.update(b"\0");
+    h.update(defs_normalise_term(term).as_bytes());
+    h.update(b"\0");
+    h.update(body.as_bytes());
+    let digest = h.finalize();
+    let hex = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    hex[..20].to_string()
+}
+
+fn defs_scope_from_title(title: &str, source_type: &str) -> Option<String> {
+    if title.contains(" s ") {
+        Some(title.to_string())
+    } else if !source_type.is_empty() {
+        Some(source_type.to_string())
+    } else {
+        None
+    }
+}
+
+fn extract_definitions(
+    doc_id: &str,
+    source_title: &str,
+    source_type: &str,
+    chunks: &[DefinitionChunk],
+) -> Vec<Definition> {
+    // Match `***term***` markers — same regex as definitions.py:_TERM_RE.
+    let term_re = Regex::new(r"\*\*\*\s*([^*\n][^*]{0,180}?)\s*\*\*\*").unwrap();
+    let cue_re = Regex::new(
+        r"(?im)^\s*(?:,?\s*of\b|,?\s*in relation\b|:|means\b|includes\b|has\b|is\b|\(Repealed\b)",
+    )
+    .unwrap();
+
+    let mut out: Vec<Definition> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String, String)> =
+        std::collections::HashSet::new();
+
+    for chunk in chunks {
+        let matches: Vec<regex::Match> = term_re.find_iter(&chunk.text).collect();
+        // Capture groups for each match — need them to extract the term text.
+        let captures: Vec<regex::Captures> = term_re.captures_iter(&chunk.text).collect();
+        if matches.is_empty() {
+            continue;
+        }
+        for (idx, m) in matches.iter().enumerate() {
+            let term_raw = captures[idx].get(1).map(|c| c.as_str()).unwrap_or("");
+            let term = defs_clean_term(term_raw);
+            if term.is_empty() {
+                continue;
+            }
+            let next_start = matches.get(idx + 1).map(|m| m.start()).unwrap_or(chunk.text.len());
+            let body_start = m.end();
+            let body_slice = &chunk.text[body_start..next_start];
+            let mut body = defs_clean_body(body_slice);
+            // Handle "***term*** or ***other***" / "***term*** and ***other***" pattern:
+            // body collapses to "or"/"and"; the real definition follows the next term marker.
+            let body_lc = body.to_lowercase();
+            if (body_lc == "or" || body_lc == "and") && idx + 1 < matches.len() {
+                let next_m = &matches[idx + 1];
+                let next_next_start = matches
+                    .get(idx + 2)
+                    .map(|m| m.start())
+                    .unwrap_or(chunk.text.len());
+                body = defs_clean_body(&chunk.text[next_m.end()..next_next_start]);
+            }
+            if body.len() < 4 || cue_re.find(&body).is_none() {
+                continue;
+            }
+            let norm = defs_normalise_term(&term);
+            let key = (norm.clone(), doc_id.to_string(), body.clone());
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.insert(key);
+            out.push(Definition {
+                definition_id: defs_definition_id(doc_id, chunk.ord, &term, &body, m.start()),
+                term: term.clone(),
+                norm_term: norm,
+                doc_id: doc_id.to_string(),
+                source_title: source_title.to_string(),
+                source_type: source_type.to_string(),
+                scope: defs_scope_from_title(source_title, source_type),
+                anchor: chunk.anchor.clone(),
+                ord: chunk.ord,
+                body,
+            });
+        }
+    }
+    out
+}
 
 fn fetch_external_doc(
     doc_id: &str,
