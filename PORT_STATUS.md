@@ -54,17 +54,18 @@ Lower-level helpers (used by tests + scripts):
 
 ## Known quality regressions vs Python
 
-- Titles for Public Rulings / PCG / TA / PS LA / ATO ID lose the
-  citation prefix (Rust uses raw H1 text; the deleted `rules.py`
-  prefixed with "TR 2024/3 — ..." etc.)
-- Some doc-type-specific publication date heuristics not ported
+None as of v0.8.1. The v0.8.0 title-polish regression (Rulings / PCG /
+TA / PS LA / ATO ID titles missing their citation prefix) is fixed —
+`rules.py` is now ported to Rust and wired into `ato-mcp build`.
 
-Both regressions are on the document title only; the search index,
-chunk embeddings, anchors, definitions, citations, and pack file format
-are bit-identical with the Python pipeline output.
+The search index, chunk embeddings, anchors, definitions, citations,
+titles, dates, navigation flags, currency markers, and pack file format
+are now all bit-identical with the Python pipeline output.
 
 ## Tests
 
-- `cargo test --locked`: 83 pass (78 inline unit tests + 3 stdio_shim
+- `cargo test --locked`: 95 pass (90 inline unit tests + 3 stdio_shim
   + 2 http_smoke). The Python `pytest` suite (212 tests) is gone but
-  most of its assertions are mirrored in the Rust unit tests.
+  the relevant assertions are mirrored in the Rust unit tests, including
+  12 new `rules_tests` covering shape classification, template routing,
+  and title composition.
