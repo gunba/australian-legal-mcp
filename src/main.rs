@@ -3963,8 +3963,10 @@ struct ChunkBlock {
     text: String,
     definition_text: String,
     anchor: Option<String>,
-    #[allow(dead_code)]
     is_oversize_table: bool,
+    /// Set when the block is an oversize table — needed by chunker_split
+    /// to walk rows in table-row-split mode.
+    table_html: Option<String>,
 }
 
 fn chunker_approx_tokens(text: &str) -> usize {
@@ -4180,11 +4182,17 @@ fn chunker_render_block(
     let anchor = chunker_first_referenced_anchor(node, referenced);
     let is_oversize_table =
         tag == "table" && chunker_approx_tokens(&text) > EMBED_MAX_TOKENS;
+    let table_html = if is_oversize_table {
+        Some(node.html())
+    } else {
+        None
+    };
     Some(ChunkBlock {
         text: text.clone(),
         definition_text: text,
         anchor,
         is_oversize_table,
+        table_html,
     })
 }
 
@@ -4223,6 +4231,7 @@ fn chunker_render_dt_dd_pair(
         definition_text: rendered,
         anchor,
         is_oversize_table: false,
+                table_html: None,
     })
 }
 
@@ -4282,6 +4291,7 @@ fn chunker_walk(
                     definition_text: rendered,
                     anchor,
                     is_oversize_table: false,
+                table_html: None,
                 });
             }
             idx += 1;
@@ -4329,17 +4339,158 @@ fn chunker_flush_inline(
             definition_text: text,
             anchor,
             is_oversize_table: false,
+                table_html: None,
         });
     }
     inline_parts.clear();
     inline_anchors.clear();
 }
 
+/// Split an oversize block into pieces that each fit within max_tokens.
+/// Mirrors chunk.py:_split_oversize_block. Order:
+///   1. oversize tables -> row split (rows stay whole).
+///   2. prose -> sentence split, greedy-pack within budget.
+///   3. word-window split as last-resort (single sentence/row over budget).
+fn chunker_split_oversize_block(block: &ChunkBlock, max_tokens: usize) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    if block.is_oversize_table {
+        if let Some(html) = block.table_html.as_deref() {
+            for (piece, defn) in chunker_table_row_split(html, max_tokens) {
+                for p in chunker_enforce_max_tokens(&piece, &defn, max_tokens) {
+                    out.push(p);
+                }
+            }
+            return out;
+        }
+    }
+    // Prose: sentence-split, greedy-pack.
+    let sentences = chunker_sentence_split(&block.text);
+    let mut buf: Vec<String> = Vec::new();
+    let mut buf_tokens: usize = 0;
+    for s in sentences {
+        let st = chunker_approx_tokens(&s);
+        if !buf.is_empty() && buf_tokens + st > max_tokens {
+            let piece = buf.join(" ");
+            for p in chunker_enforce_max_tokens(&piece, &piece, max_tokens) {
+                out.push(p);
+            }
+            buf = vec![s];
+            buf_tokens = st;
+        } else {
+            buf.push(s);
+            buf_tokens += st;
+        }
+    }
+    if !buf.is_empty() {
+        let piece = buf.join(" ");
+        for p in chunker_enforce_max_tokens(&piece, &piece, max_tokens) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+fn chunker_enforce_max_tokens(
+    text: &str,
+    definition_text: &str,
+    max_tokens: usize,
+) -> Vec<(String, String)> {
+    if chunker_approx_tokens(text) <= max_tokens {
+        return vec![(text.to_string(), definition_text.to_string())];
+    }
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let target_words = std::cmp::max(1, ((max_tokens as f64) / 1.4) as usize);
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let end = std::cmp::min(i + target_words, words.len());
+        let piece = words[i..end].join(" ");
+        out.push((piece.clone(), piece));
+        i = end;
+    }
+    out
+}
+
+fn chunker_table_row_split(table_html: &str, max_tokens: usize) -> Vec<(String, String)> {
+    let frag = scraper::Html::parse_fragment(table_html);
+    let row_sel = scraper::Selector::parse("tr").unwrap();
+    let cell_sel = scraper::Selector::parse("th, td").unwrap();
+    let referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut rows: Vec<String> = Vec::new();
+    for row in frag.select(&row_sel) {
+        let cells: Vec<String> = row
+            .select(&cell_sel)
+            .map(|c| chunker_normalise_text(&chunker_render_inline(c, &referenced)))
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !cells.is_empty() {
+            rows.push(cells.join(" | "));
+        }
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut buf: Vec<String> = Vec::new();
+    let mut buf_tokens: usize = 0;
+    for row in rows {
+        let row_tokens = chunker_approx_tokens(&row);
+        if !buf.is_empty() && buf_tokens + row_tokens > max_tokens {
+            let piece = buf.join("\n");
+            out.push((piece.clone(), piece));
+            buf = vec![row];
+            buf_tokens = row_tokens;
+        } else {
+            buf.push(row);
+            buf_tokens += row_tokens;
+        }
+    }
+    if !buf.is_empty() {
+        let piece = buf.join("\n");
+        out.push((piece.clone(), piece));
+    }
+    out
+}
+
+fn chunker_sentence_split(text: &str) -> Vec<String> {
+    // Mirrors Python's _SENT_RE: split on whitespace that follows `.!?` and
+    // precedes an uppercase letter or `(`. Rust's regex crate doesn't
+    // support lookahead, so walk char-by-char.
+    let mut sentences: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        current.push(c);
+        if matches!(c, '.' | '!' | '?') {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j > i + 1
+                && j < chars.len()
+                && (chars[j].is_ascii_uppercase() || chars[j] == '(')
+            {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    sentences.push(trimmed);
+                }
+                current.clear();
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        sentences.push(trimmed);
+    }
+    sentences
+}
+
 /// Greedy-pack blocks into chunks bounded by max_tokens. Mirrors
-/// chunk.py:_pack_chunks. A block whose own token count exceeds the
-/// budget is emitted as its own oversized chunk (this commit doesn't yet
-/// port _split_oversize_block — those cases will exceed the budget;
-/// faithful sentence/row split comes in a follow-up).
+/// chunk.py:_pack_chunks. Blocks exceeding max_tokens are split via
+/// chunker_split_oversize_block (table rows, sentences, or word-window
+/// fallback) so every emitted chunk fits the budget.
 fn chunker_pack(blocks: Vec<ChunkBlock>, max_tokens: usize) -> Vec<Chunk> {
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut ord_counter: i64 = 0;
@@ -4388,18 +4539,16 @@ fn chunker_pack(blocks: Vec<ChunkBlock>, max_tokens: usize) -> Vec<Chunk> {
                 &mut ord_counter,
                 &mut chunks,
             );
-            // Emit oversize block as its own chunk (no split for now).
-            chunks.push(Chunk {
-                ord: ord_counter,
-                anchor: block.anchor,
-                text: block.text.clone(),
-                definition_text: if block.definition_text != block.text {
-                    Some(block.definition_text)
-                } else {
-                    None
-                },
-            });
-            ord_counter += 1;
+            // Split oversize block into pieces that fit max_tokens.
+            for (text, defn) in chunker_split_oversize_block(&block, max_tokens) {
+                chunks.push(Chunk {
+                    ord: ord_counter,
+                    anchor: block.anchor.clone(),
+                    text: text.clone(),
+                    definition_text: if defn != text { Some(defn) } else { None },
+                });
+                ord_counter += 1;
+            }
             continue;
         }
         let projected_tokens =
