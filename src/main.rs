@@ -226,6 +226,17 @@ enum Command {
         #[arg(long)]
         html_file: Option<PathBuf>,
     },
+    /// Block-aware chunker for cleaned ATO HTML. Mirrors
+    /// src/ato_mcp/indexer/chunk.py:chunk_html. JSON out:
+    /// [{ord, anchor, text, definition_text}, ...].
+    ChunkHtml {
+        #[arg(long)]
+        html_file: Option<PathBuf>,
+        #[arg(long)]
+        root_title: Option<String>,
+        #[arg(long, default_value_t = 1024)]
+        max_tokens: usize,
+    },
     /// Fetch compact statutory definitions for a term.
     GetDefinition {
         term: String,
@@ -534,6 +545,26 @@ fn main() -> Result<()> {
             };
             let info = extract_currency(&html);
             println!("{}", serde_json::to_string_pretty(&info)?);
+            Ok(())
+        }
+        Command::ChunkHtml {
+            html_file,
+            root_title,
+            max_tokens,
+        } => {
+            let html = match html_file {
+                Some(p) => fs::read_to_string(&p)
+                    .with_context(|| format!("reading {}", p.display()))?,
+                None => {
+                    let mut s = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut s)
+                        .context("reading stdin")?;
+                    s
+                }
+            };
+            let chunks = chunk_html(&html, root_title.as_deref(), max_tokens);
+            println!("{}", serde_json::to_string_pretty(&chunks)?);
             Ok(())
         }
     }
@@ -3863,6 +3894,518 @@ fn normalise_named_anchors(html: &str) -> String {
         })
         .into_owned()
 }
+
+// ----- Chunker (port of src/ato_mcp/indexer/chunk.py) -----
+//
+// Block-aware chunking for cleaned ATO HTML. Walks the DOM into a flat list
+// of atomic blocks, renders each into plaintext with markdown markers, then
+// greedy-packs blocks into chunks bounded by max_tokens. Mirrors chunk.py's
+// public API (chunk_html, html_to_text, approx_tokens) and intermediate
+// shape (_Block, Chunk).
+
+#[allow(dead_code)]
+const CHUNKER_FORMAT_VERSION: u32 = 3;
+const EMBED_MAX_TOKENS: usize = 1024;
+
+#[derive(Debug, Clone, Serialize)]
+struct Chunk {
+    ord: i64,
+    anchor: Option<String>,
+    text: String,
+    definition_text: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ChunkBlock {
+    text: String,
+    definition_text: String,
+    anchor: Option<String>,
+    #[allow(dead_code)]
+    is_oversize_table: bool,
+}
+
+fn chunker_approx_tokens(text: &str) -> usize {
+    let words = text.split_whitespace().count();
+    std::cmp::max(1, ((words as f64) * 1.3) as usize)
+}
+
+/// Tighter whitespace normalisation than `normalise_paragraph_breaks`:
+/// matches chunk.py:_normalise_text. Collapses NBSP and horizontal-only
+/// runs to single spaces, collapses ` *\n *` to `\n`, caps newline runs at
+/// two, normalises numeric-range spacing, and tightens quoted text.
+fn chunker_normalise_text(text: &str) -> String {
+    let s = text.replace('\u{a0}', " ");
+    // _WS_RE: horizontal whitespace [ \t\f\v]+
+    let ws = Regex::new(r"[ \t\x0c\x0b]+").unwrap();
+    let s = ws.replace_all(&s, " ").into_owned();
+    let newline_pad = Regex::new(r" *\n *").unwrap();
+    let s = newline_pad.replace_all(&s, "\n").into_owned();
+    let newline_run = Regex::new(r"\n{3,}").unwrap();
+    let s = newline_run.replace_all(&s, "\n\n").into_owned();
+    let s = s.trim().to_string();
+    let numeric_range = Regex::new(r"(?P<a>\d)\s+-\s+(?P<b>\d)").unwrap();
+    let s = numeric_range.replace_all(&s, "$a-$b").into_owned();
+    let spaced_quote = Regex::new(r#""\s+([^"\n]*?)\s+""#).unwrap();
+    spaced_quote.replace_all(&s, r#""$1""#).into_owned()
+}
+
+fn chunker_heading_anchor(node: scraper::ElementRef) -> Option<String> {
+    if let Some(id) = node.value().attr("id") {
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+    let a_sel = scraper::Selector::parse("a").unwrap();
+    for a in node.select(&a_sel) {
+        let val = a.value();
+        if let Some(name) = val.attr("id").or_else(|| val.attr("name")) {
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn chunker_first_referenced_anchor(
+    node: scraper::ElementRef,
+    referenced: &std::collections::HashSet<String>,
+) -> Option<String> {
+    for el in node.descendants() {
+        if let Some(eref) = scraper::ElementRef::wrap(el) {
+            let val = eref.value();
+            if let Some(name) = val.attr("name") {
+                if referenced.contains(name) {
+                    return Some(name.to_string());
+                }
+            }
+            if let Some(nid) = val.attr("id") {
+                if referenced.contains(nid) {
+                    return Some(nid.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn chunker_is_root_title_echo(heading: &str, root_title: Option<&str>) -> bool {
+    let Some(rt) = root_title else { return false };
+    chunker_normalise_text(heading).to_lowercase()
+        == chunker_normalise_text(rt).to_lowercase()
+}
+
+/// Render a single subtree to inline text using the existing render_node
+/// machinery (which already produces [doc:X], [anchor:X], [asset:X],
+/// **/*/# markers). Used by the chunker for block rendering.
+fn chunker_render_inline(
+    node: scraper::ElementRef,
+    referenced: &std::collections::HashSet<String>,
+) -> String {
+    let mut buf = String::new();
+    for child in node.children() {
+        render_node(child, &mut buf, referenced);
+    }
+    buf
+}
+
+fn chunker_is_atomic_block(tag: &str, has_structural_child: bool) -> bool {
+    const PURE_ATOMIC: &[&str] = &["table", "p", "pre", "blockquote", "li", "figcaption", "caption", "dt", "dd"];
+    const CONTAINER_BLOCKS: &[&str] = &[
+        "article", "aside", "details", "div", "dl", "figure", "footer",
+        "header", "main", "ol", "section", "ul",
+    ];
+    const BLOCK_TAGS: &[&str] = &[
+        "address", "article", "aside", "blockquote", "caption", "dd",
+        "details", "div", "dl", "dt", "figcaption", "figure", "footer",
+        "header", "li", "main", "ol", "p", "pre", "section", "table",
+        "td", "th", "tr", "ul",
+    ];
+    if PURE_ATOMIC.contains(&tag) {
+        return true;
+    }
+    if !BLOCK_TAGS.contains(&tag) {
+        return false;
+    }
+    if CONTAINER_BLOCKS.contains(&tag) {
+        return !has_structural_child;
+    }
+    true
+}
+
+fn chunker_child_is_structural(tag: &str) -> bool {
+    const HEADING_TAGS: &[&str] = &["h1", "h2", "h3", "h4", "h5", "h6"];
+    const BLOCK_TAGS: &[&str] = &[
+        "address", "article", "aside", "blockquote", "caption", "dd",
+        "details", "div", "dl", "dt", "figcaption", "figure", "footer",
+        "header", "li", "main", "ol", "p", "pre", "section", "table",
+        "td", "th", "tr", "ul",
+    ];
+    HEADING_TAGS.contains(&tag) || BLOCK_TAGS.contains(&tag)
+}
+
+fn chunker_has_structural_child(node: scraper::ElementRef) -> bool {
+    for child in node.children() {
+        if let Some(eref) = scraper::ElementRef::wrap(child) {
+            if chunker_child_is_structural(eref.value().name()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn chunker_render_table_text(
+    table: scraper::ElementRef,
+    referenced: &std::collections::HashSet<String>,
+) -> String {
+    let row_sel = scraper::Selector::parse("tr").unwrap();
+    let cell_sel = scraper::Selector::parse("th, td").unwrap();
+    let mut rows: Vec<String> = Vec::new();
+    for row in table.select(&row_sel) {
+        let cells: Vec<String> = row
+            .select(&cell_sel)
+            .map(|cell| chunker_normalise_text(&chunker_render_inline(cell, referenced)))
+            .filter(|c| !c.is_empty())
+            .collect();
+        if !cells.is_empty() {
+            rows.push(cells.join(" | "));
+        }
+    }
+    if !rows.is_empty() {
+        rows.join("\n")
+    } else {
+        chunker_normalise_text(&chunker_render_inline(table, referenced))
+    }
+}
+
+fn chunker_render_block(
+    node: scraper::ElementRef,
+    referenced: &std::collections::HashSet<String>,
+) -> Option<ChunkBlock> {
+    let tag = node.value().name();
+    let text = match tag {
+        "table" => chunker_render_table_text(node, referenced),
+        "blockquote" => {
+            let inner = chunker_normalise_text(&chunker_render_inline(node, referenced));
+            if inner.is_empty() {
+                String::new()
+            } else {
+                inner
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(|l| format!("> {l}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+        "pre" => {
+            // Use raw text() rather than rendered (no markers inside <pre>).
+            let inner = node.text().collect::<String>();
+            let inner = inner.trim();
+            if inner.is_empty() {
+                String::new()
+            } else {
+                format!("```\n{inner}\n```")
+            }
+        }
+        "li" => {
+            let inner = chunker_normalise_text(&chunker_render_inline(node, referenced));
+            if inner.is_empty() {
+                String::new()
+            } else {
+                format!("- {inner}")
+            }
+        }
+        "ul" | "ol" => {
+            let li_sel = scraper::Selector::parse("li").unwrap();
+            let items: Vec<String> = node
+                .select(&li_sel)
+                .map(|li| {
+                    let t = chunker_normalise_text(&chunker_render_inline(li, referenced));
+                    if t.is_empty() { String::new() } else { format!("- {t}") }
+                })
+                .filter(|s| !s.is_empty())
+                .collect();
+            items.join("\n")
+        }
+        _ => chunker_normalise_text(&chunker_render_inline(node, referenced)),
+    };
+    if text.is_empty() {
+        return None;
+    }
+    let anchor = chunker_first_referenced_anchor(node, referenced);
+    let is_oversize_table =
+        tag == "table" && chunker_approx_tokens(&text) > EMBED_MAX_TOKENS;
+    Some(ChunkBlock {
+        text: text.clone(),
+        definition_text: text,
+        anchor,
+        is_oversize_table,
+    })
+}
+
+fn chunker_render_dt_dd_pair(
+    dt: scraper::ElementRef,
+    dd: Option<scraper::ElementRef>,
+    referenced: &std::collections::HashSet<String>,
+) -> Option<ChunkBlock> {
+    let term = chunker_normalise_text(&chunker_render_inline(dt, referenced));
+    let body = match dd {
+        Some(d) => chunker_normalise_text(&chunker_render_inline(d, referenced)),
+        None => String::new(),
+    };
+    if term.is_empty() && body.is_empty() {
+        return None;
+    }
+    let mut rendered = if term.is_empty() {
+        String::new()
+    } else {
+        format!("**{term}**")
+    };
+    if !body.is_empty() {
+        if !rendered.is_empty() {
+            rendered.push('\n');
+        }
+        rendered.push_str(&body);
+    }
+    let mut anchor = chunker_first_referenced_anchor(dt, referenced);
+    if anchor.is_none() {
+        if let Some(d) = dd {
+            anchor = chunker_first_referenced_anchor(d, referenced);
+        }
+    }
+    Some(ChunkBlock {
+        text: rendered.clone(),
+        definition_text: rendered,
+        anchor,
+        is_oversize_table: false,
+    })
+}
+
+/// Walk children of `parent` and emit ChunkBlocks. Mirrors chunk.py:_walk.
+fn chunker_walk(
+    parent: scraper::ElementRef,
+    blocks: &mut Vec<ChunkBlock>,
+    referenced: &std::collections::HashSet<String>,
+    root_title: Option<&str>,
+) {
+    const HEADING_TAGS: &[&str] = &["h1", "h2", "h3", "h4", "h5", "h6"];
+    let mut inline_parts: Vec<String> = Vec::new();
+    let mut inline_anchors: Vec<String> = Vec::new();
+
+    let children: Vec<_> = parent.children().collect();
+    let mut idx = 0;
+    while idx < children.len() {
+        let child = children[idx];
+        let Some(eref) = scraper::ElementRef::wrap(child) else {
+            // Text node — accumulate to inline buffer using render_node.
+            let mut tmp = String::new();
+            render_node(child, &mut tmp, referenced);
+            if !tmp.is_empty() {
+                inline_parts.push(tmp);
+            }
+            idx += 1;
+            continue;
+        };
+        let tag = eref.value().name();
+
+        // dt/dd pair: combine adjacent dt + dd.
+        if tag == "dt" {
+            chunker_flush_inline(&mut inline_parts, &mut inline_anchors, blocks);
+            let dd = children
+                .get(idx + 1)
+                .and_then(|n| scraper::ElementRef::wrap(*n))
+                .filter(|e| e.value().name() == "dd");
+            if let Some(block) = chunker_render_dt_dd_pair(eref, dd, referenced) {
+                blocks.push(block);
+            }
+            idx += if dd.is_some() { 2 } else { 1 };
+            continue;
+        }
+        // Headings render as their own block with markdown level marker.
+        if HEADING_TAGS.contains(&tag) {
+            chunker_flush_inline(&mut inline_parts, &mut inline_anchors, blocks);
+            let inner = chunker_render_inline(eref, referenced);
+            let heading_text = chunker_normalise_text(&inner);
+            if !heading_text.is_empty()
+                && !chunker_is_root_title_echo(&heading_text, root_title)
+            {
+                let level: usize = tag[1..].parse().unwrap_or(1).clamp(1, 6);
+                let rendered = format!("{} {}", "#".repeat(level), heading_text);
+                let anchor = chunker_heading_anchor(eref);
+                blocks.push(ChunkBlock {
+                    text: rendered.clone(),
+                    definition_text: rendered,
+                    anchor,
+                    is_oversize_table: false,
+                });
+            }
+            idx += 1;
+            continue;
+        }
+        let has_struct = chunker_has_structural_child(eref);
+        if chunker_is_atomic_block(tag, has_struct) {
+            chunker_flush_inline(&mut inline_parts, &mut inline_anchors, blocks);
+            if let Some(block) = chunker_render_block(eref, referenced) {
+                blocks.push(block);
+            }
+            idx += 1;
+            continue;
+        }
+        if has_struct {
+            chunker_flush_inline(&mut inline_parts, &mut inline_anchors, blocks);
+            chunker_walk(eref, blocks, referenced, root_title);
+            idx += 1;
+            continue;
+        }
+        // Pure inline element — accumulate.
+        let rendered = chunker_render_inline(eref, referenced);
+        if !rendered.is_empty() {
+            inline_parts.push(rendered);
+        }
+        if let Some(a) = chunker_first_referenced_anchor(eref, referenced) {
+            inline_anchors.push(a);
+        }
+        idx += 1;
+    }
+    chunker_flush_inline(&mut inline_parts, &mut inline_anchors, blocks);
+}
+
+fn chunker_flush_inline(
+    inline_parts: &mut Vec<String>,
+    inline_anchors: &mut Vec<String>,
+    blocks: &mut Vec<ChunkBlock>,
+) {
+    let joined = inline_parts.join("");
+    let text = chunker_normalise_text(&joined);
+    if !text.is_empty() {
+        let anchor = inline_anchors.first().cloned();
+        blocks.push(ChunkBlock {
+            text: text.clone(),
+            definition_text: text,
+            anchor,
+            is_oversize_table: false,
+        });
+    }
+    inline_parts.clear();
+    inline_anchors.clear();
+}
+
+/// Greedy-pack blocks into chunks bounded by max_tokens. Mirrors
+/// chunk.py:_pack_chunks. A block whose own token count exceeds the
+/// budget is emitted as its own oversized chunk (this commit doesn't yet
+/// port _split_oversize_block — those cases will exceed the budget;
+/// faithful sentence/row split comes in a follow-up).
+fn chunker_pack(blocks: Vec<ChunkBlock>, max_tokens: usize) -> Vec<Chunk> {
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut ord_counter: i64 = 0;
+    let mut current_text: Vec<String> = Vec::new();
+    let mut current_def: Vec<String> = Vec::new();
+    let mut current_words: usize = 0;
+    let mut current_anchor: Option<String> = None;
+
+    let flush =
+        |current_text: &mut Vec<String>,
+         current_def: &mut Vec<String>,
+         current_words: &mut usize,
+         current_anchor: &mut Option<String>,
+         ord_counter: &mut i64,
+         chunks: &mut Vec<Chunk>| {
+            if current_text.is_empty() {
+                return;
+            }
+            let text = current_text.join("\n\n").trim().to_string();
+            let defn = current_def.join("\n\n").trim().to_string();
+            chunks.push(Chunk {
+                ord: *ord_counter,
+                anchor: current_anchor.take(),
+                text: text.clone(),
+                definition_text: if defn != text && !defn.is_empty() {
+                    Some(defn)
+                } else {
+                    None
+                },
+            });
+            *ord_counter += 1;
+            current_text.clear();
+            current_def.clear();
+            *current_words = 0;
+        };
+
+    for block in blocks {
+        let block_words = block.text.split_whitespace().count();
+        let block_tokens = std::cmp::max(1, ((block_words as f64) * 1.3) as usize);
+        if block_tokens > max_tokens {
+            flush(
+                &mut current_text,
+                &mut current_def,
+                &mut current_words,
+                &mut current_anchor,
+                &mut ord_counter,
+                &mut chunks,
+            );
+            // Emit oversize block as its own chunk (no split for now).
+            chunks.push(Chunk {
+                ord: ord_counter,
+                anchor: block.anchor,
+                text: block.text.clone(),
+                definition_text: if block.definition_text != block.text {
+                    Some(block.definition_text)
+                } else {
+                    None
+                },
+            });
+            ord_counter += 1;
+            continue;
+        }
+        let projected_tokens =
+            std::cmp::max(1, (((current_words + block_words) as f64) * 1.3) as usize);
+        if projected_tokens > max_tokens && !current_text.is_empty() {
+            flush(
+                &mut current_text,
+                &mut current_def,
+                &mut current_words,
+                &mut current_anchor,
+                &mut ord_counter,
+                &mut chunks,
+            );
+        }
+        current_text.push(block.text.clone());
+        current_def.push(block.definition_text);
+        current_words += block_words;
+        if current_anchor.is_none() && block.anchor.is_some() {
+            current_anchor = block.anchor;
+        }
+    }
+    flush(
+        &mut current_text,
+        &mut current_def,
+        &mut current_words,
+        &mut current_anchor,
+        &mut ord_counter,
+        &mut chunks,
+    );
+    chunks
+}
+
+fn chunk_html(html: &str, root_title: Option<&str>, max_tokens: usize) -> Vec<Chunk> {
+    if html.trim().is_empty() {
+        return Vec::new();
+    }
+    let doc = scraper::Html::parse_fragment(html);
+    let referenced = collect_referenced_anchors(&doc);
+    let root = doc.root_element();
+    let mut blocks: Vec<ChunkBlock> = Vec::new();
+    // Find the first <body> or fall back to root. parse_fragment wraps
+    // content in <html><body>, but we want to walk just the body's children.
+    let body_sel = scraper::Selector::parse("body").unwrap();
+    let walk_root = doc.select(&body_sel).next().unwrap_or(root);
+    chunker_walk(walk_root, &mut blocks, &referenced, root_title);
+    chunker_pack(blocks, max_tokens)
+}
+
+// ----- end chunker -----
 
 fn fetch_external_doc(
     doc_id: &str,
