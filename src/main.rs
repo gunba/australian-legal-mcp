@@ -219,6 +219,13 @@ enum Command {
         #[arg(long)]
         source_doc_id: String,
     },
+    /// Extract currency / withdrawal markers from raw doc HTML. Mirrors
+    /// src/ato_mcp/indexer/extract.py:extract_currency. JSON out:
+    /// {withdrawn_date, superseded_by, replaces}.
+    ExtractCurrency {
+        #[arg(long)]
+        html_file: Option<PathBuf>,
+    },
     /// Fetch compact statutory definitions for a term.
     GetDefinition {
         term: String,
@@ -493,6 +500,22 @@ fn main() -> Result<()> {
             };
             let refs = extract_anchors(&html, &source_doc_id);
             println!("{}", serde_json::to_string_pretty(&refs)?);
+            Ok(())
+        }
+        Command::ExtractCurrency { html_file } => {
+            let html = match html_file {
+                Some(p) => fs::read_to_string(&p)
+                    .with_context(|| format!("reading {}", p.display()))?,
+                None => {
+                    let mut s = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut s)
+                        .context("reading stdin")?;
+                    s
+                }
+            };
+            let info = extract_currency(&html);
+            println!("{}", serde_json::to_string_pretty(&info)?);
             Ok(())
         }
     }
@@ -3221,6 +3244,342 @@ fn extract_em_front_matter(container_html: &str) -> (Vec<String>, Option<String>
         }
     }
     (refs, phrase)
+}
+
+// ----- Currency / withdrawal extraction (port of extract.py:extract_currency) -----
+//
+// Best-effort currency / supersession extraction from raw page HTML, mirroring
+// src/ato_mcp/indexer/extract.py:extract_currency and its helpers. Each
+// CurrencyInfo field is filled independently — alert panel beats body prose
+// beats timeline table beats title-suffix sentinel.
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct CurrencyInfo {
+    withdrawn_date: Option<String>,
+    superseded_by: Option<String>,
+    replaces: Option<String>,
+}
+
+const CURRENCY_TITLE_SUFFIX_SENTINEL: &str = "0001-01-01";
+
+fn currency_months() -> &'static std::collections::HashMap<&'static str, u32> {
+    static MAP: std::sync::OnceLock<std::collections::HashMap<&'static str, u32>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut m = std::collections::HashMap::new();
+        for (i, name) in [
+            "january", "february", "march", "april", "may", "june", "july",
+            "august", "september", "october", "november", "december",
+        ]
+        .iter()
+        .enumerate()
+        {
+            m.insert(*name, (i + 1) as u32);
+        }
+        m
+    })
+}
+
+fn currency_normalise_date(raw: &str) -> Option<String> {
+    let s = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    // "31 October 2025"
+    let prose = Regex::new(r"^(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})$").unwrap();
+    if let Some(c) = prose.captures(&s) {
+        let day: u32 = c.get(1)?.as_str().parse().ok()?;
+        let month_name = c.get(2)?.as_str().to_lowercase();
+        let year: u32 = c.get(3)?.as_str().parse().ok()?;
+        let month = *currency_months().get(month_name.as_str())?;
+        return Some(format!("{year:04}-{month:02}-{day:02}"));
+    }
+    // "31/10/2025"
+    let dmy = Regex::new(r"^(\d{1,2})/(\d{1,2})/(\d{4})$").unwrap();
+    if let Some(c) = dmy.captures(&s) {
+        let day: u32 = c.get(1)?.as_str().parse().ok()?;
+        let month: u32 = c.get(2)?.as_str().parse().ok()?;
+        let year: u32 = c.get(3)?.as_str().parse().ok()?;
+        return Some(format!("{year:04}-{month:02}-{day:02}"));
+    }
+    // "2025-10-31"
+    let iso = Regex::new(r"^(\d{4})-(\d{2})-(\d{2})$").unwrap();
+    if iso.is_match(&s) {
+        return Some(s);
+    }
+    None
+}
+
+fn currency_normalise_citation(raw: &str) -> Option<String> {
+    let s = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+const CURRENCY_RULING_SERIES: &str =
+    "SMSFRB|SMSFR|SMSFD|GSTR|GSTD|FBTR|WETR|WETD|LCR|SGR|FTR|PCG|LCG|PRR|CLR|COG|TXD|TPA|FBT|GII|CR|PR|TR|TD|MT|TA|LI|LG|WT|IT";
+
+fn currency_citation_pattern() -> String {
+    format!(
+        r"(?:{}|ATO\s+ID|PS\s+LA|SMSFRB)\s+\d{{1,4}}/D?\d+[A-Z0-9]*",
+        CURRENCY_RULING_SERIES
+    )
+}
+
+fn currency_date_prose_pattern() -> &'static str {
+    r"\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}|\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2}"
+}
+
+fn currency_re_withdrawn_prose() -> Regex {
+    let date = currency_date_prose_pattern();
+    let prefix = r"\b(?:was|is|were|are|been|being|has\s+been|have\s+been)?\s*withdrawn(?:\s+(?:with\s+effect)?\s*(?:from|on|as\s+of))?\s+";
+    Regex::new(&format!(r"(?i){prefix}(?P<date>{date})")).unwrap()
+}
+
+fn currency_re_withdrawn_by_prose() -> Regex {
+    let date = currency_date_prose_pattern();
+    let prefix = r"\b(?:was|is|were|are|been|being|has\s+been|have\s+been)?\s*withdrawn(?:\s+(?:with\s+effect)?\s*(?:from|on|as\s+of))?\s+";
+    let cite = currency_citation_pattern();
+    Regex::new(&format!(
+        r"(?i){prefix}(?P<date>{date})\s+by\b(?:\s+(?:draft\s+)?(?:Taxation|Class|Product|Practical|GST)?\s*(?:Ruling|Determination|Guideline|Practice\s+Statement)?)?\s+(?P<cite>{cite})"
+    )).unwrap()
+}
+
+fn currency_re_replacement_verb() -> Regex {
+    Regex::new(r"(?i)\b(replaces|replaced\s+by|supersed(?:e|es|ed|ing)|in\s+lieu\s+of)\b").unwrap()
+}
+
+fn currency_re_self_anchor() -> Regex {
+    Regex::new(
+        r"(?i)\bthis\s+(?:Ruling|Determination|Guideline|Practice\s+Statement)\b",
+    )
+    .unwrap()
+}
+
+fn currency_re_sentence_split() -> Regex {
+    Regex::new(r"[.;\n]+").unwrap()
+}
+
+fn currency_re_replaces_prose() -> Regex {
+    let cite = currency_citation_pattern();
+    Regex::new(&format!(
+        r"(?i)\b(?:this\s+(?:Ruling|Determination|Guideline|Practice\s+Statement)\s+)?replaces\b(?:\s+(?:draft\s+)?(?:Taxation|Class|Product|Practical|GST)?\s*(?:Ruling|Determination|Guideline|Practice\s+Statement)?)?\s+(?P<cite>{cite})"
+    )).unwrap()
+}
+
+fn currency_re_superseded_by_prose() -> Regex {
+    let cite = currency_citation_pattern();
+    Regex::new(&format!(
+        r"(?i)\b(?:replaced|superseded)\s+by\b(?:\s+(?:draft\s+)?(?:Taxation|Class|Product|Practical|GST)?\s*(?:Ruling|Determination|Guideline|Practice\s+Statement)?)?\s+(?P<cite>{cite})"
+    )).unwrap()
+}
+
+fn currency_withdrawal_fragment_is_self(fragment: &str, withdrawn_start: usize) -> bool {
+    let rep = currency_re_replacement_verb();
+    if !rep.is_match(fragment) {
+        return true;
+    }
+    let anchor = currency_re_self_anchor();
+    let Some(am) = anchor.find(fragment) else {
+        return false;
+    };
+    let between_start = am.end();
+    if between_start > withdrawn_start {
+        return false;
+    }
+    let between = &fragment[between_start..withdrawn_start];
+    !rep.is_match(between)
+}
+
+fn currency_extract_self_withdrawn_date(text: &str) -> Option<String> {
+    let split = currency_re_sentence_split();
+    let withdrawn = currency_re_withdrawn_prose();
+    for fragment in split.split(text) {
+        let Some(m) = withdrawn.captures(fragment) else { continue };
+        if !currency_withdrawal_fragment_is_self(fragment, m.get(0)?.start()) {
+            continue;
+        }
+        let date = m.name("date")?.as_str();
+        if let Some(iso) = currency_normalise_date(date) {
+            return Some(iso);
+        }
+    }
+    None
+}
+
+fn currency_extract_self_withdrawn_by(text: &str) -> Option<String> {
+    let split = currency_re_sentence_split();
+    let withdrawn_by = currency_re_withdrawn_by_prose();
+    for fragment in split.split(text) {
+        let Some(m) = withdrawn_by.captures(fragment) else { continue };
+        if !currency_withdrawal_fragment_is_self(fragment, m.get(0)?.start()) {
+            continue;
+        }
+        let cite = m.name("cite")?.as_str();
+        if let Some(c) = currency_normalise_citation(cite) {
+            return Some(c);
+        }
+    }
+    None
+}
+
+fn currency_alert_text(html: &str) -> String {
+    let doc = scraper::Html::parse_document(html);
+    let sel = scraper::Selector::parse("div.alert").unwrap();
+    let parts: Vec<String> = doc
+        .select(&sel)
+        .map(|el| {
+            let raw = el.text().collect::<String>();
+            raw.split_whitespace().collect::<Vec<_>>().join(" ")
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+    parts.join(" \n ")
+}
+
+fn currency_body_text(html: &str) -> String {
+    let doc = scraper::Html::parse_document(html);
+    for sel_str in &["#LawBody", "#LawContent"] {
+        let sel = scraper::Selector::parse(sel_str).unwrap();
+        if let Some(el) = doc.select(&sel).next() {
+            return anchors_node_text(el);
+        }
+    }
+    if let Ok(body_sel) = scraper::Selector::parse("body") {
+        if let Some(el) = doc.select(&body_sel).next() {
+            return anchors_node_text(el);
+        }
+    }
+    String::new()
+}
+
+fn currency_date_from_history_table(html: &str) -> Option<String> {
+    let doc = scraper::Html::parse_document(html);
+    let timeline_sel = scraper::Selector::parse("a[name='LawTimeLine']").unwrap();
+    let timeline = doc.select(&timeline_sel).next()?;
+    // Walk up to enclosing panel or table — at most 8 hops.
+    let mut current = timeline.parent();
+    let mut panel: Option<scraper::ElementRef> = None;
+    for _ in 0..8 {
+        let Some(p) = current else { break };
+        if let Some(el) = scraper::ElementRef::wrap(p) {
+            let tag = el.value().name();
+            let classes: Vec<&str> = el
+                .value()
+                .attr("class")
+                .unwrap_or("")
+                .split_whitespace()
+                .collect();
+            if tag == "table" || classes.contains(&"panel") {
+                panel = Some(el);
+                break;
+            }
+        }
+        current = p.parent();
+    }
+    let panel = panel?;
+    let row_sel = scraper::Selector::parse("tr").unwrap();
+    let cell_sel = scraper::Selector::parse("td").unwrap();
+    let mut latest: Option<String> = None;
+    for row in panel.select(&row_sel) {
+        let cells: Vec<scraper::ElementRef> = row.select(&cell_sel).collect();
+        if cells.len() < 2 {
+            continue;
+        }
+        let mut date_cell: Option<String> = None;
+        let mut label_cell: Option<String> = None;
+        for cell in &cells {
+            let cls = cell.value().attr("class").unwrap_or("").to_lowercase();
+            let text = anchors_node_text(*cell);
+            if cls.contains("date") && date_cell.is_none() {
+                date_cell = Some(text);
+            } else if date_cell.is_some() && label_cell.is_none() {
+                label_cell = Some(text.to_lowercase());
+            }
+        }
+        let Some(date) = date_cell else { continue };
+        let label = label_cell.unwrap_or_else(|| {
+            let last = cells.last().unwrap();
+            anchors_node_text(*last).to_lowercase()
+        });
+        if !label.contains("withdraw") {
+            continue;
+        }
+        if let Some(iso) = currency_normalise_date(&date) {
+            latest = Some(iso);
+        }
+    }
+    latest
+}
+
+fn currency_scan_text(text: &str) -> (Option<String>, Option<String>, Option<String>) {
+    if text.is_empty() {
+        return (None, None, None);
+    }
+    let withdrawn_date = currency_extract_self_withdrawn_date(text);
+    let mut superseded_by = currency_extract_self_withdrawn_by(text);
+    if superseded_by.is_none() {
+        let sup = currency_re_superseded_by_prose();
+        if let Some(m) = sup.captures(text) {
+            if let Some(cite) = m.name("cite") {
+                superseded_by = currency_normalise_citation(cite.as_str());
+            }
+        }
+    }
+    let mut replaces: Option<String> = None;
+    let rep = currency_re_replaces_prose();
+    if let Some(m) = rep.captures(text) {
+        if let Some(cite) = m.name("cite") {
+            replaces = currency_normalise_citation(cite.as_str());
+        }
+    }
+    (withdrawn_date, superseded_by, replaces)
+}
+
+fn currency_has_withdrawn_title_suffix(html: &str) -> bool {
+    let doc = scraper::Html::parse_document(html);
+    let sel = scraper::Selector::parse("h1, h2, h3").unwrap();
+    for el in doc.select(&sel) {
+        let text = anchors_node_text(el).to_lowercase();
+        if text.contains("(withdrawn)") {
+            return true;
+        }
+    }
+    false
+}
+
+fn extract_currency(html: &str) -> CurrencyInfo {
+    if html.trim().is_empty() {
+        return CurrencyInfo::default();
+    }
+    let alert_text = currency_alert_text(html);
+    let body_text = currency_body_text(html);
+    let (a_w, a_s, a_r) = currency_scan_text(&alert_text);
+    let (p_w, p_s, p_r) = currency_scan_text(&body_text);
+
+    let mut withdrawn_date = a_w;
+    if withdrawn_date.is_none() && p_w.is_some() {
+        withdrawn_date = p_w;
+    }
+    if withdrawn_date.is_none() {
+        withdrawn_date = currency_date_from_history_table(html);
+    }
+    if withdrawn_date.is_none() && currency_has_withdrawn_title_suffix(html) {
+        withdrawn_date = Some(CURRENCY_TITLE_SUFFIX_SENTINEL.to_string());
+    }
+    let mut superseded_by = a_s;
+    if superseded_by.is_none() && p_s.is_some() {
+        superseded_by = p_s;
+    }
+    let mut replaces = a_r;
+    if replaces.is_none() && p_r.is_some() {
+        replaces = p_r;
+    }
+    CurrencyInfo {
+        withdrawn_date,
+        superseded_by,
+        replaces,
+    }
 }
 
 fn fetch_external_doc(
