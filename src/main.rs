@@ -299,6 +299,15 @@ enum Command {
         #[arg(long, default_value_t = 30.0)]
         timeout_seconds: f64,
     },
+    /// Encode each input line as an EmbeddingGemma-quantized embedding.
+    /// Reads texts (one per line) from stdin or --input-file. Emits a JSON
+    /// array of base64-encoded raw int8 byte strings (256 dims, 256 bytes
+    /// per embedding) to stdout — same shape the build pipeline writes
+    /// into pack records.
+    Embed {
+        #[arg(long)]
+        input_file: Option<PathBuf>,
+    },
     /// Fetch compact statutory definitions for a term.
     GetDefinition {
         term: String,
@@ -800,6 +809,41 @@ fn main() -> Result<()> {
                 bail!("ATO response payload is not a list");
             }
             println!("{}", serde_json::to_string_pretty(&payload)?);
+            Ok(())
+        }
+        Command::Embed { input_file } => {
+            use base64::Engine as _;
+            let raw = match input_file.as_ref() {
+                Some(p) => fs::read_to_string(p)
+                    .with_context(|| format!("reading {}", p.display()))?,
+                None => {
+                    let mut s = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut s)
+                        .context("reading stdin")?;
+                    s
+                }
+            };
+            // Lazy-load the embedding runtime (ONNX session + tokenizer).
+            let state = ServerState::default();
+            let mut out: Vec<JsonValue> = Vec::new();
+            for line in raw.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let emb = state
+                    .encode_query_embedding(trimmed)
+                    .context("encoding embedding")?;
+                // i8 -> u8 reinterpret + base64.
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(emb.as_ptr() as *const u8, emb.len())
+                };
+                out.push(JsonValue::String(
+                    base64::engine::general_purpose::STANDARD.encode(bytes),
+                ));
+            }
+            println!("{}", serde_json::to_string_pretty(&out)?);
             Ok(())
         }
     }
