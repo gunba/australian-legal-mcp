@@ -249,6 +249,15 @@ enum Command {
     DocIdFromLink {
         href: String,
     },
+    /// Write a pack file from a JSONL stream of {"doc_id": str, "record": {...}}
+    /// records on stdin. Mirrors src/ato_mcp/indexer/pack.py:PackWriter.
+    /// JSON out on stdout: {pack_path, sha8, sha256, size, refs}.
+    PackWrite {
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 3)]
+        level: i32,
+    },
     /// Fetch compact statutory definitions for a term.
     GetDefinition {
         term: String,
@@ -608,6 +617,31 @@ fn main() -> Result<()> {
                 None => JsonValue::Null,
             };
             println!("{}", serde_json::to_string_pretty(&value)?);
+            Ok(())
+        }
+        Command::PackWrite { out, level } => {
+            use std::io::BufRead as _;
+            let stdin = std::io::stdin();
+            let lock = stdin.lock();
+            let records = lock.lines().map(|line_res| -> Result<(String, JsonValue)> {
+                let line = line_res?;
+                if line.trim().is_empty() {
+                    bail!("empty JSONL line");
+                }
+                let v: JsonValue = serde_json::from_str(&line)?;
+                let doc_id = v
+                    .get("doc_id")
+                    .and_then(|s| s.as_str())
+                    .ok_or_else(|| anyhow!("missing 'doc_id' in JSONL record"))?
+                    .to_string();
+                let record = v
+                    .get("record")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("missing 'record' in JSONL record"))?;
+                Ok((doc_id, record))
+            });
+            let summary = write_pack(&out, level, records)?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
             Ok(())
         }
     }
@@ -4809,6 +4843,92 @@ fn rewrite_links_html(html: &str) -> String {
             caps.get(0).unwrap().as_str().to_string()
         })
         .into_owned()
+}
+
+// ----- Pack file writer (port of src/ato_mcp/indexer/pack.py) -----
+//
+// A pack is a single .bin.zst blob: many records back-to-back, each
+//   length:uint32 (LE) | zstd(orjson(record))
+// Trailer: index_blob (zstd(json([{doc_id, offset, length}, ...]))) followed by
+//   MAGIC(6) | count:u32 | index_offset:u64 | index_len:u32
+// Mirrors pack.py:PackWriter.
+
+const PACK_TRAILER_MAGIC: &[u8; 6] = b"ATOPK\x01";
+const PACK_RECORD_HEADER_LEN: usize = 4;
+
+#[derive(Debug, Clone, Serialize)]
+struct PackedDocRef {
+    doc_id: String,
+    offset: u64,
+    length: u64,
+}
+
+/// Write a pack file from a stream of (doc_id, record_json) pairs read from
+/// stdin as JSONL. Each line: {"doc_id": str, "record": {...}}. Outputs JSON
+/// {pack_path, sha8, sha256, size, refs: [PackedDocRef, ...]}.
+fn write_pack(
+    out_path: &Path,
+    level: i32,
+    records: impl Iterator<Item = Result<(String, serde_json::Value)>>,
+) -> Result<JsonValue> {
+    use std::io::Write as _;
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut file = File::create(out_path)
+        .with_context(|| format!("creating {}", out_path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut offset: u64 = 0;
+    let mut refs: Vec<PackedDocRef> = Vec::new();
+
+    for r in records {
+        let (doc_id, record) = r?;
+        let payload = zstd::stream::encode_all(
+            std::io::Cursor::new(serde_json::to_vec(&record)?),
+            level,
+        )?;
+        let header = (payload.len() as u32).to_le_bytes();
+        file.write_all(&header)?;
+        file.write_all(&payload)?;
+        hasher.update(header);
+        hasher.update(&payload);
+        let length = (PACK_RECORD_HEADER_LEN + payload.len()) as u64;
+        let start = offset;
+        offset += length;
+        refs.push(PackedDocRef {
+            doc_id,
+            offset: start,
+            length,
+        });
+    }
+
+    // Trailer.
+    let index_offset = offset;
+    let index_json = serde_json::to_vec(&refs)?;
+    let index_blob =
+        zstd::stream::encode_all(std::io::Cursor::new(index_json), level)?;
+    file.write_all(&index_blob)?;
+    let mut trailer = Vec::with_capacity(6 + 4 + 8 + 4);
+    trailer.extend_from_slice(PACK_TRAILER_MAGIC);
+    trailer.extend_from_slice(&(refs.len() as u32).to_le_bytes());
+    trailer.extend_from_slice(&index_offset.to_le_bytes());
+    trailer.extend_from_slice(&(index_blob.len() as u32).to_le_bytes());
+    file.write_all(&trailer)?;
+    hasher.update(&index_blob);
+    hasher.update(&trailer);
+    file.flush()?;
+
+    let digest = hasher.finalize();
+    let sha256_hex = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let sha8 = sha256_hex[..8].to_string();
+    let size = fs::metadata(out_path)?.len();
+    Ok(json!({
+        "pack_path": out_path.display().to_string(),
+        "sha8": sha8,
+        "sha256": sha256_hex,
+        "size": size,
+        "refs": refs,
+    }))
 }
 
 fn fetch_external_doc(
