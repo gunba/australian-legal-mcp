@@ -269,6 +269,25 @@ enum Command {
         #[arg(long)]
         tag: String,
     },
+    /// Bundle the embedding model + tokenizer into a single `.tar.zst`.
+    /// Mirrors src/ato_mcp/indexer/release.py:bundle_model. JSON out:
+    /// {sha256, size}.
+    BundleModel {
+        #[arg(long)]
+        model_dir: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        /// Files to include. Names starting with `model_quantized.onnx`
+        /// are looked up under `<model_dir>/onnx/`; others under `<model_dir>/`.
+        #[arg(long, value_delimiter = ',', default_values_t = vec![
+            "model_quantized.onnx".to_string(),
+            "model_quantized.onnx_data".to_string(),
+            "tokenizer.json".to_string(),
+        ])]
+        include: Vec<String>,
+        #[arg(long, default_value_t = 3)]
+        level: i32,
+    },
     /// Fetch compact statutory definitions for a term.
     GetDefinition {
         term: String,
@@ -682,6 +701,56 @@ fn main() -> Result<()> {
             let pretty = serde_json::to_vec_pretty(&value)?;
             fs::write(&manifest, pretty)
                 .with_context(|| format!("writing {}", manifest.display()))?;
+            Ok(())
+        }
+        Command::BundleModel {
+            model_dir,
+            out,
+            include,
+            level,
+        } => {
+            use std::io::Write as _;
+            if let Some(parent) = out.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            // Build the uncompressed tar in memory.
+            let mut tar_buf: Vec<u8> = Vec::new();
+            {
+                let mut builder = tar::Builder::new(&mut tar_buf);
+                for name in &include {
+                    let candidate = if name.starts_with("model_quantized.onnx") {
+                        model_dir.join("onnx").join(name)
+                    } else {
+                        model_dir.join(name)
+                    };
+                    if !candidate.exists() {
+                        bail!("model bundle missing {}", candidate.display());
+                    }
+                    let mut f = File::open(&candidate)
+                        .with_context(|| format!("opening {}", candidate.display()))?;
+                    builder.append_file(name, &mut f)?;
+                }
+                builder.finish()?;
+            }
+            // Stream zstd-compress to disk + sha256 the output.
+            let compressed = zstd::stream::encode_all(std::io::Cursor::new(&tar_buf), level)?;
+            let mut file = File::create(&out)
+                .with_context(|| format!("creating {}", out.display()))?;
+            file.write_all(&compressed)?;
+            file.flush()?;
+            let mut hasher = Sha256::new();
+            hasher.update(&compressed);
+            let digest = hasher.finalize();
+            let sha256_hex = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            let size = fs::metadata(&out)?.len();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "sha256": sha256_hex,
+                    "size": size,
+                }))?
+            );
             Ok(())
         }
     }
