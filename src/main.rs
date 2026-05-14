@@ -183,6 +183,22 @@ enum Command {
         #[arg(long, default_value_t = false)]
         as_html: bool,
     },
+    /// Run the Rust HTML cleaner on a saved doc and emit JSON. Used by the
+    /// Python build pipeline as a subprocess (replaces the in-process call
+    /// to ato_mcp.indexer.extract.extract). Reads HTML from --html-file
+    /// (or stdin if omitted) and writes
+    /// {text, html, title, html_title} to stdout.
+    Extract {
+        /// Path to the source HTML. Reads stdin if absent.
+        #[arg(long)]
+        html_file: Option<PathBuf>,
+        /// doc_id is reserved for future asset-extraction support; ignored today.
+        #[arg(long)]
+        doc_id: Option<String>,
+        /// source_path is reserved for future asset-resolution support; ignored today.
+        #[arg(long)]
+        source_path: Option<PathBuf>,
+    },
     /// Fetch compact statutory definitions for a term.
     GetDefinition {
         term: String,
@@ -357,6 +373,34 @@ fn main() -> Result<()> {
             println!(
                 "{}",
                 fetch_external_doc(&doc_id, pit.as_deref(), view.as_deref(), as_html)?
+            );
+            Ok(())
+        }
+        Command::Extract {
+            html_file,
+            doc_id,
+            source_path,
+        } => {
+            let _ = (doc_id, source_path); // reserved for future use
+            let html = match html_file {
+                Some(p) => fs::read_to_string(&p)
+                    .with_context(|| format!("reading {}", p.display()))?,
+                None => {
+                    let mut s = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut s)
+                        .context("reading stdin")?;
+                    s
+                }
+            };
+            let cleaned = clean_ato_html(&html);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "text": cleaned.text,
+                    "html": cleaned.html,
+                    "title": cleaned.title,
+                }))?
             );
             Ok(())
         }
