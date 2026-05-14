@@ -152,6 +152,11 @@ enum Command {
         /// Include withdrawn / superseded rulings (default excludes them).
         #[arg(long)]
         include_withdrawn: bool,
+        /// Runtime-embed this text as the query vector instead of `query`
+        /// (e.g. a chunk from `fetch-external-doc`). Forces vector-only
+        /// mode and returns no title hits.
+        #[arg(long)]
+        seed_text: Option<String>,
     },
     /// Fetch a document from ATO's live website and print its chunks.
     FetchExternalDoc {
@@ -286,16 +291,16 @@ enum Command {
         #[arg(long)]
         input_file: Option<PathBuf>,
     },
-    /// Basic in-binary build orchestrator (early port of build.py).
-    /// Reads `pages_dir/index.jsonl` (one record per line, fields:
-    /// canonical_id + payload_path), runs each doc through the cleaning
-    /// pipeline + chunker + embedder in-process, and writes documents +
-    /// chunks + chunk_embeddings to the SQLite db_path.
-    /// MISSING from this version vs build.py: incremental reuse from prior
-    /// pack, resume-from-crash, multi-process parallelism, rules-engine
-    /// classification. Currency extraction, navigation flags, citations
-    /// derivation, asset persistence, pack writing and manifest emission
-    /// all land here.
+    /// In-binary build orchestrator (port of build.py). Reads
+    /// `pages_dir/index.jsonl` (one record per line, with the fields
+    /// canonical_id and payload_path), runs each doc through the cleaning
+    /// pipeline, the chunker, the rules-engine metadata classifier and the
+    /// embedder in-process, then writes the documents, chunks,
+    /// chunk_embeddings, chunks_fts, title_fts, doc_anchors, definitions
+    /// and citations tables. With --out-dir it also writes pack files,
+    /// per-doc asset blobs, and manifest.json.
+    /// MISSING from this version vs build.py: incremental reuse from a
+    /// prior pack, resume-from-crash, multi-process parallelism.
     Build {
         #[arg(long)]
         pages_dir: PathBuf,
@@ -531,6 +536,7 @@ fn main() -> Result<()> {
             sort_by,
             include_old,
             include_withdrawn,
+            seed_text,
         } => {
             let types = empty_vec_as_none(types);
             // Construct a transient ServerState so the CLI's `search` call
@@ -551,6 +557,7 @@ fn main() -> Result<()> {
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
                     similar_to_chunk_id: None,
+                    seed_text: seed_text.as_deref(),
                 },
             )?;
             println!("{}", out);
@@ -1606,6 +1613,13 @@ struct SearchOptions<'a> {
     /// chunk is filtered out of results so the agent never sees their
     /// seed chunk reflected back.
     similar_to_chunk_id: Option<i64>,
+    /// When set, this arbitrary text is runtime-embedded and used as the
+    /// query vector — the same mechanism as `similar_to_chunk_id` but for
+    /// text that isn't a corpus chunk (e.g. a chunk returned by
+    /// `fetch_external_doc`). Forces vector-only mode and skips rerank /
+    /// title hits, like `similar_to_chunk_id`. `similar_to_chunk_id` wins
+    /// if both are set.
+    seed_text: Option<&'a str>,
 }
 
 /// Metadata required to rank and dedup candidate chunks across documents.
@@ -1741,7 +1755,19 @@ fn search(
         }
         None => None,
     };
-    let effective_mode = if similar_seed.is_some() {
+    // `seed_text` runtime-embeds arbitrary text as the query vector — the
+    // same seed-driven path as `similar_to_chunk_id`, but for text that
+    // isn't a corpus chunk (e.g. a chunk from `fetch_external_doc`).
+    // `similar_to_chunk_id` wins if both are set.
+    let seed_text: Option<&str> = if similar_seed.is_some() {
+        None
+    } else {
+        opts.seed_text.map(str::trim).filter(|s| !s.is_empty())
+    };
+    // A "seed search" is driven by a seed vector rather than the `query`
+    // string: forces vector-only mode, skips rerank, returns no title hits.
+    let is_seed_search = similar_seed.is_some() || seed_text.is_some();
+    let effective_mode = if is_seed_search {
         SearchMode::Vector
     } else {
         opts.mode
@@ -1757,9 +1783,12 @@ fn search(
             let query_embedding = if let Some((_, ref seed_vec)) = similar_seed {
                 *seed_vec
             } else {
+                // `seed_text`, when set, replaces the `query` string as the
+                // text to embed for the semantic stage.
+                let embed_input = seed_text.unwrap_or(query);
                 match server_state {
-                    Some(state) => state.encode_query_embedding(query)?,
-                    None => encode_query_embedding(query)?,
+                    Some(state) => state.encode_query_embedding(embed_input)?,
+                    None => encode_query_embedding(embed_input)?,
                 }
             };
             let vector_hits = vector_search(&conn, &query_embedding, &filter, internal_limit)?;
@@ -1786,10 +1815,10 @@ fn search(
     // each ONNX inference is O(N) and the marginal hit past the first
     // few pages is dominated by first-stage recall. Tail candidates retain
     // their RRF order so they can still surface via `next_call` paging or
-    // recency sort. Skip rerank when the caller passed
-    // `similar_to_chunk_id` — there's no meaningful query string to use
-    // as the rerank pivot.
-    if similar_seed.is_none() && !matches!(effective_mode, SearchMode::Keyword) {
+    // recency sort. Skip rerank for a seed search (`similar_to_chunk_id`
+    // or `seed_text`) — there's no `query` string to use as the rerank
+    // pivot.
+    if !is_seed_search && !matches!(effective_mode, SearchMode::Keyword) {
         if let Some(state) = server_state {
         let head_count = rerank_head_count(k, ranked_hits.len());
         if head_count > 0 {
@@ -1877,9 +1906,9 @@ fn search(
     // Title-level hits — a parallel algorithm over the separate `title_fts`
     // table, surfaced as a sidebar alongside the chunk `hits`. Reuses the
     // same document filter so chunk and title queries stay consistently
-    // scoped. Skipped for `similar_to_chunk_id` (no real query text to
-    // BM25 against — `query` is ignored in that mode).
-    let title_hits: Vec<Hit> = if similar_seed.is_some() {
+    // scoped. Skipped for a seed search (`similar_to_chunk_id` / `seed_text`)
+    // — there's no real query text to BM25 against; `query` is ignored.
+    let title_hits: Vec<Hit> = if is_seed_search {
         Vec::new()
     } else {
         collect_title_hits(&conn, query, TITLE_HITS_K, &filter)?
@@ -2032,6 +2061,13 @@ fn search_next_call(query: &str, k: usize, opts: &SearchOptions<'_>) -> String {
     }
     if !opts.current_only {
         args.push("current_only=false".to_string());
+    }
+    // Seed-driven searches: preserve the seed so paging re-runs the same
+    // semantic query rather than falling back to a plain `query` search.
+    if let Some(seed_id) = opts.similar_to_chunk_id {
+        args.push(format!("similar_to_chunk_id={seed_id}"));
+    } else if let Some(seed) = opts.seed_text {
+        args.push(format!("seed_text={}", mcp_string(seed)));
     }
     format!("search({})", args.join(", "))
 }
@@ -6396,14 +6432,14 @@ mod rules_tests {
     }
 }
 
-// ----- Build orchestrator (early port of src/ato_mcp/indexer/build.py) -----
+// ----- Build orchestrator (port of src/ato_mcp/indexer/build.py) -----
 //
 // Walks pages_dir/index.jsonl, runs each doc through the cleaning + chunker
-// + embedder pipeline in-process, writes documents + chunks +
-// chunk_embeddings + chunks_fts + title_fts + doc_anchors + definitions +
-// citations rows. Optionally writes pack files + asset blobs + manifest.json
-// to --out-dir. Missing vs build.py: incremental reuse, resume, parallelism,
-// rules-engine classification.
+// + rules-engine metadata classifier + embedder pipeline in-process, writes
+// documents + chunks + chunk_embeddings + chunks_fts + title_fts +
+// doc_anchors + definitions + citations rows. Optionally writes pack files
+// + asset blobs + manifest.json to --out-dir. Missing vs build.py:
+// incremental reuse, resume, parallelism.
 
 fn build_corpus(
     pages_dir: &Path,
@@ -11429,6 +11465,7 @@ fn call_tool(params: JsonValue, state: &ServerState) -> Result<JsonValue> {
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: optional_bool(&args, "include_snippet").unwrap_or(true),
                     similar_to_chunk_id: optional_i64(&args, "similar_to_chunk_id"),
+                    seed_text: args.get("seed_text").and_then(|v| v.as_str()),
                 },
                 Some(state),
             )?
@@ -11978,6 +12015,7 @@ The MCP may need external supplementation for:
 - Use `doc_scope` to restrict search to one document ID, or a prefix pattern like `<PREFIX>/%` for a document family.
 - Use `current_only=false` and `include_old=true` when old, withdrawn, transitional, repealed, or historical material may matter.
 - Use `similar_to_chunk_id` after finding a good chunk to locate semantically similar chunks without writing a new query (returns no `title_hits`).
+- Use `seed_text` to do the same with arbitrary text rather than a corpus `chunk_id` — for example, paste a chunk returned by `fetch_external_doc` to pull related corpus material. The text is runtime-embedded as the query vector (returns no `title_hits`).
 
 2. `get_chunks`
 - Use this after `search` to retrieve the actual text of promising hits.
@@ -11994,6 +12032,7 @@ The MCP may need external supplementation for:
 4. `fetch_external_doc`
 - Use this when a `[doc:X]` marker in chunk text points at an id the local corpus does not index — subdivisions, paragraph-level references, footnote pointers, or historical point-in-time pointers (the `url` in `get_doc_anchors` historical_versions).
 - Returns the live ATO document as the same `{ord, anchor, text}` chunk shape `search`/`get_chunks` use, so it reads like a corpus document.
+- To pivot from an external chunk back into the corpus, pass its text to `search` as `seed_text`.
 - Network-dependent and slower than the local corpus tools — prefer `search` for anything indexed.
 
 ### Standard Research Workflow
@@ -12109,7 +12148,7 @@ fn tool_descriptors() -> JsonValue {
     json!([
         {
             "name": "search",
-            "description": "Hybrid semantic+lexical search over the ATO corpus. Returns two parallel result arrays: `hits` — chunk-level pointer hits (chunk_id, doc_id, anchor, optional snippet); fetch bodies via get_chunks. `title_hits` — up to 10 document-level hits ranked by title (no chunk_id), including exact doc_id / ATO-document-link lookups; treat as a sidebar of strongly-matching whole documents. doc_scope filters by full doc_id (in-doc search) or \"<PREFIX>/%\" (family). mode=keyword forces lexical-only; hybrid/vector require the semantic index. Set include_snippet=false when the caller will follow up with get_chunks. Pass similar_to_chunk_id to find chunks semantically close to one the agent already has (skips query encoding, ignores `query`, forces vector-only mode, filters the seed chunk out of results, and returns no title_hits). Hits in both arrays include navigation hints: has_in_doc_links (doc has paragraph anchors / contents entries — call get_doc_anchors to navigate), has_related_docs (doc has companion documents like errata / addenda), has_history (doc has earlier point-in-time versions — get_doc_anchors lists their URLs).",
+            "description": "Hybrid semantic+lexical search over the ATO corpus. Returns two parallel result arrays: `hits` — chunk-level pointer hits (chunk_id, doc_id, anchor, optional snippet); fetch bodies via get_chunks. `title_hits` — up to 10 document-level hits ranked by title (no chunk_id), including exact doc_id / ATO-document-link lookups; treat as a sidebar of strongly-matching whole documents. doc_scope filters by full doc_id (in-doc search) or \"<PREFIX>/%\" (family). mode=keyword forces lexical-only; hybrid/vector require the semantic index. Set include_snippet=false when the caller will follow up with get_chunks. Pass similar_to_chunk_id to find chunks semantically close to one the agent already has (skips query encoding, ignores `query`, forces vector-only mode, filters the seed chunk out of results, and returns no title_hits). Pass seed_text to do the same with arbitrary text rather than a corpus chunk_id — e.g. a chunk returned by fetch_external_doc — to pull related corpus material; it is runtime-embedded as the query vector, forces vector-only mode, and returns no title_hits. similar_to_chunk_id wins if both are set. Hits in both arrays include navigation hints: has_in_doc_links (doc has paragraph anchors / contents entries — call get_doc_anchors to navigate), has_related_docs (doc has companion documents like errata / addenda), has_history (doc has earlier point-in-time versions — get_doc_anchors lists their URLs).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -12124,6 +12163,7 @@ fn tool_descriptors() -> JsonValue {
                     "include_old": {"type": "boolean"},
                     "current_only": {"type": "boolean", "description": "When true (default), excludes withdrawn rulings. Set false to include withdrawn material with a visible marker."},
                     "similar_to_chunk_id": {"type": "integer", "description": "When set, use this chunk's stored embedding as the query vector (skips encoding `query`, forces mode=vector, excludes the seed chunk from results, returns no title_hits)."},
+                    "seed_text": {"type": "string", "description": "When set, runtime-embed this text as the query vector instead of `query` (e.g. a chunk from fetch_external_doc). Forces mode=vector, returns no title_hits. Ignored when similar_to_chunk_id is also set."},
                     "include_snippet": {"type": "boolean", "description": "When true (default), each hit carries a BM25-windowed snippet. Set false to omit the snippet field entirely — useful when the caller will fetch full text via get_chunks."},
                     "format": {"type": "string", "enum": ["json"], "default": "json"}
                 },
@@ -13054,11 +13094,66 @@ mod tests {
             max_per_doc: DEFAULT_MAX_PER_DOC,
             include_snippet: true,
             similar_to_chunk_id: None,
+            seed_text: None,
         };
         let call = search_next_call("depreciation", 16, &opts);
         assert!(
             call.contains("current_only=false"),
             "continuation must preserve withdrawn-doc inclusion; got: {call}"
+        );
+    }
+
+    #[test]
+    fn search_next_call_preserves_seed_text() {
+        let opts = SearchOptions {
+            k: 8,
+            types: None,
+            date_from: None,
+            date_to: None,
+            doc_scope: None,
+            mode: SearchMode::Hybrid,
+            sort_by: SortBy::Relevance,
+            include_old: false,
+            current_only: true,
+            max_per_doc: DEFAULT_MAX_PER_DOC,
+            include_snippet: true,
+            similar_to_chunk_id: None,
+            seed_text: Some("an external passage about depreciation"),
+        };
+        let call = search_next_call("ignored", 16, &opts);
+        assert!(
+            call.contains(r#"seed_text="an external passage about depreciation""#),
+            "continuation must preserve seed_text; got: {call}"
+        );
+    }
+
+    #[test]
+    fn search_next_call_prefers_similar_to_chunk_id_over_seed_text() {
+        // similar_to_chunk_id wins if both are set — the continuation must
+        // not also carry seed_text.
+        let opts = SearchOptions {
+            k: 8,
+            types: None,
+            date_from: None,
+            date_to: None,
+            doc_scope: None,
+            mode: SearchMode::Vector,
+            sort_by: SortBy::Relevance,
+            include_old: false,
+            current_only: true,
+            max_per_doc: DEFAULT_MAX_PER_DOC,
+            include_snippet: true,
+            similar_to_chunk_id: Some(42),
+            seed_text: Some("should be ignored"),
+        };
+        let call = search_next_call("ignored", 16, &opts);
+        assert!(
+            call.contains("similar_to_chunk_id=42"),
+            "continuation must preserve similar_to_chunk_id; got: {call}"
+        );
+        assert!(
+            !call.contains("seed_text"),
+            "similar_to_chunk_id wins — seed_text must not appear; got: {call}"
         );
     }
 
@@ -13574,6 +13669,7 @@ mod tests {
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
                     similar_to_chunk_id: None,
+                    seed_text: None,
                 },
                 None,
             )?;
@@ -13611,6 +13707,7 @@ mod tests {
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
                     similar_to_chunk_id: None,
+                    seed_text: None,
                 },
                 None,
             )?;
@@ -13697,6 +13794,7 @@ mod tests {
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
                     similar_to_chunk_id: None,
+                    seed_text: None,
                 },
                 None,
             )?;
@@ -14526,6 +14624,7 @@ mod tests {
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
                     similar_to_chunk_id: None,
+                    seed_text: None,
                 },
             )
         });
