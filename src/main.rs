@@ -420,25 +420,15 @@ fn main() -> Result<()> {
                 }
             };
             let cleaned = clean_ato_html(&html);
-            // Title composition + heading collection + EM front-matter + anchors
-            // mirror the Python `extract.extract` return shape.
-            let frag = scraper::Html::parse_fragment(&cleaned.html);
-            let heading_sel = scraper::Selector::parse("h1, h2, h3, h4, h5, h6").unwrap();
-            let mut headings: Vec<String> = Vec::new();
-            let mut heading_levels: Vec<u32> = Vec::new();
-            for h in frag.select(&heading_sel) {
-                let text = anchors_node_text(h);
-                headings.push(text);
-                let lvl: u32 = h.value().name()[1..].parse().unwrap_or(0);
-                heading_levels.push(lvl);
-            }
+            // EM front-matter + leading-heading title composition read raw
+            // (pre-mutation) container HTML, matching Python.
             let leading = extract_leading_headings(&cleaned.html);
             let composed_title = extract_compose_title(&leading);
             let title = composed_title.or(cleaned.title.clone());
-            let anchors = extract_collect_anchors(&frag);
             let (fm_refs, fm_phrase) = extract_em_front_matter(&cleaned.html);
-            // Asset extraction when --doc-id and --source-path are both supplied.
-            let (final_html, assets) = if doc_id.is_some() && source_path.is_some() {
+            // Mutation chain on the cleaned container HTML, mirroring Python's
+            // _rewrite_images_html + _normalise_named_anchors + _strip_attributes.
+            let (rewritten_html, assets) = if doc_id.is_some() && source_path.is_some() {
                 rewrite_images_html(
                     &cleaned.html,
                     doc_id.as_deref(),
@@ -447,20 +437,34 @@ fn main() -> Result<()> {
             } else {
                 (cleaned.html.clone(), Vec::new())
             };
-            // strip_attributes + normalise_named_anchors on the final HTML.
-            // Order matters: normalise BEFORE strip, since strip drops name=.
-            let final_html = normalise_named_anchors(&final_html);
-            let final_html = strip_attributes(&final_html);
+            let normalised = normalise_named_anchors(&rewritten_html);
+            let final_html = strip_attributes(&normalised);
+            // Re-render text from the mutated HTML so [asset:X] markers
+            // (from rewrite_images_html spans) appear inline.
+            let final_doc = scraper::Html::parse_fragment(&final_html);
+            let referenced = collect_referenced_anchors(&final_doc);
+            let text = subtree_text(&final_doc, &referenced);
+            // Headings + heading_levels + anchors are read AFTER mutations.
+            let heading_sel = scraper::Selector::parse("h1, h2, h3, h4, h5, h6").unwrap();
+            let mut headings: Vec<String> = Vec::new();
+            let mut heading_levels: Vec<u32> = Vec::new();
+            for h in final_doc.select(&heading_sel) {
+                let t = anchors_node_text(h);
+                headings.push(t);
+                let lvl: u32 = h.value().name()[1..].parse().unwrap_or(0);
+                heading_levels.push(lvl);
+            }
+            let anchors_pairs = extract_collect_anchors(&final_doc);
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
-                    "text": cleaned.text,
+                    "text": text,
                     "html": final_html,
                     "title": title,
                     "html_title": cleaned.title,
                     "headings": headings,
                     "heading_levels": heading_levels,
-                    "anchors": anchors,
+                    "anchors": anchors_pairs,
                     "front_matter_refs": fm_refs,
                     "front_matter_phrase": fm_phrase,
                     "assets": assets,
