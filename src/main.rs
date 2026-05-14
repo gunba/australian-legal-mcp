@@ -447,6 +447,10 @@ fn main() -> Result<()> {
             } else {
                 (cleaned.html.clone(), Vec::new())
             };
+            // strip_attributes + normalise_named_anchors on the final HTML.
+            // Order matters: normalise BEFORE strip, since strip drops name=.
+            let final_html = normalise_named_anchors(&final_html);
+            let final_html = strip_attributes(&final_html);
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -3803,6 +3807,57 @@ fn extract_attr<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
         .or_else(|| caps.get(2))
         .or_else(|| caps.get(3))
         .map(|m| m.as_str())
+}
+
+/// Strip attributes matching the deny list from HTML. Mirrors
+/// extract.py:_strip_attributes / _DROP_ATTRS / _DROP_PREFIXES. We strip via
+/// regex over the source HTML rather than mutating a DOM tree because
+/// scraper's API is read-only-ish; the regex is bounded by attribute syntax
+/// (`name=("..."|'...'|bareword)`) so it doesn't span tag boundaries.
+fn strip_attributes(html: &str) -> String {
+    const DROP_ATTRS: &[&str] = &[
+        "style", "width", "height", "align", "valign", "bgcolor",
+        "name", "data-icon", "cite",
+    ];
+    let mut out = html.to_string();
+    for name in DROP_ATTRS {
+        let pat = format!(
+            r#"(?is)\s+{}\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)"#,
+            regex::escape(name)
+        );
+        let re = Regex::new(&pat).unwrap();
+        out = re.replace_all(&out, "").into_owned();
+    }
+    // Also drop event handlers: any attribute whose name starts with `on`.
+    let on_re = Regex::new(r#"(?is)\s+on[a-zA-Z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)"#).unwrap();
+    out = on_re.replace_all(&out, "").into_owned();
+    out
+}
+
+/// Copy `<a name="X">` to `<a id="X">` (only when no existing id) and drop
+/// the bare `name=` attribute. Mirrors extract.py:_normalise_named_anchors.
+/// Operates over the HTML string directly.
+fn normalise_named_anchors(html: &str) -> String {
+    let a_re = Regex::new(r#"(?is)<a\b([^>]*)>"#).unwrap();
+    a_re
+        .replace_all(html, |caps: &regex::Captures| {
+            let attrs = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let name = extract_attr(attrs, "name");
+            let id = extract_attr(attrs, "id");
+            // Build the new attribute string.
+            let mut new_attrs = attrs.to_string();
+            // Drop name=... regardless.
+            let name_re = Regex::new(r#"(?is)\s+name\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)"#).unwrap();
+            new_attrs = name_re.replace_all(&new_attrs, "").into_owned();
+            // If the source had a name and no id, append id="<name>".
+            if let Some(n) = name {
+                if id.is_none() {
+                    new_attrs.push_str(&format!(r#" id="{}""#, assets_html_escape(n)));
+                }
+            }
+            format!("<a{new_attrs}>")
+        })
+        .into_owned()
 }
 
 fn fetch_external_doc(
