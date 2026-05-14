@@ -243,6 +243,12 @@ enum Command {
     DocMeta {
         canonical_id: String,
     },
+    /// Parse an ATO link href into (doc_id, pit, view). Mirrors
+    /// extract.py:_doc_id_from_ato_link. JSON out: null OR
+    /// {doc_id, pit, view}.
+    DocIdFromLink {
+        href: String,
+    },
     /// Fetch compact statutory definitions for a term.
     GetDefinition {
         term: String,
@@ -587,6 +593,19 @@ fn main() -> Result<()> {
                     "human_code": human_code,
                 }))?
             );
+            Ok(())
+        }
+        Command::DocIdFromLink { href } => {
+            let resolved = doc_id_from_ato_link(&href);
+            let value = match resolved {
+                Some((doc_id, pit, view)) => json!({
+                    "doc_id": doc_id,
+                    "pit": pit,
+                    "view": view,
+                }),
+                None => JsonValue::Null,
+            };
+            println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
     }
