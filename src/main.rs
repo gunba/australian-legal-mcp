@@ -153,26 +153,13 @@ enum Command {
         #[arg(long)]
         include_withdrawn: bool,
     },
-    /// Fetch a document or a slice of it.
-    GetDocument {
-        doc_id: String,
-        /// When set, return the raw cleaned HTML instead of plaintext.
-        #[arg(long, default_value_t = false)]
-        as_html: bool,
-        #[arg(long)]
-        max_chars: Option<usize>,
-        #[arg(long)]
-        from_char: Option<usize>,
-    },
-    /// Fetch a document from ATO's live website and print its text.
+    /// Fetch a document from ATO's live website and print its chunks.
     FetchExternalDoc {
         doc_id: String,
         #[arg(long)]
         pit: Option<String>,
         #[arg(long)]
         view: Option<String>,
-        #[arg(long, default_value_t = false)]
-        as_html: bool,
     },
     /// Run the Rust HTML cleaner on a saved doc and emit JSON. Used by the
     /// Python build pipeline as a subprocess (replaces the in-process call
@@ -569,25 +556,6 @@ fn main() -> Result<()> {
             println!("{}", out);
             Ok(())
         }
-        Command::GetDocument {
-            doc_id,
-            as_html,
-            max_chars,
-            from_char,
-        } => {
-            println!(
-                "{}",
-                get_document(
-                    &doc_id,
-                    GetDocumentOptions {
-                        as_html,
-                        max_chars,
-                        from_char,
-                    },
-                )?
-            );
-            Ok(())
-        }
         Command::GetDefinition {
             term,
             context_doc_id,
@@ -681,11 +649,10 @@ fn main() -> Result<()> {
             doc_id,
             pit,
             view,
-            as_html,
         } => {
             println!(
                 "{}",
-                fetch_external_doc(&doc_id, pit.as_deref(), view.as_deref(), as_html)?
+                fetch_external_doc(&doc_id, pit.as_deref(), view.as_deref())?
             );
             Ok(())
         }
@@ -1723,7 +1690,7 @@ fn dedup_per_doc(
     // until we hit `k`. We do not back-fill beyond the cap — the user
     // wants per-doc diversity to be a hard constraint, not a soft one.
     // Callers that need more chunks from the same doc should follow up
-    // with `get_chunks` / `get_document`.
+    // with `get_chunks`.
     let mut out: Vec<VectorHit> = Vec::with_capacity(k);
     for (_doc_id, _score, chunks) in &docs {
         if out.len() >= k {
@@ -2554,8 +2521,8 @@ enum RerankerState {
 // Lazy slots use Mutex<Option<_>> for the embedding runtime and Mutex<RerankerState>
 // for the reranker so concurrent requests can drive the load-once state machine
 // without `&mut self`. Search-time inference holds the lock for the duration of
-// the ONNX call (~10s of ms per query); read-only tools (search_titles,
-// get_document, get_chunks, get_definition, stats) run fully concurrently.
+// the ONNX call (~10s of ms per query); read-only tools (get_chunks,
+// get_definition, get_doc_anchors, get_asset, stats) run fully concurrently.
 // [SW-04] SemanticRuntime/reranker load once; failed reranker loads disable reranking for the session.
 #[derive(Default)]
 struct ServerState {
@@ -3108,112 +3075,6 @@ fn collect_title_hits(
     rows.splice(0..0, direct_hits);
     rows.truncate(k);
     Ok(rows)
-}
-
-struct GetDocumentOptions {
-    /// `false` (default) joins chunk plaintext; `true` serves the raw
-    /// cleaned-HTML blob from `documents.html`. Pagination applies to
-    /// whichever body is selected.
-    as_html: bool,
-    max_chars: Option<usize>,
-    from_char: Option<usize>,
-}
-
-fn get_document(doc_id: &str, opts: GetDocumentOptions) -> Result<String> {
-    let conn = open_read()?;
-    let doc = load_document_row(&conn, doc_id)?;
-    let Some(doc) = doc else {
-        return Ok(format!(
-            "_Document `{}` is not in the local corpus._\n\n\
-             Call `fetch_external_doc(doc_id=\"{}\")` to retrieve it from \
-             ATO's live website (<{}>). `[doc:X]` markers in chunk text \
-             frequently point at ids the corpus doesn't index — subdivisions, \
-             paragraph-level refs, footnote pointers, historical PiT views — \
-             and fetch_external_doc is how you follow them.",
-            doc_id,
-            doc_id,
-            canonical_url(doc_id),
-        ));
-    };
-    let body = if opts.as_html {
-        load_document_html(&conn, &doc.doc_id)?.unwrap_or_default()
-    } else {
-        load_document_plaintext(&conn, &doc.doc_id)?
-    };
-    format_document_response(
-        &doc,
-        &body,
-        opts.as_html,
-        opts.from_char.unwrap_or(0),
-        opts.max_chars,
-    )
-}
-
-/// Reassemble the document's plaintext as the chunk pipeline saw it. The
-/// chunks already carry the `[doc:X]` / `[asset:X]` annotations after a
-/// rebuild, so the agent sees the same text it would in `get_chunks`.
-fn load_document_plaintext(conn: &Connection, doc_id: &str) -> Result<String> {
-    let mut stmt =
-        conn.prepare("SELECT text FROM chunks WHERE doc_id = ? ORDER BY ord ASC")?;
-    let rows = stmt.query_map([doc_id], |row| row.get::<_, Vec<u8>>("text"))?;
-    let mut parts: Vec<String> = Vec::new();
-    for row in rows {
-        let blob = row?;
-        parts.push(decompress_text(blob)?);
-    }
-    Ok(parts.join("\n\n"))
-}
-
-fn format_document_response(
-    doc: &DocumentRow,
-    body: &str,
-    as_html: bool,
-    from_char: usize,
-    max_chars: Option<usize>,
-) -> Result<String> {
-    let total_chars = body.chars().count();
-    let start_char = from_char.min(total_chars);
-    let start_byte = char_offset_to_byte(body, start_char);
-    let remaining = &body[start_byte..];
-    let (slice, next_offset) = if let Some(max_chars) = max_chars {
-        if remaining.chars().count() > max_chars {
-            let end = char_offset_to_byte(remaining, max_chars);
-            (&remaining[..end], Some(start_char + max_chars))
-        } else {
-            (remaining, None)
-        }
-    } else {
-        (remaining, None)
-    };
-    let next_call = next_offset.map(|next| {
-        let suffix = if as_html { ", as_html=true" } else { "" };
-        format!(
-            "get_document(doc_id=\"{}\", from_char={}, max_chars={}{})",
-            doc.doc_id,
-            next,
-            max_chars.unwrap_or(20_000),
-            suffix,
-        )
-    });
-    let mut meta = serde_json::Map::new();
-    meta.insert(
-        "total_chars".to_string(),
-        JsonValue::Number(serde_json::Number::from(total_chars as u64)),
-    );
-    if next_offset.is_some() {
-        meta.insert("truncated".to_string(), JsonValue::Bool(true));
-        if let Some(call) = next_call.as_ref() {
-            meta.insert(
-                "next_call".to_string(),
-                JsonValue::String(call.to_string()),
-            );
-        }
-    }
-    Ok(serde_json::to_string_pretty(&json!({
-        "document": doc,
-        "text": slice,
-        "meta": meta,
-    }))?)
 }
 
 // ----- External fetch (live ATO scrape) -----
@@ -7081,7 +6942,6 @@ fn fetch_external_doc(
     doc_id: &str,
     pit: Option<&str>,
     view: Option<&str>,
-    as_html: bool,
 ) -> Result<String> {
     let mut url = format!(
         "https://www.ato.gov.au/law/view/document?docid={}",
@@ -7136,21 +6996,28 @@ fn fetch_external_doc(
              structure may have changed"
         );
     }
-    if as_html {
-        Ok(serde_json::to_string_pretty(&json!({
-            "doc_id": doc_id,
-            "canonical_url": url,
-            "html": cleaned.html,
-            "title": cleaned.title,
-        }))?)
-    } else {
-        Ok(serde_json::to_string_pretty(&json!({
-            "doc_id": doc_id,
-            "canonical_url": url,
-            "text": cleaned.text,
-            "title": cleaned.title,
-        }))?)
-    }
+    // Run the cleaned HTML through the same deterministic block-aware
+    // chunker the build pipeline uses, so an external doc reads like a
+    // corpus doc: a list of {ord, anchor, text} chunks. Stateless — the
+    // chunks aren't persisted and carry no chunk_id; all of them come
+    // back inline in this one response.
+    let chunks = chunk_html(&cleaned.html, cleaned.title.as_deref(), EMBED_MAX_TOKENS);
+    let chunk_json: Vec<JsonValue> = chunks
+        .iter()
+        .map(|c| {
+            json!({
+                "ord": c.ord,
+                "anchor": c.anchor,
+                "text": c.text,
+            })
+        })
+        .collect();
+    Ok(serde_json::to_string_pretty(&json!({
+        "doc_id": doc_id,
+        "canonical_url": url,
+        "title": cleaned.title,
+        "chunks": chunk_json,
+    }))?)
 }
 
 struct CleanedAtoDoc {
@@ -7726,56 +7593,6 @@ fn normalise_paragraph_breaks(s: &str) -> String {
         out_lines.pop();
     }
     out_lines.join("\n")
-}
-
-#[derive(Debug, Serialize)]
-struct DocumentRow {
-    doc_id: String,
-    #[serde(rename = "type")]
-    doc_type: String,
-    title: String,
-    date: Option<String>,
-    downloaded_at: String,
-    canonical_url: String,
-}
-
-fn load_document_row(conn: &Connection, doc_id: &str) -> Result<Option<DocumentRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT doc_id, type, title, date, downloaded_at FROM documents WHERE doc_id = ?",
-    )?;
-    let mut rows = stmt.query([doc_id])?;
-    if let Some(row) = rows.next()? {
-        let doc_id: String = row.get("doc_id")?;
-        Ok(Some(DocumentRow {
-            canonical_url: canonical_url(&doc_id),
-            doc_id,
-            doc_type: row.get("type")?,
-            title: row.get("title")?,
-            date: row.get("date")?,
-            downloaded_at: row.get("downloaded_at")?,
-        }))
-    } else {
-        Ok(None)
-    }
-}
-
-fn load_document_html(conn: &Connection, doc_id: &str) -> Result<Option<String>> {
-    let mut stmt = conn.prepare("SELECT html FROM documents WHERE doc_id = ?")?;
-    let mut rows = stmt.query([doc_id])?;
-    if let Some(row) = rows.next()? {
-        let blob: Vec<u8> = row.get("html")?;
-        Ok(Some(decompress_text(blob)?))
-    } else {
-        Ok(None)
-    }
-}
-
-fn char_offset_to_byte(value: &str, chars: usize) -> usize {
-    value
-        .char_indices()
-        .nth(chars)
-        .map(|(idx, _)| idx)
-        .unwrap_or(value.len())
 }
 
 struct GetDefinitionOptions<'a> {
@@ -11616,17 +11433,6 @@ fn call_tool(params: JsonValue, state: &ServerState) -> Result<JsonValue> {
                 Some(state),
             )?
         }
-        "get_document" => {
-            let doc_id = required_str(&args, "doc_id")?;
-            get_document(
-                doc_id,
-                GetDocumentOptions {
-                    as_html: optional_bool(&args, "as_html").unwrap_or(false),
-                    max_chars: optional_usize(&args, "max_chars"),
-                    from_char: optional_usize(&args, "from_char"),
-                },
-            )?
-        }
         "get_asset" => get_asset_mcp(&args)?,
         "get_doc_anchors" => get_doc_anchors_mcp(&args)?,
         "get_chunks" => get_chunks_mcp(&args)?,
@@ -11647,7 +11453,6 @@ fn call_tool(params: JsonValue, state: &ServerState) -> Result<JsonValue> {
                 doc_id,
                 args.get("pit").and_then(|v| v.as_str()),
                 args.get("view").and_then(|v| v.as_str()),
-                optional_bool(&args, "as_html").unwrap_or(false),
             )?
         }
         _ => bail!("unknown tool: {name}"),
@@ -12165,13 +11970,14 @@ The MCP may need external supplementation for:
 ### Tool Surface
 
 1. `search`
-- Use this first for chunk-level retrieval.
-- Returns slim search hits such as `chunk_id`, `doc_id`, anchor/title metadata, snippets, and flags showing whether related navigation may be useful.
+- Use this first. Returns two parallel arrays: `hits` (chunk-level) and `title_hits` (document-level, up to 10).
+- `hits` are slim chunk pointers — `chunk_id`, `doc_id`, anchor/title metadata, snippets, and flags showing whether related navigation may be useful. Fetch the actual text via `get_chunks`.
+- `title_hits` is a sidebar of strongly-matching whole documents (ranked by title, plus exact `doc_id` / ATO-document-link lookups). Use it to recognise when a single authoritative document IS the answer, then `search` again with `doc_scope=<doc_id>` or read it chunk-by-chunk.
 - Search works best with section numbers, defined terms, ruling IDs, and exact tax phrases.
 - Default search is current-focused and excludes some older, withdrawn, private, or non-current material.
 - Use `doc_scope` to restrict search to one document ID, or a prefix pattern like `<PREFIX>/%` for a document family.
 - Use `current_only=false` and `include_old=true` when old, withdrawn, transitional, repealed, or historical material may matter.
-- Use `similar_to_chunk_id` after finding a good chunk to locate semantically similar chunks without writing a new query.
+- Use `similar_to_chunk_id` after finding a good chunk to locate semantically similar chunks without writing a new query (returns no `title_hits`).
 
 2. `get_chunks`
 - Use this after `search` to retrieve the actual text of promising hits.
@@ -12185,16 +11991,21 @@ The MCP may need external supplementation for:
 - Also surfaces related documents, history links, and `cited_by` documents where available.
 - Use this to move from a single chunk to surrounding sections, related rulings, amendments, explanatory links, or later materials citing the document.
 
+4. `fetch_external_doc`
+- Use this when a `[doc:X]` marker in chunk text points at an id the local corpus does not index — subdivisions, paragraph-level references, footnote pointers, or historical point-in-time pointers (the `url` in `get_doc_anchors` historical_versions).
+- Returns the live ATO document as the same `{ord, anchor, text}` chunk shape `search`/`get_chunks` use, so it reads like a corpus document.
+- Network-dependent and slower than the local corpus tools — prefer `search` for anything indexed.
+
 ### Standard Research Workflow
 
 1. Start with targeted searches.
-Prefer searches like `s 25-90 foreign branch income deduction`, `Subdivision 768-G active foreign business asset percentage`, `TR 2008/7 royalty withholding tax`, or `GIC deduction incurred after 1 July 2025`. Avoid relying only on broad natural-language searches like "is this deductible?"
+Prefer searches like `s 25-90 foreign branch income deduction`, `Subdivision 768-G active foreign business asset percentage`, `TR 2008/7 royalty withholding tax`, or `GIC deduction incurred after 1 July 2025`. Avoid relying only on broad natural-language searches like "is this deductible?" Scan both `hits` and `title_hits` — a strong `title_hits` entry often names the controlling document directly.
 
 2. Open the best chunks.
 Use `get_chunks` on multiple promising hits. Include neighbouring chunks where the answer may depend on nearby exceptions, formulas, definitions, or notes.
 
 3. Follow the document structure.
-If the result has document anchors, history, related docs, or cited-by flags, call `get_doc_anchors`. Tax answers often depend on adjacent provisions or related interpretive material.
+If the result has document anchors, history, related docs, or cited-by flags, call `get_doc_anchors`. Tax answers often depend on adjacent provisions or related interpretive material. When a `[doc:X]` marker or a historical-version URL points outside the corpus, follow it with `fetch_external_doc`.
 
 4. Confirm the full rule, not just the headline rule.
 For each issue, check the operative rule, exceptions, definitions, timing rule, calculation method, rounding rule, transitional or commencement rule, interaction with other regimes, and administrative guidance where relevant.
@@ -12290,9 +12101,9 @@ fn server_instructions(update_notice: Option<&UpdateAvailability>) -> String {
 }
 
 fn tool_descriptors() -> JsonValue {
-    // [SW-01] Eight MCP tools are exposed by tool_descriptors/call_tool: search,
-    // search_titles, get_document, get_chunks, get_definition, get_asset,
-    // get_doc_anchors, stats.
+    // [SW-01] Seven MCP tools are exposed by tool_descriptors/call_tool:
+    // search, get_chunks, get_asset, get_doc_anchors, get_definition, stats,
+    // fetch_external_doc.
     //   The surface stays small and explicit; unsupported tools fail through the
     //   normal tools/call error path.
     json!([
@@ -12320,20 +12131,6 @@ fn tool_descriptors() -> JsonValue {
             }
         },
         {
-            "name": "get_document",
-            "description": "Fetch a full document by doc_id. Default body is plaintext joined from chunks (carries [doc:X] cross-reference and [asset:X] image markers); as_html=true returns cleaned source HTML with data-doc-id and data-asset-ref attributes. Pagination via from_char/max_chars. Prefer search → get_chunks for in-doc reading; this is the full-doc escape hatch.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "doc_id": {"type": "string"},
-                    "as_html": {"type": "boolean", "description": "When true, return the cleaned source HTML; default plaintext."},
-                    "from_char": {"type": "integer"},
-                    "max_chars": {"type": "integer"}
-                },
-                "required": ["doc_id"]
-            }
-        },
-        {
             "name": "get_asset",
             "description": "Resolve an image asset reference (from [asset:X] markers in plaintext or data-asset-ref attributes in HTML) to a local file path plus source metadata.",
             "inputSchema": {
@@ -12346,7 +12143,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_doc_anchors",
-            "description": "Return the navigation map for a document: in-doc anchors (paragraph references, contents-table entries), sister documents (errata, addenda, withdrawal notices), historical versions (earlier point-in-time publications), and reverse citations (other documents whose chunks carry a [doc:X] marker pointing AT this doc). Slim search hits surface `has_in_doc_links`, `has_related_docs`, or `has_history` when this tool would return useful entries — call it then to navigate. `in_doc` entries carry chunk_id (pass to get_chunks); `related_docs` carry doc_id (pass to search/get_document/get_chunks); `historical_versions` carry {doc_id, pit, date, url}; `cited_by` carries [{doc_id, title, type, date}] ordered by source date DESC and capped at 100 — when more citers exist, `cited_by_total` reports the full count. The corpus does not store historical content; use the historical-version `url` field with WebFetch to retrieve an older version when needed.",
+            "description": "Return the navigation map for a document: in-doc anchors (paragraph references, contents-table entries), sister documents (errata, addenda, withdrawal notices), historical versions (earlier point-in-time publications), and reverse citations (other documents whose chunks carry a [doc:X] marker pointing AT this doc). Slim search hits surface `has_in_doc_links`, `has_related_docs`, or `has_history` when this tool would return useful entries — call it then to navigate. `in_doc` entries carry chunk_id (pass to get_chunks); `related_docs` carry doc_id (pass to search/get_chunks); `historical_versions` carry {doc_id, pit, date, url}; `cited_by` carries [{doc_id, title, type, date}] ordered by source date DESC and capped at 100 — when more citers exist, `cited_by_total` reports the full count. The corpus does not store historical content; use the historical-version `url` field with fetch_external_doc to retrieve an older version when needed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -12357,7 +12154,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_chunks",
-            "description": "Fetch chunk bodies by chunk_id. before/after expand the response with ordinal neighbour chunks within the same doc (0-20 each). Plaintext carries [doc:X] cross-reference markers (resolve via search/get_document) and [asset:X] image markers (resolve via get_asset). On max_chars truncation, truncated_at + next_call point at the next chunk_id to continue scrolling.",
+            "description": "Fetch chunk bodies by chunk_id. before/after expand the response with ordinal neighbour chunks within the same doc (0-20 each). Plaintext carries [doc:X] cross-reference markers (resolve via search, or fetch_external_doc when not indexed) and [asset:X] image markers (resolve via get_asset). On max_chars truncation, truncated_at + next_call point at the next chunk_id to continue scrolling.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -12396,14 +12193,13 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "fetch_external_doc",
-            "description": "Fetch a document FROM ATO's live website by doc_id and return its cleaned content. Use this when get_document tells you a referenced [doc:X] marker isn't in the local corpus — typically subdivisions (PAC/<act>/SDiv*), paragraph-level references (PAC/<act>/<section>(N)), footnote pointers (.../fpN), or historical PiT-qualified pointers. URL is https://www.ato.gov.au/law/view/document?docid=<doc_id>[&PiT=<pit>][&db=<view>]. Default returns plaintext from the legal content container (nav chrome, scripts, history-toggle UI stripped); as_html=true returns the cleaned HTML. Network-dependent and slower than local corpus tools — prefer search/get_document for anything indexed.",
+            "description": "Fetch a document FROM ATO's live website by doc_id and return it as deterministic chunks — the same {ord, anchor, text} chunk shape `search`/`get_chunks` work with, so an external doc reads like a corpus doc. Use this when a [doc:X] marker in chunk text points at an id the local corpus doesn't index — typically subdivisions (PAC/<act>/SDiv*), paragraph-level references (PAC/<act>/<section>(N)), footnote pointers (.../fpN), or historical PiT-qualified pointers. URL is https://www.ato.gov.au/law/view/document?docid=<doc_id>[&PiT=<pit>][&db=<view>]. Stateless: the chunks are not persisted and carry no chunk_id; all of them are returned inline. Network-dependent and slower than local corpus tools — prefer search for anything indexed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "doc_id": {"type": "string"},
                     "pit": {"type": "string", "description": "Optional PiT timestamp (e.g. 99991231235958 for current view)."},
-                    "view": {"type": "string", "description": "Optional db= view qualifier (e.g. HISTFT for amendment-history view)."},
-                    "as_html": {"type": "boolean", "description": "When true, return the cleaned HTML; default plaintext."}
+                    "view": {"type": "string", "description": "Optional db= view qualifier (e.g. HISTFT for amendment-history view)."}
                 },
                 "required": ["doc_id"]
             }

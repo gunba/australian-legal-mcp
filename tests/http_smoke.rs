@@ -148,10 +148,16 @@ fn initialize_and_tools_list_over_http() -> Result<()> {
         .iter()
         .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
         .collect();
-    for expected in ["search", "search_titles", "get_document", "get_chunks", "stats"] {
+    for expected in ["search", "get_chunks", "get_doc_anchors", "fetch_external_doc", "stats"] {
         assert!(
             names.iter().any(|n| n == expected),
             "expected `{expected}` in tool list, got {names:?}"
+        );
+    }
+    for removed in ["search_titles", "get_document"] {
+        assert!(
+            !names.iter().any(|n| n == removed),
+            "`{removed}` should no longer be exposed, got {names:?}"
         );
     }
 
