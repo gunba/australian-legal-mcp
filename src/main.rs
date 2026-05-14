@@ -208,6 +208,17 @@ enum Command {
         #[arg(long)]
         input_file: Option<PathBuf>,
     },
+    /// Extract doc-navigation anchors from cleaned HTML. Mirrors
+    /// src/ato_mcp/indexer/anchors.py:extract_anchors. JSON out:
+    /// [{kind, label, target_anchor?, target_doc_id?, target_pit?}, ...].
+    ExtractAnchors {
+        /// Path to the cleaned HTML. Reads stdin if absent.
+        #[arg(long)]
+        html_file: Option<PathBuf>,
+        /// doc_id of the source doc — needed to filter self-links.
+        #[arg(long)]
+        source_doc_id: String,
+    },
     /// Fetch compact statutory definitions for a term.
     GetDefinition {
         term: String,
@@ -440,6 +451,25 @@ fn main() -> Result<()> {
                 &input.chunks,
             );
             println!("{}", serde_json::to_string_pretty(&defs)?);
+            Ok(())
+        }
+        Command::ExtractAnchors {
+            html_file,
+            source_doc_id,
+        } => {
+            let html = match html_file {
+                Some(p) => fs::read_to_string(&p)
+                    .with_context(|| format!("reading {}", p.display()))?,
+                None => {
+                    let mut s = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut s)
+                        .context("reading stdin")?;
+                    s
+                }
+            };
+            let refs = extract_anchors(&html, &source_doc_id);
+            println!("{}", serde_json::to_string_pretty(&refs)?);
             Ok(())
         }
     }
@@ -2779,6 +2809,235 @@ fn extract_definitions(
         }
     }
     out
+}
+
+// ----- Doc-navigation anchors (port of src/ato_mcp/indexer/anchors.py) -----
+//
+// Walks cleaned HTML for a single doc and classifies every <a href> into
+// one of three kinds, mirroring the Python module: in_doc (#X target inside
+// this doc), sister (cross-doc link, no PiT), history (cross-doc with PiT
+// timestamp pointing at a historical version we don't store).
+
+const ANCHORS_SENTINEL_PITS: &[&str] = &["99991231235958", "10010101000001"];
+
+#[derive(Debug, Clone, Serialize)]
+struct AnchorRef {
+    kind: String,
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_anchor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_doc_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_pit: Option<String>,
+}
+
+fn anchors_pit_to_date(pit: &str) -> String {
+    let s = pit.trim();
+    if s.len() >= 8 && s[..8].chars().all(|c| c.is_ascii_digit()) {
+        format!("{}-{}-{}", &s[..4], &s[4..6], &s[6..8])
+    } else {
+        s.to_string()
+    }
+}
+
+fn anchors_collect_targets(doc: &scraper::Html) -> std::collections::HashSet<String> {
+    use scraper::Selector;
+    let mut targets = std::collections::HashSet::new();
+    let a_name = Selector::parse("a[name]").unwrap();
+    for el in doc.select(&a_name) {
+        if let Some(name) = el.value().attr("name") {
+            if !name.is_empty() {
+                targets.insert(name.to_string());
+            }
+        }
+    }
+    let with_id = Selector::parse("[id]").unwrap();
+    for el in doc.select(&with_id) {
+        if let Some(nid) = el.value().attr("id") {
+            if !nid.is_empty() {
+                targets.insert(nid.to_string());
+            }
+        }
+    }
+    targets
+}
+
+fn anchors_find_ancestor<'a>(
+    node: scraper::ElementRef<'a>,
+    tags: &[&str],
+) -> Option<scraper::ElementRef<'a>> {
+    let mut current = node.parent();
+    while let Some(p) = current {
+        if let Some(el) = scraper::ElementRef::wrap(p) {
+            if tags.contains(&el.value().name()) {
+                return Some(el);
+            }
+        }
+        current = p.parent();
+    }
+    None
+}
+
+fn anchors_node_text(node: scraper::ElementRef) -> String {
+    let mut out = String::new();
+    for s in node.text() {
+        out.push_str(s);
+    }
+    let mut collapsed = String::with_capacity(out.len());
+    let mut last_ws = true;
+    for c in out.chars() {
+        if c.is_whitespace() {
+            if !last_ws {
+                collapsed.push(' ');
+                last_ws = true;
+            }
+        } else {
+            collapsed.push(c);
+            last_ws = false;
+        }
+    }
+    collapsed.trim().to_string()
+}
+
+fn anchors_sibling_cells_text(a: scraper::ElementRef) -> String {
+    let row = match anchors_find_ancestor(a, &["tr"]) {
+        Some(r) => r,
+        None => return String::new(),
+    };
+    let own_cell = anchors_find_ancestor(a, &["td", "th"]);
+    let cell_sel = scraper::Selector::parse("td, th").unwrap();
+    let mut parts: Vec<String> = Vec::new();
+    for cell in row.select(&cell_sel) {
+        if let Some(own) = own_cell {
+            if cell.id() == own.id() {
+                continue;
+            }
+        }
+        let text = anchors_node_text(cell);
+        if !text.is_empty() {
+            parts.push(text);
+        }
+    }
+    parts.join(" ").trim().to_string()
+}
+
+fn anchors_resolve_label(a: scraper::ElementRef, default_date: Option<&str>) -> String {
+    let own = anchors_node_text(a);
+    let sibling = anchors_sibling_cells_text(a);
+    let mut parts: Vec<String> = Vec::new();
+    if !sibling.is_empty() {
+        parts.push(sibling);
+    }
+    if !own.is_empty() && !parts.iter().any(|p| p == &own) {
+        parts.push(own);
+    }
+    let mut label = parts.join(" ").trim().to_string();
+    if let Some(date) = default_date {
+        label = if label.is_empty() {
+            date.to_string()
+        } else {
+            format!("{label} ({date})")
+        };
+    }
+    if label.is_empty() {
+        "(unnamed)".to_string()
+    } else {
+        label
+    }
+}
+
+fn extract_anchors(html: &str, source_doc_id: &str) -> Vec<AnchorRef> {
+    if html.trim().is_empty() {
+        return Vec::new();
+    }
+    let doc = scraper::Html::parse_document(html);
+    let targets = anchors_collect_targets(&doc);
+    let mut refs: Vec<AnchorRef> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String, Option<String>, String)> =
+        std::collections::HashSet::new();
+
+    let a_sel = scraper::Selector::parse("a[href]").unwrap();
+    for a in doc.select(&a_sel) {
+        let href = a.value().attr("href").unwrap_or("");
+        if let Some(target) = href.strip_prefix('#') {
+            if target.is_empty() || !targets.contains(target) {
+                continue;
+            }
+            let label = anchors_resolve_label(a, None);
+            let key = (
+                "in_doc".to_string(),
+                target.to_string(),
+                None,
+                label.clone(),
+            );
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.insert(key);
+            refs.push(AnchorRef {
+                kind: "in_doc".to_string(),
+                label,
+                target_anchor: Some(target.to_string()),
+                target_doc_id: None,
+                target_pit: None,
+            });
+            continue;
+        }
+        let resolved = doc_id_from_ato_link(href);
+        let Some((target_doc_id, mut pit, _view)) = resolved else {
+            continue;
+        };
+        if let Some(p) = pit.as_ref() {
+            if ANCHORS_SENTINEL_PITS.iter().any(|s| *s == p) {
+                pit = None;
+            }
+        }
+        if let Some(p) = pit {
+            let date = anchors_pit_to_date(&p);
+            let label = anchors_resolve_label(a, Some(&date));
+            let key = (
+                "history".to_string(),
+                target_doc_id.clone(),
+                Some(p.clone()),
+                label.clone(),
+            );
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.insert(key);
+            refs.push(AnchorRef {
+                kind: "history".to_string(),
+                label,
+                target_anchor: None,
+                target_doc_id: Some(target_doc_id),
+                target_pit: Some(p),
+            });
+            continue;
+        }
+        if target_doc_id == source_doc_id {
+            continue;
+        }
+        let label = anchors_resolve_label(a, None);
+        let key = (
+            "sister".to_string(),
+            target_doc_id.clone(),
+            None,
+            label.clone(),
+        );
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.insert(key);
+        refs.push(AnchorRef {
+            kind: "sister".to_string(),
+            label,
+            target_anchor: None,
+            target_doc_id: Some(target_doc_id),
+            target_pit: None,
+        });
+    }
+    refs
 }
 
 fn fetch_external_doc(
