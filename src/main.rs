@@ -354,6 +354,23 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         max_defs: usize,
     },
+    /// Crawl the ATO browse-content tree and write nodes.jsonl + meta.json
+    /// to a snapshot directory. Mirrors src/ato_mcp/scraper/tree_crawler.py
+    /// + src/ato_mcp/scraper/snapshot.py.
+    TreeCrawl {
+        #[arg(long, default_value = "Mode=type&Action=initialise")]
+        root_query: String,
+        #[arg(long)]
+        out_dir: PathBuf,
+        #[arg(long, default_value = "https://www.ato.gov.au/API/v1/law/lawservices/browse-content/")]
+        base_url: String,
+        #[arg(long, default_value_t = 30.0)]
+        timeout_seconds: f64,
+        #[arg(long, default_value_t = 0.05)]
+        request_interval_seconds: f64,
+        #[arg(long)]
+        max_nodes: Option<usize>,
+    },
     /// Publish a corpus release to GitHub. Mirrors
     /// src/ato_mcp/indexer/release.py:publish — rewrites manifest URLs to
     /// release asset URLs, fixes embedding-model fields if they're
@@ -569,6 +586,21 @@ fn main() -> Result<()> {
             model_size,
             sign_key,
         }),
+        Command::TreeCrawl {
+            root_query,
+            out_dir,
+            base_url,
+            timeout_seconds,
+            request_interval_seconds,
+            max_nodes,
+        } => tree_crawl(
+            &root_query,
+            &out_dir,
+            &base_url,
+            timeout_seconds,
+            request_interval_seconds,
+            max_nodes,
+        ),
         Command::FetchExternalDoc {
             doc_id,
             pit,
@@ -7612,6 +7644,286 @@ fn manifest_fingerprint(manifest: &Manifest) -> Result<String> {
     });
     let bytes = serde_json::to_vec(&payload)?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+// ----- tree-crawl (port of src/ato_mcp/scraper/tree_crawler.py + snapshot.py) -----
+
+const SCRAPER_EXCLUDED_TITLES: &[&str] = &[
+    "Archived document types",
+    "Amending legislation",
+    "Amending regulations",
+    "Archived",
+    "Full document",
+    "View list of provisions",
+    "Draft",
+    "Draft amendments",
+];
+
+fn scraper_normalise_title(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<&str>>().join(" ").to_lowercase()
+}
+
+fn scraper_is_excluded(title: &str) -> bool {
+    static EXCLUDED: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
+    let set = EXCLUDED.get_or_init(|| {
+        SCRAPER_EXCLUDED_TITLES
+            .iter()
+            .map(|s| scraper_normalise_title(s))
+            .collect()
+    });
+    set.contains(&scraper_normalise_title(title))
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SnapshotNode {
+    uid: u64,
+    parent_uid: Option<u64>,
+    title: String,
+    level: u32,
+    node_type: String,
+    data_url: Option<String>,
+    href: Option<String>,
+    canonical_id: Option<String>,
+    path: Vec<String>,
+    payload: JsonValue,
+}
+
+fn canonical_id_from(data_url: Option<&str>, href: Option<&str>) -> Option<String> {
+    if let Some(h) = href {
+        return Some(h.to_string());
+    }
+    let data_url = data_url?;
+    // parse_qs equivalent: find TOC=value in the query string portion.
+    let qs = data_url.split_once('?').map(|x| x.1).unwrap_or(data_url);
+    for pair in qs.split('&') {
+        let mut it = pair.splitn(2, '=');
+        if let (Some(k), Some(v)) = (it.next(), it.next()) {
+            if k == "TOC" {
+                // Manual percent-decode (avoids pulling percent-encoding crate).
+                let mut out = String::with_capacity(v.len());
+                let bytes = v.as_bytes();
+                let mut i = 0;
+                while i < bytes.len() {
+                    if bytes[i] == b'%' && i + 2 < bytes.len() {
+                        if let Ok(byte) = u8::from_str_radix(
+                            std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("00"),
+                            16,
+                        ) {
+                            out.push(byte as char);
+                            i += 3;
+                            continue;
+                        }
+                    }
+                    out.push(bytes[i] as char);
+                    i += 1;
+                }
+                return Some(out);
+            }
+        }
+    }
+    Some(data_url.to_string())
+}
+
+fn fetch_nodes_blocking(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    query: &str,
+) -> Result<Vec<JsonValue>> {
+    let url = if query.is_empty() {
+        base_url.trim_end_matches('?').to_string()
+    } else {
+        format!("{}?{}", base_url.trim_end_matches('?'), query.trim_start_matches('?'))
+    };
+    let resp = client.get(&url).send().with_context(|| format!("fetching {url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("ATO API returned HTTP {status} for {url}");
+    }
+    let body = resp.text()?;
+    let payload: JsonValue = serde_json::from_str(&body).context("parsing ATO API JSON")?;
+    let arr = payload
+        .as_array()
+        .ok_or_else(|| anyhow!("ATO response payload is not a list"))?;
+    Ok(arr.clone())
+}
+
+fn tree_crawl(
+    root_query: &str,
+    out_dir: &Path,
+    base_url: &str,
+    timeout_seconds: f64,
+    request_interval_seconds: f64,
+    max_nodes: Option<usize>,
+) -> Result<()> {
+    use std::collections::VecDeque;
+
+    fs::create_dir_all(out_dir)?;
+    let nodes_path = out_dir.join("nodes.jsonl");
+    let nodes_file = File::create(&nodes_path)?;
+    let mut nodes_writer = std::io::BufWriter::new(nodes_file);
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(ATO_USER_AGENT)
+        .timeout(Duration::from_secs_f64(timeout_seconds))
+        .build()?;
+
+    // Rate limiter: enforce request_interval_seconds between any two outgoing
+    // calls. Tree crawler can issue thousands per run.
+    let last_request = std::sync::Mutex::new(std::time::Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .unwrap_or_else(std::time::Instant::now));
+    let acquire = || {
+        if request_interval_seconds <= 0.0 {
+            return;
+        }
+        let mut last = last_request.lock().unwrap();
+        let now = std::time::Instant::now();
+        let earliest = *last + Duration::from_secs_f64(request_interval_seconds);
+        if earliest > now {
+            std::thread::sleep(earliest - now);
+            *last = earliest;
+        } else {
+            *last = now;
+        }
+    };
+
+    acquire();
+    let initial = fetch_nodes_blocking(&client, base_url, root_query)?;
+
+    #[derive(Debug)]
+    struct QueueItem {
+        parent_uid: Option<u64>,
+        path: Vec<String>,
+        payload: JsonValue,
+        level: u32,
+    }
+    let mut queue: VecDeque<QueueItem> = VecDeque::new();
+    queue.extend(initial.into_iter().map(|p| QueueItem {
+        parent_uid: None,
+        path: Vec::new(),
+        payload: p,
+        level: 0,
+    }));
+    let mut visited_data_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut uid_counter: u64 = 0;
+    let mut total_written: usize = 0;
+    let mut folder_count: usize = 0;
+    let mut link_count: usize = 0;
+
+    while let Some(item) = queue.pop_front() {
+        uid_counter += 1;
+        let title = item
+            .payload
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(untitled)")
+            .to_string();
+        let data_url = item
+            .payload
+            .get("data")
+            .and_then(|d| d.get("url"))
+            .and_then(|u| u.as_str())
+            .map(|s| s.to_string());
+        let href = item
+            .payload
+            .get("a_attr")
+            .and_then(|a| a.get("href"))
+            .and_then(|h| h.as_str())
+            .map(|s| s.to_string());
+        let node_type = match (data_url.is_some(), href.is_some()) {
+            (true, true) => "folder+link",
+            (true, false) => "folder",
+            (false, true) => "link",
+            (false, false) => "unknown",
+        }
+        .to_string();
+        let canonical_id = canonical_id_from(data_url.as_deref(), href.as_deref());
+        let mut new_path = item.path.clone();
+        new_path.push(title.clone());
+
+        let node = SnapshotNode {
+            uid: uid_counter,
+            parent_uid: item.parent_uid,
+            title: title.clone(),
+            level: item.level,
+            node_type: node_type.clone(),
+            data_url: data_url.clone(),
+            href: href.clone(),
+            canonical_id,
+            path: new_path.clone(),
+            payload: item.payload.clone(),
+        };
+
+        if scraper_is_excluded(&title) {
+            if let Some(url) = data_url.as_deref() {
+                visited_data_urls.insert(url.to_string());
+            }
+            continue;
+        }
+
+        // Stream node to disk to avoid holding entire snapshot in memory.
+        use std::io::Write as _;
+        writeln!(nodes_writer, "{}", serde_json::to_string(&node)?)?;
+        total_written += 1;
+        if node_type.contains("folder") {
+            folder_count += 1;
+        }
+        if node_type.contains("link") {
+            link_count += 1;
+        }
+
+        if total_written.is_multiple_of(500) {
+            eprintln!(
+                "tree-crawl: nodes={total_written} folders={folder_count} links={link_count} frontier={}",
+                queue.len(),
+            );
+        }
+        if let Some(cap) = max_nodes {
+            if total_written >= cap {
+                eprintln!("tree-crawl: reached max_nodes={cap}");
+                break;
+            }
+        }
+
+        let Some(child_url) = data_url else { continue };
+        if !visited_data_urls.insert(child_url.clone()) {
+            continue;
+        }
+
+        acquire();
+        let child_payloads = match fetch_nodes_blocking(&client, base_url, &child_url) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("tree-crawl: failed to fetch {child_url}: {e}");
+                continue;
+            }
+        };
+        queue.extend(child_payloads.into_iter().map(|p| QueueItem {
+            parent_uid: Some(uid_counter),
+            path: new_path.clone(),
+            payload: p,
+            level: item.level + 1,
+        }));
+    }
+
+    nodes_writer.flush()?;
+
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let meta = json!({
+        "generated_at": timestamp,
+        "node_count": total_written,
+        "folder_count": folder_count,
+        "link_count": link_count,
+        "root_query": root_query,
+    });
+    let meta_path = out_dir.join("meta.json");
+    fs::write(&meta_path, serde_json::to_vec_pretty(&meta)?)?;
+
+    eprintln!(
+        "tree-crawl: captured {total_written} nodes (folders={folder_count}, links={link_count}) in {}",
+        out_dir.display()
+    );
+    Ok(())
 }
 
 // ----- publish-release (port of src/ato_mcp/indexer/release.py:publish) -----
