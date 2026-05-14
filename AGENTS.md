@@ -47,8 +47,8 @@ source-derived version/effective-date data that can support the feature safely.
 
 ## Install
 
-End users install the Rust binary from GitHub Releases. Do not install the
-Python package on user machines.
+End users install the Rust binary from GitHub Releases. There is no
+Python package — the Rust binary is the entire product.
 
 1. Download the platform asset from the latest release:
    - Linux x64: `ato-mcp-x86_64-unknown-linux-gnu.tar.gz`
@@ -135,13 +135,12 @@ Default search is intentionally current-guidance-first:
 
 ## Maintainer-Only Work
 
-Python is maintainer tooling only. Use it only on a machine that has the
-source corpus, model files, and a GPU-backed ONNX Runtime setup.
-Use `pip install -e '.[dev,gpu]'` for release builds; install the `cpu` and
-`gpu` extras separately because their ONNX Runtime wheels conflict.
-Maintainer corpus builds should pass `--gpu` and fail fast if CUDA is not
-available. The Rust end-user runtime must remain CPU-safe; do not make ordinary
-install, update, search, or serve require a GPU.
+Maintainer corpus builds happen via `cargo build --release && scripts/maintainer-sync.sh`
+on a machine with the source corpus, EmbeddingGemma model files, and a
+GPU-capable ONNX runtime. The Rust binary's `--gpu` flag should be set
+and the build should fail fast if CUDA is not available. The Rust
+end-user runtime must remain CPU-safe; do not make ordinary install,
+update, search, or serve require a GPU.
 Maintainer corpus rebuilds should run with sleep prevention active. `build-index`
 and `scripts/maintainer-sync.sh` do this automatically through `systemd-inhibit`
 or `caffeinate` when available.

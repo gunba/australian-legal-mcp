@@ -1,15 +1,15 @@
 # Maintainer Runbook
 
-End users install the Rust binary and never run the Python maintainer
+End users install the Rust binary and never run any of the publication
 commands. This file is for corpus publication only.
 
 ## What Runs Where
 
-- Rust binary: end-user CLI, updater, MCP server, search/fetch tools.
-- Python maintainer package: scrape, extract, chunk, GPU-backed embedding
-  build, pack generation, GitHub release upload.
-- GitHub Actions: cheap CI, cross-platform Rust binary release assets, and
-  an optional self-hosted GPU release workflow.
+- Rust binary: end-user CLI, updater, MCP server, search/fetch tools,
+  **and** the entire maintainer pipeline (scrape, extract, chunk,
+  embed, pack generation, GitHub release upload).
+- GitHub Actions: cheap CI, cross-platform Rust binary release assets,
+  and an optional self-hosted GPU corpus release workflow.
 
 The corpus build must use GPU-backed embeddings. If there is no suitable
 GitHub GPU runner, keep the build local. Do not silently fall back to a CPU
@@ -19,38 +19,27 @@ or keyword-only release build.
 
 ```bash
 cd /path/to/ato-mcp
-
-python -m venv .venv
-.venv/bin/pip install -e '.[dev]'
-# Swap CPU onnxruntime for the GPU build (end-users never load this Python
-# package — they ship with the Rust binary — so the heavier wheel is
-# isolated to the maintainer venv). Both packages provide the same
-# ``onnxruntime`` module name, so the CPU one must come off first or it
-# clobbers the GPU build.
-.venv/bin/pip uninstall -y onnxruntime
-.venv/bin/pip install -e '.[gpu]'
+cargo build --release
 
 ATO_MCP_MODE=incremental \
 ATO_MCP_REPO_DIR="$PWD" \
 ATO_MCP_PAGES_DIR="/path/to/ato_pages" \
 ATO_MCP_MODEL_DIR="$PWD/models/embeddinggemma" \
-ATO_MCP_RERANKER_BUNDLE="$PWD/models/reranker" \
-ATO_MCP_RERANKER_URL="hf://Alibaba-NLP/gte-reranker-modernbert-base@<revision-sha>" \
 ATO_MCP_GH_REPO=gunba/ato-mcp \
 scripts/maintainer-sync.sh
 ```
 
 `scripts/maintainer-sync.sh` will:
 
-1. Refresh `ato_pages` in the requested mode, then always run the
-   incremental What's New refresh as the final pre-build source step.
-2. Build `release/<tag>/ato.db`, packs, and `manifest.json`.
+1. Refresh `ato_pages` in the requested mode (incremental, catch_up, full),
+   then always run the incremental What's New refresh as the final
+   pre-build source step.
+2. Build `release/<tag>/ato.db`, packs, and `manifest.json` via
+   `ato-mcp build`.
 3. Write the pinned Hugging Face EmbeddingGemma source into the manifest,
    unless `ATO_MCP_MODEL_URL` points at an approved mirror.
-4. Add the optional reranker manifest entry when `ATO_MCP_RERANKER_BUNDLE`
-   or the explicit `ATO_MCP_RERANKER_*` env vars are set.
-5. Upload the corpus assets with `.venv/bin/ato-mcp release`.
-6. Mark the release latest.
+4. Upload the corpus assets via `ato-mcp publish-release`.
+5. Mark the release latest.
 
 Weekly release runs should use `ATO_MCP_MODE=incremental`. The full-tree
 `catch_up` mode is for proving genuinely missing canonical IDs after a
@@ -64,9 +53,10 @@ model, or reranker-only publications. After a successful publication,
 `release/.latest` points at the whole release directory so the next
 incremental run can reuse both `manifest.json` and prior `packs/`.
 
-The script requires `nvidia-smi`/CUDA to be available through the local
-Python ONNX Runtime install. If CUDA is unavailable, fix the environment
-instead of publishing a degraded corpus.
+The script requires `nvidia-smi`/CUDA to be available so the Rust
+binary's bundled `ort` runtime can use the CUDA execution provider. If
+CUDA is unavailable, fix the environment instead of publishing a
+degraded corpus.
 
 Manifest signing with `--sign-key` requires the `minisign` CLI on `PATH`.
 
@@ -104,8 +94,8 @@ scripts/publish-release.sh v0.3.0 gunba/ato-mcp
 Set `ATO_MCP_MODEL_URL` only when publishing against an approved model mirror.
 By default the manifest points at pinned Hugging Face EmbeddingGemma files.
 This uploads manifest and packs to GitHub Releases; it does not upload the
-model to GitHub, build Python wheels, or duplicate the corpus into an offline
-bundle by default. Do not publish DB-derived repacks.
+model to GitHub or duplicate the corpus into an offline bundle by default.
+Do not publish DB-derived repacks.
 
 For an explicit air-gapped install package:
 
@@ -206,7 +196,6 @@ ONNX from the Hugging Face URL on first use.
 ato-mcp stats
 ato-mcp doctor
 cargo test --locked
-.venv/bin/pytest -q
 ```
 
 Watch for:

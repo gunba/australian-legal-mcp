@@ -289,88 +289,69 @@ ato-mcp/
 
 ## Maintainer Workflow
 
-The Rust binary is the end-user product. Python remains maintainer tooling
-for scraping, metadata extraction, vector generation, pack building, and
-release publication.
+The Rust binary is the end-user product **and** the maintainer tool. The
+Python pipeline that used to do scraping, metadata extraction, vector
+generation, pack building, and release publication has been retired —
+all of it now ships as `ato-mcp` subcommands.
 
 Local GPU release build:
 
 ```bash
-python -m venv .venv
-.venv/bin/pip install -e '.[dev,gpu]'
+cargo build --release
 
-.venv/bin/ato-mcp refresh-source \
-  --mode incremental \
-  --output-dir /path/to/ato_pages
+./target/release/ato-mcp scrape-diff \
+  --index         /path/to/ato_pages/index.jsonl \
+  --whats-new-url https://www.ato.gov.au/law/view/whatsnew.htm?fid=whatsnew \
+  --out           /tmp/whats_new_pending.jsonl
 
-LD_LIBRARY_PATH="$(find .venv/lib*/python3.*/site-packages/nvidia/ -maxdepth 2 -name lib -type d | tr '\n' ':')$LD_LIBRARY_PATH" \
-  .venv/bin/ato-mcp build-index \
+./target/release/ato-mcp link-download \
+  --deduped-links /tmp/whats_new_pending.jsonl \
+  --out-dir       /path/to/ato_pages
+
+./target/release/ato-mcp build \
   --pages-dir /path/to/ato_pages \
-  --out-dir ./release \
-  --db-path ./release/ato.db \
-  --model-path ./models/embeddinggemma/onnx/model_quantized.onnx \
-  --tokenizer-path ./models/embeddinggemma/tokenizer.json \
-  --gpu
+  --db-path   ./release/ato.db \
+  --out-dir   ./release
 
-.venv/bin/ato-mcp release \
+./target/release/ato-mcp publish-release \
   --out-dir ./release \
-  --tag v0.3.0 \
-  --repo gunba/ato-mcp \
-  --model-dir ./models/embeddinggemma \
+  --tag     v0.8.0 \
+  --repo    gunba/ato-mcp \
   --overwrite
 ```
 
-Run the incremental What's New refresh immediately before every release build.
-If it changes `ato_pages/index.jsonl`, rebuild from that refreshed source before
-publishing.
+For full crawls (rare, hours):
 
-`build-index` consumes local model files only to embed the corpus. Hosted model
-and reranker distribution metadata is resolved in the `release` step, not in the
-corpus build step.
+```bash
+./target/release/ato-mcp tree-crawl --out-dir snapshots/$(date -u +%Y%m%dT%H%M%SZ)
+./target/release/ato-mcp snapshot-reduce --nodes-path snapshots/.../nodes.jsonl
+./target/release/ato-mcp link-download --deduped-links snapshots/.../deduped_links.jsonl --out-dir /path/to/ato_pages
+```
 
-For faster local rebuilds while tuning extraction/chunking, use a smaller
-`--limit` smoke corpus first. `scripts/maintainer-sync.sh` also accepts
-`ATO_MCP_BUILD_WORKERS`, `ATO_MCP_WINDOW_DOCS`, `ATO_MCP_ENCODE_BATCH_SIZE`,
-`ATO_MCP_MAX_BATCH_TOKENS`, `ATO_MCP_CHECKPOINT_EVERY`,
-`ATO_MCP_PACK_TARGET_MB`, and
-`ATO_MCP_UNSAFE_FAST_SQLITE=1` for maintainer scratch builds. `--gpu` defaults
-to larger embedding batches than CPU, with a conservative padded-token cap for
-12 GB CUDA cards. Both fresh and previous-manifest builds
-use windowed, length-bucketed embedding batches; unchanged documents still reuse
-prior pack records. By default, full builds commit a resumable checkpoint every
-20,000 prepared records, so a later extractor or embed failure loses only the
-current window and a rerun skips already sealed documents. The build log prints
-per-window prepare/embed/write timing, token throughput, batch size, and
-approximate padded-token pressure so you can tune those values from evidence.
+`scripts/maintainer-sync.sh` wraps all three modes (`incremental`,
+`catch_up`, `full`) and handles release publication. Drive it from the
+provided `systemd/ato-mcp-maintainer-sync.service` unit on a GPU host.
 
-Long maintainer runs automatically inhibit system sleep when the host provides
-`systemd-inhibit` or macOS `caffeinate`. `build-index` protects direct corpus
-rebuilds, and `scripts/maintainer-sync.sh` protects the full scrape, rebuild,
-and release flow. Set `ATO_MCP_ALLOW_SLEEP=1` only for short local checks where
-sleep prevention is unwanted.
+Release builds use EmbeddingGemma vectors and should run on the
+maintainer GPU. The Rust end-user runtime does not require a GPU; query
+embedding and reranking must continue to work on ordinary CPU-only
+laptops. The model is not uploaded to GitHub Releases; by default the
+manifest points at pinned Hugging Face EmbeddingGemma files, and the
+Rust client downloads and verifies them during `ato-mcp update`. The
+model URL can be redirected at release time via `--model-url` /
+`--model-sha256` / `--model-size`.
 
-Release builds use EmbeddingGemma vectors and should run on the maintainer GPU.
-The Rust end-user runtime does not require a GPU; query embedding and reranking
-must continue to work on ordinary CPU-only laptops. The model is not uploaded to
-GitHub Releases; by default the manifest points at pinned Hugging Face
-EmbeddingGemma files, and the Rust client downloads and verifies them during
-`ato-mcp update`. The model URL can be redirected at release time as documented
-under [Enterprise / corporate environments](#enterprise--corporate-environments).
-Corpus releases must come from `build-index`; DB-derived repack scripts are not
-a supported release path. A full current corpus should use the current 64 MB
-pack target, which is about a dozen pack assets rather than dozens of small
-packs.
-Explicit `mode=keyword` is a query-time FTS mode, not an alternative corpus
-embedder. The optional `corpus release (gpu)` workflow targets a self-hosted
-runner labelled `gpu` and fails if `nvidia-smi` or ONNX Runtime's
-`CUDAExecutionProvider` is unavailable. It is not scheduled by default, so it
-does not spend hosted GPU minutes.
+Corpus releases must come from `ato-mcp build`; DB-derived repack
+scripts are not a supported release path. The optional
+`corpus release (gpu)` workflow targets a self-hosted runner labelled
+`gpu` and fails if `nvidia-smi` is unavailable. It is not scheduled by
+default, so it does not spend hosted GPU minutes.
 
 ## Development
 
 ```bash
 cargo test --locked
-.venv/bin/pytest -q
+cargo clippy --all-targets --all-features --locked -- -D warnings
 ```
 
 Published corpus/install smoke test:
@@ -387,8 +368,8 @@ ATO_MCP_MODEL_BUNDLE=/path/to/embeddinggemma-bundle.tar.zst \
 scripts/make-offline-bundle.sh ./release/ato-mcp-offline-bundle.tar.zst
 ```
 
-CI runs both the Rust binary checks and the Python maintainer test suite.
-Release binary assets are produced by `.github/workflows/release-binaries.yml`.
+CI runs the Rust binary checks. Release binary assets are produced by
+`.github/workflows/release-binaries.yml`.
 
 ## Corporate Windows Builds from Source
 
