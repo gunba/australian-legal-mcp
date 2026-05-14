@@ -423,6 +423,25 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Rewrite a manifest.json so packs/model URLs point at filenames
+    /// inside an offline bundle (with fresh SHA256 + size). Used by
+    /// scripts/make-offline-bundle.sh as the post-bundling step. Also
+    /// emits update.json (UpdateSummary).
+    BundleLocalizeManifest {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        packs_dir: PathBuf,
+        #[arg(long)]
+        model_bundle: PathBuf,
+    },
+    /// Recompute the citations table on an existing ato-mcp DB by scanning
+    /// chunk text for [doc:X] markers. Mirrors scripts/backfill-citations.py.
+    BackfillCitations {
+        /// Path to ato.db. Defaults to ~/.local/share/ato-mcp/live/ato.db.
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
     /// Publish a corpus release to GitHub. Mirrors
     /// src/ato_mcp/indexer/release.py:publish — rewrites manifest URLs to
     /// release asset URLs, fixes embedding-model fields if they're
@@ -681,6 +700,12 @@ fn main() -> Result<()> {
             path_prefix,
             out,
         } => scrape_diff(&index, deduped.as_deref(), whats_new_url.as_deref(), path_prefix.as_deref(), &out),
+        Command::BundleLocalizeManifest {
+            manifest,
+            packs_dir,
+            model_bundle,
+        } => bundle_localize_manifest(&manifest, &packs_dir, &model_bundle),
+        Command::BackfillCitations { db } => backfill_citations(db.as_deref()),
         Command::FetchExternalDoc {
             doc_id,
             pit,
@@ -8879,6 +8904,128 @@ fn scrape_diff(
     for (cat, n) in sorted_cats.iter().take(10) {
         eprintln!("  {n:>5} {cat}");
     }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    use std::io::Read as _;
+    let mut hasher = Sha256::new();
+    let mut f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut buf = [0u8; 1024 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn bundle_localize_manifest(
+    manifest_path: &Path,
+    packs_dir: &Path,
+    model_bundle: &Path,
+) -> Result<()> {
+    let mut manifest: JsonValue = serde_json::from_str(
+        &fs::read_to_string(manifest_path)?,
+    )
+    .with_context(|| format!("parsing {}", manifest_path.display()))?;
+
+    if let Some(packs) = manifest.get_mut("packs").and_then(|v| v.as_array_mut()) {
+        for pack in packs {
+            let url = pack
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let filename = std::path::Path::new(&url)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&url)
+                .to_string();
+            let pack_path = packs_dir.join(&filename);
+            if !pack_path.exists() {
+                bail!("manifest references missing pack: {}", filename);
+            }
+            pack["url"] = JsonValue::String(format!("packs/{filename}"));
+            pack["sha256"] = JsonValue::String(sha256_file(&pack_path)?);
+            pack["size"] = JsonValue::Number(serde_json::Number::from(
+                fs::metadata(&pack_path)?.len(),
+            ));
+        }
+    }
+
+    let model_filename = model_bundle
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow!("model bundle has no filename"))?;
+    if let Some(model) = manifest.get_mut("model") {
+        model["url"] = JsonValue::String(model_filename.to_string());
+        model["sha256"] = JsonValue::String(sha256_file(model_bundle)?);
+        model["size"] = JsonValue::Number(serde_json::Number::from(
+            fs::metadata(model_bundle)?.len(),
+        ));
+    }
+
+    fs::write(manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+
+    let summary = json!({
+        "schema_version": manifest.get("schema_version").cloned().unwrap_or(JsonValue::Null),
+        "index_version": manifest.get("index_version").cloned().unwrap_or(JsonValue::Null),
+        "min_client_version": manifest.get("min_client_version").cloned().unwrap_or(JsonValue::String(String::new())),
+        "model": manifest.get("model").cloned().unwrap_or(JsonValue::Null),
+        "reranker": manifest.get("reranker").cloned().unwrap_or(JsonValue::Null),
+        "document_count": manifest
+            .get("documents")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0),
+        "pack_count": manifest
+            .get("packs")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0),
+    });
+    let summary_path = manifest_path
+        .parent()
+        .map(|p| p.join("update.json"))
+        .ok_or_else(|| anyhow!("manifest has no parent dir"))?;
+    fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?)?;
+
+    eprintln!(
+        "bundle-localize-manifest: rewrote {} + {}",
+        manifest_path.display(),
+        summary_path.display(),
+    );
+    Ok(())
+}
+
+fn backfill_citations(db: Option<&Path>) -> Result<()> {
+    let default_path = dirs::data_dir()
+        .map(|d| d.join("ato-mcp").join("live").join("ato.db"))
+        .ok_or_else(|| anyhow!("no data dir"))?;
+    let db_path = db.unwrap_or(default_path.as_path());
+    if !db_path.exists() {
+        bail!("db not found: {}", db_path.display());
+    }
+    let conn = open_write_at(db_path)?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS citations (
+            source_chunk_id  INTEGER NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+            source_doc_id    TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+            target_doc_id    TEXT NOT NULL,
+            PRIMARY KEY (source_chunk_id, target_doc_id)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_citations_target ON citations(target_doc_id)",
+        [],
+    )?;
+    let t0 = std::time::Instant::now();
+    derive_citations(&conn)?;
+    eprintln!("backfill complete in {:.1}s", t0.elapsed().as_secs_f64());
     Ok(())
 }
 

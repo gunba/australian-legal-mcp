@@ -64,65 +64,17 @@ else
     | zstd -T0 -3 -o "$MIRROR/embeddinggemma-bundle.tar.zst"
 fi
 
-python3 - "$MIRROR/manifest.json" "$MIRROR/packs" "$MIRROR/embeddinggemma-bundle.tar.zst" <<'PY'
-import hashlib
-import json
-import sys
-from pathlib import Path
-
-manifest_path = Path(sys.argv[1])
-packs_dir = Path(sys.argv[2])
-model_bundle = Path(sys.argv[3])
-
-def sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-for pack in manifest["packs"]:
-    pack_path = packs_dir / Path(pack["url"]).name
-    if not pack_path.exists():
-        raise SystemExit(f"manifest references missing pack: {pack_path.name}")
-    pack["url"] = f"packs/{pack_path.name}"
-    pack["sha256"] = sha256(pack_path)
-    pack["size"] = pack_path.stat().st_size
-
-manifest["model"]["url"] = model_bundle.name
-manifest["model"]["sha256"] = sha256(model_bundle)
-manifest["model"]["size"] = model_bundle.stat().st_size
-
-manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
-summary = {
-    "schema_version": manifest["schema_version"],
-    "index_version": manifest["index_version"],
-    "min_client_version": manifest.get("min_client_version", ""),
-    "model": manifest["model"],
-    "reranker": manifest.get("reranker"),
-    "document_count": len(manifest.get("documents", [])),
-    "pack_count": len(manifest.get("packs", [])),
-}
-(manifest_path.parent / "update.json").write_text(
-    json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
-)
-PY
+"$BIN" bundle-localize-manifest \
+  --manifest     "$MIRROR/manifest.json" \
+  --packs-dir    "$MIRROR/packs" \
+  --model-bundle "$MIRROR/embeddinggemma-bundle.tar.zst"
 
 ATO_MCP_DATA_DIR="$DATA_DIR" "$BIN" update --manifest-url "$MIRROR/manifest.json"
 ATO_MCP_DATA_DIR="$DATA_DIR" "$BIN" doctor
 
-python3 - "$DATA_DIR/live/ato.db" <<'PY'
-import sqlite3
-import sys
-
-conn = sqlite3.connect(sys.argv[1])
-try:
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    conn.execute("PRAGMA optimize")
-finally:
-    conn.close()
-PY
+if command -v sqlite3 >/dev/null 2>&1; then
+  sqlite3 "$DATA_DIR/live/ato.db" 'PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;'
+fi
 rm -f "$DATA_DIR/LOCK" "$DATA_DIR/live/ato.db-shm" "$DATA_DIR/live/ato.db-wal"
 rm -rf "$DATA_DIR/backups" "$DATA_DIR/staging"
 
