@@ -8,7 +8,7 @@ ATO material and apply professional judgment before relying on an answer.
 
 The installed server is a Rust binary. End users do not need Python, pip,
 pipx, uv, a compiler, `gh`, or an API key. The corpus is shipped as GitHub
-release assets, while the EmbeddingGemma query encoder is downloaded from the
+release assets, while the Granite embedding query encoder is downloaded from the
 external URL recorded in the release manifest.
 
 ## Tools
@@ -100,7 +100,7 @@ to delay or block first run:
 
 - **Egress allow-list.** `ato-mcp update` fetches from two hosts:
   `github.com` (release manifest + pack assets) and `huggingface.co`
-  (EmbeddingGemma model). Both need to be reachable. The release URL
+  (Granite embedding model). Both need to be reachable. The release URL
   base can be overridden with `ATO_MCP_RELEASES_URL` to point at an
   internal mirror; the model URL is recorded in `manifest.model.url` and
   can be redirected at release time with `--model-url`.
@@ -209,7 +209,7 @@ disables the update-availability probe entirely.
 
 Default search is tuned for current public tax-law work:
 
-- `search` defaults to `mode=hybrid`, combining EmbeddingGemma vector retrieval
+- `search` defaults to `mode=hybrid`, combining Granite vector retrieval
   with lexical ranking. `mode=vector` and explicit `mode=keyword` are available;
   hybrid/vector fail rather than silently downgrading when semantic search is
   unavailable.
@@ -278,8 +278,8 @@ ato-mcp/
 ├── live/
 │   ├── ato.db
 │   ├── assets/
-│   ├── model_quantized.onnx
-│   ├── model_quantized.onnx_data
+│   ├── model_fp16.onnx
+│   ├── model_fp16.onnx_data
 │   └── tokenizer.json
 ├── installed_manifest.json
 ├── backups/ato.db.prev
@@ -297,7 +297,7 @@ all of it now ships as `ato-mcp` subcommands.
 Local GPU release build:
 
 ```bash
-cargo build --release
+cargo build --release --features cuda
 
 ./target/release/ato-mcp scrape-diff \
   --index         /path/to/ato_pages/index.jsonl \
@@ -332,11 +332,11 @@ For full crawls (rare, hours):
 `catch_up`, `full`) and handles release publication. Drive it from the
 provided `systemd/ato-mcp-maintainer-sync.service` unit on a GPU host.
 
-Release builds use EmbeddingGemma vectors and should run on the
+Release builds use Granite embedding vectors and should run on the
 maintainer GPU. The Rust end-user runtime does not require a GPU; query
 embedding must continue to work on ordinary CPU-only laptops. The model is not
 uploaded to GitHub Releases; by default the
-manifest points at pinned Hugging Face EmbeddingGemma files, and the
+manifest points at pinned Hugging Face Granite embedding files, and the
 Rust client downloads and verifies them during `ato-mcp update`. The
 model URL can be redirected at release time via `--model-url` /
 `--model-sha256` / `--model-size`.
@@ -364,7 +364,7 @@ Offline bundles are materialized through the Rust installer:
 
 ```bash
 ATO_MCP_RELEASE_DIR=./release/index-2026.05.02 \
-ATO_MCP_MODEL_BUNDLE=/path/to/embeddinggemma-bundle.tar.zst \
+ATO_MCP_MODEL_BUNDLE=/path/to/semantic-model-bundle.tar.zst \
 scripts/make-offline-bundle.sh ./release/ato-mcp-offline-bundle.tar.zst
 ```
 
@@ -398,4 +398,4 @@ environments](#enterprise--corporate-environments) subsection above.
 ## License
 
 MIT. ATO content remains subject to the ATO's publication terms.
-EmbeddingGemma remains subject to the Gemma Terms of Use.
+Granite Embedding Small English R2 is distributed under Apache-2.0.

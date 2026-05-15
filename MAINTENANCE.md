@@ -19,12 +19,12 @@ or keyword-only release build.
 
 ```bash
 cd /path/to/ato-mcp
-cargo build --release
+cargo build --release --features cuda
 
 ATO_MCP_MODE=incremental \
 ATO_MCP_REPO_DIR="$PWD" \
 ATO_MCP_PAGES_DIR="/path/to/ato_pages" \
-ATO_MCP_MODEL_DIR="$PWD/models/embeddinggemma" \
+ATO_MCP_MODEL_DIR="$PWD/models/granite-embedding-small-r2" \
 ATO_MCP_GH_REPO=gunba/ato-mcp \
 scripts/maintainer-sync.sh
 ```
@@ -36,7 +36,7 @@ scripts/maintainer-sync.sh
    pre-build source step.
 2. Build `release/<tag>/ato.db`, packs, and `manifest.json` via
    `ato-mcp build`.
-3. Write the pinned Hugging Face EmbeddingGemma source into the manifest,
+3. Write the pinned Hugging Face Granite embedding source into the manifest,
    unless `ATO_MCP_MODEL_URL` points at an approved mirror.
 4. Upload the corpus assets via `ato-mcp publish-release`.
 5. Mark the release latest.
@@ -48,8 +48,8 @@ ATO served without extractable body content and should be treated as
 diagnostics unless a live document URL is known to have gained content.
 
 The script skips rebuilds when the refreshed `index.jsonl` hash is unchanged,
-except in `ATO_MCP_MODE=full`. Set `ATO_MCP_FORCE_REBUILD=1` for schema,
-model, or reranker-only publications. After a successful publication,
+except in `ATO_MCP_MODE=full`. Set `ATO_MCP_FORCE_REBUILD=1` for schema or
+model-only publications. After a successful publication,
 `release/.latest` points at the whole release directory so the next
 incremental run can reuse both `manifest.json` and prior `packs/`.
 
@@ -84,7 +84,7 @@ Run it by pushing a `v*` tag or via `workflow_dispatch`.
 
 ## Manual Corpus Publication
 
-After a local `build-index`:
+After a local `ato-mcp build`:
 
 ```bash
 jq '.packs | length' release/manifest.json
@@ -92,7 +92,7 @@ scripts/publish-release.sh v0.3.0 gunba/ato-mcp
 ```
 
 Set `ATO_MCP_MODEL_URL` only when publishing against an approved model mirror.
-By default the manifest points at pinned Hugging Face EmbeddingGemma files.
+By default the manifest points at pinned Hugging Face Granite embedding files.
 This uploads manifest and packs to GitHub Releases; it does not upload the
 model to GitHub or duplicate the corpus into an offline bundle by default.
 Do not publish DB-derived repacks.
@@ -106,89 +106,6 @@ scripts/make-offline-bundle.sh release/ato-mcp-offline-v0.3.0.tar.zst
 The offline bundle script runs the Rust installer against a local mirror of
 the manifest, packs, and model bundle, then packages the resulting data
 directory. Do not build offline bundles by copying `release/ato.db` directly.
-
-## Reranker model preparation
-
-Wave 3 (0.6.0+) introduces an optional cross-encoder reranker that the Rust
-runtime applies to the top-N hybrid candidates. The preferred model is
-`Alibaba-NLP/gte-reranker-modernbert-base`, using the quantized ONNX export
-(~151 MB on disk).
-
-The reranker is **optional**. A release built without `--reranker-bundle`
-leaves the manifest's `reranker` field `null` and the runtime falls back to
-the un-reranked hybrid score. End-user binaries continue to work; only the
-result quality drops.
-
-### One-off: build the bundle
-
-```bash
-mkdir -p ./reranker_bundle/onnx
-curl -fL -o ./reranker_bundle/onnx/model_quantized.onnx \
-    https://huggingface.co/Alibaba-NLP/gte-reranker-modernbert-base/resolve/<revision-sha>/onnx/model_quantized.onnx
-curl -fL -o ./reranker_bundle/tokenizer.json \
-    https://huggingface.co/Alibaba-NLP/gte-reranker-modernbert-base/resolve/<revision-sha>/tokenizer.json
-```
-
-The output directory contains:
-
-- `onnx/model_quantized.onnx` (~151 MB) — the quantized weights
-- `tokenizer.json` (~3.5 MB) — the tokenizer
-- `config.json` — model architecture metadata
-
-### Hosting
-
-Mirror the EmbeddingGemma pattern: pin to a specific Hugging Face revision
-URL so the Rust client always fetches the same artifact bytes. The manifest
-records this URL via `--reranker-url`. Format:
-
-```
-hf://Alibaba-NLP/gte-reranker-modernbert-base@<revision-sha>
-```
-
-The Rust client fetches exactly `onnx/model_quantized.onnx` under that
-revision and verifies it against `reranker.sha256`. Do not add alternate
-filename fallbacks or aliases. If a future exporter produces a different
-path, normalize the hosted artifact to this path before release and keep the
-manifest hash tied to the bytes at that path.
-
-The Rust client also downloads `tokenizer.json` from the same revision and
-renames the pair to `live/reranker.onnx` and `live/reranker_tokenizer.json`
-on disk. When `--reranker-bundle` includes a `tokenizer.json`, its sha256
-is auto-derived into `reranker.tokenizer_sha256` so the runtime can
-verify it byte-for-byte. Manifests built before this field landed (or
-publishers who omit `tokenizer.json` from the bundle) skip tokenizer
-verification with a one-line warning.
-
-When publishing a new revision, update the URL revision sha and re-run
-`ato-mcp release` with the new bundle so the manifest's sha256 advances.
-
-### Release CLI invocation
-
-```bash
-ato-mcp release \
-    --out-dir ./release \
-    --tag index-2026.05.06 \
-    --repo gunba/ato-mcp \
-    --model-dir ./models/embeddinggemma \
-    --reranker-bundle ./reranker_bundle \
-    --reranker-url 'hf://Alibaba-NLP/gte-reranker-modernbert-base@<revision-sha>' \
-    --overwrite
-```
-
-The `--reranker-bundle` flag computes sha256 + size from
-`reranker_bundle/onnx/model_quantized.onnx` automatically; pass
-`--reranker-sha256` / `--reranker-size` only to override the auto-computed
-values.
-
-If your bundle includes `tokenizer.json`, its sha256 is also auto-derived
-and embedded into `reranker.tokenizer_sha256`. Pass
-`--reranker-tokenizer-sha256` to override or to set it explicitly when the
-manifest points at an HF revision whose tokenizer you've vetted out of
-band.
-
-The bundle itself is **not** uploaded to GitHub Releases; only its
-fingerprint goes into `manifest.json`. The Rust runtime fetches the actual
-ONNX from the Hugging Face URL on first use.
 
 ## Health Checks
 
@@ -206,18 +123,11 @@ Watch for:
 - `ato-mcp doctor` failures after update.
 - Missing `CUDAExecutionProvider` before a release build.
 
-### CLI search mirrors the MCP server pipeline
+### CLI Search
 
 `ato-mcp search "..."` from the CLI runs the same `search()` code path the
-MCP server does, including the cross-encoder reranker when its model files
-are installed under `live/`. The reranker reorders results internally; its
-state is not surfaced on the wire (per the project's wire-hygiene rule),
-but `ATO_MCP_DISABLE_RERANKER=1` in the environment disables it for the
-process.
-
-This means CLI latency benchmarks reflect production behaviour. To
-A/B compare RRF-only vs. reranker-on, run the same query twice with and
-without `ATO_MCP_DISABLE_RERANKER=1` in the environment.
+MCP server does. CLI latency benchmarks therefore reflect production
+hybrid search behaviour.
 
 ## Do Not
 

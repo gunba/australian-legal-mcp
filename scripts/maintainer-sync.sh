@@ -8,8 +8,8 @@
 # Expects these env vars (set in the systemd unit or your shell):
 #   ATO_MCP_REPO_DIR   absolute path to this repo checkout
 #   ATO_MCP_PAGES_DIR  absolute path to ato_pages/ (default: $ATO_MCP_REPO_DIR/../ato_pages)
-#   ATO_MCP_MODEL_DIR  absolute path to the EmbeddingGemma dir holding
-#                      tokenizer.json and onnx/model_quantized.onnx
+#   ATO_MCP_MODEL_DIR  absolute path to the Granite embedding dir holding
+#                      tokenizer.json and onnx/model_fp16.onnx
 #   ATO_MCP_MODEL_URL  optional approved model mirror URL
 #   ATO_MCP_FORCE_REBUILD set to 1/true/yes/on to rebuild even when source did not change
 #   ATO_MCP_RELEASE_TAG  tag prefix (default: index)
@@ -42,8 +42,8 @@ fi
 
 REPO_DIR="${ATO_MCP_REPO_DIR:?set ATO_MCP_REPO_DIR}"
 PAGES_DIR="${ATO_MCP_PAGES_DIR:-$REPO_DIR/../ato_pages}"
-MODEL_DIR="${ATO_MCP_MODEL_DIR:?set ATO_MCP_MODEL_DIR (path to EmbeddingGemma checkout)}"
-MODEL_ONNX="$MODEL_DIR/onnx/model_quantized.onnx"
+MODEL_DIR="${ATO_MCP_MODEL_DIR:?set ATO_MCP_MODEL_DIR (path to Granite embedding checkout)}"
+MODEL_ONNX="$MODEL_DIR/onnx/model_fp16.onnx"
 TOKENIZER="$MODEL_DIR/tokenizer.json"
 MODEL_URL="${ATO_MCP_MODEL_URL:-}"
 MODEL_URL_ARG=()
@@ -65,10 +65,8 @@ else
     for nvidia_root in \
         "$REPO_DIR"/.venv/lib/python*/site-packages/nvidia \
         "$HOME"/.local/lib/python*/site-packages/nvidia; do
-        for component in cuda_runtime cublas cudnn cufft curand; do
-            if [[ -d "$nvidia_root/$component/lib" ]]; then
-                CUDA_LIB_DIRS+=("$nvidia_root/$component/lib")
-            fi
+        for component_lib in "$nvidia_root"/*/lib; do
+            [[ -d "$component_lib" ]] && CUDA_LIB_DIRS+=("$component_lib")
         done
     done
     shopt -u nullglob

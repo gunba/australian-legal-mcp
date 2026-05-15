@@ -135,22 +135,23 @@ Default search is intentionally current-guidance-first:
 
 ## Maintainer-Only Work
 
-Maintainer corpus builds happen via `cargo build --release && scripts/maintainer-sync.sh`
-on a machine with the source corpus, EmbeddingGemma model files, and a
+Maintainer corpus builds happen via `cargo build --release --features cuda && scripts/maintainer-sync.sh`
+on a machine with the source corpus, Granite embedding model files, and a
 GPU-capable ONNX runtime. The Rust binary's `--gpu` flag should be set
 and the build should fail fast if CUDA is not available. The Rust
 end-user runtime must remain CPU-safe; do not make ordinary install,
 update, search, or serve require a GPU.
-Maintainer corpus rebuilds should run with sleep prevention active. `build-index`
+Maintainer corpus rebuilds should run with sleep prevention active. `build`
 and `scripts/maintainer-sync.sh` do this automatically through `systemd-inhibit`
 or `caffeinate` when available.
 
-`build-index` consumes local embedding model files and writes corpus artifacts.
+`build` consumes local embedding model files and writes corpus artifacts.
 Do not thread hosted model URLs or other distribution metadata through corpus
 building. The `release` step owns model distribution metadata and final
 manifest publication.
 
-Do not run `refresh-source`, `catch-up`, `build-index`, or `release` on a
+Do not run `tree-crawl`, `link-download`, `scrape-diff`, `build`, or
+`publish-release` on a
 user install. Those commands require the maintainer checkout and model
 assets.
 

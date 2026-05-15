@@ -43,9 +43,9 @@ const TITLE_HITS_K: usize = 10;
 const SNIPPET_CHARS: usize = 280;
 const EMBEDDING_DIM: usize = 256;
 const EMBEDDING_INPUT_MAX_TOKENS: usize = 1024;
-const QUERY_PREFIX: &str = "task: search result | query: ";
-const EMBEDDINGGEMMA_HF_FINGERPRINT: &str =
-    "5d4d31914cdb65cd84d3248390946461efdd4ec4f99afd13d23218cd4060d706";
+const EMBEDDING_TEXT_PREFIX: &str = "";
+const EMBEDDING_MODEL_FINGERPRINT: &str =
+    "granite-small-r2-fp16:ee200de55cb2f94e858aabca54be7697a9c0805a14c858ee26ad0922b05f57d7:28d16e29cd623f25cc6fa0968700c5bc31036466091a5fa06d1353c1777f050e:feeb83348dcb033bc6b9d2e1f7906ca9eb2d122845000c9416d894d7c2927149";
 const OLD_CONTENT_CUTOFF: &str = "2000-01-01";
 const DEFAULT_EXCLUDED_TYPES: &[&str] = &["Edited_private_advice"];
 const LEGISLATION_TYPE: &str = "Legislation_and_supporting_material";
@@ -58,8 +58,8 @@ const SUPPORTED_SCHEMA_VERSION: u32 = 8;
 /// Single release manifest format (`Manifest.schema_version`) this binary
 /// ingests. No legacy manifest layouts are accepted.
 const SUPPORTED_MANIFEST_VERSION: u32 = 4;
-const EMBEDDING_MODEL_ID: &str = "embeddinggemma-300m-int8-256d";
-const BUILD_EMBED_BATCH_SIZE: usize = 128;
+const EMBEDDING_MODEL_ID: &str = "granite-embedding-small-r2-fp16-256d";
+const BUILD_EMBED_BATCH_SIZE: usize = 64;
 const BUILD_EMBED_PENDING_FLUSH_CHUNKS: usize = 4096;
 const BUILD_PACK_RECORDS_PER_SHARD: usize = 4096;
 const DEFAULT_MAX_PER_DOC: usize = 2;
@@ -244,11 +244,11 @@ enum Command {
         model_dir: PathBuf,
         #[arg(long)]
         out: PathBuf,
-        /// Files to include. Names starting with `model_quantized.onnx`
+        /// Files to include. Names starting with `model_`
         /// are looked up under `<model_dir>/onnx/`; others under `<model_dir>/`.
         #[arg(long, value_delimiter = ',', default_values_t = vec![
-            "model_quantized.onnx".to_string(),
-            "model_quantized.onnx_data".to_string(),
+            "model_fp16.onnx".to_string(),
+            "model_fp16.onnx_data".to_string(),
             "tokenizer.json".to_string(),
         ])]
         include: Vec<String>,
@@ -269,7 +269,7 @@ enum Command {
         #[arg(long, default_value_t = 30.0)]
         timeout_seconds: f64,
     },
-    /// Encode each input line as an EmbeddingGemma-quantized embedding.
+    /// Encode each input line as a quantized semantic embedding.
     /// Reads texts (one per line) from stdin or --input-file. Emits a JSON
     /// array of base64-encoded raw int8 byte strings (256 dims, 256 bytes
     /// per embedding) to stdout — same shape the build pipeline writes
@@ -911,7 +911,7 @@ fn main() -> Result<()> {
             {
                 let mut builder = tar::Builder::new(&mut tar_buf);
                 for name in &include {
-                    let candidate = if name.starts_with("model_quantized.onnx") {
+                    let candidate = if name.starts_with("model_") {
                         model_dir.join("onnx").join(name)
                     } else {
                         model_dir.join(name)
@@ -1204,7 +1204,7 @@ fn lock_path() -> Result<PathBuf> {
 }
 
 fn model_path() -> Result<PathBuf> {
-    Ok(live_dir()?.join("model_quantized.onnx"))
+    Ok(live_dir()?.join("model_fp16.onnx"))
 }
 
 fn tokenizer_path() -> Result<PathBuf> {
@@ -2011,13 +2011,13 @@ fn load_chunk_embedding(conn: &Connection, chunk_id: i64) -> Result<[i8; EMBEDDI
 }
 
 fn ensure_vector_search_ready(conn: &Connection) -> Result<()> {
-    // [MT-09] Hybrid/vector modes require an installed EmbeddingGemma semantic corpus.
+    // [MT-09] Hybrid/vector modes require the current semantic corpus model.
     let model_id = get_meta(conn, "embedding_model_id")?.ok_or_else(|| {
         anyhow!("semantic search unavailable: missing embedding_model_id metadata")
     })?;
-    if !model_id.starts_with("embeddinggemma") {
+    if model_id != EMBEDDING_MODEL_ID {
         bail!(
-            "semantic search unavailable: installed corpus uses unsupported embedding model `{model_id}`; install an EmbeddingGemma corpus"
+            "semantic search unavailable: installed corpus uses unsupported embedding model `{model_id}`; install a {EMBEDDING_MODEL_ID} corpus"
         );
     }
     if !model_path()?.exists() {
@@ -2263,7 +2263,7 @@ impl SemanticRuntime {
         }
         let prefixed: Vec<String> = queries
             .iter()
-            .map(|query| format!("{QUERY_PREFIX}{query}"))
+            .map(|query| format!("{EMBEDDING_TEXT_PREFIX}{query}"))
             .collect();
         let mut stats = SemanticEncodeStats::default();
         let started = std::time::Instant::now();
@@ -7651,9 +7651,9 @@ fn build_corpus(
         min_client_version: env!("CARGO_PKG_VERSION").to_string(),
         model: ModelInfo {
             id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: EMBEDDINGGEMMA_HF_FINGERPRINT.to_string(),
-            size: EMBEDDINGGEMMA_HF_SIZE,
-            url: EMBEDDINGGEMMA_HF_URL.to_string(),
+            sha256: EMBEDDING_MODEL_FINGERPRINT.to_string(),
+            size: EMBEDDING_MODEL_HF_SIZE,
+            url: EMBEDDING_MODEL_HF_URL.to_string(),
         },
         documents,
         packs,
@@ -9026,7 +9026,7 @@ fn doctor(rollback: bool) -> Result<()> {
     println!("documents: {docs}");
     println!("chunks: {chunks}");
     let model_id = get_meta(&conn, "embedding_model_id")?.unwrap_or_default();
-    if model_id.starts_with("embeddinggemma") {
+    if model_id == EMBEDDING_MODEL_ID {
         ensure_vector_search_ready(&conn)?;
         let embeddings: i64 =
             conn.query_row("SELECT COUNT(*) FROM chunk_embeddings", [], |r| r.get(0))?;
@@ -9097,24 +9097,24 @@ struct HfModelFile {
     size: u64,
 }
 
-const EMBEDDINGGEMMA_HF_FILES: &[HfModelFile] = &[
+const EMBEDDING_MODEL_HF_FILES: &[HfModelFile] = &[
     HfModelFile {
-        path: "onnx/model_quantized.onnx",
-        output_name: "model_quantized.onnx",
-        sha256: "172efde319fe1542dc41f31be6154910b05b78f7a861c265c4600eec906bd6d8",
-        size: 567_874,
+        path: "onnx/model_fp16.onnx",
+        output_name: "model_fp16.onnx",
+        sha256: "ee200de55cb2f94e858aabca54be7697a9c0805a14c858ee26ad0922b05f57d7",
+        size: 200_792,
     },
     HfModelFile {
-        path: "onnx/model_quantized.onnx_data",
-        output_name: "model_quantized.onnx_data",
-        sha256: "705626e28e4c23c82ade34566b4197d97f534c12275fa406dfb71e9937d388c0",
-        size: 308_890_624,
+        path: "onnx/model_fp16.onnx_data",
+        output_name: "model_fp16.onnx_data",
+        sha256: "28d16e29cd623f25cc6fa0968700c5bc31036466091a5fa06d1353c1777f050e",
+        size: 97_402_880,
     },
     HfModelFile {
         path: "tokenizer.json",
         output_name: "tokenizer.json",
-        sha256: "4dda02faaf32bc91031dc8c88457ac272b00c1016cc679757d1c441b248b9c47",
-        size: 20_323_312,
+        sha256: "feeb83348dcb033bc6b9d2e1f7906ca9eb2d122845000c9416d894d7c2927149",
+        size: 2_128_614,
     },
 ];
 
@@ -9386,7 +9386,7 @@ fn insert_docs_from_packs(
 }
 
 fn semantic_backfill_required_for_model(conn: &Connection, model_id: &str) -> Result<bool> {
-    if !model_id.starts_with("embeddinggemma") {
+    if model_id != EMBEDDING_MODEL_ID {
         return Ok(false);
     }
     let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?;
@@ -9398,7 +9398,7 @@ fn semantic_backfill_required_for_model(conn: &Connection, model_id: &str) -> Re
 }
 
 fn verify_semantic_install(conn: &Connection, manifest: &Manifest) -> Result<()> {
-    if !manifest.model.id.starts_with("embeddinggemma") {
+    if manifest.model.id != EMBEDDING_MODEL_ID {
         return Ok(());
     }
     let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?;
@@ -10945,9 +10945,9 @@ fn bundle_localize_manifest(
 
 // ----- publish-release (port of src/ato_mcp/indexer/release.py:publish) -----
 
-const EMBEDDINGGEMMA_HF_URL: &str =
-    "https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX/resolve/main/model.tar.zst";
-const EMBEDDINGGEMMA_HF_SIZE: u64 = 329_781_810;
+const EMBEDDING_MODEL_HF_URL: &str =
+    "hf://onnx-community/granite-embedding-small-english-r2-ONNX@main";
+const EMBEDDING_MODEL_HF_SIZE: u64 = 99_732_286;
 
 struct PublishReleaseArgs {
     out_dir: PathBuf,
@@ -11012,7 +11012,7 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
     let mut manifest: Manifest = serde_json::from_str(&raw)
         .with_context(|| format!("parsing {}", manifest_path.display()))?;
 
-    if manifest.model.id.starts_with("embeddinggemma") {
+    if manifest.model.id == EMBEDDING_MODEL_ID {
         let explicit_model_url = args.model_url.is_some();
         let mut model_url = args
             .model_url
@@ -11023,10 +11023,10 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
             || (is_github_url(&model_url) && !explicit_model_url);
 
         let (sha256, size) = if needs_default {
-            model_url = EMBEDDINGGEMMA_HF_URL.to_string();
+            model_url = EMBEDDING_MODEL_HF_URL.to_string();
             (
-                EMBEDDINGGEMMA_HF_FINGERPRINT.to_string(),
-                EMBEDDINGGEMMA_HF_SIZE,
+                EMBEDDING_MODEL_FINGERPRINT.to_string(),
+                EMBEDDING_MODEL_HF_SIZE,
             )
         } else if is_hf_url(&model_url) {
             (
@@ -11034,15 +11034,15 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
                     .clone()
                     .or_else(|| Some(manifest.model.sha256.clone()))
                     .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| EMBEDDINGGEMMA_HF_FINGERPRINT.to_string()),
+                    .unwrap_or_else(|| EMBEDDING_MODEL_FINGERPRINT.to_string()),
                 args.model_size
                     .or(Some(manifest.model.size))
                     .filter(|n| *n > 0)
-                    .unwrap_or(EMBEDDINGGEMMA_HF_SIZE),
+                    .unwrap_or(EMBEDDING_MODEL_HF_SIZE),
             )
         } else {
             if is_github_url(&model_url) {
-                bail!("EmbeddingGemma model bundles must not be hosted on GitHub");
+                bail!("semantic model bundles must not be hosted on GitHub");
             }
             let sha = args
                 .model_sha256
@@ -11053,7 +11053,7 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
         };
 
         if sha256.is_empty() || size == 0 {
-            bail!("EmbeddingGemma releases require model sha256 and size");
+            bail!("semantic model releases require model sha256 and size");
         }
         manifest.model.sha256 = sha256;
         manifest.model.size = size;
@@ -11174,14 +11174,14 @@ fn model_info_matches(left: &ModelInfo, right: &ModelInfo) -> bool {
 
 fn embedding_model_marker_value(info: &ModelInfo) -> String {
     if info.sha256.is_empty() && parse_hf_model_url(&info.url).is_some() {
-        EMBEDDINGGEMMA_HF_FINGERPRINT.to_string()
+        EMBEDDING_MODEL_FINGERPRINT.to_string()
     } else {
         info.sha256.clone()
     }
 }
 
 fn embedding_model_installed_matches(info: &ModelInfo) -> Result<bool> {
-    if !info.id.starts_with("embeddinggemma") {
+    if info.id != EMBEDDING_MODEL_ID {
         return Ok(false);
     }
     let marker_value = embedding_model_marker_value(info);
@@ -11396,10 +11396,10 @@ fn verify_sha256_file(path: &Path, expected: &str) -> Result<()> {
 }
 
 fn ensure_model(manifest: &Manifest, context: &UrlContext, staging: &Path) -> Result<()> {
-    if !manifest.model.id.starts_with("embeddinggemma") {
+    if manifest.model.id != EMBEDDING_MODEL_ID {
         bail!(
-            "semantic search requires an EmbeddingGemma model bundle; manifest uses `{}`",
-            manifest.model.id
+            "semantic search requires a {EMBEDDING_MODEL_ID} model bundle; manifest uses `{}`",
+            manifest.model.id,
         );
     }
     let live_model = model_path()?;
@@ -11407,7 +11407,7 @@ fn ensure_model(manifest: &Manifest, context: &UrlContext, staging: &Path) -> Re
     let marker = live_dir()?.join(".model.sha256");
     let marker_value =
         if manifest.model.sha256.is_empty() && parse_hf_model_url(&manifest.model.url).is_some() {
-            EMBEDDINGGEMMA_HF_FINGERPRINT
+            EMBEDDING_MODEL_FINGERPRINT
         } else {
             manifest.model.sha256.as_str()
         };
@@ -11455,7 +11455,7 @@ fn ensure_model(manifest: &Manifest, context: &UrlContext, staging: &Path) -> Re
 
 fn install_hf_embedding_model(repo: &str, revision: &str, staging: &Path) -> Result<()> {
     fs::create_dir_all(staging)?;
-    for file in EMBEDDINGGEMMA_HF_FILES {
+    for file in EMBEDDING_MODEL_HF_FILES {
         let url = hf_resolve_url(repo, revision, file.path);
         let part = staging.join(format!("{}.part", file.output_name));
         fetch_http_to_file(&url, &part)
@@ -13650,7 +13650,7 @@ mod tests {
             created_at: "2026-05-04T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
             model: ModelInfo {
-                id: "embeddinggemma-test".to_string(),
+                id: EMBEDDING_MODEL_ID.to_string(),
                 sha256: "installed-sha".to_string(),
                 size: 5,
                 url: "model-bundle.tar.zst".to_string(),
@@ -13705,7 +13705,7 @@ mod tests {
             created_at: "2026-05-04T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
             model: ModelInfo {
-                id: "embeddinggemma-test".to_string(),
+                id: EMBEDDING_MODEL_ID.to_string(),
                 sha256: model_sha.to_string(),
                 size: 5,
                 url: "model-bundle.tar.zst".to_string(),
@@ -13737,7 +13737,7 @@ mod tests {
                 installed_manifest_path()?,
                 serde_json::to_vec_pretty(&manifest)?,
             )?;
-            fs::write(live_dir()?.join("model_quantized.onnx"), b"model")?;
+            fs::write(model_path()?, b"model")?;
             fs::write(live_dir()?.join("tokenizer.json"), br#"{"version":"1.0"}"#)?;
             fs::write(live_dir()?.join(".model.sha256"), model_sha)?;
             check_for_update_availability(manifest_path.to_str().expect("utf-8 path"))
@@ -14663,7 +14663,7 @@ mod tests {
         write_test_tar_zst(
             &model_bundle,
             &[
-                ("model_quantized.onnx", b"dummy onnx bytes"),
+                ("model_fp16.onnx", b"dummy onnx bytes"),
                 ("tokenizer.json", br#"{"version":"1.0","truncation":null}"#),
             ],
         )?;
@@ -14700,7 +14700,7 @@ mod tests {
             created_at: "2026-05-01T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
             model: ModelInfo {
-                id: "embeddinggemma-test".to_string(),
+                id: EMBEDDING_MODEL_ID.to_string(),
                 sha256: sha256_hex(&model_bundle_bytes),
                 size: model_bundle_bytes.len() as u64,
                 url: "model-bundle.tar.zst".to_string(),
@@ -14771,7 +14771,7 @@ mod tests {
         write_test_tar_zst(
             &model_bundle,
             &[
-                ("model_quantized.onnx", b"dummy onnx bytes"),
+                ("model_fp16.onnx", b"dummy onnx bytes"),
                 ("tokenizer.json", br#"{"version":"1.0","truncation":null}"#),
             ],
         )?;
@@ -14804,7 +14804,7 @@ mod tests {
             created_at: "2026-05-01T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
             model: ModelInfo {
-                id: "embeddinggemma-test".to_string(),
+                id: EMBEDDING_MODEL_ID.to_string(),
                 sha256: sha256_hex(&model_bundle_bytes),
                 size: model_bundle_bytes.len() as u64,
                 url: "model-bundle.tar.zst".to_string(),
@@ -14859,7 +14859,7 @@ mod tests {
         write_test_tar_zst(
             &model_bundle,
             &[
-                ("model_quantized.onnx", b"dummy onnx bytes"),
+                ("model_fp16.onnx", b"dummy onnx bytes"),
                 ("tokenizer.json", br#"{"version":"1.0","truncation":null}"#),
             ],
         )?;
@@ -14892,7 +14892,7 @@ mod tests {
             created_at: "2026-05-01T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
             model: ModelInfo {
-                id: "embeddinggemma-test".to_string(),
+                id: EMBEDDING_MODEL_ID.to_string(),
                 sha256: sha256_hex(&model_bundle_bytes),
                 size: model_bundle_bytes.len() as u64,
                 url: "model-bundle.tar.zst".to_string(),
@@ -14988,7 +14988,7 @@ mod tests {
             created_at: "2026-05-04T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
             model: ModelInfo {
-                id: "embeddinggemma-test".to_string(),
+                id: EMBEDDING_MODEL_ID.to_string(),
                 sha256: model_sha.to_string(),
                 size: 5,
                 url: "model-bundle.tar.zst".to_string(),
@@ -15018,7 +15018,7 @@ mod tests {
                 installed_manifest_path()?,
                 serde_json::to_vec_pretty(&manifest)?,
             )?;
-            fs::write(live_dir()?.join("model_quantized.onnx"), b"model")?;
+            fs::write(model_path()?, b"model")?;
             fs::write(live_dir()?.join("tokenizer.json"), br#"{"version":"1.0"}"#)?;
             fs::write(live_dir()?.join(".model.sha256"), model_sha)?;
 
@@ -15048,7 +15048,7 @@ mod tests {
         write_test_tar_zst(
             &model_bundle,
             &[
-                ("model_quantized.onnx", b"dummy onnx bytes"),
+                ("model_fp16.onnx", b"dummy onnx bytes"),
                 ("tokenizer.json", br#"{"version":"1.0","truncation":null}"#),
             ],
         )?;
@@ -15085,7 +15085,7 @@ mod tests {
             created_at: "2026-05-03T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
             model: ModelInfo {
-                id: "embeddinggemma-test".to_string(),
+                id: EMBEDDING_MODEL_ID.to_string(),
                 sha256: sha256_hex(&model_bundle_bytes),
                 size: model_bundle_bytes.len() as u64,
                 url: "model-bundle.tar.zst".to_string(),

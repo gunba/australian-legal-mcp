@@ -6,7 +6,7 @@ IMPORTANT: The user is not expected to have a GPU and may be using a low perform
 
 IMPORTANT: We should be looking to simplify the MCP surface and minimise extraneous context at all times.
 
-IMPORTANT: Tool responses must contain only information a tax-professional agent would act on. Do NOT serialise internal debug metadata to the agent — no ranking scores, no model identifiers, no candidate counts, no reranker_used flags, no chunk ordinals, no echo of the query, no excluded-types policy, no `returned_chars`, no `distinct_docs`. If a field doesn't help the agent navigate or cite documents, it doesn't belong on the wire. Empty-value Option fields must use `skip_serializing_if = "Option::is_none"` rather than render as JSON null. Every byte the agent reads competes with the source text for their attention budget.
+IMPORTANT: Tool responses must contain only information a tax-professional agent would act on. Do NOT serialise internal debug metadata to the agent — no ranking scores, no model identifiers, no candidate counts, no chunk ordinals, no echo of the query, no excluded-types policy, no `returned_chars`, no `distinct_docs`. If a field doesn't help the agent navigate or cite documents, it doesn't belong on the wire. Empty-value Option fields must use `skip_serializing_if = "Option::is_none"` rather than render as JSON null. Every byte the agent reads competes with the source text for their attention budget.
 
 # Design Philosophy
 
@@ -36,16 +36,15 @@ Use `/r`, `/j`, `/b`, `/c`, and `/rj` from this repo root.
 For long-running Bash commands such as builds or test suites, launch them with background execution when the runtime supports it.
 Do NOT poll background tasks. Wait for completion before acting on dependent results.
 
-`build-index` consumes local embedding model files and writes corpus artifacts.
-Do not thread hosted model URLs, reranker URLs, or other distribution metadata
-through corpus building. The `release` step owns model/reranker distribution
-metadata and final manifest publication.
-Use `pip install -e '.[dev,gpu]'` for release builds; install the `cpu` and
-`gpu` extras separately because their ONNX Runtime wheels conflict.
+`build` consumes local embedding model files and writes corpus artifacts.
+Do not thread hosted model URLs or other distribution metadata through corpus
+building. The `publish-release` step owns model distribution metadata and final
+manifest publication.
+Use `cargo build --release --features cuda` for release builds.
 Maintainer corpus builds should pass `--gpu` and fail fast if CUDA is not
 available. The Rust end-user runtime must remain CPU-safe; do not make ordinary
 install, update, search, or serve require a GPU.
-Maintainer corpus rebuilds should run with sleep prevention active. `build-index`
+Maintainer corpus rebuilds should run with sleep prevention active. `build`
 and `scripts/maintainer-sync.sh` do this automatically through `systemd-inhibit`
 or `caffeinate` when available.
 

@@ -5,7 +5,7 @@
 # `publish-release` subcommand.
 #
 # Prereqs:
-#   - build-index has finished; release/ contains packs/ and manifest.json
+#   - ato-mcp build has finished; release/ contains packs/ and manifest.json
 #   - target/release/ato-mcp built (or ATO_MCP_BIN points at one)
 #   - optional ATO_MCP_MODEL_URL for an approved model mirror
 #   - optional ATO_MCP_SIGN_KEY for manifest signing (minisign secret key)

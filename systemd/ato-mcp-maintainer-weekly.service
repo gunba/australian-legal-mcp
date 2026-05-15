@@ -8,7 +8,7 @@ Wants=network-online.target
 Type=oneshot
 Environment=ATO_MCP_REPO_DIR=%h/src/ato-mcp
 Environment=ATO_MCP_PAGES_DIR=%h/src/ato_pages
-Environment=ATO_MCP_MODEL_DIR=%h/src/ato-mcp/models/embeddinggemma
+Environment=ATO_MCP_MODEL_DIR=%h/src/ato-mcp/models/granite-embedding-small-r2
 Environment=ATO_MCP_GH_REPO=gunba/ato-mcp
 Environment=ATO_MCP_MODE=incremental
 ExecStart=%h/src/ato-mcp/scripts/maintainer-sync.sh

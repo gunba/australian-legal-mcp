@@ -13,14 +13,14 @@
 #   ATO_MCP_REPO_DIR       default: $(pwd)
 #   ATO_MCP_RELEASE_DIR    default: $REPO_DIR/release
 #   ATO_MCP_BIN            default: $REPO_DIR/target/release/ato-mcp
-#   ATO_MCP_MODEL_BUNDLE   optional existing embeddinggemma-bundle.tar.zst
+#   ATO_MCP_MODEL_BUNDLE   optional existing semantic-model-bundle.tar.zst
 #   ATO_MCP_MODEL_DIR      used to build the bundle when ATO_MCP_MODEL_BUNDLE is unset
 set -euo pipefail
 
 REPO_DIR="${ATO_MCP_REPO_DIR:-$(pwd)}"
 RELEASE_DIR="${ATO_MCP_RELEASE_DIR:-$REPO_DIR/release}"
 BIN="${ATO_MCP_BIN:-$REPO_DIR/target/release/ato-mcp}"
-MODEL_DIR="${ATO_MCP_MODEL_DIR:-$REPO_DIR/models/embeddinggemma}"
+MODEL_DIR="${ATO_MCP_MODEL_DIR:-$REPO_DIR/models/granite-embedding-small-r2}"
 OUT="${1:-$RELEASE_DIR/ato-mcp-offline-bundle.tar.zst}"
 mkdir -p "$(dirname "$OUT")"
 rm -f "$OUT" "${OUT}.part"*.bin
@@ -40,17 +40,17 @@ cp "$RELEASE_DIR/manifest.json" "$MIRROR/manifest.json"
 cp "$RELEASE_DIR"/packs/pack-*.bin.zst "$MIRROR/packs/"
 
 MODEL_BUNDLE="${ATO_MCP_MODEL_BUNDLE:-}"
-if [ -z "$MODEL_BUNDLE" ] && [ -f "$RELEASE_DIR/embeddinggemma-bundle.tar.zst" ]; then
-  MODEL_BUNDLE="$RELEASE_DIR/embeddinggemma-bundle.tar.zst"
+if [ -z "$MODEL_BUNDLE" ] && [ -f "$RELEASE_DIR/semantic-model-bundle.tar.zst" ]; then
+  MODEL_BUNDLE="$RELEASE_DIR/semantic-model-bundle.tar.zst"
 fi
 
 if [ -n "$MODEL_BUNDLE" ]; then
   [ -f "$MODEL_BUNDLE" ] || { echo "missing: $MODEL_BUNDLE" >&2; exit 1; }
-  cp "$MODEL_BUNDLE" "$MIRROR/embeddinggemma-bundle.tar.zst"
+  cp "$MODEL_BUNDLE" "$MIRROR/semantic-model-bundle.tar.zst"
 else
   MODEL_STAGE="$WORKDIR/model-stage"
   mkdir -p "$MODEL_STAGE"
-  for name in model_quantized.onnx model_quantized.onnx_data tokenizer.json; do
+  for name in model_fp16.onnx model_fp16.onnx_data tokenizer.json; do
     if [ -f "$MODEL_DIR/$name" ]; then
       cp "$MODEL_DIR/$name" "$MODEL_STAGE/$name"
     elif [ -f "$MODEL_DIR/onnx/$name" ]; then
@@ -61,13 +61,13 @@ else
     fi
   done
   tar --sort=name --mtime='2026-01-01 UTC' -C "$MODEL_STAGE" -cf - . \
-    | zstd -T0 -3 -o "$MIRROR/embeddinggemma-bundle.tar.zst"
+    | zstd -T0 -3 -o "$MIRROR/semantic-model-bundle.tar.zst"
 fi
 
 "$BIN" bundle-localize-manifest \
   --manifest     "$MIRROR/manifest.json" \
   --packs-dir    "$MIRROR/packs" \
-  --model-bundle "$MIRROR/embeddinggemma-bundle.tar.zst"
+  --model-bundle "$MIRROR/semantic-model-bundle.tar.zst"
 
 ATO_MCP_DATA_DIR="$DATA_DIR" "$BIN" update --manifest-url "$MIRROR/manifest.json"
 ATO_MCP_DATA_DIR="$DATA_DIR" "$BIN" doctor
