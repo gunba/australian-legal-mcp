@@ -3,7 +3,12 @@ use base64::Engine;
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use fs2::FileExt;
-use ort::session::{builder::GraphOptimizationLevel, Session};
+#[cfg(feature = "cuda")]
+use ort::ep;
+use ort::session::{
+    builder::{GraphOptimizationLevel, SessionBuilder},
+    Session,
+};
 use ort::value::TensorRef;
 use regex::Regex;
 use reqwest::blocking::Client;
@@ -37,7 +42,7 @@ const MAX_K: usize = 50;
 const TITLE_HITS_K: usize = 10;
 const SNIPPET_CHARS: usize = 280;
 const EMBEDDING_DIM: usize = 256;
-const MAX_TOKENS: usize = 1024;
+const EMBEDDING_INPUT_MAX_TOKENS: usize = 1024;
 const QUERY_PREFIX: &str = "task: search result | query: ";
 const EMBEDDINGGEMMA_HF_FINGERPRINT: &str =
     "5d4d31914cdb65cd84d3248390946461efdd4ec4f99afd13d23218cd4060d706";
@@ -48,34 +53,17 @@ const OEWN_2024_URL: &str = "https://en-word.net/static/english-wordnet-2024.zip
 const OEWN_2024_SOURCE: &str = "Open English WordNet 2024 (CC-BY 4.0)";
 const ORDINARY_DICTIONARY_PATH_ENV: &str = "ATO_MCP_DICTIONARY_PATH";
 /// On-disk schema version this binary supports. Bump when introducing
-/// schema changes; older binaries reject newer corpora via [`open_read`]
-/// / [`open_write`] / [`apply_update_locked`] guards.
+/// schema changes; binaries reject any corpus whose schema does not match.
 const SUPPORTED_SCHEMA_VERSION: u32 = 8;
-/// Highest manifest format version (`Manifest.schema_version`) this binary
-/// will ingest. v2 (released alongside ato-mcp 0.5.0) signals that
-/// `min_client_version` is now meaningfully populated by the builder
-/// (older "v1" manifests left it at "0.1.0", making the version gate
-/// dormant). v3 (released alongside ato-mcp 0.6.0) adds the optional
-/// `reranker` field for cross-encoder rerank stage. The
-/// `min_client_version > CARGO_PKG_VERSION` check inside
-/// `enforce_manifest_compatibility` is the actual cross-version gate;
-/// this constant is a belt-and-suspenders upper bound for future format
-/// bumps that older binaries can't decode. v4 carries cleaned HTML and image
-/// asset records in release packs.
-const MAX_SUPPORTED_MANIFEST_VERSION: u32 = 4;
-/// Maximum number of RRF top-N candidates we feed into the cross-encoder
-/// reranker per query. Reranking is O(N) ONNX inference; the quantized
-/// ModernBERT cross-encoder is still CPU-expensive, so keep the rerank
-/// head tight and let the RRF tail preserve recall for paging.
-const RERANK_CANDIDATE_LIMIT: usize = 24;
-/// Cross-encoder query side max-token budget. We reserve the remaining
-/// tokens for the document side so a long snippet does not evict the query.
-const RERANK_QUERY_MAX_TOKENS: usize = 64;
-/// Cross-encoder total sequence max length (`[CLS] q [SEP] d [SEP]`).
-const RERANK_PAIR_MAX_TOKENS: usize = 512;
+/// Single release manifest format (`Manifest.schema_version`) this binary
+/// ingests. No legacy manifest layouts are accepted.
+const SUPPORTED_MANIFEST_VERSION: u32 = 4;
+const EMBEDDING_MODEL_ID: &str = "embeddinggemma-300m-int8-256d";
+const BUILD_EMBED_BATCH_SIZE: usize = 128;
+const BUILD_EMBED_PENDING_FLUSH_CHUNKS: usize = 4096;
+const BUILD_PACK_RECORDS_PER_SHARD: usize = 4096;
 const DEFAULT_MAX_PER_DOC: usize = 2;
 const HARD_MAX_PER_DOC: usize = 3;
-const RERANKER_HF_MODEL_PATH: &str = "onnx/model_quantized.onnx";
 // Avoid expensive online transformer graph rewrites on every fresh CLI/MCP
 // process. The ONNX models are shipped pre-quantized; Level1 keeps cheap
 // semantics-preserving cleanup without the high startup cost of Level2/All.
@@ -223,15 +211,11 @@ enum Command {
     /// Derive metadata fields from an ATO canonical_id / doc_id. Mirrors
     /// src/ato_mcp/indexer/metadata.py public helpers. JSON out:
     /// {doc_id, type_prefix, year, human_code}.
-    DocMeta {
-        canonical_id: String,
-    },
+    DocMeta { canonical_id: String },
     /// Parse an ATO link href into (doc_id, pit, view). Mirrors
     /// extract.py:_doc_id_from_ato_link. JSON out: null OR
     /// {doc_id, pit, view}.
-    DocIdFromLink {
-        href: String,
-    },
+    DocIdFromLink { href: String },
     /// Write a pack file from a JSONL stream of {"doc_id": str, "record": {...}}
     /// records on stdin. Mirrors src/ato_mcp/indexer/pack.py:PackWriter.
     /// JSON out on stdout: {pack_path, sha8, sha256, size, refs}.
@@ -277,7 +261,10 @@ enum Command {
     AtoFetchNodes {
         /// Either a raw query string or "key=value,key=value,..." pairs.
         query: String,
-        #[arg(long, default_value = "https://www.ato.gov.au/API/v1/law/lawservices/browse-content/")]
+        #[arg(
+            long,
+            default_value = "https://www.ato.gov.au/API/v1/law/lawservices/browse-content/"
+        )]
         base_url: String,
         #[arg(long, default_value_t = 30.0)]
         timeout_seconds: f64,
@@ -290,6 +277,9 @@ enum Command {
     Embed {
         #[arg(long)]
         input_file: Option<PathBuf>,
+        /// Use the CUDA execution provider. Requires a binary built with --features cuda.
+        #[arg(long)]
+        gpu: bool,
     },
     /// In-binary build orchestrator (port of build.py). Reads
     /// `pages_dir/index.jsonl` (one record per line, with the fields
@@ -297,28 +287,36 @@ enum Command {
     /// pipeline, the chunker, the rules-engine metadata classifier and the
     /// embedder in-process, then writes the documents, chunks,
     /// chunk_embeddings, chunks_fts, title_fts, doc_anchors, definitions
-    /// and citations tables. With --out-dir it also writes pack files,
-    /// per-doc asset blobs, and manifest.json.
+    /// and citations tables, then writes pack files, per-doc asset blobs,
+    /// manifest.json, and update.json to --out-dir.
     /// MISSING from this version vs build.py: incremental reuse from a
-    /// prior pack, resume-from-crash, multi-process parallelism.
+    /// prior pack and multi-process parallelism.
     Build {
         #[arg(long)]
         pages_dir: PathBuf,
         #[arg(long)]
         db_path: PathBuf,
-        /// Output directory for pack files, asset blobs, manifest.json. If
-        /// omitted, only the SQLite corpus DB is written (legacy mode).
+        /// Output directory for pack files, asset blobs, manifest.json, and update.json.
         #[arg(long)]
-        out_dir: Option<PathBuf>,
+        out_dir: PathBuf,
         #[arg(long, default_value_t = 3)]
         zstd_level: i32,
         #[arg(long)]
         limit: Option<usize>,
+        /// Use the CUDA execution provider and fail if CUDA is unavailable.
+        #[arg(long)]
+        gpu: bool,
+        /// Print cumulative build-stage timings to stderr.
+        #[arg(long)]
+        profile: bool,
     },
     /// Fetch the ATO "What's New" feed and return the deduped doc entries
     /// as JSON. Mirrors src/ato_mcp/scraper/whats_new.py:WhatsNewFetcher.
     WhatsNew {
-        #[arg(long, default_value = "https://www.ato.gov.au/law/view/whatsnew.htm?fid=whatsnew")]
+        #[arg(
+            long,
+            default_value = "https://www.ato.gov.au/law/view/whatsnew.htm?fid=whatsnew"
+        )]
         url: String,
         #[arg(long, default_value_t = 30.0)]
         timeout_seconds: f64,
@@ -326,9 +324,7 @@ enum Command {
     /// Normalise an ATO law/view/document href to its canonical relative
     /// form (drops PiT, decodes percent-encoded docid, etc.). Mirrors
     /// src/ato_mcp/scraper/whats_new.py:normalize_doc_href.
-    NormalizeDocHref {
-        href: String,
-    },
+    NormalizeDocHref { href: String },
     /// Fetch compact statutory definitions for a term.
     GetDefinition {
         term: String,
@@ -345,7 +341,10 @@ enum Command {
         root_query: String,
         #[arg(long)]
         out_dir: PathBuf,
-        #[arg(long, default_value = "https://www.ato.gov.au/API/v1/law/lawservices/browse-content/")]
+        #[arg(
+            long,
+            default_value = "https://www.ato.gov.au/API/v1/law/lawservices/browse-content/"
+        )]
         base_url: String,
         #[arg(long, default_value_t = 30.0)]
         timeout_seconds: f64,
@@ -417,13 +416,6 @@ enum Command {
         packs_dir: PathBuf,
         #[arg(long)]
         model_bundle: PathBuf,
-    },
-    /// Recompute the citations table on an existing ato-mcp DB by scanning
-    /// chunk text for [doc:X] markers. Mirrors scripts/backfill-citations.py.
-    BackfillCitations {
-        /// Path to ato.db. Defaults to ~/.local/share/ato-mcp/live/ato.db.
-        #[arg(long)]
-        db: Option<PathBuf>,
     },
     /// Publish a corpus release to GitHub. Mirrors
     /// src/ato_mcp/indexer/release.py:publish — rewrites manifest URLs to
@@ -540,8 +532,8 @@ fn main() -> Result<()> {
         } => {
             let types = empty_vec_as_none(types);
             // Construct a transient ServerState so the CLI's `search` call
-            // reuses the same lazy semantic/reranker runtimes the MCP server
-            // does for modes that need them.
+            // reuses the same lazy semantic runtime the MCP server does for
+            // modes that need it.
             let (out, _state) = search_cli(
                 &query,
                 SearchOptions {
@@ -645,18 +637,19 @@ fn main() -> Result<()> {
             whats_new_url,
             path_prefix,
             out,
-        } => scrape_diff(&index, deduped.as_deref(), whats_new_url.as_deref(), path_prefix.as_deref(), &out),
+        } => scrape_diff(
+            &index,
+            deduped.as_deref(),
+            whats_new_url.as_deref(),
+            path_prefix.as_deref(),
+            &out,
+        ),
         Command::BundleLocalizeManifest {
             manifest,
             packs_dir,
             model_bundle,
         } => bundle_localize_manifest(&manifest, &packs_dir, &model_bundle),
-        Command::BackfillCitations { db } => backfill_citations(db.as_deref()),
-        Command::FetchExternalDoc {
-            doc_id,
-            pit,
-            view,
-        } => {
+        Command::FetchExternalDoc { doc_id, pit, view } => {
             println!(
                 "{}",
                 fetch_external_doc(&doc_id, pit.as_deref(), view.as_deref())?
@@ -669,8 +662,9 @@ fn main() -> Result<()> {
             source_path,
         } => {
             let html = match html_file.as_ref() {
-                Some(p) => fs::read_to_string(p)
-                    .with_context(|| format!("reading {}", p.display()))?,
+                Some(p) => {
+                    fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?
+                }
                 None => {
                     let mut s = String::new();
                     std::io::stdin()
@@ -689,11 +683,7 @@ fn main() -> Result<()> {
             // Mutation chain on the cleaned container HTML, mirroring Python's
             // _rewrite_images_html + _normalise_named_anchors + _strip_attributes.
             let (rewritten_html, assets) = if doc_id.is_some() && source_path.is_some() {
-                rewrite_images_html(
-                    &cleaned.html,
-                    doc_id.as_deref(),
-                    source_path.as_deref(),
-                )
+                rewrite_images_html(&cleaned.html, doc_id.as_deref(), source_path.as_deref())
             } else {
                 (cleaned.html.clone(), Vec::new())
             };
@@ -743,8 +733,9 @@ fn main() -> Result<()> {
                 chunks: Vec<DefinitionChunk>,
             }
             let raw = match input_file {
-                Some(p) => fs::read_to_string(&p)
-                    .with_context(|| format!("reading {}", p.display()))?,
+                Some(p) => {
+                    fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?
+                }
                 None => {
                     let mut s = String::new();
                     std::io::stdin()
@@ -753,7 +744,8 @@ fn main() -> Result<()> {
                     s
                 }
             };
-            let input: Input = serde_json::from_str(&raw).context("parsing extract-definitions input")?;
+            let input: Input =
+                serde_json::from_str(&raw).context("parsing extract-definitions input")?;
             let defs = extract_definitions(
                 &input.doc_id,
                 &input.source_title,
@@ -768,8 +760,9 @@ fn main() -> Result<()> {
             source_doc_id,
         } => {
             let html = match html_file {
-                Some(p) => fs::read_to_string(&p)
-                    .with_context(|| format!("reading {}", p.display()))?,
+                Some(p) => {
+                    fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?
+                }
                 None => {
                     let mut s = String::new();
                     std::io::stdin()
@@ -784,8 +777,9 @@ fn main() -> Result<()> {
         }
         Command::ExtractCurrency { html_file } => {
             let html = match html_file {
-                Some(p) => fs::read_to_string(&p)
-                    .with_context(|| format!("reading {}", p.display()))?,
+                Some(p) => {
+                    fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?
+                }
                 None => {
                     let mut s = String::new();
                     std::io::stdin()
@@ -804,8 +798,9 @@ fn main() -> Result<()> {
             max_tokens,
         } => {
             let html = match html_file {
-                Some(p) => fs::read_to_string(&p)
-                    .with_context(|| format!("reading {}", p.display()))?,
+                Some(p) => {
+                    fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?
+                }
                 None => {
                     let mut s = String::new();
                     std::io::stdin()
@@ -889,9 +884,8 @@ fn main() -> Result<()> {
                             .and_then(|s| s.to_str())
                             .unwrap_or(url)
                             .to_string();
-                        let new_url = format!(
-                            "https://github.com/{repo}/releases/download/{tag}/{filename}"
-                        );
+                        let new_url =
+                            format!("https://github.com/{repo}/releases/download/{tag}/{filename}");
                         pack["url"] = JsonValue::String(new_url);
                     }
                 }
@@ -933,14 +927,17 @@ fn main() -> Result<()> {
             }
             // Stream zstd-compress to disk + sha256 the output.
             let compressed = zstd::stream::encode_all(std::io::Cursor::new(&tar_buf), level)?;
-            let mut file = File::create(&out)
-                .with_context(|| format!("creating {}", out.display()))?;
+            let mut file =
+                File::create(&out).with_context(|| format!("creating {}", out.display()))?;
             file.write_all(&compressed)?;
             file.flush()?;
             let mut hasher = Sha256::new();
             hasher.update(&compressed);
             let digest = hasher.finalize();
-            let sha256_hex = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            let sha256_hex = digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
             let size = fs::metadata(&out)?.len();
             println!(
                 "{}",
@@ -976,7 +973,10 @@ fn main() -> Result<()> {
             let client = reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs_f64(timeout_seconds))
                 .build()?;
-            let resp = client.get(&url).send().with_context(|| format!("fetching {url}"))?;
+            let resp = client
+                .get(&url)
+                .send()
+                .with_context(|| format!("fetching {url}"))?;
             let status = resp.status();
             if !status.is_success() {
                 bail!("ATO API returned HTTP {status} for {url}");
@@ -989,11 +989,12 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&payload)?);
             Ok(())
         }
-        Command::Embed { input_file } => {
+        Command::Embed { input_file, gpu } => {
             use base64::Engine as _;
             let raw = match input_file.as_ref() {
-                Some(p) => fs::read_to_string(p)
-                    .with_context(|| format!("reading {}", p.display()))?,
+                Some(p) => {
+                    fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?
+                }
                 None => {
                     let mut s = String::new();
                     std::io::stdin()
@@ -1002,21 +1003,20 @@ fn main() -> Result<()> {
                     s
                 }
             };
-            // Lazy-load the embedding runtime (ONNX session + tokenizer).
-            let state = ServerState::default();
-            let mut out: Vec<JsonValue> = Vec::new();
-            for line in raw.lines() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let emb = state
-                    .encode_query_embedding(trimmed)
-                    .context("encoding embedding")?;
-                // i8 -> u8 reinterpret + base64.
-                let bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(emb.as_ptr() as *const u8, emb.len())
-                };
+            let state = ServerState::new(gpu);
+            let inputs: Vec<String> = raw
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect();
+            let embeddings = state
+                .encode_query_embeddings(&inputs)
+                .context("encoding embeddings")?;
+            let mut out: Vec<JsonValue> = Vec::with_capacity(embeddings.len());
+            for emb in embeddings {
+                let bytes: &[u8] =
+                    unsafe { std::slice::from_raw_parts(emb.as_ptr() as *const u8, emb.len()) };
                 out.push(JsonValue::String(
                     base64::engine::general_purpose::STANDARD.encode(bytes),
                 ));
@@ -1030,7 +1030,11 @@ fn main() -> Result<()> {
             out_dir,
             zstd_level,
             limit,
-        } => build_corpus(&pages_dir, &db_path, out_dir.as_deref(), zstd_level, limit),
+            gpu,
+            profile,
+        } => build_corpus(
+            &pages_dir, &db_path, &out_dir, zstd_level, limit, gpu, profile,
+        ),
         Command::WhatsNew {
             url,
             timeout_seconds,
@@ -1130,10 +1134,9 @@ impl HttpConfig {
         if !p.exists() {
             return Ok(None);
         }
-        let raw =
-            fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
-        let cfg: Self = serde_json::from_str(&raw)
-            .with_context(|| format!("parsing {}", p.display()))?;
+        let raw = fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
+        let cfg: Self =
+            serde_json::from_str(&raw).with_context(|| format!("parsing {}", p.display()))?;
         Ok(Some(cfg))
     }
 
@@ -1189,8 +1192,8 @@ impl HttpConfig {
 /// it; `serve()` then errors at bind time and the user can re-run install.
 fn pick_free_port() -> Result<u16> {
     use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .context("binding 127.0.0.1:0 to discover a free port")?;
+    let listener =
+        TcpListener::bind("127.0.0.1:0").context("binding 127.0.0.1:0 to discover a free port")?;
     let port = listener.local_addr()?.port();
     drop(listener);
     Ok(port)
@@ -1206,14 +1209,6 @@ fn model_path() -> Result<PathBuf> {
 
 fn tokenizer_path() -> Result<PathBuf> {
     Ok(live_dir()?.join("tokenizer.json"))
-}
-
-fn reranker_model_path() -> Result<PathBuf> {
-    Ok(live_dir()?.join("reranker.onnx"))
-}
-
-fn reranker_tokenizer_path() -> Result<PathBuf> {
-    Ok(live_dir()?.join("reranker_tokenizer.json"))
 }
 
 fn lock_file() -> Result<File> {
@@ -1616,9 +1611,8 @@ struct SearchOptions<'a> {
     /// When set, this arbitrary text is runtime-embedded and used as the
     /// query vector — the same mechanism as `similar_to_chunk_id` but for
     /// text that isn't a corpus chunk (e.g. a chunk returned by
-    /// `fetch_external_doc`). Forces vector-only mode and skips rerank /
-    /// title hits, like `similar_to_chunk_id`. `similar_to_chunk_id` wins
-    /// if both are set.
+    /// `fetch_external_doc`). Forces vector-only mode and skips title hits,
+    /// like `similar_to_chunk_id`. `similar_to_chunk_id` wins if both are set.
     seed_text: Option<&'a str>,
 }
 
@@ -1718,14 +1712,6 @@ fn dedup_per_doc(
     out
 }
 
-fn rerank_head_count(k: usize, candidate_count: usize) -> usize {
-    let desired = std::cmp::max(k.saturating_mul(5), 12);
-    std::cmp::min(
-        candidate_count,
-        std::cmp::min(RERANK_CANDIDATE_LIMIT, desired),
-    )
-}
-
 fn search(
     query: &str,
     opts: SearchOptions<'_>,
@@ -1765,7 +1751,7 @@ fn search(
         opts.seed_text.map(str::trim).filter(|s| !s.is_empty())
     };
     // A "seed search" is driven by a seed vector rather than the `query`
-    // string: forces vector-only mode, skips rerank, returns no title hits.
+    // string: forces vector-only mode and returns no title hits.
     let is_seed_search = similar_seed.is_some() || seed_text.is_some();
     let effective_mode = if is_seed_search {
         SearchMode::Vector
@@ -1777,7 +1763,7 @@ fn search(
     } else {
         Vec::new()
     };
-    let mut ranked_hits = match effective_mode {
+    let ranked_hits = match effective_mode {
         SearchMode::Hybrid | SearchMode::Vector => {
             ensure_vector_search_ready(&conn)?;
             let query_embedding = if let Some((_, ref seed_vec)) = similar_seed {
@@ -1811,59 +1797,6 @@ fn search(
     };
     let candidate_count = ranked_hits.len();
 
-    // Cross-encoder rerank stage. We rerank only the top head because
-    // each ONNX inference is O(N) and the marginal hit past the first
-    // few pages is dominated by first-stage recall. Tail candidates retain
-    // their RRF order so they can still surface via `next_call` paging or
-    // recency sort. Skip rerank for a seed search (`similar_to_chunk_id`
-    // or `seed_text`) — there's no `query` string to use as the rerank
-    // pivot.
-    if !is_seed_search && !matches!(effective_mode, SearchMode::Keyword) {
-        if let Some(state) = server_state {
-        let head_count = rerank_head_count(k, ranked_hits.len());
-        if head_count > 0 {
-            // Load text for the top-N candidates in one batch. We hold
-            // them as `String`s because the tokenizer wants `&str`s and
-            // the rusqlite blob borrow doesn't survive across iterations.
-            let head_ids: Vec<i64> = ranked_hits[..head_count]
-                .iter()
-                .map(|h| h.chunk_id)
-                .collect();
-            let texts = load_chunk_texts(&conn, &head_ids)?;
-            let candidate_refs: Vec<(i64, &str)> = head_ids
-                .iter()
-                .filter_map(|id| texts.get(id).map(|t| (*id, t.as_str())))
-                .collect();
-            if !candidate_refs.is_empty() {
-                if let Some(scores) = state.rerank_candidates(query, &candidate_refs)? {
-                    let reranker_scores: HashMap<i64, f64> = scores.iter().copied().collect();
-                    // Re-order the head by reranker score (desc). Tail
-                    // (below RERANK_CANDIDATE_LIMIT) keeps RRF order. We
-                    // overwrite the per-chunk score with the reranker
-                    // value for the head so downstream code (dedup,
-                    // recency sort) can rank by overall merit without a
-                    // second branch.
-                    let mut head: Vec<VectorHit> = ranked_hits.drain(..head_count).collect();
-                    for hit in head.iter_mut() {
-                        if let Some(s) = reranker_scores.get(&hit.chunk_id) {
-                            hit.score = *s;
-                        }
-                    }
-                    head.sort_by(|a, b| {
-                        b.score
-                            .partial_cmp(&a.score)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    let mut new_ranked: Vec<VectorHit> = Vec::with_capacity(candidate_count);
-                    new_ranked.extend(head);
-                    new_ranked.append(&mut ranked_hits);
-                    ranked_hits = new_ranked;
-                }
-            }
-        }
-    }
-    }
-
     let frontier = match opts.sort_by {
         SortBy::Relevance => k,
         SortBy::Recency => std::cmp::max(k * 5, 50),
@@ -1877,9 +1810,9 @@ fn search(
     let mut records = Vec::new();
     for ranked_hit in deduped.into_iter() {
         if let Some(hit) = load_hit(&conn, ranked_hit.chunk_id, query, opts.include_snippet)? {
-            // First-stage RRF / reranker scores drive `deduped` ordering;
-            // we just iterate in that order. Internal scores never reach
-            // the agent — results are presented sorted by relevance.
+            // First-stage scores drive `deduped` ordering; we just iterate in
+            // that order. Internal scores never reach the agent — results are
+            // presented sorted by relevance.
             records.push(hit);
         }
     }
@@ -1929,35 +1862,6 @@ fn search_cli(query: &str, opts: SearchOptions<'_>) -> Result<(String, ServerSta
     Ok((out, state))
 }
 
-/// Batch-load decompressed chunk text for the given ids. Returns a map
-/// keyed by chunk_id; missing rows are silently dropped (caller treats
-/// missing texts as "no rerank candidate" and they fall through to the
-/// tail). One round-trip + one zstd decode per id.
-fn load_chunk_texts(conn: &Connection, ids: &[i64]) -> Result<HashMap<i64, String>> {
-    if ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let mut unique = ids.to_vec();
-    unique.sort_unstable();
-    unique.dedup();
-    let placeholders = vec!["?"; unique.len()].join(",");
-    let sql = format!("SELECT chunk_id, text FROM chunks WHERE chunk_id IN ({placeholders})");
-    let params_vec: Vec<Value> = unique.into_iter().map(Value::Integer).collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(params_vec), |row| {
-        let chunk_id: i64 = row.get("chunk_id")?;
-        let blob: Vec<u8> = row.get("text")?;
-        Ok((chunk_id, blob))
-    })?;
-    let mut out = HashMap::new();
-    for row in rows {
-        let (chunk_id, blob) = row?;
-        let text = decompress_text(blob)?;
-        out.insert(chunk_id, text);
-    }
-    Ok(out)
-}
-
 fn load_candidate_meta(
     conn: &Connection,
     ranked: &[VectorHit],
@@ -1978,9 +1882,8 @@ fn load_candidate_meta(
     // text length precisely. Heading-path is gone; "intro" now means
     // "leading stub chunk" (ord 0 with short text) which still
     // correctly demotes the typical preamble pattern.
-    let sql = format!(
-        "SELECT chunk_id, doc_id, ord FROM chunks WHERE chunk_id IN ({placeholders})"
-    );
+    let sql =
+        format!("SELECT chunk_id, doc_id, ord FROM chunks WHERE chunk_id IN ({placeholders})");
     let params_vec: Vec<Value> = ids.into_iter().map(Value::Integer).collect();
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params_vec), |row| {
@@ -2003,10 +1906,7 @@ fn load_candidate_meta(
     if !leading_chunk_ids.is_empty() {
         let placeholders2 = vec!["?"; leading_chunk_ids.len()].join(",");
         let sql2 = format!("SELECT chunk_id, text FROM chunks WHERE chunk_id IN ({placeholders2})");
-        let params_vec2: Vec<Value> = leading_chunk_ids
-            .into_iter()
-            .map(Value::Integer)
-            .collect();
+        let params_vec2: Vec<Value> = leading_chunk_ids.into_iter().map(Value::Integer).collect();
         let mut stmt2 = conn.prepare(&sql2)?;
         let rows2 = stmt2.query_map(params_from_iter(params_vec2), |row| {
             let chunk_id: i64 = row.get("chunk_id")?;
@@ -2304,21 +2204,25 @@ struct SemanticRuntime {
 }
 
 impl SemanticRuntime {
-    fn load() -> Result<Self> {
+    fn load(use_gpu: bool) -> Result<Self> {
         let mut tokenizer = Tokenizer::from_file(tokenizer_path()?)
             .map_err(|err| anyhow!("loading tokenizer: {err}"))?;
         tokenizer
             .with_truncation(Some(TruncationParams {
-                max_length: MAX_TOKENS,
+                max_length: EMBEDDING_INPUT_MAX_TOKENS,
                 ..TruncationParams::default()
             }))
             .map_err(|err| anyhow!("configuring tokenizer truncation: {err}"))?;
         tokenizer.with_padding(Some(PaddingParams::default()));
 
-        let session = Session::builder()
+        let mut builder = Session::builder()
             .map_err(|err| anyhow!("creating ONNX Runtime session: {err}"))?
             .with_optimization_level(ONLINE_MODEL_OPTIMIZATION_LEVEL)
-            .map_err(|err| anyhow!("configuring ONNX Runtime session: {err}"))?
+            .map_err(|err| anyhow!("configuring ONNX Runtime session: {err}"))?;
+        if use_gpu {
+            builder = configure_cuda_execution_provider(builder)?;
+        }
+        let session = builder
             .commit_from_file(model_path()?)
             .map_err(|err| anyhow!("loading ONNX model: {err}"))?;
         let has_token_type_ids = session
@@ -2334,33 +2238,65 @@ impl SemanticRuntime {
     }
 
     fn encode_query(&mut self, query: &str) -> Result<[i8; EMBEDDING_DIM]> {
-        let prefixed = format!("{QUERY_PREFIX}{query}");
-        let mut encodings = self
-            .tokenizer
-            .encode_batch(vec![prefixed], true)
-            .map_err(|err| anyhow!("tokenizing query: {err}"))?;
-        let encoding = encodings
+        let mut embeddings = self.encode_queries(&[query.to_string()])?;
+        embeddings
             .pop()
-            .ok_or_else(|| anyhow!("tokenizer returned no query encoding"))?;
-        let input_ids: Vec<i64> = encoding.get_ids().iter().map(|id| i64::from(*id)).collect();
-        let attention_mask: Vec<i64> = encoding
-            .get_attention_mask()
+            .ok_or_else(|| anyhow!("semantic encoder returned no query embedding"))
+    }
+
+    fn encode_queries(&mut self, queries: &[String]) -> Result<Vec<[i8; EMBEDDING_DIM]>> {
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let prefixed: Vec<String> = queries
             .iter()
-            .map(|mask| i64::from(*mask))
+            .map(|query| format!("{QUERY_PREFIX}{query}"))
             .collect();
-        let seq_len = input_ids.len();
+        let encodings = self
+            .tokenizer
+            .encode_batch(prefixed, true)
+            .map_err(|err| anyhow!("tokenizing queries: {err}"))?;
+        let batch = encodings.len();
+        if batch != queries.len() {
+            bail!(
+                "tokenizer returned {} encodings for {} inputs",
+                batch,
+                queries.len()
+            );
+        }
+        let seq_len = encodings
+            .first()
+            .map(|encoding| encoding.get_ids().len())
+            .unwrap_or(0);
         if seq_len == 0 {
             bail!("semantic search unavailable: query produced no tokens");
         }
+        let mut input_ids = Vec::with_capacity(batch * seq_len);
+        let mut attention_mask = Vec::with_capacity(batch * seq_len);
+        for encoding in &encodings {
+            if encoding.get_ids().len() != seq_len {
+                bail!(
+                    "tokenizer produced ragged encodings: expected {seq_len}, got {}",
+                    encoding.get_ids().len()
+                );
+            }
+            input_ids.extend(encoding.get_ids().iter().map(|id| i64::from(*id)));
+            attention_mask.extend(
+                encoding
+                    .get_attention_mask()
+                    .iter()
+                    .map(|mask| i64::from(*mask)),
+            );
+        }
 
         let input_ids_tensor =
-            TensorRef::from_array_view(([1usize, seq_len], input_ids.as_slice()))?;
+            TensorRef::from_array_view(([batch, seq_len], input_ids.as_slice()))?;
         let attention_mask_tensor =
-            TensorRef::from_array_view(([1usize, seq_len], attention_mask.as_slice()))?;
+            TensorRef::from_array_view(([batch, seq_len], attention_mask.as_slice()))?;
         let outputs = if self.has_token_type_ids {
-            let token_type_ids = vec![0i64; seq_len];
+            let token_type_ids = vec![0i64; batch * seq_len];
             let token_type_ids_tensor =
-                TensorRef::from_array_view(([1usize, seq_len], token_type_ids.as_slice()))?;
+                TensorRef::from_array_view(([batch, seq_len], token_type_ids.as_slice()))?;
             self.session.run(ort::inputs! {
                 "input_ids" => input_ids_tensor,
                 "attention_mask" => attention_mask_tensor,
@@ -2376,298 +2312,136 @@ impl SemanticRuntime {
             .get("sentence_embedding")
             .unwrap_or_else(|| &outputs[0]);
         let (shape, data) = output.try_extract_tensor::<f32>()?;
-        let embedding = pooled_embedding(shape, data, &attention_mask)?;
-        quantize_embedding(&embedding)
-    }
-}
-
-/// Cross-encoder reranker ONNX model.
-/// Loaded lazily on first search and cached on `ServerState`. Inputs are
-/// `[CLS] query [SEP] doc [SEP]` token pairs; the model emits a single
-/// relevance logit per pair which we squash through sigmoid into [0, 1].
-struct Reranker {
-    tokenizer: Tokenizer,
-    session: Session,
-    has_token_type_ids: bool,
-}
-
-impl Reranker {
-    fn load() -> Result<Self> {
-        let mut tokenizer = Tokenizer::from_file(reranker_tokenizer_path()?)
-            .map_err(|err| anyhow!("loading reranker tokenizer: {err}"))?;
-        // Cap each side at PAIR_MAX_TOKENS; the tokenizer trims the
-        // longest segment first so a long doc won't push the query out.
-        tokenizer
-            .with_truncation(Some(TruncationParams {
-                max_length: RERANK_PAIR_MAX_TOKENS,
-                ..TruncationParams::default()
-            }))
-            .map_err(|err| anyhow!("configuring reranker truncation: {err}"))?;
-        tokenizer.with_padding(Some(PaddingParams::default()));
-
-        let session = Session::builder()
-            .map_err(|err| anyhow!("creating reranker ONNX Runtime session: {err}"))?
-            .with_optimization_level(ONLINE_MODEL_OPTIMIZATION_LEVEL)
-            .map_err(|err| anyhow!("configuring reranker ONNX Runtime session: {err}"))?
-            .commit_from_file(reranker_model_path()?)
-            .map_err(|err| anyhow!("loading reranker ONNX model: {err}"))?;
-        let has_token_type_ids = session
-            .inputs()
+        let embeddings = pooled_embeddings(shape, data, &attention_mask, batch, seq_len)?;
+        embeddings
             .iter()
-            .any(|input| input.name() == "token_type_ids");
-
-        Ok(Self {
-            tokenizer,
-            session,
-            has_token_type_ids,
-        })
-    }
-
-    /// Score `(chunk_id, doc_text)` candidates against `query`. Returns
-    /// pairs in input order; the caller is responsible for re-sorting.
-    /// The query is hard-truncated to roughly `RERANK_QUERY_MAX_TOKENS`
-    /// tokens upstream of tokenization. Note: the constant is in TOKENS;
-    /// we approximate ~4 chars per token for the pre-tokenization trim
-    /// (cheaper than re-running the tokenizer twice). The tokenizer's own
-    /// truncation handles the doc side; we leave a wide margin so the
-    /// 512-token budget can absorb a long chunk body.
-    fn rerank(&mut self, query: &str, candidates: &[(i64, &str)]) -> Result<Vec<(i64, f64)>> {
-        if candidates.is_empty() {
-            return Ok(Vec::new());
-        }
-        // Trim query token budget by approximating ~4 chars/token for
-        // English (cheaper than re-running the tokenizer twice). The
-        // model's truncation guarantees we stay within 512 total.
-        let query_max_chars = RERANK_QUERY_MAX_TOKENS * 4;
-        let query_trimmed: String = query.chars().take(query_max_chars).collect();
-
-        let inputs: Vec<(String, String)> = candidates
-            .iter()
-            .map(|(_, doc)| (query_trimmed.clone(), (*doc).to_string()))
-            .collect();
-        let encodings = self
-            .tokenizer
-            .encode_batch(inputs, true)
-            .map_err(|err| anyhow!("tokenizing reranker pairs: {err}"))?;
-        let batch = encodings.len();
-        if batch == 0 {
-            return Ok(Vec::new());
-        }
-        let seq_len = encodings[0].get_ids().len();
-        if seq_len == 0 {
-            bail!("reranker tokenizer returned zero-length encoding");
-        }
-
-        let mut input_ids: Vec<i64> = Vec::with_capacity(batch * seq_len);
-        let mut attention_mask: Vec<i64> = Vec::with_capacity(batch * seq_len);
-        let mut token_type_ids: Vec<i64> = Vec::with_capacity(batch * seq_len);
-        for enc in &encodings {
-            // BatchLongest padding guarantees uniform seq_len, but we
-            // assert defensively to avoid silently feeding ragged shapes.
-            if enc.get_ids().len() != seq_len {
-                bail!(
-                    "reranker batch produced ragged encodings: expected {seq_len}, got {}",
-                    enc.get_ids().len()
-                );
-            }
-            input_ids.extend(enc.get_ids().iter().map(|id| i64::from(*id)));
-            attention_mask.extend(enc.get_attention_mask().iter().map(|m| i64::from(*m)));
-            token_type_ids.extend(enc.get_type_ids().iter().map(|t| i64::from(*t)));
-        }
-
-        let input_ids_tensor =
-            TensorRef::from_array_view(([batch, seq_len], input_ids.as_slice()))?;
-        let attention_mask_tensor =
-            TensorRef::from_array_view(([batch, seq_len], attention_mask.as_slice()))?;
-        let outputs = if self.has_token_type_ids {
-            let token_type_ids_tensor =
-                TensorRef::from_array_view(([batch, seq_len], token_type_ids.as_slice()))?;
-            self.session.run(ort::inputs! {
-                "input_ids" => input_ids_tensor,
-                "attention_mask" => attention_mask_tensor,
-                "token_type_ids" => token_type_ids_tensor,
-            })?
-        } else {
-            self.session.run(ort::inputs! {
-                "input_ids" => input_ids_tensor,
-                "attention_mask" => attention_mask_tensor,
-            })?
-        };
-        // Cross-encoders typically output `logits` as `[batch, 1]`. Some
-        // exports emit a flat `[batch]` instead. Try the named output
-        // first so users with non-standard wrappers still work.
-        let output = outputs.get("logits").unwrap_or_else(|| &outputs[0]);
-        let (shape, data) = output.try_extract_tensor::<f32>()?;
-        let logits = extract_rerank_logits(shape, data, batch)?;
-        if logits.len() != batch {
-            bail!(
-                "reranker produced {} logits for batch of {}",
-                logits.len(),
-                batch
-            );
-        }
-        Ok(candidates
-            .iter()
-            .zip(logits)
-            .map(|((id, _), logit)| (*id, sigmoid(logit as f64)))
-            .collect())
+            .map(|embedding| quantize_embedding(embedding))
+            .collect()
     }
 }
 
-fn extract_rerank_logits(shape: &[i64], data: &[f32], batch: usize) -> Result<Vec<f32>> {
-    match shape {
-        [b] if *b as usize == batch => Ok(data[..batch].to_vec()),
-        [b, 1] if *b as usize == batch => Ok(data[..batch].to_vec()),
-        [b, d] if *b as usize == batch && *d as usize >= 1 => {
-            // Some reranker exports emit `[batch, 2]` (positive/negative
-            // logits). Take the positive class only — index 1 is the
-            // standard convention for ms-marco rerankers.
-            let dims = *d as usize;
-            let positive = if dims == 1 { 0 } else { 1 };
-            Ok((0..batch).map(|i| data[i * dims + positive]).collect())
-        }
-        _ => bail!("unexpected reranker output shape {:?}", shape),
-    }
+#[cfg(feature = "cuda")]
+fn configure_cuda_execution_provider(builder: SessionBuilder) -> Result<SessionBuilder> {
+    builder
+        .with_execution_providers([ep::CUDA::default()
+            .with_device_id(0)
+            .with_conv_algorithm_search(ep::cuda::ConvAlgorithmSearch::Heuristic)
+            .build()
+            .error_on_failure()])
+        .map_err(|err| anyhow!("registering CUDA execution provider: {err}"))
 }
 
-fn sigmoid(x: f64) -> f64 {
-    1.0 / (1.0 + (-x).exp())
-}
-
-/// Tracks reranker availability across server lifetime. Once a load
-/// attempt fails (or the model file is missing) we record `Disabled` so
-/// every subsequent search short-circuits to RRF without a retry storm.
-#[derive(Default)]
-enum RerankerState {
-    /// Not yet attempted in this process. Triggers a single load on first
-    /// `rerank_candidates` call.
-    #[default]
-    Pending,
-    /// Cross-encoder loaded and ready. Boxed so the enum stays small —
-    /// `Reranker` owns an ONNX `Session` and a `Tokenizer`, both of
-    /// which are large enough that an unboxed variant would inflate
-    /// every `RerankerState` instance.
-    Loaded(Box<Reranker>),
-    /// Either `ATO_MCP_DISABLE_RERANKER` was set, the model files were
-    /// missing, or load failed. We do not retry within this process.
-    Disabled,
+#[cfg(not(feature = "cuda"))]
+fn configure_cuda_execution_provider(_builder: SessionBuilder) -> Result<SessionBuilder> {
+    bail!("GPU build requested but this ato-mcp binary was built without CUDA support; rebuild with `cargo build --release --features cuda`")
 }
 
 // [MT-01] HTTP transport keeps one ServerState shared across worker threads.
-// Lazy slots use Mutex<Option<_>> for the embedding runtime and Mutex<RerankerState>
-// for the reranker so concurrent requests can drive the load-once state machine
-// without `&mut self`. Search-time inference holds the lock for the duration of
-// the ONNX call (~10s of ms per query); read-only tools (get_chunks,
-// get_definition, get_doc_anchors, get_asset, stats) run fully concurrently.
-// [SW-04] SemanticRuntime/reranker load once; failed reranker loads disable reranking for the session.
-#[derive(Default)]
+// The semantic runtime is loaded lazily and reused across tool calls. Search-time
+// inference holds the lock for one query embedding; read-only tools
+// (get_chunks, get_definition, get_doc_anchors, get_asset, stats) run fully
+// concurrently.
 struct ServerState {
     semantic_runtime: Mutex<Option<SemanticRuntime>>,
-    reranker_state: Mutex<RerankerState>,
     update_notice: Option<UpdateAvailability>,
+    use_gpu: bool,
 }
 
 impl ServerState {
+    fn new(use_gpu: bool) -> Self {
+        Self {
+            semantic_runtime: Mutex::new(None),
+            update_notice: None,
+            use_gpu,
+        }
+    }
+
     fn encode_query_embedding(&self, query: &str) -> Result<[i8; EMBEDDING_DIM]> {
-        let mut guard = self.semantic_runtime.lock().expect("semantic_runtime mutex");
+        let mut embeddings = self.encode_query_embeddings(&[query.to_string()])?;
+        embeddings
+            .pop()
+            .ok_or_else(|| anyhow!("semantic encoder returned no query embedding"))
+    }
+
+    fn encode_query_embeddings(&self, queries: &[String]) -> Result<Vec<[i8; EMBEDDING_DIM]>> {
+        let mut guard = self
+            .semantic_runtime
+            .lock()
+            .expect("semantic_runtime mutex");
         if guard.is_none() {
-            *guard = Some(SemanticRuntime::load()?);
+            *guard = Some(SemanticRuntime::load(self.use_gpu)?);
         }
         guard
             .as_mut()
             .expect("semantic runtime was just initialized")
-            .encode_query(query)
+            .encode_queries(queries)
     }
+}
 
-    /// Cross-encoder rerank entry point. Returns `Ok(None)` whenever the
-    /// reranker is unavailable (env-var disabled, model files missing, or
-    /// previously failed to load) so the caller falls back to RRF.
-    fn rerank_candidates(
-        &self,
-        query: &str,
-        candidates: &[(i64, &str)],
-    ) -> Result<Option<Vec<(i64, f64)>>> {
-        if env_truthy("ATO_MCP_DISABLE_RERANKER") {
-            // Once disabled (via env var or model-load failure), the
-            // reranker stays disabled for the rest of this server session
-            // — no per-request retry. Restart the server to re-enable.
-            *self.reranker_state.lock().expect("reranker_state mutex") = RerankerState::Disabled;
-            return Ok(None);
-        }
-        if candidates.is_empty() {
-            return Ok(Some(Vec::new()));
-        }
-        let mut state = self.reranker_state.lock().expect("reranker_state mutex");
-        // Drive the state machine. We replace `Pending` once and never
-        // again — failed loads stick at `Disabled`.
-        if matches!(*state, RerankerState::Pending) {
-            let model_present = reranker_model_path().map(|p| p.exists()).unwrap_or(false);
-            let tokenizer_present = reranker_tokenizer_path()
-                .map(|p| p.exists())
-                .unwrap_or(false);
-            if !model_present || !tokenizer_present {
-                eprintln!(
-                    "ato-mcp: reranker model files not present (model={}, tokenizer={}); falling back to RRF for the rest of this session",
-                    model_present, tokenizer_present
-                );
-                *state = RerankerState::Disabled;
-                return Ok(None);
-            }
-            match Reranker::load() {
-                Ok(r) => *state = RerankerState::Loaded(Box::new(r)),
-                Err(err) => {
-                    eprintln!(
-                        "ato-mcp: failed to load reranker ({err}); falling back to RRF for the rest of this session"
-                    );
-                    *state = RerankerState::Disabled;
-                    return Ok(None);
-                }
-            }
-        }
-        match &mut *state {
-            RerankerState::Loaded(r) => Ok(Some(r.rerank(query, candidates)?)),
-            RerankerState::Disabled => Ok(None),
-            // Unreachable: we just ensured Pending was resolved above.
-            RerankerState::Pending => Ok(None),
-        }
+impl Default for ServerState {
+    fn default() -> Self {
+        Self::new(false)
     }
 }
 
 fn encode_query_embedding(query: &str) -> Result<[i8; EMBEDDING_DIM]> {
-    let mut runtime = SemanticRuntime::load()?;
+    let mut runtime = SemanticRuntime::load(false)?;
     runtime.encode_query(query)
 }
 
-fn pooled_embedding(shape: &[i64], data: &[f32], attention_mask: &[i64]) -> Result<Vec<f32>> {
+fn pooled_embeddings(
+    shape: &[i64],
+    data: &[f32],
+    attention_mask: &[i64],
+    batch: usize,
+    seq_len: usize,
+) -> Result<Vec<Vec<f32>>> {
     match shape {
-        [1, dims] => {
+        [out_batch, dims] => {
+            let out_batch = *out_batch as usize;
             let dims = *dims as usize;
-            if data.len() < dims {
+            if out_batch != batch {
+                bail!("model output batch {out_batch} does not match input batch {batch}");
+            }
+            if data.len() < batch * dims {
                 bail!("model output too short for shape {:?}", shape);
             }
-            Ok(data[..dims].to_vec())
+            Ok((0..batch)
+                .map(|idx| data[idx * dims..(idx + 1) * dims].to_vec())
+                .collect())
         }
-        [1, seq_len, dims] => {
-            let seq_len = *seq_len as usize;
+        [out_batch, out_seq_len, dims] => {
+            let out_batch = *out_batch as usize;
+            let out_seq_len = *out_seq_len as usize;
             let dims = *dims as usize;
-            if data.len() < seq_len * dims {
+            if out_batch != batch || out_seq_len != seq_len {
+                bail!(
+                    "model output shape {:?} does not match input batch={batch} seq_len={seq_len}",
+                    shape
+                );
+            }
+            if data.len() < batch * seq_len * dims {
                 bail!("model output too short for shape {:?}", shape);
             }
-            let mut pooled = vec![0.0f32; dims];
-            let mut denom = 0.0f32;
-            for token_idx in 0..seq_len {
-                let mask = attention_mask.get(token_idx).copied().unwrap_or(0) as f32;
-                denom += mask;
-                let offset = token_idx * dims;
-                for dim in 0..dims {
-                    pooled[dim] += data[offset + dim] * mask;
+            let mut out = Vec::with_capacity(batch);
+            for batch_idx in 0..batch {
+                let mut pooled = vec![0.0f32; dims];
+                let mut denom = 0.0f32;
+                for token_idx in 0..seq_len {
+                    let mask = attention_mask[batch_idx * seq_len + token_idx] as f32;
+                    denom += mask;
+                    let offset = (batch_idx * seq_len + token_idx) * dims;
+                    for dim in 0..dims {
+                        pooled[dim] += data[offset + dim] * mask;
+                    }
                 }
+                let denom = denom.max(1e-6);
+                for value in &mut pooled {
+                    *value /= denom;
+                }
+                out.push(pooled);
             }
-            let denom = denom.max(1e-6);
-            for value in &mut pooled {
-                *value /= denom;
-            }
-            Ok(pooled)
+            Ok(out)
         }
         _ => bail!("unsupported model output shape {:?}", shape),
     }
@@ -3130,12 +2904,8 @@ const ATO_USER_AGENT: &str = concat!(
 );
 // Containers ATO has used over the years. First match wins; falls back to
 // <main>/<body> if none match. Mirrors extract.py:_pick_container.
-const ATO_CONTAINER_SELECTORS: &[&str] = &[
-    "#LawContent",
-    "#lawContents",
-    "#LawContents",
-    "#contents",
-];
+const ATO_CONTAINER_SELECTORS: &[&str] =
+    &["#LawContent", "#lawContents", "#LawContents", "#contents"];
 // Strip these wholesale before any text extraction. Mirrors extract.py:_strip_noise.
 const ATO_NOISE_SELECTORS: &[&str] = &[
     "script",
@@ -3213,7 +2983,8 @@ fn defs_clean_term(term: &str) -> String {
             last_ws = false;
         }
     }
-    out.trim_matches(|c: char| matches!(c, ' ' | ':' | '*')).to_string()
+    out.trim_matches(|c: char| matches!(c, ' ' | ':' | '*'))
+        .to_string()
 }
 
 fn defs_clean_body(body: &str) -> String {
@@ -3235,7 +3006,10 @@ fn defs_definition_id(doc_id: &str, ord: i64, term: &str, body: &str, offset: us
     h.update(b"\0");
     h.update(body.as_bytes());
     let digest = h.finalize();
-    let hex = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let hex = digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     hex[..20].to_string()
 }
 
@@ -3279,7 +3053,10 @@ fn extract_definitions(
             if term.is_empty() {
                 continue;
             }
-            let next_start = matches.get(idx + 1).map(|m| m.start()).unwrap_or(chunk.text.len());
+            let next_start = matches
+                .get(idx + 1)
+                .map(|m| m.start())
+                .unwrap_or(chunk.text.len());
             let body_start = m.end();
             let body_slice = &chunk.text[body_start..next_start];
             let mut body = defs_clean_body(body_slice);
@@ -3731,8 +3508,18 @@ fn currency_months() -> &'static std::collections::HashMap<&'static str, u32> {
     MAP.get_or_init(|| {
         let mut m = std::collections::HashMap::new();
         for (i, name) in [
-            "january", "february", "march", "april", "may", "june", "july",
-            "august", "september", "october", "november", "december",
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
         ]
         .iter()
         .enumerate()
@@ -3813,10 +3600,7 @@ fn currency_re_replacement_verb() -> Regex {
 }
 
 fn currency_re_self_anchor() -> Regex {
-    Regex::new(
-        r"(?i)\bthis\s+(?:Ruling|Determination|Guideline|Practice\s+Statement)\b",
-    )
-    .unwrap()
+    Regex::new(r"(?i)\bthis\s+(?:Ruling|Determination|Guideline|Practice\s+Statement)\b").unwrap()
 }
 
 fn currency_re_sentence_split() -> Regex {
@@ -3858,7 +3642,9 @@ fn currency_extract_self_withdrawn_date(text: &str) -> Option<String> {
     let split = currency_re_sentence_split();
     let withdrawn = currency_re_withdrawn_prose();
     for fragment in split.split(text) {
-        let Some(m) = withdrawn.captures(fragment) else { continue };
+        let Some(m) = withdrawn.captures(fragment) else {
+            continue;
+        };
         if !currency_withdrawal_fragment_is_self(fragment, m.get(0)?.start()) {
             continue;
         }
@@ -3874,7 +3660,9 @@ fn currency_extract_self_withdrawn_by(text: &str) -> Option<String> {
     let split = currency_re_sentence_split();
     let withdrawn_by = currency_re_withdrawn_by_prose();
     for fragment in split.split(text) {
-        let Some(m) = withdrawn_by.captures(fragment) else { continue };
+        let Some(m) = withdrawn_by.captures(fragment) else {
+            continue;
+        };
         if !currency_withdrawal_fragment_is_self(fragment, m.get(0)?.start()) {
             continue;
         }
@@ -4080,7 +3868,11 @@ fn assets_url_encode_doc_id(doc_id: &str) -> String {
 }
 
 fn assets_asset_ref(doc_id: &str, ordinal: u32) -> String {
-    format!("ato-image://{}/{}", assets_url_encode_doc_id(doc_id), ordinal)
+    format!(
+        "ato-image://{}/{}",
+        assets_url_encode_doc_id(doc_id),
+        ordinal
+    )
 }
 
 fn assets_guess_media_type(src: &str) -> Option<String> {
@@ -4118,7 +3910,10 @@ fn assets_relative_path(data: &[u8], src: &str, media_type: &Option<String>) -> 
     let mut h = Sha256::new();
     h.update(data);
     let sha_full = h.finalize();
-    let sha = sha_full.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let sha = sha_full
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     let path = src.split('?').next().unwrap_or(src);
     let mut suffix = std::path::Path::new(path)
         .extension()
@@ -4247,15 +4042,48 @@ fn rewrite_images_html(
 }
 
 fn extract_attr<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
+    fn common_re(name: &str) -> Option<&'static Regex> {
+        macro_rules! attr_re {
+            ($cell:ident, $name:literal) => {{
+                static $cell: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+                $cell.get_or_init(|| {
+                    Regex::new(concat!(
+                        r#"(?is)\b"#,
+                        $name,
+                        r#"\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]*))"#
+                    ))
+                    .unwrap()
+                })
+            }};
+        }
+        match name.to_ascii_lowercase().as_str() {
+            "alt" => Some(attr_re!(ATTR_ALT_RE, "alt")),
+            "href" => Some(attr_re!(ATTR_HREF_RE, "href")),
+            "id" => Some(attr_re!(ATTR_ID_RE, "id")),
+            "name" => Some(attr_re!(ATTR_NAME_RE, "name")),
+            "src" => Some(attr_re!(ATTR_SRC_RE, "src")),
+            "title" => Some(attr_re!(ATTR_TITLE_RE, "title")),
+            _ => None,
+        }
+    }
+    fn capture_attr<'a>(re: &Regex, attrs: &'a str) -> Option<&'a str> {
+        let caps = re.captures(attrs)?;
+        caps.get(1)
+            .or_else(|| caps.get(2))
+            .or_else(|| caps.get(3))
+            .map(|m| m.as_str())
+    }
+    if let Some(re) = common_re(name) {
+        return capture_attr(re, attrs);
+    }
     // Match name="value" or name='value' or name=value (no quotes, up to whitespace).
     // Case-insensitive on the name.
-    let pat = format!(r#"(?is)\b{}\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]*))"#, regex::escape(name));
+    let pat = format!(
+        r#"(?is)\b{}\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]*))"#,
+        regex::escape(name)
+    );
     let re = Regex::new(&pat).ok()?;
-    let caps = re.captures(attrs)?;
-    caps.get(1)
-        .or_else(|| caps.get(2))
-        .or_else(|| caps.get(3))
-        .map(|m| m.as_str())
+    capture_attr(&re, attrs)
 }
 
 /// Strip attributes matching the deny list from HTML. Mirrors
@@ -4264,49 +4092,42 @@ fn extract_attr<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
 /// scraper's API is read-only-ish; the regex is bounded by attribute syntax
 /// (`name=("..."|'...'|bareword)`) so it doesn't span tag boundaries.
 fn strip_attributes(html: &str) -> String {
-    const DROP_ATTRS: &[&str] = &[
-        "style", "width", "height", "align", "valign", "bgcolor",
-        "name", "data-icon", "cite",
-    ];
-    let mut out = html.to_string();
-    for name in DROP_ATTRS {
-        let pat = format!(
-            r#"(?is)\s+{}\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)"#,
-            regex::escape(name)
-        );
-        let re = Regex::new(&pat).unwrap();
-        out = re.replace_all(&out, "").into_owned();
-    }
-    // Also drop event handlers: any attribute whose name starts with `on`.
-    let on_re = Regex::new(r#"(?is)\s+on[a-zA-Z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)"#).unwrap();
-    out = on_re.replace_all(&out, "").into_owned();
-    out
+    static STRIP_ATTR_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = STRIP_ATTR_RE.get_or_init(|| {
+        Regex::new(
+            r#"(?is)\s+(?:style|width|height|align|valign|bgcolor|name|data-icon|cite|on[a-zA-Z]+)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)"#,
+        )
+        .unwrap()
+    });
+    re.replace_all(html, "").into_owned()
 }
 
 /// Copy `<a name="X">` to `<a id="X">` (only when no existing id) and drop
 /// the bare `name=` attribute. Mirrors extract.py:_normalise_named_anchors.
 /// Operates over the HTML string directly.
 fn normalise_named_anchors(html: &str) -> String {
-    let a_re = Regex::new(r#"(?is)<a\b([^>]*)>"#).unwrap();
-    a_re
-        .replace_all(html, |caps: &regex::Captures| {
-            let attrs = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let name = extract_attr(attrs, "name");
-            let id = extract_attr(attrs, "id");
-            // Build the new attribute string.
-            let mut new_attrs = attrs.to_string();
-            // Drop name=... regardless.
-            let name_re = Regex::new(r#"(?is)\s+name\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)"#).unwrap();
-            new_attrs = name_re.replace_all(&new_attrs, "").into_owned();
-            // If the source had a name and no id, append id="<name>".
-            if let Some(n) = name {
-                if id.is_none() {
-                    new_attrs.push_str(&format!(r#" id="{}""#, assets_html_escape(n)));
-                }
+    static A_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static NAME_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let a_re = A_RE.get_or_init(|| Regex::new(r#"(?is)<a\b([^>]*)>"#).unwrap());
+    let name_re = NAME_RE
+        .get_or_init(|| Regex::new(r#"(?is)\s+name\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)"#).unwrap());
+    a_re.replace_all(html, |caps: &regex::Captures| {
+        let attrs = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let name = extract_attr(attrs, "name");
+        let id = extract_attr(attrs, "id");
+        // Build the new attribute string.
+        let mut new_attrs = attrs.to_string();
+        // Drop name=... regardless.
+        new_attrs = name_re.replace_all(&new_attrs, "").into_owned();
+        // If the source had a name and no id, append id="<name>".
+        if let Some(n) = name {
+            if id.is_none() {
+                new_attrs.push_str(&format!(r#" id="{}""#, assets_html_escape(n)));
             }
-            format!("<a{new_attrs}>")
-        })
-        .into_owned()
+        }
+        format!("<a{new_attrs}>")
+    })
+    .into_owned()
 }
 
 // ----- Chunker (port of src/ato_mcp/indexer/chunk.py) -----
@@ -4350,18 +4171,24 @@ fn chunker_approx_tokens(text: &str) -> usize {
 /// runs to single spaces, collapses ` *\n *` to `\n`, caps newline runs at
 /// two, normalises numeric-range spacing, and tightens quoted text.
 fn chunker_normalise_text(text: &str) -> String {
+    static WS_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static NEWLINE_PAD_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static NEWLINE_RUN_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static NUMERIC_RANGE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static SPACED_QUOTE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let s = text.replace('\u{a0}', " ");
     // _WS_RE: horizontal whitespace [ \t\f\v]+
-    let ws = Regex::new(r"[ \t\x0c\x0b]+").unwrap();
+    let ws = WS_RE.get_or_init(|| Regex::new(r"[ \t\x0c\x0b]+").unwrap());
     let s = ws.replace_all(&s, " ").into_owned();
-    let newline_pad = Regex::new(r" *\n *").unwrap();
+    let newline_pad = NEWLINE_PAD_RE.get_or_init(|| Regex::new(r" *\n *").unwrap());
     let s = newline_pad.replace_all(&s, "\n").into_owned();
-    let newline_run = Regex::new(r"\n{3,}").unwrap();
+    let newline_run = NEWLINE_RUN_RE.get_or_init(|| Regex::new(r"\n{3,}").unwrap());
     let s = newline_run.replace_all(&s, "\n\n").into_owned();
     let s = s.trim().to_string();
-    let numeric_range = Regex::new(r"(?P<a>\d)\s+-\s+(?P<b>\d)").unwrap();
+    let numeric_range =
+        NUMERIC_RANGE_RE.get_or_init(|| Regex::new(r"(?P<a>\d)\s+-\s+(?P<b>\d)").unwrap());
     let s = numeric_range.replace_all(&s, "$a-$b").into_owned();
-    let spaced_quote = Regex::new(r#""\s+([^"\n]*?)\s+""#).unwrap();
+    let spaced_quote = SPACED_QUOTE_RE.get_or_init(|| Regex::new(r#""\s+([^"\n]*?)\s+""#).unwrap());
     spaced_quote.replace_all(&s, r#""$1""#).into_owned()
 }
 
@@ -4407,8 +4234,7 @@ fn chunker_first_referenced_anchor(
 
 fn chunker_is_root_title_echo(heading: &str, root_title: Option<&str>) -> bool {
     let Some(rt) = root_title else { return false };
-    chunker_normalise_text(heading).to_lowercase()
-        == chunker_normalise_text(rt).to_lowercase()
+    chunker_normalise_text(heading).to_lowercase() == chunker_normalise_text(rt).to_lowercase()
 }
 
 /// Render a single subtree to inline text using the existing render_node
@@ -4426,16 +4252,47 @@ fn chunker_render_inline(
 }
 
 fn chunker_is_atomic_block(tag: &str, has_structural_child: bool) -> bool {
-    const PURE_ATOMIC: &[&str] = &["table", "p", "pre", "blockquote", "li", "figcaption", "caption", "dt", "dd"];
+    const PURE_ATOMIC: &[&str] = &[
+        "table",
+        "p",
+        "pre",
+        "blockquote",
+        "li",
+        "figcaption",
+        "caption",
+        "dt",
+        "dd",
+    ];
     const CONTAINER_BLOCKS: &[&str] = &[
-        "article", "aside", "details", "div", "dl", "figure", "footer",
-        "header", "main", "ol", "section", "ul",
+        "article", "aside", "details", "div", "dl", "figure", "footer", "header", "main", "ol",
+        "section", "ul",
     ];
     const BLOCK_TAGS: &[&str] = &[
-        "address", "article", "aside", "blockquote", "caption", "dd",
-        "details", "div", "dl", "dt", "figcaption", "figure", "footer",
-        "header", "li", "main", "ol", "p", "pre", "section", "table",
-        "td", "th", "tr", "ul",
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "caption",
+        "dd",
+        "details",
+        "div",
+        "dl",
+        "dt",
+        "figcaption",
+        "figure",
+        "footer",
+        "header",
+        "li",
+        "main",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "table",
+        "td",
+        "th",
+        "tr",
+        "ul",
     ];
     if PURE_ATOMIC.contains(&tag) {
         return true;
@@ -4452,10 +4309,31 @@ fn chunker_is_atomic_block(tag: &str, has_structural_child: bool) -> bool {
 fn chunker_child_is_structural(tag: &str) -> bool {
     const HEADING_TAGS: &[&str] = &["h1", "h2", "h3", "h4", "h5", "h6"];
     const BLOCK_TAGS: &[&str] = &[
-        "address", "article", "aside", "blockquote", "caption", "dd",
-        "details", "div", "dl", "dt", "figcaption", "figure", "footer",
-        "header", "li", "main", "ol", "p", "pre", "section", "table",
-        "td", "th", "tr", "ul",
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "caption",
+        "dd",
+        "details",
+        "div",
+        "dl",
+        "dt",
+        "figcaption",
+        "figure",
+        "footer",
+        "header",
+        "li",
+        "main",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "table",
+        "td",
+        "th",
+        "tr",
+        "ul",
     ];
     HEADING_TAGS.contains(&tag) || BLOCK_TAGS.contains(&tag)
 }
@@ -4539,7 +4417,11 @@ fn chunker_render_block(
                 .select(&li_sel)
                 .map(|li| {
                     let t = chunker_normalise_text(&chunker_render_inline(li, referenced));
-                    if t.is_empty() { String::new() } else { format!("- {t}") }
+                    if t.is_empty() {
+                        String::new()
+                    } else {
+                        format!("- {t}")
+                    }
                 })
                 .filter(|s| !s.is_empty())
                 .collect();
@@ -4551,8 +4433,7 @@ fn chunker_render_block(
         return None;
     }
     let anchor = chunker_first_referenced_anchor(node, referenced);
-    let is_oversize_table =
-        tag == "table" && chunker_approx_tokens(&text) > EMBED_MAX_TOKENS;
+    let is_oversize_table = tag == "table" && chunker_approx_tokens(&text) > EMBED_MAX_TOKENS;
     let table_html = if is_oversize_table {
         Some(node.html())
     } else {
@@ -4602,7 +4483,7 @@ fn chunker_render_dt_dd_pair(
         definition_text: rendered,
         anchor,
         is_oversize_table: false,
-                table_html: None,
+        table_html: None,
     })
 }
 
@@ -4651,9 +4532,7 @@ fn chunker_walk(
             chunker_flush_inline(&mut inline_parts, &mut inline_anchors, blocks);
             let inner = chunker_render_inline(eref, referenced);
             let heading_text = chunker_normalise_text(&inner);
-            if !heading_text.is_empty()
-                && !chunker_is_root_title_echo(&heading_text, root_title)
-            {
+            if !heading_text.is_empty() && !chunker_is_root_title_echo(&heading_text, root_title) {
                 let level: usize = tag[1..].parse().unwrap_or(1).clamp(1, 6);
                 let rendered = format!("{} {}", "#".repeat(level), heading_text);
                 let anchor = chunker_heading_anchor(eref);
@@ -4662,7 +4541,7 @@ fn chunker_walk(
                     definition_text: rendered,
                     anchor,
                     is_oversize_table: false,
-                table_html: None,
+                    table_html: None,
                 });
             }
             idx += 1;
@@ -4710,7 +4589,7 @@ fn chunker_flush_inline(
             definition_text: text,
             anchor,
             is_oversize_table: false,
-                table_html: None,
+            table_html: None,
         });
     }
     inline_parts.clear();
@@ -4836,10 +4715,7 @@ fn chunker_sentence_split(text: &str) -> Vec<String> {
             while j < chars.len() && chars[j].is_whitespace() {
                 j += 1;
             }
-            if j > i + 1
-                && j < chars.len()
-                && (chars[j].is_ascii_uppercase() || chars[j] == '(')
-            {
+            if j > i + 1 && j < chars.len() && (chars[j].is_ascii_uppercase() || chars[j] == '(') {
                 let trimmed = current.trim().to_string();
                 if !trimmed.is_empty() {
                     sentences.push(trimmed);
@@ -4870,33 +4746,32 @@ fn chunker_pack(blocks: Vec<ChunkBlock>, max_tokens: usize) -> Vec<Chunk> {
     let mut current_words: usize = 0;
     let mut current_anchor: Option<String> = None;
 
-    let flush =
-        |current_text: &mut Vec<String>,
-         current_def: &mut Vec<String>,
-         current_words: &mut usize,
-         current_anchor: &mut Option<String>,
-         ord_counter: &mut i64,
-         chunks: &mut Vec<Chunk>| {
-            if current_text.is_empty() {
-                return;
-            }
-            let text = current_text.join("\n\n").trim().to_string();
-            let defn = current_def.join("\n\n").trim().to_string();
-            chunks.push(Chunk {
-                ord: *ord_counter,
-                anchor: current_anchor.take(),
-                text: text.clone(),
-                definition_text: if defn != text && !defn.is_empty() {
-                    Some(defn)
-                } else {
-                    None
-                },
-            });
-            *ord_counter += 1;
-            current_text.clear();
-            current_def.clear();
-            *current_words = 0;
-        };
+    let flush = |current_text: &mut Vec<String>,
+                 current_def: &mut Vec<String>,
+                 current_words: &mut usize,
+                 current_anchor: &mut Option<String>,
+                 ord_counter: &mut i64,
+                 chunks: &mut Vec<Chunk>| {
+        if current_text.is_empty() {
+            return;
+        }
+        let text = current_text.join("\n\n").trim().to_string();
+        let defn = current_def.join("\n\n").trim().to_string();
+        chunks.push(Chunk {
+            ord: *ord_counter,
+            anchor: current_anchor.take(),
+            text: text.clone(),
+            definition_text: if defn != text && !defn.is_empty() {
+                Some(defn)
+            } else {
+                None
+            },
+        });
+        *ord_counter += 1;
+        current_text.clear();
+        current_def.clear();
+        *current_words = 0;
+    };
 
     for block in blocks {
         let block_words = block.text.split_whitespace().count();
@@ -4980,10 +4855,7 @@ fn chunker_html_to_text(html: &str) -> String {
     let doc = scraper::Html::parse_fragment(html);
     let referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
     let body_sel = scraper::Selector::parse("body").unwrap();
-    let walk_root = doc
-        .select(&body_sel)
-        .next()
-        .unwrap_or(doc.root_element());
+    let walk_root = doc.select(&body_sel).next().unwrap_or(doc.root_element());
     let mut blocks: Vec<ChunkBlock> = Vec::new();
     chunker_walk(walk_root, &mut blocks, &referenced, None);
     blocks
@@ -5004,9 +4876,9 @@ const METADATA_OTHER_CATEGORY: &str = "Other_ATO_documents";
 const METADATA_PACK_FORMAT_VERSION: u32 = 2;
 
 fn metadata_extract_docid_path(canonical_id: &str) -> Option<String> {
-    let parsed = url::Url::parse(canonical_id).ok().or_else(|| {
-        url::Url::parse(&format!("https://placeholder/{canonical_id}")).ok()
-    })?;
+    let parsed = url::Url::parse(canonical_id)
+        .ok()
+        .or_else(|| url::Url::parse(&format!("https://placeholder/{canonical_id}")).ok())?;
     for (k, v) in parsed.query_pairs() {
         if k.eq_ignore_ascii_case("docid") {
             let s = v.into_owned();
@@ -5048,9 +4920,8 @@ fn metadata_extract_pub_date(text: &str) -> Option<String> {
         r"(?i)\b(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})\b",
     )
     .unwrap();
-    let bound = std::cmp::min(text.len(), 2000);
-    let head = &text[..bound];
-    let m = date_re.captures(head)?;
+    let head = text.chars().take(2000).collect::<String>();
+    let m = date_re.captures(&head)?;
     let day: u32 = m.get(1)?.as_str().parse().ok()?;
     let month_name = m.get(2)?.as_str().to_lowercase();
     let year: u32 = m.get(3)?.as_str().parse().ok()?;
@@ -5066,9 +4937,9 @@ fn metadata_human_code_for_doc_id(doc_id: &str) -> Option<String> {
     let body = segments[1];
     // Year-series codes, longest-first to avoid prefix collisions.
     let year_series: Vec<&str> = vec![
-        "SMSFRB", "SMSFR", "SMSFD", "GSTR", "GSTD", "FBTR", "WETR", "WETD",
-        "LCR", "SGR", "FTR", "PCG", "LCG", "PRR", "CLR", "COG", "TXD", "TPA",
-        "FBT", "CR", "PR", "TR", "TD", "MT", "TA", "LI", "LG", "WT",
+        "SMSFRB", "SMSFR", "SMSFD", "GSTR", "GSTD", "FBTR", "WETR", "WETD", "LCR", "SGR", "FTR",
+        "PCG", "LCG", "PRR", "CLR", "COG", "TXD", "TPA", "FBT", "CR", "PR", "TR", "TD", "MT", "TA",
+        "LI", "LG", "WT",
     ];
     let alt = year_series.join("|");
     // Modern 4-digit year form: TR20243 -> TR 2024/3
@@ -5083,17 +4954,29 @@ fn metadata_human_code_for_doc_id(doc_id: &str) -> Option<String> {
     // PS LA final
     let re_psla = Regex::new(r"^PSLA(\d{4})(\d+)$").unwrap();
     if let Some(c) = re_psla.captures(body) {
-        return Some(format!("PS LA {}/{}", c.get(1)?.as_str(), c.get(2)?.as_str()));
+        return Some(format!(
+            "PS LA {}/{}",
+            c.get(1)?.as_str(),
+            c.get(2)?.as_str()
+        ));
     }
     // PS LA draft
     let re_psla_d = Regex::new(r"^PSD(\d{4})D?(\d+)$").unwrap();
     if let Some(c) = re_psla_d.captures(body) {
-        return Some(format!("PS LA {}/D{}", c.get(1)?.as_str(), c.get(2)?.as_str()));
+        return Some(format!(
+            "PS LA {}/D{}",
+            c.get(1)?.as_str(),
+            c.get(2)?.as_str()
+        ));
     }
     // ATO ID
     let re_atoid = Regex::new(r"^(?:ATOID|AID)(\d{4})(\d+)$").unwrap();
     if let Some(c) = re_atoid.captures(body) {
-        return Some(format!("ATO ID {}/{}", c.get(1)?.as_str(), c.get(2)?.as_str()));
+        return Some(format!(
+            "ATO ID {}/{}",
+            c.get(1)?.as_str(),
+            c.get(2)?.as_str()
+        ));
     }
     // Legacy 2-digit-year form: TR9725 -> TR 97/25 (year starts with 8 or 9)
     let re_y2 = Regex::new(&format!(r"^({alt})([89]\d)(\d+)$")).unwrap();
@@ -5113,13 +4996,21 @@ fn metadata_content_hash(text: &str) -> String {
     let mut h = Sha256::new();
     h.update(text.as_bytes());
     let digest = h.finalize();
-    let hex = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let hex = digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     format!("sha256:{hex}")
 }
 
 #[allow(dead_code)]
 const METADATA_SIG_KEYS: &[&str] = &[
-    "title", "type", "date", "withdrawn_date", "superseded_by", "replaces",
+    "title",
+    "type",
+    "date",
+    "withdrawn_date",
+    "superseded_by",
+    "replaces",
     "pack_format_version",
 ];
 
@@ -5150,36 +5041,42 @@ fn metadata_signature(fields: &serde_json::Map<String, JsonValue>) -> String {
 /// Operates string-side over the cleaned HTML.
 fn rewrite_links_html(html: &str) -> String {
     let a_re = Regex::new(r#"(?is)<a\b([^>]*)>"#).unwrap();
-    a_re
-        .replace_all(html, |caps: &regex::Captures| {
-            let attrs = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let Some(href) = extract_attr(attrs, "href") else {
-                return caps.get(0).unwrap().as_str().to_string();
-            };
-            // Try ATO doc-link parse.
-            if let Some((doc_id, pit, view)) = doc_id_from_ato_link(href) {
-                let href_re = Regex::new(r#"(?is)\s+href\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)"#).unwrap();
-                let stripped = href_re.replace_all(attrs, "").into_owned();
-                let mut new_attrs = stripped;
-                new_attrs.push_str(&format!(r#" data-doc-id="{}""#, assets_html_escape(&doc_id)));
-                if let Some(p) = pit {
-                    new_attrs.push_str(&format!(r#" data-pit="{}""#, assets_html_escape(&p)));
-                }
-                if let Some(v) = view {
-                    new_attrs.push_str(&format!(r#" data-view="{}""#, assets_html_escape(&v)));
-                }
-                return format!("<a{new_attrs}>");
+    a_re.replace_all(html, |caps: &regex::Captures| {
+        let attrs = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let Some(href) = extract_attr(attrs, "href") else {
+            return caps.get(0).unwrap().as_str().to_string();
+        };
+        // Try ATO doc-link parse.
+        if let Some((doc_id, pit, view)) = doc_id_from_ato_link(href) {
+            let href_re = Regex::new(r#"(?is)\s+href\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)"#).unwrap();
+            let stripped = href_re.replace_all(attrs, "").into_owned();
+            let mut new_attrs = stripped;
+            new_attrs.push_str(&format!(
+                r#" data-doc-id="{}""#,
+                assets_html_escape(&doc_id)
+            ));
+            if let Some(p) = pit {
+                new_attrs.push_str(&format!(r#" data-pit="{}""#, assets_html_escape(&p)));
             }
-            // Non-ATO link: keep href cleaned (strip javascript:/data:).
-            let safe = href.trim();
-            if safe.is_empty() || Regex::new(r#"(?is)^\s*(?:javascript|data):"#).unwrap().is_match(safe) {
-                let href_re = Regex::new(r#"(?is)\s+href\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)"#).unwrap();
-                let stripped = href_re.replace_all(attrs, "").into_owned();
-                return format!("<a{stripped}>");
+            if let Some(v) = view {
+                new_attrs.push_str(&format!(r#" data-view="{}""#, assets_html_escape(&v)));
             }
-            caps.get(0).unwrap().as_str().to_string()
-        })
-        .into_owned()
+            return format!("<a{new_attrs}>");
+        }
+        // Non-ATO link: keep href cleaned (strip javascript:/data:).
+        let safe = href.trim();
+        if safe.is_empty()
+            || Regex::new(r#"(?is)^\s*(?:javascript|data):"#)
+                .unwrap()
+                .is_match(safe)
+        {
+            let href_re = Regex::new(r#"(?is)\s+href\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)"#).unwrap();
+            let stripped = href_re.replace_all(attrs, "").into_owned();
+            return format!("<a{stripped}>");
+        }
+        caps.get(0).unwrap().as_str().to_string()
+    })
+    .into_owned()
 }
 
 // ----- Pack file writer (port of src/ato_mcp/indexer/pack.py) -----
@@ -5212,18 +5109,16 @@ fn write_pack(
     if let Some(parent) = out_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    let mut file = File::create(out_path)
-        .with_context(|| format!("creating {}", out_path.display()))?;
+    let mut file =
+        File::create(out_path).with_context(|| format!("creating {}", out_path.display()))?;
     let mut hasher = Sha256::new();
     let mut offset: u64 = 0;
     let mut refs: Vec<PackedDocRef> = Vec::new();
 
     for r in records {
         let (doc_id, record) = r?;
-        let payload = zstd::stream::encode_all(
-            std::io::Cursor::new(serde_json::to_vec(&record)?),
-            level,
-        )?;
+        let payload =
+            zstd::stream::encode_all(std::io::Cursor::new(serde_json::to_vec(&record)?), level)?;
         let header = (payload.len() as u32).to_le_bytes();
         file.write_all(&header)?;
         file.write_all(&payload)?;
@@ -5242,8 +5137,7 @@ fn write_pack(
     // Trailer.
     let index_offset = offset;
     let index_json = serde_json::to_vec(&refs)?;
-    let index_blob =
-        zstd::stream::encode_all(std::io::Cursor::new(index_json), level)?;
+    let index_blob = zstd::stream::encode_all(std::io::Cursor::new(index_json), level)?;
     file.write_all(&index_blob)?;
     let mut trailer = Vec::with_capacity(6 + 4 + 8 + 4);
     trailer.extend_from_slice(PACK_TRAILER_MAGIC);
@@ -5256,7 +5150,10 @@ fn write_pack(
     file.flush()?;
 
     let digest = hasher.finalize();
-    let sha256_hex = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let sha256_hex = digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     let sha8 = sha256_hex[..8].to_string();
     let size = fs::metadata(out_path)?.len();
     Ok(json!({
@@ -5310,11 +5207,17 @@ impl RuleInputs {
     }
 
     fn h1(&self) -> String {
-        self.headings.first().map(|s| s.trim().to_string()).unwrap_or_default()
+        self.headings
+            .first()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
     }
 
     fn h2(&self) -> String {
-        self.headings.get(1).map(|s| s.trim().to_string()).unwrap_or_default()
+        self.headings
+            .get(1)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
     }
 }
 
@@ -5366,9 +5269,9 @@ enum Template {
 
 const RULING_SERIES_LIST: &[&str] = &[
     // Sorted by length desc so longer prefixes match first in the alternation.
-    "SMSFRB", "SMSFR", "SMSFD", "GSTR", "GSTD", "FBTR", "WETR", "WETD",
-    "LCR", "SGR", "FTR", "PCG", "LCG", "PRR", "CLR", "COG", "TXD", "TPA",
-    "FBT", "GII", "CR", "PR", "TR", "TD", "MT", "TA", "LI", "LG", "WT", "IT",
+    "SMSFRB", "SMSFR", "SMSFD", "GSTR", "GSTD", "FBTR", "WETR", "WETD", "LCR", "SGR", "FTR", "PCG",
+    "LCG", "PRR", "CLR", "COG", "TXD", "TPA", "FBT", "GII", "CR", "PR", "TR", "TD", "MT", "TA",
+    "LI", "LG", "WT", "IT",
 ];
 
 fn ruling_series_alt() -> &'static str {
@@ -5433,8 +5336,7 @@ fn re_name_v_name() -> &'static regex::Regex {
 fn re_re_x() -> &'static regex::Regex {
     static R: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     R.get_or_init(|| {
-        regex::Regex::new(r"(?i)^(?:Re|In\s+re|In\s+the\s+Matter\s+of|Ex\s+parte)\s+[A-Z]")
-            .unwrap()
+        regex::Regex::new(r"(?i)^(?:Re|In\s+re|In\s+the\s+Matter\s+of|Ex\s+parte)\s+[A-Z]").unwrap()
     })
 }
 
@@ -5458,41 +5360,95 @@ fn re_bill_title() -> &'static regex::Regex {
     R.get_or_init(|| regex::Regex::new(r"\bBill\s+(?:19|20)\d{2}\b").unwrap())
 }
 
-fn type_phrases() -> &'static std::collections::HashMap<Shape, std::collections::HashSet<&'static str>> {
-    static M: std::sync::OnceLock<std::collections::HashMap<Shape, std::collections::HashSet<&'static str>>> = std::sync::OnceLock::new();
+fn type_phrases(
+) -> &'static std::collections::HashMap<Shape, std::collections::HashSet<&'static str>> {
+    static M: std::sync::OnceLock<
+        std::collections::HashMap<Shape, std::collections::HashSet<&'static str>>,
+    > = std::sync::OnceLock::new();
     M.get_or_init(|| {
         let mut m = std::collections::HashMap::new();
-        m.insert(Shape::RulingTypePhrase, [
-            "taxation ruling", "class ruling", "product ruling",
-            "law companion ruling", "gst ruling", "gst determination",
-            "taxation determination", "superannuation guarantee ruling",
-            "fuel tax ruling", "fringe benefits tax ruling",
-            "income tax ruling", "miscellaneous taxation ruling",
-            "law companion guideline", "wine equalisation tax ruling",
-            "wine equalisation tax determination",
-            "superannuation guarantee determination",
-            "smsf ruling", "smsf determination", "ruling compendium",
-            "goods and services tax ruling", "goods and services tax determination",
-        ].iter().copied().collect());
-        m.insert(Shape::GuidelineTypePhrase, [
-            "practical compliance guideline", "practical compliance guidelines",
-        ].iter().copied().collect());
-        m.insert(Shape::AlertPhrase, ["taxpayer alert"].iter().copied().collect());
-        m.insert(Shape::AtoidPhrase, ["ato interpretative decision"].iter().copied().collect());
-        m.insert(Shape::PslaPhrase, [
-            "practice statement law administration",
-            "ato practice statement law administration",
-            "law administration practice statement",
-        ].iter().copied().collect());
-        m.insert(Shape::SmsfrbPhrase, [
-            "smsf regulator's bulletin", "smsf regulators bulletin",
-        ].iter().copied().collect());
-        m.insert(Shape::DisPhrase, [
-            "decision impact statement", "decision impact statements",
-        ].iter().copied().collect());
-        m.insert(Shape::EmPhrase, [
-            "explanatory memorandum", "supplementary explanatory memorandum",
-        ].iter().copied().collect());
+        m.insert(
+            Shape::RulingTypePhrase,
+            [
+                "taxation ruling",
+                "class ruling",
+                "product ruling",
+                "law companion ruling",
+                "gst ruling",
+                "gst determination",
+                "taxation determination",
+                "superannuation guarantee ruling",
+                "fuel tax ruling",
+                "fringe benefits tax ruling",
+                "income tax ruling",
+                "miscellaneous taxation ruling",
+                "law companion guideline",
+                "wine equalisation tax ruling",
+                "wine equalisation tax determination",
+                "superannuation guarantee determination",
+                "smsf ruling",
+                "smsf determination",
+                "ruling compendium",
+                "goods and services tax ruling",
+                "goods and services tax determination",
+            ]
+            .iter()
+            .copied()
+            .collect(),
+        );
+        m.insert(
+            Shape::GuidelineTypePhrase,
+            [
+                "practical compliance guideline",
+                "practical compliance guidelines",
+            ]
+            .iter()
+            .copied()
+            .collect(),
+        );
+        m.insert(
+            Shape::AlertPhrase,
+            ["taxpayer alert"].iter().copied().collect(),
+        );
+        m.insert(
+            Shape::AtoidPhrase,
+            ["ato interpretative decision"].iter().copied().collect(),
+        );
+        m.insert(
+            Shape::PslaPhrase,
+            [
+                "practice statement law administration",
+                "ato practice statement law administration",
+                "law administration practice statement",
+            ]
+            .iter()
+            .copied()
+            .collect(),
+        );
+        m.insert(
+            Shape::SmsfrbPhrase,
+            ["smsf regulator's bulletin", "smsf regulators bulletin"]
+                .iter()
+                .copied()
+                .collect(),
+        );
+        m.insert(
+            Shape::DisPhrase,
+            ["decision impact statement", "decision impact statements"]
+                .iter()
+                .copied()
+                .collect(),
+        );
+        m.insert(
+            Shape::EmPhrase,
+            [
+                "explanatory memorandum",
+                "supplementary explanatory memorandum",
+            ]
+            .iter()
+            .copied()
+            .collect(),
+        );
         m
     })
 }
@@ -5503,22 +5459,44 @@ fn shape_of(heading: &str) -> Shape {
         return Shape::Empty;
     }
     let t_lower = t.to_lowercase();
-    if re_neutral().is_match(&t) { return Shape::NeutralCitation; }
-    if re_atoid().is_match(&t) { return Shape::Atoid; }
-    if re_psla().is_match(&t) { return Shape::Psla; }
-    if re_smsfrb().is_match(&t) { return Shape::Smsfrb; }
-    if re_ruling_citation().is_match(&t) { return Shape::RulingCitation; }
-    if re_ruling_unslashed().is_match(&t) { return Shape::RulingUnslashed; }
+    if re_neutral().is_match(&t) {
+        return Shape::NeutralCitation;
+    }
+    if re_atoid().is_match(&t) {
+        return Shape::Atoid;
+    }
+    if re_psla().is_match(&t) {
+        return Shape::Psla;
+    }
+    if re_smsfrb().is_match(&t) {
+        return Shape::Smsfrb;
+    }
+    if re_ruling_citation().is_match(&t) {
+        return Shape::RulingCitation;
+    }
+    if re_ruling_unslashed().is_match(&t) {
+        return Shape::RulingUnslashed;
+    }
     for (sh, phrases) in type_phrases().iter() {
         if phrases.contains(t_lower.as_str()) {
             return *sh;
         }
     }
-    if re_act_title().is_match(&t) { return Shape::ActTitle; }
-    if re_bill_title().is_match(&t) { return Shape::BillTitle; }
-    if re_re_x().is_match(&t) { return Shape::ReX; }
-    if re_case_number().is_match(&t) { return Shape::CaseNumber; }
-    if re_name_v_name().is_match(&t) && t.len() < 200 { return Shape::NameVName; }
+    if re_act_title().is_match(&t) {
+        return Shape::ActTitle;
+    }
+    if re_bill_title().is_match(&t) {
+        return Shape::BillTitle;
+    }
+    if re_re_x().is_match(&t) {
+        return Shape::ReX;
+    }
+    if re_case_number().is_match(&t) {
+        return Shape::CaseNumber;
+    }
+    if re_name_v_name().is_match(&t) && t.len() < 200 {
+        return Shape::NameVName;
+    }
     Shape::Other
 }
 
@@ -5535,7 +5513,12 @@ fn re_docid_act_section() -> &'static regex::Regex {
 fn classify(ins: &RuleInputs) -> Template {
     let shapes: Vec<Shape> = ins.headings.iter().take(6).map(|h| shape_of(h)).collect();
     let has = |s: Shape| shapes.contains(&s);
-    let any_citation = shapes.iter().any(|s| matches!(s, Shape::RulingCitation | Shape::RulingUnslashed | Shape::Atoid | Shape::Psla));
+    let any_citation = shapes.iter().any(|s| {
+        matches!(
+            s,
+            Shape::RulingCitation | Shape::RulingUnslashed | Shape::Atoid | Shape::Psla
+        )
+    });
 
     if has(Shape::Smsfrb) || has(Shape::SmsfrbPhrase) {
         return Template::Smsfrb;
@@ -5551,17 +5534,34 @@ fn classify(ins: &RuleInputs) -> Template {
     if any_citation {
         return Template::OfficialPub;
     }
-    if has(Shape::DisPhrase) && shapes.iter().any(|s| matches!(s, Shape::NameVName | Shape::ReX | Shape::NeutralCitation)) {
+    if has(Shape::DisPhrase)
+        && shapes
+            .iter()
+            .any(|s| matches!(s, Shape::NameVName | Shape::ReX | Shape::NeutralCitation))
+    {
         return Template::Dis;
     }
-    if !shapes.is_empty() && matches!(shapes[0], Shape::NameVName | Shape::ReX | Shape::NeutralCitation | Shape::CaseNumber) {
+    if !shapes.is_empty()
+        && matches!(
+            shapes[0],
+            Shape::NameVName | Shape::ReX | Shape::NeutralCitation | Shape::CaseNumber
+        )
+    {
         return Template::CaseH1;
     }
-    if shapes.len() >= 2 && shapes[1] == Shape::NameVName && ins.category.as_deref() == Some("Cases") {
+    if shapes.len() >= 2
+        && shapes[1] == Shape::NameVName
+        && ins.category.as_deref() == Some("Cases")
+    {
         return Template::CaseH2;
     }
     if ins.category.as_deref() == Some("Cases") {
-        if shapes.iter().any(|s| matches!(s, Shape::NameVName | Shape::ReX | Shape::NeutralCitation | Shape::CaseNumber)) {
+        if shapes.iter().any(|s| {
+            matches!(
+                s,
+                Shape::NameVName | Shape::ReX | Shape::NeutralCitation | Shape::CaseNumber
+            )
+        }) {
             return Template::CaseH1;
         }
         return Template::CaseH1;
@@ -5569,7 +5569,9 @@ fn classify(ins: &RuleInputs) -> Template {
     if !shapes.is_empty() && shapes[0] == Shape::ActTitle {
         return Template::Act;
     }
-    if has(Shape::ActTitle) && ins.category.as_deref() == Some("Legislation_and_supporting_material") {
+    if has(Shape::ActTitle)
+        && ins.category.as_deref() == Some("Legislation_and_supporting_material")
+    {
         return Template::Act;
     }
     if has(Shape::BillTitle) || has(Shape::EmPhrase) {
@@ -5596,12 +5598,19 @@ fn re_citation_token() -> &'static regex::Regex {
 
 fn re_atoid_token() -> &'static regex::Regex {
     static R: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    R.get_or_init(|| regex::Regex::new(r"^ATO\s+ID\s+(?P<year>\d{4})/(?P<num>\d+)(?P<suffix>[A-Z0-9]*)").unwrap())
+    R.get_or_init(|| {
+        regex::Regex::new(r"^ATO\s+ID\s+(?P<year>\d{4})/(?P<num>\d+)(?P<suffix>[A-Z0-9]*)").unwrap()
+    })
 }
 
 fn re_psla_token() -> &'static regex::Regex {
     static R: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    R.get_or_init(|| regex::Regex::new(r"^PS\s+LA\s+(?P<year>\d{4})/(?P<draft>D?)(?P<num>\d+)(?P<suffix>[A-Z0-9]*)").unwrap())
+    R.get_or_init(|| {
+        regex::Regex::new(
+            r"^PS\s+LA\s+(?P<year>\d{4})/(?P<draft>D?)(?P<num>\d+)(?P<suffix>[A-Z0-9]*)",
+        )
+        .unwrap()
+    })
 }
 
 fn re_smsfrb_token() -> &'static regex::Regex {
@@ -5611,7 +5620,9 @@ fn re_smsfrb_token() -> &'static regex::Regex {
 
 fn re_neutral_token() -> &'static regex::Regex {
     static R: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    R.get_or_init(|| regex::Regex::new(r"^\[(?P<year>\d{4})\]\s+(?P<court>[A-Z]+)\s+(?P<num>\d+)").unwrap())
+    R.get_or_init(|| {
+        regex::Regex::new(r"^\[(?P<year>\d{4})\]\s+(?P<court>[A-Z]+)\s+(?P<num>\d+)").unwrap()
+    })
 }
 
 fn re_act_year() -> &'static regex::Regex {
@@ -5638,9 +5649,18 @@ fn re_precise_date() -> &'static regex::Regex {
 
 fn month_index(name: &str) -> u32 {
     match name.to_ascii_lowercase().as_str() {
-        "january" => 1, "february" => 2, "march" => 3, "april" => 4,
-        "may" => 5, "june" => 6, "july" => 7, "august" => 8,
-        "september" => 9, "october" => 10, "november" => 11, "december" => 12,
+        "january" => 1,
+        "february" => 2,
+        "march" => 3,
+        "april" => 4,
+        "may" => 5,
+        "june" => 6,
+        "july" => 7,
+        "august" => 8,
+        "september" => 9,
+        "october" => 10,
+        "november" => 11,
+        "december" => 12,
         _ => 0,
     }
 }
@@ -5664,7 +5684,10 @@ fn re_case_header_name() -> &'static regex::Regex {
 
 fn clean_citation(raw: &str) -> String {
     let cleaned = re_withdrawn().replace_all(raw, "").trim().to_string();
-    let cleaned = regex::Regex::new(r"\s+").unwrap().replace_all(&cleaned, " ").to_string();
+    let cleaned = regex::Regex::new(r"\s+")
+        .unwrap()
+        .replace_all(&cleaned, " ")
+        .to_string();
     let pattern = format!(
         r"^({}|ATO\s+ID|PS\s+LA|SMSFRB)\s+(\d{{1,4}})/(D?)(\d+)([A-Z]{{1,2}}\d*)?$",
         ruling_series_alt()
@@ -5682,7 +5705,13 @@ fn clean_citation(raw: &str) -> String {
 }
 
 fn year_from_token(token: &str) -> Option<u32> {
-    let regs = [re_citation_token(), re_atoid_token(), re_psla_token(), re_smsfrb_token(), re_neutral_token()];
+    let regs = [
+        re_citation_token(),
+        re_atoid_token(),
+        re_psla_token(),
+        re_smsfrb_token(),
+        re_neutral_token(),
+    ];
     for re in regs.iter() {
         if let Some(c) = re.captures(token) {
             if let Some(y) = c.name("year") {
@@ -5701,21 +5730,41 @@ fn precise_date(text: &str) -> Option<String> {
     let month_name = m.get(2)?.as_str();
     let year: u32 = m.get(3)?.as_str().parse().ok()?;
     let month = month_index(month_name);
-    if month == 0 { return None; }
+    if month == 0 {
+        return None;
+    }
     Some(format!("{:04}-{:02}-{:02}", year, month, day))
 }
 
 fn type_phrase_shape(s: Shape) -> bool {
-    matches!(s, Shape::RulingTypePhrase | Shape::GuidelineTypePhrase
-              | Shape::AtoidPhrase | Shape::PslaPhrase | Shape::SmsfrbPhrase
-              | Shape::DisPhrase | Shape::AlertPhrase | Shape::EmPhrase)
+    matches!(
+        s,
+        Shape::RulingTypePhrase
+            | Shape::GuidelineTypePhrase
+            | Shape::AtoidPhrase
+            | Shape::PslaPhrase
+            | Shape::SmsfrbPhrase
+            | Shape::DisPhrase
+            | Shape::AlertPhrase
+            | Shape::EmPhrase
+    )
 }
 
 fn citation_shape(s: Shape) -> bool {
-    matches!(s, Shape::RulingCitation | Shape::RulingUnslashed
-              | Shape::Atoid | Shape::Psla | Shape::Smsfrb | Shape::NeutralCitation
-              | Shape::NameVName | Shape::ReX | Shape::CaseNumber
-              | Shape::ActTitle | Shape::BillTitle)
+    matches!(
+        s,
+        Shape::RulingCitation
+            | Shape::RulingUnslashed
+            | Shape::Atoid
+            | Shape::Psla
+            | Shape::Smsfrb
+            | Shape::NeutralCitation
+            | Shape::NameVName
+            | Shape::ReX
+            | Shape::CaseNumber
+            | Shape::ActTitle
+            | Shape::BillTitle
+    )
 }
 
 fn collapse_ws(s: &str) -> String {
@@ -5724,17 +5773,25 @@ fn collapse_ws(s: &str) -> String {
 
 fn compose_title(primary: Option<&str>, ins: &RuleInputs) -> Option<String> {
     let primary = primary?;
-    if primary.is_empty() { return None; }
+    if primary.is_empty() {
+        return None;
+    }
     let primary = collapse_ws(primary);
     let mut parts = vec![primary.clone()];
     let mut seen = std::collections::HashSet::new();
     seen.insert(primary.to_lowercase());
     for h in ins.headings.iter().take(5) {
         let t = collapse_ws(h);
-        if t.is_empty() || seen.contains(&t.to_lowercase()) { continue; }
-        if t.starts_with("/law/view/") { continue; }
+        if t.is_empty() || seen.contains(&t.to_lowercase()) {
+            continue;
+        }
+        if t.starts_with("/law/view/") {
+            continue;
+        }
         let s = shape_of(&t);
-        if type_phrase_shape(s) || citation_shape(s) { continue; }
+        if type_phrase_shape(s) || citation_shape(s) {
+            continue;
+        }
         parts.push(t);
         break;
     }
@@ -5745,7 +5802,10 @@ fn prefix_overlap(candidate: &str, parts: &[String]) -> bool {
     let cand_lower = candidate.to_lowercase();
     for p in parts {
         let p_lower = p.to_lowercase();
-        if cand_lower == p_lower || cand_lower.starts_with(&p_lower) || p_lower.starts_with(&cand_lower) {
+        if cand_lower == p_lower
+            || cand_lower.starts_with(&p_lower)
+            || p_lower.starts_with(&cand_lower)
+        {
             return true;
         }
     }
@@ -5754,9 +5814,17 @@ fn prefix_overlap(candidate: &str, parts: &[String]) -> bool {
 
 fn compose_from_em_front_matter(ins: &RuleInputs) -> Option<String> {
     let phrase = ins.front_matter_phrase.as_deref()?.trim().to_string();
-    if phrase.is_empty() { return None; }
-    let refs: Vec<&String> = ins.front_matter_refs.iter().filter(|r| !r.trim().is_empty()).collect();
-    if refs.is_empty() { return None; }
+    if phrase.is_empty() {
+        return None;
+    }
+    let refs: Vec<&String> = ins
+        .front_matter_refs
+        .iter()
+        .filter(|r| !r.trim().is_empty())
+        .collect();
+    if refs.is_empty() {
+        return None;
+    }
     let citation = collapse_ws(refs[0]);
     let mut parts = vec![phrase, citation];
     let mut section: Option<String> = None;
@@ -5787,15 +5855,22 @@ fn compose_from_body_h2(ins: &RuleInputs) -> Option<String> {
     for (i, lvl) in ins.heading_levels.iter().enumerate() {
         if *lvl == 2 {
             let t = collapse_ws(&ins.headings[i]);
-            if !t.is_empty() { return Some(t); }
+            if !t.is_empty() {
+                return Some(t);
+            }
         }
     }
     None
 }
 
 fn compose_from_first_ref(ins: &RuleInputs) -> Option<String> {
-    if ins.front_matter_phrase.is_some() { return None; }
-    let first = ins.front_matter_refs.iter().find(|r| !r.trim().is_empty())?;
+    if ins.front_matter_phrase.is_some() {
+        return None;
+    }
+    let first = ins
+        .front_matter_refs
+        .iter()
+        .find(|r| !r.trim().is_empty())?;
     Some(collapse_ws(first))
 }
 
@@ -5803,21 +5878,24 @@ fn compose_from_leading_headings(ins: &RuleInputs) -> Option<String> {
     if ins.headings.is_empty() || ins.heading_levels.len() != ins.headings.len() {
         return None;
     }
-    let h1_idx = ins.heading_levels.iter().enumerate().find(|(i, lvl)| {
-        **lvl == 1 && !collapse_ws(&ins.headings[*i]).is_empty()
-    }).map(|(i, _)| i)?;
+    let h1_idx = ins
+        .heading_levels
+        .iter()
+        .enumerate()
+        .find(|(i, lvl)| **lvl == 1 && !collapse_ws(&ins.headings[*i]).is_empty())
+        .map(|(i, _)| i)?;
     let h1 = collapse_ws(&ins.headings[h1_idx]);
-    let h2_idx = ((h1_idx + 1)..ins.headings.len()).find(|i| {
-        ins.heading_levels[*i] == 2 && !collapse_ws(&ins.headings[*i]).is_empty()
-    });
+    let h2_idx = ((h1_idx + 1)..ins.headings.len())
+        .find(|i| ins.heading_levels[*i] == 2 && !collapse_ws(&ins.headings[*i]).is_empty());
     let h3_anchor = h2_idx.unwrap_or(h1_idx);
-    let h3_idx = ((h3_anchor + 1)..ins.headings.len()).find(|i| {
-        ins.heading_levels[*i] == 3 && !collapse_ws(&ins.headings[*i]).is_empty()
-    });
+    let h3_idx = ((h3_anchor + 1)..ins.headings.len())
+        .find(|i| ins.heading_levels[*i] == 3 && !collapse_ws(&ins.headings[*i]).is_empty());
     let mut parts = vec![h1];
     for idx in [h2_idx, h3_idx].iter().flatten() {
         let candidate = collapse_ws(&ins.headings[*idx]);
-        if prefix_overlap(&candidate, &parts) { continue; }
+        if prefix_overlap(&candidate, &parts) {
+            continue;
+        }
         parts.push(candidate);
     }
     Some(parts.join(" — "))
@@ -5841,7 +5919,11 @@ fn extract_official_pub(ins: &RuleInputs) -> DerivedMetadata {
     if citation_heading.is_none() {
         if let Some(uh) = unslashed_heading {
             let t = collapse_ws(&uh);
-            let trimmed = regex::Regex::new(r"\s*[—\-].*$").unwrap().replace(&t, "").trim().to_string();
+            let trimmed = regex::Regex::new(r"\s*[—\-].*$")
+                .unwrap()
+                .replace(&t, "")
+                .trim()
+                .to_string();
             return DerivedMetadata {
                 title: compose_title(Some(&trimmed), ins),
                 date: precise_date(&ins.body_head.chars().take(600).collect::<String>()),
@@ -5865,9 +5947,18 @@ fn extract_official_pub(ins: &RuleInputs) -> DerivedMetadata {
 
 fn case_name_from(heading: &str) -> Option<String> {
     let t = collapse_ws(heading);
-    if t.is_empty() || t.len() > 200 { return None; }
-    let t = regex::Regex::new(r"\s*\[\d{4}\].*$").unwrap().replace(&t, "").trim().to_string();
-    let t = regex::Regex::new(r"\bv\.\s+").unwrap().replace_all(&t, "v ").to_string();
+    if t.is_empty() || t.len() > 200 {
+        return None;
+    }
+    let t = regex::Regex::new(r"\s*\[\d{4}\].*$")
+        .unwrap()
+        .replace(&t, "")
+        .trim()
+        .to_string();
+    let t = regex::Regex::new(r"\bv\.\s+")
+        .unwrap()
+        .replace_all(&t, "v ")
+        .to_string();
     Some(t)
 }
 
@@ -5914,7 +6005,9 @@ fn extract_case_h1(ins: &RuleInputs) -> DerivedMetadata {
                     }
                 }
             }
-            if name.is_some() { break; }
+            if name.is_some() {
+                break;
+            }
         }
     }
     if name.is_none() && ins.category.as_deref() == Some("Cases") {
@@ -5989,7 +6082,9 @@ fn extract_dis(ins: &RuleInputs) -> DerivedMetadata {
 
 fn extract_act(ins: &RuleInputs) -> DerivedMetadata {
     let name = collapse_ws(&ins.h1());
-    let year = re_act_year().captures(&name).and_then(|c| c["year"].parse().ok());
+    let year = re_act_year()
+        .captures(&name)
+        .and_then(|c| c["year"].parse().ok());
     DerivedMetadata {
         title: if name.is_empty() { None } else { Some(name) },
         date: year.map(|y: u32| format!("{}-01-01", y)),
@@ -6024,7 +6119,9 @@ fn parse_mailto_body(body_head: &str) -> Vec<String> {
             i += 1;
         }
         let text = decoded.trim().to_string();
-        if text.is_empty() || text.to_lowercase().starts_with("link:") { continue; }
+        if text.is_empty() || text.to_lowercase().starts_with("link:") {
+            continue;
+        }
         out.push(text);
     }
     out
@@ -6034,7 +6131,9 @@ fn extract_legislation_section(ins: &RuleInputs) -> DerivedMetadata {
     let inner = ins.inner_body();
     let cap = re_docid_act_section().captures(&inner);
     let year = cap.as_ref().and_then(|c| c[1].parse::<u32>().ok());
-    let act_no = cap.as_ref().map(|c| c[2].trim_start_matches('0').to_string());
+    let act_no = cap
+        .as_ref()
+        .map(|c| c[2].trim_start_matches('0').to_string());
     let segs: Vec<&str> = ins.doc_id.split('/').filter(|s| !s.is_empty()).collect();
     let section_id = segs.get(2).map(|s| s.to_string()).unwrap_or_default();
     let outer = ins.outer_prefix();
@@ -6042,17 +6141,29 @@ fn extract_legislation_section(ins: &RuleInputs) -> DerivedMetadata {
     let mut act_name: Option<String> = None;
     for h in ins.headings.iter().take(6) {
         let t = collapse_ws(h);
-        if re_act_title().is_match(&t) { act_name = Some(t); break; }
+        if re_act_title().is_match(&t) {
+            act_name = Some(t);
+            break;
+        }
     }
     if act_name.is_none() {
         for line in parse_mailto_body(&ins.body_head) {
-            if re_act_title().is_match(&line) { act_name = Some(line); break; }
+            if re_act_title().is_match(&line) {
+                act_name = Some(line);
+                break;
+            }
         }
     }
     let title = if let Some(n) = act_name.clone() {
         if !section_id.is_empty() {
-            if outer == "PAC" { format!("{} s {}", n, section_id) } else { format!("{} reg {}", n, section_id) }
-        } else { n }
+            if outer == "PAC" {
+                format!("{} s {}", n, section_id)
+            } else {
+                format!("{} reg {}", n, section_id)
+            }
+        } else {
+            n
+        }
     } else if outer == "PAC" {
         match (year, act_no.as_deref()) {
             (Some(y), Some(no)) => format!("Act {} No. {} s {}", y, no, section_id),
@@ -6065,18 +6176,25 @@ fn extract_legislation_section(ins: &RuleInputs) -> DerivedMetadata {
         }
     };
     let final_year = year.or_else(|| {
-        act_name.as_ref().and_then(|n| re_act_year().captures(n)).and_then(|c| c["year"].parse().ok())
+        act_name
+            .as_ref()
+            .and_then(|n| re_act_year().captures(n))
+            .and_then(|c| c["year"].parse().ok())
     });
     let head6: String = ins.body_head.chars().take(600).collect();
     DerivedMetadata {
         title: Some(title),
-        date: precise_date(&head6).or_else(|| final_year.map(|y| format!("{}-01-01", y))).or_else(|| ins.pub_date.clone()),
+        date: precise_date(&head6)
+            .or_else(|| final_year.map(|y| format!("{}-01-01", y)))
+            .or_else(|| ins.pub_date.clone()),
     }
 }
 
 fn extract_historical_case(ins: &RuleInputs) -> DerivedMetadata {
     let inner = ins.inner_body();
-    let year = re_docid_jud_star().captures(&inner).and_then(|c| c[1].parse::<u32>().ok());
+    let year = re_docid_jud_star()
+        .captures(&inner)
+        .and_then(|c| c[1].parse::<u32>().ok());
     let head4: String = ins.body_head.chars().take(400).collect();
     let mut name: Option<String> = None;
     if let Some(c) = re_case_header_name().captures(&head4) {
@@ -6085,10 +6203,15 @@ fn extract_historical_case(ins: &RuleInputs) -> DerivedMetadata {
     if name.is_none() {
         let trail_re = regex::Regex::new(r"\s*-\s*\([^)]+\)\s*$").unwrap();
         for line in parse_mailto_body(&ins.body_head) {
-            if line.to_lowercase() == "cases" { continue; }
+            if line.to_lowercase() == "cases" {
+                continue;
+            }
             if line.contains(" v ") || line.contains(" - (") {
                 let nm = trail_re.replace(&line, "").trim().to_string();
-                if !nm.is_empty() && nm.len() < 200 { name = Some(nm); break; }
+                if !nm.is_empty() && nm.len() < 200 {
+                    name = Some(nm);
+                    break;
+                }
             }
         }
     }
@@ -6096,7 +6219,8 @@ fn extract_historical_case(ins: &RuleInputs) -> DerivedMetadata {
         for h in ins.headings.iter().take(4) {
             let t = collapse_ws(h);
             if !t.is_empty() && !t.starts_with("/law/view/") && t.len() < 200 {
-                name = Some(t); break;
+                name = Some(t);
+                break;
             }
         }
     }
@@ -6106,7 +6230,9 @@ fn extract_historical_case(ins: &RuleInputs) -> DerivedMetadata {
     let head6: String = ins.body_head.chars().take(600).collect();
     DerivedMetadata {
         title: name,
-        date: precise_date(&head6).or_else(|| year.map(|y| format!("{}-01-01", y))).or_else(|| ins.pub_date.clone()),
+        date: precise_date(&head6)
+            .or_else(|| year.map(|y| format!("{}-01-01", y)))
+            .or_else(|| ins.pub_date.clone()),
     }
 }
 
@@ -6122,11 +6248,13 @@ fn extract_bill_em(ins: &RuleInputs) -> DerivedMetadata {
         for cap in bold_re.captures_iter(&head8) {
             let line = collapse_ws(&cap[1]);
             if re_bill_year().is_match(&line) || re_act_title().is_match(&line) {
-                bill_title = line; break;
+                bill_title = line;
+                break;
             }
         }
     }
-    let year = re_bill_year().captures(&bill_title)
+    let year = re_bill_year()
+        .captures(&bill_title)
         .or_else(|| re_act_year().captures(&bill_title))
         .and_then(|c| c["year"].parse::<u32>().ok());
     let mut title = em_title;
@@ -6137,16 +6265,24 @@ fn extract_bill_em(ins: &RuleInputs) -> DerivedMetadata {
             Some(bill_title.clone())
         };
     }
-    let needs_compose = title.as_deref().map(|t| type_phrase_shape(shape_of(t))).unwrap_or(true);
+    let needs_compose = title
+        .as_deref()
+        .map(|t| type_phrase_shape(shape_of(t)))
+        .unwrap_or(true);
     if needs_compose {
-        if let Some(c) = compose_from_leading_headings(ins).or_else(|| compose_from_body_h2(ins)).or_else(|| compose_from_first_ref(ins)) {
+        if let Some(c) = compose_from_leading_headings(ins)
+            .or_else(|| compose_from_body_h2(ins))
+            .or_else(|| compose_from_first_ref(ins))
+        {
             title = Some(c);
         }
     }
     let head6: String = ins.body_head.chars().take(600).collect();
     DerivedMetadata {
         title,
-        date: precise_date(&head6).or_else(|| year.map(|y| format!("{}-01-01", y))).or_else(|| ins.pub_date.clone()),
+        date: precise_date(&head6)
+            .or_else(|| year.map(|y| format!("{}-01-01", y)))
+            .or_else(|| ins.pub_date.clone()),
     }
 }
 
@@ -6169,14 +6305,19 @@ fn re_docid_year4() -> &'static regex::Regex {
         regex::Regex::new(&format!(
             r"^({})(?P<year>(?:19|20)\d{{2}})(?P<draft>D?)(?P<num>\d+)$",
             ruling_series_alt()
-        )).unwrap()
+        ))
+        .unwrap()
     })
 }
 
 fn re_docid_year2() -> &'static regex::Regex {
     static R: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     R.get_or_init(|| {
-        regex::Regex::new(&format!(r"^({})(?P<year>[89]\d)(?P<num>\d+)$", ruling_series_alt())).unwrap()
+        regex::Regex::new(&format!(
+            r"^({})(?P<year>[89]\d)(?P<num>\d+)$",
+            ruling_series_alt()
+        ))
+        .unwrap()
     })
 }
 
@@ -6201,7 +6342,10 @@ fn extract_from_docid(ins: &RuleInputs) -> (Option<String>, Option<u32>) {
         let series = &c[1];
         let y: u32 = c["year"].parse().unwrap_or(0);
         let draft = &c["draft"];
-        return (Some(format!("{} {}/{}{}", series, &c["year"], draft, &c["num"])), Some(y));
+        return (
+            Some(format!("{} {}/{}{}", series, &c["year"], draft, &c["num"])),
+            Some(y),
+        );
     }
     if let Some(c) = re_docid_psla().captures(&body) {
         let y: u32 = c["year"].parse().unwrap_or(0);
@@ -6209,16 +6353,25 @@ fn extract_from_docid(ins: &RuleInputs) -> (Option<String>, Option<u32>) {
     }
     if let Some(c) = re_docid_psla_draft().captures(&body) {
         let y: u32 = c["year"].parse().unwrap_or(0);
-        return (Some(format!("PS LA {}/D{}", &c["year"], &c["num"])), Some(y));
+        return (
+            Some(format!("PS LA {}/D{}", &c["year"], &c["num"])),
+            Some(y),
+        );
     }
     if let Some(c) = re_docid_atoid().captures(&body) {
         let y: u32 = c["year"].parse().unwrap_or(0);
-        return (Some(format!("ATO ID {}/{}", &c["year"], &c["num"])), Some(y));
+        return (
+            Some(format!("ATO ID {}/{}", &c["year"], &c["num"])),
+            Some(y),
+        );
     }
     if let Some(c) = re_docid_year2().captures(&body) {
         let series = &c[1];
         let y2: u32 = c["year"].parse().unwrap_or(0);
-        return (Some(format!("{} {}/{}", series, &c["year"], &c["num"])), Some(1900 + y2));
+        return (
+            Some(format!("{} {}/{}", series, &c["year"], &c["num"])),
+            Some(1900 + y2),
+        );
     }
     (None, None)
 }
@@ -6234,7 +6387,11 @@ fn extract_epa(ins: &RuleInputs) -> DerivedMetadata {
     let auth = ins.inner_body();
     let auth = auth.trim().to_string();
     let outer = ins.outer_prefix();
-    let code = if !auth.is_empty() { Some(format!("{} {}", outer, auth)) } else { None };
+    let code = if !auth.is_empty() {
+        Some(format!("{} {}", outer, auth))
+    } else {
+        None
+    };
     let head: String = ins.body_head.chars().take(1500).collect();
     let mut precise: Option<String> = None;
     if let Some(c) = re_date_of_advice().captures(&head) {
@@ -6269,7 +6426,9 @@ fn extract_other(ins: &RuleInputs) -> DerivedMetadata {
         .or(code);
     DerivedMetadata {
         title,
-        date: pd.or_else(|| ins.pub_date.clone()).or_else(|| year.map(|y| format!("{}-01-01", y))),
+        date: pd
+            .or_else(|| ins.pub_date.clone())
+            .or_else(|| year.map(|y| format!("{}-01-01", y))),
     }
 }
 
@@ -6279,7 +6438,9 @@ fn universal_fallback_title(ins: &RuleInputs) -> Option<String> {
     if !outer.is_empty() && !inner.is_empty() {
         return Some(format!("{} {}", outer, inner));
     }
-    if !outer.is_empty() { return Some(outer); }
+    if !outer.is_empty() {
+        return Some(outer);
+    }
     None
 }
 
@@ -6367,24 +6528,46 @@ mod rules_tests {
 
     #[test]
     fn classify_ruling_routes_to_official_pub() {
-        let i = ins("TXR/TR20243/NAT/ATO/00001", &["Taxation Ruling", "TR 2024/3", "Subtitle"]);
+        let i = ins(
+            "TXR/TR20243/NAT/ATO/00001",
+            &["Taxation Ruling", "TR 2024/3", "Subtitle"],
+        );
         assert_eq!(classify(&i), Template::OfficialPub);
     }
 
     #[test]
     fn derive_metadata_official_pub_title_with_citation() {
-        let i = ins("TXR/TR20243/NAT/ATO/00001", &["Taxation Ruling", "TR 2024/3", "R&D tax incentive eligibility"]);
+        let i = ins(
+            "TXR/TR20243/NAT/ATO/00001",
+            &[
+                "Taxation Ruling",
+                "TR 2024/3",
+                "R&D tax incentive eligibility",
+            ],
+        );
         let d = derive_metadata(&i);
-        assert_eq!(d.title.as_deref(), Some("TR 2024/3 — R&D tax incentive eligibility"));
+        assert_eq!(
+            d.title.as_deref(),
+            Some("TR 2024/3 — R&D tax incentive eligibility")
+        );
         assert_eq!(d.date.as_deref(), Some("2024-01-01"));
     }
 
     #[test]
     fn derive_metadata_dis() {
-        let mut i = ins("DIS/DIS2024_PEPSICO/NAT/ATO", &["Decision impact statement", "Pepsico Inc v Commissioner of Taxation"]);
+        let mut i = ins(
+            "DIS/DIS2024_PEPSICO/NAT/ATO",
+            &[
+                "Decision impact statement",
+                "Pepsico Inc v Commissioner of Taxation",
+            ],
+        );
         i.body_head = String::new();
         let d = derive_metadata(&i);
-        assert_eq!(d.title.as_deref(), Some("DIS: Pepsico Inc v Commissioner of Taxation"));
+        assert_eq!(
+            d.title.as_deref(),
+            Some("DIS: Pepsico Inc v Commissioner of Taxation")
+        );
     }
 
     #[test]
@@ -6393,14 +6576,20 @@ mod rules_tests {
         // The Act name comes from h1 and gets " s <section>" appended.
         let i = ins("PAC/19970038/995-1", &["Income Tax Assessment Act 1997"]);
         let d = derive_metadata(&i);
-        assert_eq!(d.title.as_deref(), Some("Income Tax Assessment Act 1997 s 995-1"));
+        assert_eq!(
+            d.title.as_deref(),
+            Some("Income Tax Assessment Act 1997 s 995-1")
+        );
         assert_eq!(d.date.as_deref(), Some("1997-01-01"));
     }
 
     #[test]
     fn derive_metadata_act_template_no_section() {
         // Pure Act title with no PAC docid → Act extractor.
-        let i = ins("ACT/INCOME_TAX_ASSESSMENT_1997", &["Income Tax Assessment Act 1997"]);
+        let i = ins(
+            "ACT/INCOME_TAX_ASSESSMENT_1997",
+            &["Income Tax Assessment Act 1997"],
+        );
         let d = derive_metadata(&i);
         assert_eq!(d.title.as_deref(), Some("Income Tax Assessment Act 1997"));
         assert_eq!(d.date.as_deref(), Some("1997-01-01"));
@@ -6423,7 +6612,10 @@ mod rules_tests {
 
     #[test]
     fn precise_date_parses_real_date() {
-        assert_eq!(precise_date("issued on 12 March 2024 by ..."), Some("2024-03-12".to_string()));
+        assert_eq!(
+            precise_date("issued on 12 March 2024 by ..."),
+            Some("2024-03-12".to_string())
+        );
     }
 
     #[test]
@@ -6437,41 +6629,439 @@ mod rules_tests {
 // Walks pages_dir/index.jsonl, runs each doc through the cleaning + chunker
 // + rules-engine metadata classifier + embedder pipeline in-process, writes
 // documents + chunks + chunk_embeddings + chunks_fts + title_fts +
-// doc_anchors + definitions + citations rows. Optionally writes pack files
-// + asset blobs + manifest.json to --out-dir. Missing vs build.py:
-// incremental reuse, resume, parallelism.
+// doc_anchors + definitions + citations rows, then writes pack files,
+// asset blobs, manifest.json, and update.json to --out-dir. Missing vs
+// build.py: incremental reuse, resume, parallelism.
+
+struct PendingBuildEmbedding {
+    chunk_id: i64,
+    doc_idx: usize,
+    chunk_idx: usize,
+    text: String,
+}
+
+#[derive(Default)]
+struct BuildProfile {
+    enabled: bool,
+    started_at: Option<std::time::Instant>,
+    docs: usize,
+    chunks: usize,
+    html_bytes: u64,
+    read: Duration,
+    clean: Duration,
+    metadata: Duration,
+    chunking: Duration,
+    references: Duration,
+    sqlite: Duration,
+    assets: Duration,
+    embedding: Duration,
+    pack: Duration,
+    checkpoint: Duration,
+    finalise: Duration,
+}
+
+impl BuildProfile {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            started_at: enabled.then(std::time::Instant::now),
+            ..Self::default()
+        }
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.started_at
+            .map(|started| started.elapsed())
+            .unwrap_or_default()
+    }
+
+    fn print(&self) {
+        if !self.enabled {
+            return;
+        }
+        let total = self.elapsed().as_secs_f64().max(0.000_001);
+        eprintln!(
+            "ato-mcp build profile: docs={} chunks={} html_mb={:.1} total_s={:.2} docs_per_s={:.2}",
+            self.docs,
+            self.chunks,
+            self.html_bytes as f64 / (1024.0 * 1024.0),
+            total,
+            self.docs as f64 / total
+        );
+        let rows = [
+            ("read", self.read),
+            ("clean", self.clean),
+            ("metadata", self.metadata),
+            ("chunking", self.chunking),
+            ("references", self.references),
+            ("sqlite", self.sqlite),
+            ("assets", self.assets),
+            ("embedding", self.embedding),
+            ("pack", self.pack),
+            ("checkpoint", self.checkpoint),
+            ("finalise", self.finalise),
+        ];
+        for (name, duration) in rows {
+            let secs = duration.as_secs_f64();
+            eprintln!("  {name:>10}: {secs:>8.2}s {:>5.1}%", secs * 100.0 / total);
+        }
+    }
+}
+
+fn is_batch_allocation_failure(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}").to_lowercase();
+    msg.contains("failed to allocate memory") || msg.contains("out of memory")
+}
+
+fn encode_build_embeddings_adaptive(
+    state: &ServerState,
+    inputs: &[String],
+) -> Result<Vec<[i8; EMBEDDING_DIM]>> {
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    match state.encode_query_embeddings(inputs) {
+        Ok(embeddings) => Ok(embeddings),
+        Err(err) if inputs.len() > 1 && is_batch_allocation_failure(&err) => {
+            let mid = inputs.len() / 2;
+            eprintln!(
+                "ato-mcp build: embedding batch of {} exceeded GPU memory; retrying as {} + {}",
+                inputs.len(),
+                mid,
+                inputs.len() - mid
+            );
+            let mut embeddings = encode_build_embeddings_adaptive(state, &inputs[..mid])?;
+            embeddings.extend(encode_build_embeddings_adaptive(state, &inputs[mid..])?);
+            Ok(embeddings)
+        }
+        Err(err) => Err(err).context(format!("encoding {} chunk embeddings", inputs.len())),
+    }
+}
+
+fn flush_pending_build_embeddings(
+    state: &ServerState,
+    conn: &Connection,
+    pending: &mut Vec<PendingBuildEmbedding>,
+    pack_records: &mut [(String, JsonValue)],
+    profile: &mut BuildProfile,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    let mut order: Vec<usize> = (0..pending.len()).collect();
+    order.sort_by_key(|&idx| pending[idx].text.len());
+    for batch in order.chunks(BUILD_EMBED_BATCH_SIZE) {
+        let inputs: Vec<String> = batch.iter().map(|&idx| pending[idx].text.clone()).collect();
+        let embeddings = encode_build_embeddings_adaptive(state, &inputs)?;
+        if embeddings.len() != batch.len() {
+            bail!(
+                "embedding batch returned {} vectors for {} chunks",
+                embeddings.len(),
+                batch.len()
+            );
+        }
+        for (&idx, emb) in batch.iter().zip(embeddings.iter()) {
+            let item = &pending[idx];
+            let bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(emb.as_ptr() as *const u8, emb.len()) };
+            conn.execute(
+                "INSERT INTO chunk_embeddings (chunk_id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![item.chunk_id, bytes],
+            )
+            .context("INSERT chunk_embeddings")?;
+            let emb_b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+            let chunk_record = pack_records
+                .get_mut(item.doc_idx)
+                .and_then(|(_doc_id, record)| record.get_mut("chunks"))
+                .and_then(|chunks| chunks.as_array_mut())
+                .and_then(|chunks| chunks.get_mut(item.chunk_idx))
+                .ok_or_else(|| anyhow!("missing pack chunk record for embedded chunk"))?;
+            chunk_record["embedding_b64"] = JsonValue::String(emb_b64);
+        }
+    }
+    pending.clear();
+    profile.embedding += started.elapsed();
+    Ok(())
+}
+
+fn write_build_pack_shard(
+    out_dir: &Path,
+    zstd_level: i32,
+    shard_idx: usize,
+    pack_records: &mut Vec<(String, JsonValue)>,
+    doc_hashes: &HashMap<String, String>,
+    documents: &mut Vec<DocRef>,
+    packs: &mut Vec<PackInfo>,
+    profile: &mut BuildProfile,
+) -> Result<()> {
+    if pack_records.is_empty() {
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    eprintln!(
+        "ato-mcp build: writing pack shard {} ({} docs)",
+        shard_idx + 1,
+        pack_records.len()
+    );
+    let tmp_pack = out_dir
+        .join("packs")
+        .join(format!(".pack-{shard_idx:04}-writing.bin.zst.tmp"));
+    let pack_meta = write_pack(&tmp_pack, zstd_level, pack_records.drain(..).map(Ok))?;
+    let sha8 = pack_meta
+        .get("sha8")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("write_pack returned no sha8"))?
+        .to_string();
+    let final_pack = out_dir.join("packs").join(format!("pack-{sha8}.bin.zst"));
+    fs::rename(&tmp_pack, &final_pack)?;
+
+    let refs = pack_meta
+        .get("refs")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("write_pack returned no refs"))?;
+    for r in refs {
+        let doc_id = r
+            .get("doc_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("pack ref missing doc_id"))?
+            .to_string();
+        let content_hash = doc_hashes
+            .get(&doc_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("missing content hash for packed doc {doc_id}"))?;
+        documents.push(DocRef {
+            doc_id,
+            content_hash,
+            pack_sha8: sha8.clone(),
+            offset: r
+                .get("offset")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| anyhow!("pack ref missing offset"))?,
+            length: r
+                .get("length")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| anyhow!("pack ref missing length"))?,
+        });
+    }
+
+    let pack_size = pack_meta
+        .get("size")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow!("write_pack returned no size"))?;
+    let pack_sha256 = pack_meta
+        .get("sha256")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("write_pack returned no sha256"))?
+        .to_string();
+    packs.push(PackInfo {
+        sha8: sha8.clone(),
+        sha256: pack_sha256,
+        size: pack_size,
+        url: format!("packs/pack-{sha8}.bin.zst"),
+    });
+    profile.pack += started.elapsed();
+    Ok(())
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BuildCheckpoint {
+    schema_version: u32,
+    source_index_sha256: String,
+    zstd_level: i32,
+    documents: Vec<DocRef>,
+    packs: Vec<PackInfo>,
+}
+
+fn build_checkpoint_path(out_dir: &Path) -> PathBuf {
+    out_dir.join("build-state.json")
+}
+
+fn load_build_checkpoint(
+    out_dir: &Path,
+    source_index_sha256: &str,
+    zstd_level: i32,
+) -> Result<Option<BuildCheckpoint>> {
+    let path = build_checkpoint_path(out_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let checkpoint: BuildCheckpoint =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    if checkpoint.schema_version != 1 {
+        bail!(
+            "unsupported build checkpoint schema {} in {}",
+            checkpoint.schema_version,
+            path.display()
+        );
+    }
+    if checkpoint.source_index_sha256 != source_index_sha256 {
+        bail!(
+            "build checkpoint source index hash differs from {}; remove {} to start a fresh build",
+            source_index_sha256,
+            path.display()
+        );
+    }
+    if checkpoint.zstd_level != zstd_level {
+        bail!(
+            "build checkpoint zstd level {} differs from requested {}; remove {} to start a fresh build",
+            checkpoint.zstd_level,
+            zstd_level,
+            path.display()
+        );
+    }
+    Ok(Some(checkpoint))
+}
+
+fn save_build_checkpoint(
+    out_dir: &Path,
+    source_index_sha256: &str,
+    zstd_level: i32,
+    documents: &[DocRef],
+    packs: &[PackInfo],
+) -> Result<()> {
+    let checkpoint = BuildCheckpoint {
+        schema_version: 1,
+        source_index_sha256: source_index_sha256.to_string(),
+        zstd_level,
+        documents: documents.to_vec(),
+        packs: packs.to_vec(),
+    };
+    let path = build_checkpoint_path(out_dir);
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(&checkpoint)?)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, &path)
+        .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+fn clean_stale_build_packs(out_dir: &Path, packs: &[PackInfo]) -> Result<()> {
+    let packs_dir = out_dir.join("packs");
+    if !packs_dir.exists() {
+        return Ok(());
+    }
+    let keep: HashSet<String> = packs
+        .iter()
+        .map(|pack| format!("pack-{}.bin.zst", pack.sha8))
+        .collect();
+    for entry in fs::read_dir(&packs_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let is_pack = name.starts_with("pack-") && name.ends_with(".bin.zst");
+        let is_tmp = name.starts_with(".pack-") && name.ends_with(".tmp");
+        if is_tmp || (is_pack && !keep.contains(name)) {
+            fs::remove_file(&path).with_context(|| format!("removing stale {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn committed_build_doc_count(conn: &Connection) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM documents WHERE pack_sha8 <> 'PENDING'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
+fn pending_build_doc_count(conn: &Connection) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM documents WHERE pack_sha8 = 'PENDING'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
+fn update_pack_sha8_for_docs(conn: &Connection, docs: &[DocRef]) -> Result<()> {
+    let mut update = conn.prepare("UPDATE documents SET pack_sha8 = ?1 WHERE doc_id = ?2")?;
+    for doc in docs {
+        update.execute(rusqlite::params![&doc.pack_sha8, &doc.doc_id])?;
+    }
+    Ok(())
+}
 
 fn build_corpus(
     pages_dir: &Path,
     db_path: &Path,
-    out_dir: Option<&Path>,
+    out_dir: &Path,
     zstd_level: i32,
     limit: Option<usize>,
+    use_gpu: bool,
+    profile_enabled: bool,
 ) -> Result<()> {
     use std::io::BufRead as _;
 
     let index_path = pages_dir.join("index.jsonl");
-    let index_file = File::open(&index_path)
-        .with_context(|| format!("opening {}", index_path.display()))?;
+    let source_index_sha256 = sha256_file(&index_path)?;
+    let index_file =
+        File::open(&index_path).with_context(|| format!("opening {}", index_path.display()))?;
     let reader = std::io::BufReader::new(index_file);
 
     let conn = open_write_at(db_path)
         .with_context(|| format!("opening sqlite at {}", db_path.display()))?;
+    init_db(&conn)?;
 
-    if let Some(dir) = out_dir {
-        fs::create_dir_all(dir)
-            .with_context(|| format!("creating out_dir {}", dir.display()))?;
-        fs::create_dir_all(dir.join("packs"))?;
-        fs::create_dir_all(dir.join("assets"))?;
+    fs::create_dir_all(out_dir)
+        .with_context(|| format!("creating out_dir {}", out_dir.display()))?;
+    fs::create_dir_all(out_dir.join("packs"))?;
+    fs::create_dir_all(out_dir.join("assets"))?;
+
+    let checkpoint = load_build_checkpoint(out_dir, &source_index_sha256, zstd_level)?;
+    let (mut documents, mut packs) = match checkpoint {
+        Some(checkpoint) => {
+            eprintln!(
+                "ato-mcp build: resuming from checkpoint ({} docs, {} packs)",
+                checkpoint.documents.len(),
+                checkpoint.packs.len()
+            );
+            (checkpoint.documents, checkpoint.packs)
+        }
+        None => {
+            fs::remove_file(out_dir.join("manifest.json")).ok();
+            fs::remove_file(out_dir.join("update.json")).ok();
+            (Vec::new(), Vec::new())
+        }
+    };
+    clean_stale_build_packs(out_dir, &packs)?;
+    let committed_docs = committed_build_doc_count(&conn)?;
+    let pending_docs = pending_build_doc_count(&conn)?;
+    if pending_docs > 0 {
+        bail!(
+            "build DB has {pending_docs} uncheckpointed PENDING documents at {}; remove the release dir to start fresh",
+            db_path.display()
+        );
     }
+    if committed_docs != documents.len() {
+        bail!(
+            "build checkpoint has {} documents but DB has {committed_docs}; remove {} to start fresh",
+            documents.len(),
+            build_checkpoint_path(out_dir).display()
+        );
+    }
+    let mut completed_doc_ids: HashSet<String> =
+        documents.iter().map(|doc| doc.doc_id.clone()).collect();
 
-    let state = ServerState::default();
-    let mut processed: usize = 0;
+    let mut profile = BuildProfile::new(profile_enabled);
+    let state = ServerState::new(use_gpu);
+    let mut processed: usize = completed_doc_ids.len();
+    let mut skipped_no_payload: usize = 0;
+    let mut tx = conn.unchecked_transaction()?;
 
-    // Pack records collected for this build (when out_dir is set). Each
-    // record is the full doc payload (chunks + embeddings_b64) destined
-    // for `pack-<sha8>.bin.zst`.
+    // Pack records collected for this build. Each record is the full doc
+    // payload the Rust updater can ingest from `pack-<sha8>.bin.zst`.
     let mut pack_records: Vec<(String, JsonValue)> = Vec::new();
+    let mut pending_embeddings: Vec<PendingBuildEmbedding> =
+        Vec::with_capacity(BUILD_EMBED_BATCH_SIZE);
+    let mut doc_hashes: HashMap<String, String> = HashMap::new();
+    let mut pack_shard_idx: usize = packs.len();
 
     for line_res in reader.lines() {
         if let Some(n) = limit {
@@ -6483,36 +7073,44 @@ fn build_corpus(
         if line.trim().is_empty() {
             continue;
         }
-        let record: JsonValue =
-            serde_json::from_str(&line).context("parsing index.jsonl line")?;
+        let record: JsonValue = serde_json::from_str(&line).context("parsing index.jsonl line")?;
         let canonical_id = record
             .get("canonical_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("index record missing canonical_id"))?;
-        let payload_path_raw = record
-            .get("payload_path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("index record missing payload_path"))?;
+        let Some(payload_path_raw) = record.get("payload_path").and_then(|v| v.as_str()) else {
+            skipped_no_payload += 1;
+            continue;
+        };
+        if payload_path_raw.is_empty() {
+            skipped_no_payload += 1;
+            continue;
+        }
         let payload_path = pages_dir.join(payload_path_raw);
-
-        let html = fs::read_to_string(&payload_path).with_context(|| {
-            format!("reading payload {}", payload_path.display())
-        })?;
         let doc_id = metadata_doc_id_for(canonical_id);
+        if completed_doc_ids.contains(&doc_id) {
+            continue;
+        }
+
+        let started = std::time::Instant::now();
+        let html = fs::read_to_string(&payload_path)
+            .with_context(|| format!("reading payload {}", payload_path.display()))?;
+        profile.read += started.elapsed();
+        profile.html_bytes += html.len() as u64;
         let doc_type = metadata_parse_docid(canonical_id).unwrap_or_default();
 
         // Cleaning pipeline.
+        let started = std::time::Instant::now();
         let cleaned = clean_ato_html(&html);
-        let (rewritten_html, assets) = rewrite_images_html(
-            &cleaned.html,
-            Some(&doc_id),
-            Some(payload_path.as_path()),
-        );
+        let (rewritten_html, assets) =
+            rewrite_images_html(&cleaned.html, Some(&doc_id), Some(payload_path.as_path()));
         let normalised = normalise_named_anchors(&rewritten_html);
         let with_links = rewrite_links_html(&normalised);
         let final_html = strip_attributes(&with_links);
+        profile.clean += started.elapsed();
 
         // Currency / supersession from raw page HTML (alert + body scan).
+        let started = std::time::Instant::now();
         let currency = extract_currency(&html);
 
         // Initial title from leading-headings composer (always present).
@@ -6528,16 +7126,19 @@ fn build_corpus(
         let mut heading_levels: Vec<u32> = Vec::new();
         {
             let frag = scraper::Html::parse_fragment(&final_html);
-            let h_sel =
-                scraper::Selector::parse("h1, h2, h3, h4, h5, h6").unwrap();
+            let h_sel = scraper::Selector::parse("h1, h2, h3, h4, h5, h6").unwrap();
             for h in frag.select(&h_sel) {
                 let text = anchors_node_text(h);
                 if text.is_empty() {
                     continue;
                 }
                 let level: u32 = match h.value().name() {
-                    "h1" => 1, "h2" => 2, "h3" => 3,
-                    "h4" => 4, "h5" => 5, "h6" => 6,
+                    "h1" => 1,
+                    "h2" => 2,
+                    "h3" => 3,
+                    "h4" => 4,
+                    "h5" => 5,
+                    "h6" => 6,
                     _ => 0,
                 };
                 headings.push(text);
@@ -6566,23 +7167,31 @@ fn build_corpus(
         let derived = derive_metadata(&rule_inputs);
         let title = derived.title.clone().unwrap_or(raw_title);
         let derived_date = derived.date.clone();
+        profile.metadata += started.elapsed();
 
         // Chunker.
+        let started = std::time::Instant::now();
         let chunks = chunk_html(&final_html, Some(&title), EMBED_MAX_TOKENS);
+        profile.chunking += started.elapsed();
+        profile.chunks += chunks.len();
 
         // Anchor refs (used for navigation flags + doc_anchors table).
+        let started = std::time::Instant::now();
         let anchor_refs = extract_anchors(&final_html, &doc_id);
         let has_in_doc_links = anchor_refs.iter().any(|r| r.kind == "in_doc");
         let has_related_docs = anchor_refs.iter().any(|r| r.kind == "sister");
         let has_history = anchor_refs.iter().any(|r| r.kind == "history");
+        profile.references += started.elapsed();
 
         let now = chrono::Utc::now().to_rfc3339();
         let content_hash = metadata_content_hash(&cleaned.text);
+        doc_hashes.insert(doc_id.clone(), content_hash.clone());
 
         // Pack sha8 placeholder; finalised after all docs processed.
         let pack_placeholder = "PENDING".to_string();
 
-        conn.execute(
+        let started = std::time::Instant::now();
+        tx.execute(
             "INSERT OR REPLACE INTO documents
                 (doc_id, type, title, date, downloaded_at, content_hash, pack_sha8,
                  html, withdrawn_date, superseded_by, replaces,
@@ -6596,10 +7205,10 @@ fn build_corpus(
                 now,
                 content_hash,
                 pack_placeholder,
-                final_html,
-                currency.withdrawn_date,
-                currency.superseded_by,
-                currency.replaces,
+                compress_text(&final_html)?,
+                currency.withdrawn_date.clone(),
+                currency.superseded_by.clone(),
+                currency.replaces.clone(),
                 has_in_doc_links as i64,
                 has_related_docs as i64,
                 has_history as i64,
@@ -6611,46 +7220,34 @@ fn build_corpus(
         // entry for pack writing.
         let mut chunk_ids: Vec<(i64, String, Option<String>)> = Vec::new();
         let mut chunk_records: Vec<JsonValue> = Vec::new();
+        let mut doc_pending_embeddings: Vec<(i64, usize, String)> = Vec::new();
         for chunk in &chunks {
-            let zstd_text = zstd::stream::encode_all(
-                std::io::Cursor::new(chunk.text.as_bytes()),
-                zstd_level,
-            )
-            .context("zstd-compressing chunk text")?;
-            conn.execute(
+            let zstd_text =
+                zstd::stream::encode_all(std::io::Cursor::new(chunk.text.as_bytes()), zstd_level)
+                    .context("zstd-compressing chunk text")?;
+            tx.execute(
                 "INSERT INTO chunks (doc_id, ord, anchor, text)
                  VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params![doc_id, chunk.ord, chunk.anchor, zstd_text],
             )
             .context("INSERT chunks")?;
-            let chunk_id: i64 = conn.last_insert_rowid();
+            let chunk_id: i64 = tx.last_insert_rowid();
             chunk_ids.push((chunk_id, chunk.text.clone(), chunk.anchor.clone()));
 
-            let emb = state
-                .encode_query_embedding(&chunk.text)
-                .context("encoding chunk embedding")?;
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(emb.as_ptr() as *const u8, emb.len())
-            };
-            let emb_b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-            conn.execute(
-                "INSERT INTO chunk_embeddings (chunk_id, embedding)
-                 VALUES (?1, ?2)",
-                rusqlite::params![chunk_id, bytes],
-            )
-            .context("INSERT chunk_embeddings")?;
-            conn.execute(
+            tx.execute(
                 "INSERT INTO chunks_fts (rowid, text) VALUES (?1, ?2)",
                 rusqlite::params![chunk_id, chunk.text],
             )
             .context("INSERT chunks_fts")?;
 
+            let chunk_idx = chunk_records.len();
             chunk_records.push(json!({
                 "ord": chunk.ord,
-                "anchor": chunk.anchor,
-                "text": chunk.text,
-                "embedding_b64": emb_b64,
+                "anchor": chunk.anchor.clone(),
+                "text": chunk.text.clone(),
+                "embedding_b64": JsonValue::Null,
             }));
+            doc_pending_embeddings.push((chunk_id, chunk_idx, chunk.text.clone()));
         }
 
         // title_fts: concat headings into a searchable per-doc row.
@@ -6662,13 +7259,14 @@ fn build_corpus(
             .filter(|s| !s.is_empty())
             .collect();
         let headings_text = headings_concat.join(" ");
-        conn.execute(
+        tx.execute(
             "INSERT INTO title_fts (doc_id, title, headings) VALUES (?1, ?2, ?3)",
             rusqlite::params![doc_id, title, headings_text],
         )
         .context("INSERT title_fts")?;
 
         // doc_anchors.
+        let mut anchor_records: Vec<JsonValue> = Vec::new();
         for (anchor_ord, r) in (0_i64..).zip(anchor_refs.iter()) {
             let target_chunk_id: Option<i64> = if r.kind == "in_doc" {
                 if let Some(name) = r.target_anchor.as_deref() {
@@ -6683,7 +7281,15 @@ fn build_corpus(
             } else {
                 None
             };
-            conn.execute(
+            anchor_records.push(json!({
+                "ord": anchor_ord,
+                "kind": r.kind.clone(),
+                "label": r.label.clone(),
+                "target_chunk_id": target_chunk_id,
+                "target_doc_id": r.target_doc_id.clone(),
+                "target_pit": r.target_pit.clone(),
+            }));
+            tx.execute(
                 "INSERT INTO doc_anchors
                     (doc_id, ord, kind, label, target_chunk_id, target_doc_id, target_pit)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -6699,8 +7305,10 @@ fn build_corpus(
             )
             .context("INSERT doc_anchors")?;
         }
+        profile.sqlite += started.elapsed();
 
         // Definitions.
+        let started = std::time::Instant::now();
         let def_chunks: Vec<DefinitionChunk> = chunks
             .iter()
             .map(|c| DefinitionChunk {
@@ -6710,8 +7318,27 @@ fn build_corpus(
             })
             .collect();
         let defs = extract_definitions(&doc_id, &title, &doc_type, &def_chunks);
-        for d in defs {
-            conn.execute(
+        let definition_records: Vec<JsonValue> = defs
+            .iter()
+            .map(|d| {
+                json!({
+                    "definition_id": d.definition_id.clone(),
+                    "term": d.term.clone(),
+                    "norm_term": d.norm_term.clone(),
+                    "doc_id": d.doc_id.clone(),
+                    "source_title": d.source_title.clone(),
+                    "source_type": d.source_type.clone(),
+                    "scope": d.scope.clone(),
+                    "anchor": d.anchor.clone(),
+                    "ord": d.ord,
+                    "body": d.body.clone(),
+                })
+            })
+            .collect();
+        profile.references += started.elapsed();
+        let started = std::time::Instant::now();
+        for d in &defs {
+            tx.execute(
                 "INSERT OR REPLACE INTO definitions
                     (definition_id, term, norm_term, doc_id, source_title,
                      source_type, scope, anchor, ord, body)
@@ -6731,136 +7358,209 @@ fn build_corpus(
             )
             .context("INSERT definitions")?;
         }
+        profile.sqlite += started.elapsed();
 
         // Asset persistence: write each image to <out_dir>/assets/<sha[:2]>/<sha>.bin.
-        if let Some(dir) = out_dir {
-            for asset in &assets {
-                let target = dir.join(&asset.relative_path);
-                if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                if !target.exists() || fs::metadata(&target)?.len() != asset.size {
-                    let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(asset.data_b64.as_bytes())
-                        .context("decoding asset b64")?;
-                    fs::write(&target, &bytes)?;
-                }
+        let started = std::time::Instant::now();
+        for asset in &assets {
+            let target = out_dir.join(&asset.relative_path);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if !target.exists() || fs::metadata(&target)?.len() != asset.size {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(asset.data_b64.as_bytes())
+                    .context("decoding asset b64")?;
+                fs::write(&target, &bytes)?;
             }
         }
+        profile.assets += started.elapsed();
 
         // Pack record (in-memory; written at end of build).
-        if out_dir.is_some() {
-            pack_records.push((
-                doc_id.clone(),
-                json!({
-                    "doc_id": doc_id,
-                    "type": doc_type,
-                    "title": title,
-                    "date": derived_date,
-                    "downloaded_at": now,
-                    "content_hash": content_hash,
-                    "chunks": chunk_records,
-                    "assets": assets.iter().map(|a| json!({
-                        "asset_ref": a.asset_ref,
-                        "source_path": a.source_path,
-                        "relative_path": a.relative_path,
-                        "media_type": a.media_type,
-                        "alt": a.alt,
-                        "title": a.title,
-                        "sha256": a.sha256,
-                        "size": a.size,
-                    })).collect::<Vec<_>>(),
-                }),
-            ));
+        let started = std::time::Instant::now();
+        let doc_idx = pack_records.len();
+        pack_records.push((
+            doc_id.clone(),
+            json!({
+                "doc_id": doc_id,
+                "type": doc_type,
+                "title": title,
+                "date": derived_date,
+                "downloaded_at": now,
+                "content_hash": content_hash,
+                "html": final_html,
+                "withdrawn_date": currency.withdrawn_date,
+                "superseded_by": currency.superseded_by,
+                "replaces": currency.replaces,
+                "has_in_doc_links": has_in_doc_links as i64,
+                "has_related_docs": has_related_docs as i64,
+                "has_history": has_history as i64,
+                "anchors": anchor_records,
+                "definitions": definition_records,
+                "chunks": chunk_records,
+                "assets": assets.iter().map(|a| json!({
+                    "asset_ref": a.asset_ref.clone(),
+                    "source_path": a.source_path.clone(),
+                    "relative_path": a.relative_path.clone(),
+                    "media_type": a.media_type.clone(),
+                    "alt": a.alt.clone(),
+                    "title": a.title.clone(),
+                    "sha256": a.sha256.clone(),
+                    "size": a.size,
+                    "data_b64": a.data_b64.clone(),
+                })).collect::<Vec<_>>(),
+            }),
+        ));
+        profile.pack += started.elapsed();
+        for (chunk_id, chunk_idx, text) in doc_pending_embeddings {
+            pending_embeddings.push(PendingBuildEmbedding {
+                chunk_id,
+                doc_idx,
+                chunk_idx,
+                text,
+            });
+        }
+        if pending_embeddings.len() >= BUILD_EMBED_PENDING_FLUSH_CHUNKS {
+            flush_pending_build_embeddings(
+                &state,
+                &tx,
+                &mut pending_embeddings,
+                &mut pack_records,
+                &mut profile,
+            )?;
+        }
+        if pack_records.len() >= BUILD_PACK_RECORDS_PER_SHARD {
+            flush_pending_build_embeddings(
+                &state,
+                &tx,
+                &mut pending_embeddings,
+                &mut pack_records,
+                &mut profile,
+            )?;
+            let first_new_doc = documents.len();
+            write_build_pack_shard(
+                out_dir,
+                zstd_level,
+                pack_shard_idx,
+                &mut pack_records,
+                &doc_hashes,
+                &mut documents,
+                &mut packs,
+                &mut profile,
+            )?;
+            let started = std::time::Instant::now();
+            update_pack_sha8_for_docs(&tx, &documents[first_new_doc..])?;
+            tx.commit()?;
+            save_build_checkpoint(
+                out_dir,
+                &source_index_sha256,
+                zstd_level,
+                &documents,
+                &packs,
+            )?;
+            profile.checkpoint += started.elapsed();
+            for doc in &documents[first_new_doc..] {
+                completed_doc_ids.insert(doc.doc_id.clone());
+            }
+            doc_hashes.clear();
+            tx = conn.unchecked_transaction()?;
+            pack_shard_idx += 1;
         }
 
         processed += 1;
+        profile.docs += 1;
         if processed.is_multiple_of(50) {
             eprintln!("ato-mcp build: processed {processed} docs");
         }
     }
 
-    // Citations: scan chunk text for [doc:X] markers, write reverse index.
-    eprintln!("ato-mcp build: deriving citations…");
-    derive_citations(&conn)?;
-
-    // Pack writing + manifest emission (when out_dir is set).
-    if let Some(dir) = out_dir {
-        eprintln!("ato-mcp build: writing pack ({} docs)…", pack_records.len());
-        let tmp_pack = dir.join("packs").join(".pack-writing.bin.zst.tmp");
-        let pack_meta = write_pack(
-            &tmp_pack,
+    flush_pending_build_embeddings(
+        &state,
+        &tx,
+        &mut pending_embeddings,
+        &mut pack_records,
+        &mut profile,
+    )?;
+    let first_new_doc = documents.len();
+    write_build_pack_shard(
+        out_dir,
+        zstd_level,
+        pack_shard_idx,
+        &mut pack_records,
+        &doc_hashes,
+        &mut documents,
+        &mut packs,
+        &mut profile,
+    )?;
+    let started = std::time::Instant::now();
+    update_pack_sha8_for_docs(&tx, &documents[first_new_doc..])?;
+    tx.commit()?;
+    if documents.len() > first_new_doc {
+        save_build_checkpoint(
+            out_dir,
+            &source_index_sha256,
             zstd_level,
-            pack_records.into_iter().map(Ok),
+            &documents,
+            &packs,
         )?;
-        let sha8 = pack_meta
-            .get("sha8")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("write_pack returned no sha8"))?
-            .to_string();
-        let final_pack = dir.join("packs").join(format!("pack-{sha8}.bin.zst"));
-        fs::rename(&tmp_pack, &final_pack)?;
-        // Backfill pack_sha8 + offsets/lengths into documents rows.
-        if let Some(refs) = pack_meta.get("refs").and_then(|v| v.as_array()) {
-            let mut update = conn.prepare(
-                "UPDATE documents SET pack_sha8 = ?1, pack_offset = ?2, pack_length = ?3
-                 WHERE doc_id = ?4",
-            )?;
-            for r in refs {
-                let did = r.get("doc_id").and_then(|v| v.as_str()).unwrap_or_default();
-                let off = r.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
-                let len = r.get("length").and_then(|v| v.as_u64()).unwrap_or(0);
-                update.execute(rusqlite::params![sha8, off as i64, len as i64, did])?;
-            }
-        }
-
-        let pack_size = pack_meta.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
-        let pack_sha256 = pack_meta
-            .get("sha256")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        // Doc refs from pack_meta.refs.
-        let refs_for_manifest: Vec<JsonValue> = pack_meta
-            .get("refs")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| {
-                let did = r.get("doc_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let off = r.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
-                let len = r.get("length").and_then(|v| v.as_u64()).unwrap_or(0);
-                json!({
-                    "doc_id": did,
-                    "pack_sha8": sha8,
-                    "offset": off,
-                    "length": len,
-                })
-            })
-            .collect();
-
-        let manifest = json!({
-            "format_version": 3,
-            "version": chrono::Utc::now().format("%Y%m%d").to_string(),
-            "embedding_model_sha8": null,
-            "packs": [{
-                "url": format!("packs/pack-{sha8}.bin.zst"),
-                "sha8": sha8,
-                "sha256": pack_sha256,
-                "size": pack_size,
-            }],
-            "docs": refs_for_manifest,
-            "categories": {},
-            "schema_version": 3,
-        });
-        let manifest_path = dir.join("manifest.json");
-        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
-        eprintln!("ato-mcp build: wrote {}", manifest_path.display());
+    }
+    profile.checkpoint += started.elapsed();
+    if skipped_no_payload > 0 {
+        eprintln!("ato-mcp build: skipped {skipped_no_payload} index records without payload_path");
     }
 
-    eprintln!("ato-mcp build: done — {processed} docs written to {}", db_path.display());
+    let started = std::time::Instant::now();
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let manifest = Manifest {
+        schema_version: SUPPORTED_MANIFEST_VERSION as i64,
+        index_version: chrono::Utc::now().format("%Y.%m.%d").to_string(),
+        created_at,
+        min_client_version: env!("CARGO_PKG_VERSION").to_string(),
+        model: ModelInfo {
+            id: EMBEDDING_MODEL_ID.to_string(),
+            sha256: EMBEDDINGGEMMA_HF_FINGERPRINT.to_string(),
+            size: EMBEDDINGGEMMA_HF_SIZE,
+            url: EMBEDDINGGEMMA_HF_URL.to_string(),
+        },
+        documents,
+        packs,
+    };
+
+    let final_tx = conn.unchecked_transaction()?;
+    set_meta(&final_tx, "index_version", &manifest.index_version)?;
+    set_meta(&final_tx, "embedding_model_id", &manifest.model.id)?;
+    set_meta(&final_tx, "last_update_at", &manifest.created_at)?;
+    eprintln!("ato-mcp build: deriving citations…");
+    derive_citations(&final_tx)?;
+    verify_semantic_install(&final_tx, &manifest)?;
+    final_tx.commit()?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+
+    let manifest_path = out_dir.join("manifest.json");
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    let summary = UpdateSummary {
+        schema_version: manifest.schema_version,
+        index_version: manifest.index_version.clone(),
+        min_client_version: manifest.min_client_version.clone(),
+        model: manifest.model.clone(),
+        document_count: manifest.documents.len(),
+        pack_count: manifest.packs.len(),
+        manifest_fingerprint: Some(manifest_fingerprint(&manifest)?),
+    };
+    let summary_path = out_dir.join("update.json");
+    fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?)?;
+    eprintln!(
+        "ato-mcp build: wrote {} + {}",
+        manifest_path.display(),
+        summary_path.display()
+    );
+    profile.finalise += started.elapsed();
+    profile.print();
+
+    eprintln!(
+        "ato-mcp build: done - {processed} docs written to {}",
+        db_path.display()
+    );
     Ok(())
 }
 
@@ -6878,9 +7578,9 @@ fn normalize_doc_href(href: &str) -> String {
         return String::new();
     }
     // Try to parse as absolute URL; if relative, treat path/query directly.
-    let parsed = url::Url::parse(href).ok().or_else(|| {
-        url::Url::parse(&format!("https://www.ato.gov.au{href}")).ok()
-    });
+    let parsed = url::Url::parse(href)
+        .ok()
+        .or_else(|| url::Url::parse(&format!("https://www.ato.gov.au{href}")).ok());
     let Some(parsed) = parsed else {
         return href.to_string();
     };
@@ -6938,15 +7638,14 @@ fn parse_whats_new(html: &str, base_url: &str) -> Result<Vec<WhatsNewEntry>> {
                     Some(h) => h,
                     None => continue,
                 };
-                let absolute = if raw_href.starts_with("http://")
-                    || raw_href.starts_with("https://")
-                {
-                    raw_href.to_string()
-                } else if raw_href.starts_with('/') {
-                    format!("{}{}", base_url.trim_end_matches('/'), raw_href)
-                } else {
-                    format!("{}/{}", base_url.trim_end_matches('/'), raw_href)
-                };
+                let absolute =
+                    if raw_href.starts_with("http://") || raw_href.starts_with("https://") {
+                        raw_href.to_string()
+                    } else if raw_href.starts_with('/') {
+                        format!("{}{}", base_url.trim_end_matches('/'), raw_href)
+                    } else {
+                        format!("{}/{}", base_url.trim_end_matches('/'), raw_href)
+                    };
                 let canonical = normalize_doc_href(&absolute);
                 if !canonical.starts_with("/law/view/document") {
                     continue;
@@ -6974,15 +7673,8 @@ fn parse_whats_new(html: &str, base_url: &str) -> Result<Vec<WhatsNewEntry>> {
     Ok(entries)
 }
 
-fn fetch_external_doc(
-    doc_id: &str,
-    pit: Option<&str>,
-    view: Option<&str>,
-) -> Result<String> {
-    let mut url = format!(
-        "https://www.ato.gov.au/law/view/document?docid={}",
-        doc_id
-    );
+fn fetch_external_doc(doc_id: &str, pit: Option<&str>, view: Option<&str>) -> Result<String> {
+    let mut url = format!("https://www.ato.gov.au/law/view/document?docid={}", doc_id);
     if let Some(p) = pit.filter(|s| !s.is_empty()) {
         url.push_str(&format!("&PiT={}", p));
     }
@@ -7073,7 +7765,9 @@ fn clean_ato_html(html: &str) -> CleanedAtoDoc {
         .select(&title_selector)
         .next()
         .map(|n| n.text().collect::<String>());
-    let title = raw_title.map(|t| normalise_ws(&t)).filter(|t| !t.is_empty());
+    let title = raw_title
+        .map(|t| normalise_ws(&t))
+        .filter(|t| !t.is_empty());
 
     // Pick container — first match wins; fallback to <main> then <body>.
     let container_html = pick_container_html(&doc);
@@ -7148,7 +7842,10 @@ fn strip_history_ui_controls(doc: &mut scraper::Html) {
         let val = el.value();
         let title = val.attr("title").unwrap_or("").trim().to_lowercase();
         let alt = val.attr("alt").unwrap_or("").trim().to_lowercase();
-        if ATO_HISTORY_UI_LABELS.iter().any(|l| *l == title || *l == alt) {
+        if ATO_HISTORY_UI_LABELS
+            .iter()
+            .any(|l| *l == title || *l == alt)
+        {
             img_remove.push(el.id());
         }
     }
@@ -7235,10 +7932,31 @@ fn render_node(
     use scraper::Node as ScraperNode;
 
     const BLOCK_TAGS: &[&str] = &[
-        "p", "div", "section", "article", "header", "footer", "main", "aside",
-        "table", "tr", "thead", "tbody", "tfoot", "td", "th", "caption",
-        "ul", "ol", "li", "dl", "dt", "dd",
-        "hr", "pre", "blockquote",
+        "p",
+        "div",
+        "section",
+        "article",
+        "header",
+        "footer",
+        "main",
+        "aside",
+        "table",
+        "tr",
+        "thead",
+        "tbody",
+        "tfoot",
+        "td",
+        "th",
+        "caption",
+        "ul",
+        "ol",
+        "li",
+        "dl",
+        "dt",
+        "dd",
+        "hr",
+        "pre",
+        "blockquote",
     ];
 
     match node.value() {
@@ -8186,42 +8904,34 @@ fn doctor(rollback: bool) -> Result<()> {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Manifest {
     schema_version: i64,
     index_version: String,
     created_at: String,
     min_client_version: String,
     model: ModelInfo,
-    /// Optional cross-encoder reranker. Manifests without one degrade
-    /// gracefully to RRF-only ranking.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reranker: Option<ModelInfo>,
     documents: Vec<DocRef>,
     packs: Vec<PackInfo>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ModelInfo {
     id: String,
     sha256: String,
     size: u64,
     url: String,
-    /// Optional sha256 of the companion tokenizer file. Reranker manifests
-    /// must set it; tar.zst model bundles verify the bundle as a whole and
-    /// ignore this field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    tokenizer_sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateSummary {
     schema_version: i64,
     index_version: String,
     #[serde(default)]
     min_client_version: String,
     model: ModelInfo,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    reranker: Option<ModelInfo>,
     document_count: usize,
     pack_count: usize,
     #[serde(default)]
@@ -8229,6 +8939,7 @@ struct UpdateSummary {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct DocRef {
     doc_id: String,
     content_hash: String,
@@ -8238,6 +8949,7 @@ struct DocRef {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct PackInfo {
     sha8: String,
     sha256: String,
@@ -8300,23 +9012,21 @@ fn env_truthy(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Reject a manifest whose `schema_version` exceeds what this binary knows
-/// how to ingest, or whose `min_client_version` is newer than the
-/// currently-running binary.
+/// Reject a manifest whose `schema_version` is not the current release
+/// format, or whose `min_client_version` is newer than the currently-running
+/// binary.
 fn enforce_manifest_compatibility(manifest: &Manifest) -> Result<()> {
     // [CC-03] `ato-mcp update` and the `serve` startup availability probe
-    // both gate on this — incompatible manifests/summaries are surfaced as
-    // an upgrade-the-binary error from `update`, and silently suppressed
-    // from the probe so the agent never points the user at an action that
-    // could not succeed.
+    // both gate on this. There is one current manifest schema; old or new
+    // schemas are incompatible.
     let schema_version = manifest.schema_version;
     if schema_version < 0 {
         bail!("manifest schema_version is negative ({schema_version}); manifest is malformed");
     }
     let schema_version = schema_version as u32;
-    if schema_version > MAX_SUPPORTED_MANIFEST_VERSION {
+    if schema_version != SUPPORTED_MANIFEST_VERSION {
         bail!(
-            "installed corpus requires ato-mcp >= newer version (manifest schema_version={schema_version}, this binary supports up to {MAX_SUPPORTED_MANIFEST_VERSION}); please upgrade the ato-mcp binary"
+            "manifest schema_version {schema_version} is not supported by this binary (expects {SUPPORTED_MANIFEST_VERSION}); install a matching ato-mcp release"
         );
     }
     let min = manifest.min_client_version.trim();
@@ -8370,14 +9080,6 @@ fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
     enforce_manifest_compatibility(&new_manifest)?;
 
     ensure_model(&new_manifest, &manifest_context, &staging)?;
-    // Reranker is optional and best-effort. Failures here log to stderr
-    // but never abort an otherwise-successful corpus update — search
-    // falls back to RRF when the cross-encoder isn't available.
-    if new_manifest.reranker.is_some() {
-        if let Err(err) = ensure_reranker(&new_manifest, &manifest_context, &staging) {
-            eprintln!("ato-mcp: reranker download failed ({err}); search will fall back to RRF");
-        }
-    }
 
     // Cheap stats-only diff for the human-readable "+a ~c -r" CLI line.
     // No code path branches on the result — the rebuild always replaces
@@ -8441,9 +9143,6 @@ fn rebuild_live_db_from_manifest(
         )?;
         set_meta(&tx, "index_version", &manifest.index_version)?;
         set_meta(&tx, "embedding_model_id", &manifest.model.id)?;
-        if let Some(reranker) = &manifest.reranker {
-            set_meta(&tx, "reranker_model_id", &reranker.id)?;
-        }
         set_meta(&tx, "last_update_at", &Utc::now().to_rfc3339())?;
         // [UM-07] citations is a derived index of `[doc:X]` markers in
         // chunks.text. Newly-inserted chunks carry no citation rows; derive
@@ -8720,7 +9419,6 @@ fn enforce_update_summary_compatibility(summary: &UpdateSummary) -> Result<()> {
         created_at: String::new(),
         min_client_version: summary.min_client_version.clone(),
         model: summary.model.clone(),
-        reranker: summary.reranker.clone(),
         documents: Vec::new(),
         packs: Vec::new(),
     };
@@ -8738,7 +9436,6 @@ fn installed_matches_update_summary(installed: &Manifest, summary: &UpdateSummar
         || installed.packs.len() != summary.pack_count
         || manifest_fingerprint(installed)? != summary_fingerprint
         || !model_info_matches(&installed.model, &summary.model)
-        || !optional_model_info_matches(installed.reranker.as_ref(), summary.reranker.as_ref())
     {
         return Ok(false);
     }
@@ -8749,11 +9446,6 @@ fn installed_matches_update_summary(installed: &Manifest, summary: &UpdateSummar
     }
     if !embedding_model_installed_matches(&summary.model)? {
         return Ok(false);
-    }
-    if let Some(reranker) = &summary.reranker {
-        if !reranker_installed_matches(reranker)? {
-            return Ok(false);
-        }
     }
     let conn = open_read()?;
     Ok(!semantic_backfill_required_for_model(
@@ -8800,11 +9492,16 @@ const SCRAPER_EXCLUDED_TITLES: &[&str] = &[
 ];
 
 fn scraper_normalise_title(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<&str>>().join(" ").to_lowercase()
+    value
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 fn scraper_is_excluded(title: &str) -> bool {
-    static EXCLUDED: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
+    static EXCLUDED: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
     let set = EXCLUDED.get_or_init(|| {
         SCRAPER_EXCLUDED_TITLES
             .iter()
@@ -8872,9 +9569,16 @@ fn fetch_nodes_blocking(
     let url = if query.is_empty() {
         base_url.trim_end_matches('?').to_string()
     } else {
-        format!("{}?{}", base_url.trim_end_matches('?'), query.trim_start_matches('?'))
+        format!(
+            "{}?{}",
+            base_url.trim_end_matches('?'),
+            query.trim_start_matches('?')
+        )
     };
-    let resp = client.get(&url).send().with_context(|| format!("fetching {url}"))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .with_context(|| format!("fetching {url}"))?;
     let status = resp.status();
     if !status.is_success() {
         bail!("ATO API returned HTTP {status} for {url}");
@@ -8909,9 +9613,11 @@ fn tree_crawl(
 
     // Rate limiter: enforce request_interval_seconds between any two outgoing
     // calls. Tree crawler can issue thousands per run.
-    let last_request = std::sync::Mutex::new(std::time::Instant::now()
-        .checked_sub(Duration::from_secs(60))
-        .unwrap_or_else(std::time::Instant::now));
+    let last_request = std::sync::Mutex::new(
+        std::time::Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or_else(std::time::Instant::now),
+    );
     let acquire = || {
         if request_interval_seconds <= 0.0 {
             return;
@@ -9107,8 +9813,7 @@ fn snapshot_reduce(nodes_path: &Path, output_dir: Option<&Path>) -> Result<()> {
         .ok_or_else(|| anyhow!("could not derive output dir"))?;
     fs::create_dir_all(&out_dir)?;
 
-    let f = File::open(nodes_path)
-        .with_context(|| format!("opening {}", nodes_path.display()))?;
+    let f = File::open(nodes_path).with_context(|| format!("opening {}", nodes_path.display()))?;
     let reader = std::io::BufReader::new(f);
 
     // node uid → (parent_uid, data_url)
@@ -9164,7 +9869,11 @@ fn snapshot_reduce(nodes_path: &Path, output_dir: Option<&Path>) -> Result<()> {
         if title_excluded || parent_excluded {
             excluded_uids.insert(uid);
             *excluded_counts
-                .entry(if title.is_empty() { "(untitled)".into() } else { title.clone() })
+                .entry(if title.is_empty() {
+                    "(untitled)".into()
+                } else {
+                    title.clone()
+                })
                 .or_default() += 1;
             if let Some(url) = &data_url {
                 excluded_folder_urls.insert(url.clone());
@@ -9174,23 +9883,31 @@ fn snapshot_reduce(nodes_path: &Path, output_dir: Option<&Path>) -> Result<()> {
 
         if let Some(url) = &data_url {
             let parent_folder = find_parent_folder(parent_uid, &node_meta);
-            let entry = folder_records.entry(url.clone()).or_insert_with(|| FolderRecord {
-                data_url: url.clone(),
-                title: record.get("title").and_then(|v| v.as_str()).map(String::from),
-                path: record
-                    .get("path")
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|p| p.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                parent_data_url: parent_folder.clone(),
-                ..Default::default()
-            });
+            let entry = folder_records
+                .entry(url.clone())
+                .or_insert_with(|| FolderRecord {
+                    data_url: url.clone(),
+                    title: record
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    path: record
+                        .get("path")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|p| p.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    parent_data_url: parent_folder.clone(),
+                    ..Default::default()
+                });
             entry.parent_data_url = parent_folder.clone();
-            folder_children.entry(parent_folder).or_default().insert(url.clone());
+            folder_children
+                .entry(parent_folder)
+                .or_default()
+                .insert(url.clone());
         }
 
         let node_type = record
@@ -9202,11 +9919,15 @@ fn snapshot_reduce(nodes_path: &Path, output_dir: Option<&Path>) -> Result<()> {
             .and_then(|v| v.as_str())
             .map(String::from);
         if node_type.contains("link") {
-            let Some(canonical_id) = canonical_id_opt else { continue };
+            let Some(canonical_id) = canonical_id_opt else {
+                continue;
+            };
             let folder_url = data_url
                 .clone()
                 .or_else(|| find_parent_folder(parent_uid, &node_meta));
-            let Some(folder_url) = folder_url else { continue };
+            let Some(folder_url) = folder_url else {
+                continue;
+            };
             folder_records
                 .entry(folder_url.clone())
                 .or_insert_with(|| FolderRecord {
@@ -9222,8 +9943,14 @@ fn snapshot_reduce(nodes_path: &Path, output_dir: Option<&Path>) -> Result<()> {
                         .collect()
                 })
                 .unwrap_or_default();
-            let title_str = record.get("title").and_then(|v| v.as_str()).map(String::from);
-            let href_str = record.get("href").and_then(|v| v.as_str()).map(String::from);
+            let title_str = record
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let href_str = record
+                .get("href")
+                .and_then(|v| v.as_str())
+                .map(String::from);
 
             let entry = canonical_entries
                 .entry(canonical_id.clone())
@@ -9246,11 +9973,9 @@ fn snapshot_reduce(nodes_path: &Path, output_dir: Option<&Path>) -> Result<()> {
                 entry.title = title_str;
                 entry.owner_folder = Some(folder_url.clone());
             }
-            folder_records
-                .entry(folder_url.clone())
-                .and_modify(|fr| {
-                    fr.canonical_ids.insert(canonical_id.clone());
-                });
+            folder_records.entry(folder_url.clone()).and_modify(|fr| {
+                fr.canonical_ids.insert(canonical_id.clone());
+            });
         }
 
         total_nodes += 1;
@@ -9330,28 +10055,40 @@ fn snapshot_reduce(nodes_path: &Path, output_dir: Option<&Path>) -> Result<()> {
         "excluded_titles": excluded_counts,
         "excluded_folder_urls": excluded_urls_sorted,
     });
-    fs::write(out_dir.join("dedup_summary.json"), serde_json::to_vec_pretty(&summary)?)?;
+    fs::write(
+        out_dir.join("dedup_summary.json"),
+        serde_json::to_vec_pretty(&summary)?,
+    )?;
 
-    let mut redundant: Vec<&FolderRecord> = folder_records.values().filter(|r| r.redundant).collect();
+    let mut redundant: Vec<&FolderRecord> =
+        folder_records.values().filter(|r| r.redundant).collect();
     redundant.sort_by(|a, b| (a.path.len(), &a.data_url).cmp(&(b.path.len(), &b.data_url)));
     let payload: Vec<JsonValue> = redundant
         .iter()
-        .map(|r| json!({
-            "data_url": r.data_url,
-            "title": r.title,
-            "path": r.path,
-            "parent_data_url": r.parent_data_url,
-            "canonical_id_count": r.canonical_ids.len(),
-            "owned_canonical_ids": r.owned_ids.len(),
-        }))
+        .map(|r| {
+            json!({
+                "data_url": r.data_url,
+                "title": r.title,
+                "path": r.path,
+                "parent_data_url": r.parent_data_url,
+                "canonical_id_count": r.canonical_ids.len(),
+                "owned_canonical_ids": r.owned_ids.len(),
+            })
+        })
         .collect();
-    fs::write(out_dir.join("redundant_paths.json"), serde_json::to_vec_pretty(&payload)?)?;
+    fs::write(
+        out_dir.join("redundant_paths.json"),
+        serde_json::to_vec_pretty(&payload)?,
+    )?;
 
     let mut all_skip: HashSet<String> = redundant.iter().map(|r| r.data_url.clone()).collect();
     all_skip.extend(excluded_folder_urls.iter().cloned());
     let mut skip_sorted: Vec<String> = all_skip.into_iter().collect();
     skip_sorted.sort();
-    fs::write(out_dir.join("skip_data_urls.json"), serde_json::to_vec_pretty(&skip_sorted)?)?;
+    fs::write(
+        out_dir.join("skip_data_urls.json"),
+        serde_json::to_vec_pretty(&skip_sorted)?,
+    )?;
 
     eprintln!(
         "snapshot-reduce: {} unique links, {} folders, {} redundant; out={}",
@@ -9380,7 +10117,11 @@ fn slug_for(text: &str, fallback: &str) -> String {
     let re = RE.get_or_init(|| regex::Regex::new(r"[^A-Za-z0-9]+").unwrap());
     let s = re.replace_all(text.trim(), "_");
     let s = s.trim_matches('_').to_string();
-    let s = if s.is_empty() { fallback.to_string() } else { s };
+    let s = if s.is_empty() {
+        fallback.to_string()
+    } else {
+        s
+    };
     s.chars().take(80).collect()
 }
 
@@ -9392,7 +10133,10 @@ fn build_payload_path(out_dir: &Path, link: &JsonValue) -> PathBuf {
             dir = dir.join(slug_for(s, "node"));
         }
     }
-    let canonical_id = link.get("canonical_id").and_then(|v| v.as_str()).unwrap_or("");
+    let canonical_id = link
+        .get("canonical_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let filename = format!("{}.html", slug_for(canonical_id, "link"));
     dir.join(filename)
 }
@@ -9576,7 +10320,9 @@ fn link_download(args: LinkDownloadArgs) -> Result<()> {
                 }
 
                 let url = match href.as_deref() {
-                    Some(h) if h.starts_with('/') => format!("{}{}", base_url.trim_end_matches('/'), h),
+                    Some(h) if h.starts_with('/') => {
+                        format!("{}{}", base_url.trim_end_matches('/'), h)
+                    }
                     Some(h) => h.to_string(),
                     None => {
                         eprintln!("link-download w{worker_id}: missing href for {canonical_id}");
@@ -9590,7 +10336,9 @@ fn link_download(args: LinkDownloadArgs) -> Result<()> {
                     Ok(r) => {
                         let status = r.status();
                         if !status.is_success() {
-                            eprintln!("link-download w{worker_id}: HTTP {status} for {canonical_id}");
+                            eprintln!(
+                                "link-download w{worker_id}: HTTP {status} for {canonical_id}"
+                            );
                             stats_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let now = chrono::Utc::now().to_rfc3339();
                             let rec = json!({
@@ -9640,7 +10388,9 @@ fn link_download(args: LinkDownloadArgs) -> Result<()> {
                 let snippet = match extract_law_contents(&html) {
                     Some(s) => s,
                     None => {
-                        eprintln!("link-download w{worker_id}: missing lawContents for {canonical_id}");
+                        eprintln!(
+                            "link-download w{worker_id}: missing lawContents for {canonical_id}"
+                        );
                         stats_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let now = chrono::Utc::now().to_rfc3339();
                         let rec = json!({
@@ -9729,7 +10479,10 @@ fn link_download(args: LinkDownloadArgs) -> Result<()> {
         "total_links": total,
         "completed_links": stats_completed.load(std::sync::atomic::Ordering::Relaxed),
     });
-    fs::write(args.out_dir.join("metadata.json"), serde_json::to_vec_pretty(&metadata)?)?;
+    fs::write(
+        args.out_dir.join("metadata.json"),
+        serde_json::to_vec_pretty(&metadata)?,
+    )?;
 
     eprintln!(
         "link-download: done — {} success, {} errors, {} skipped (out_dir={})",
@@ -9743,7 +10496,11 @@ fn link_download(args: LinkDownloadArgs) -> Result<()> {
 
 // ----- scrape-diff (port of pipeline.py incremental + catch_up diff steps) -----
 
-fn representative_path_from_docid(canonical_id: &str, title: &str, heading: Option<&str>) -> Vec<String> {
+fn representative_path_from_docid(
+    canonical_id: &str,
+    title: &str,
+    heading: Option<&str>,
+) -> Vec<String> {
     // Mirrors src/ato_mcp/indexer/metadata.py:representative_path_from_docid.
     // Falls back to ['Other'] when nothing better can be determined.
     use scraper as _;
@@ -9773,7 +10530,8 @@ fn doc_id_top_category(canonical_id: &str) -> Option<&'static str> {
     if lower.contains("docid=cm") || lower.contains("docid=tr") || lower.contains("docid=tr%2f") {
         return Some("Public_rulings");
     }
-    if lower.contains("docid=psr") || lower.contains("docid=ps%20la") || lower.contains("docid=ps") {
+    if lower.contains("docid=psr") || lower.contains("docid=ps%20la") || lower.contains("docid=ps")
+    {
         return Some("Practice_statements");
     }
     if lower.contains("docid=pba") || lower.contains("docid=pbr") {
@@ -9839,10 +10597,18 @@ fn scrape_diff(
     use std::io::Write as _;
 
     let existing = load_canonical_ids(index_path)?;
-    eprintln!("scrape-diff: {} existing canonical IDs in {}", existing.len(), index_path.display());
+    eprintln!(
+        "scrape-diff: {} existing canonical IDs in {}",
+        existing.len(),
+        index_path.display()
+    );
 
     let prefix_parts: Vec<String> = match path_prefix {
-        Some(p) => p.split('/').map(String::from).filter(|s| !s.is_empty()).collect(),
+        Some(p) => p
+            .split('/')
+            .map(String::from)
+            .filter(|s| !s.is_empty())
+            .collect(),
         None => Vec::new(),
     };
 
@@ -9851,7 +10617,8 @@ fn scrape_diff(
 
     let mut total: usize = 0;
     let mut missing: usize = 0;
-    let mut by_category: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut by_category: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
 
     if let Some(d) = deduped {
         // Catch-up mode: diff a deduped_links.jsonl against the existing index.
@@ -9874,8 +10641,10 @@ fn scrape_diff(
                 continue;
             }
             if !prefix_parts.is_empty() {
-                let mut new_path: Vec<JsonValue> =
-                    prefix_parts.iter().map(|s| JsonValue::String(s.clone())).collect();
+                let mut new_path: Vec<JsonValue> = prefix_parts
+                    .iter()
+                    .map(|s| JsonValue::String(s.clone()))
+                    .collect();
                 if let Some(rep) = rec.get("representative_path").and_then(|v| v.as_array()) {
                     new_path.extend(rep.iter().cloned());
                 }
@@ -9898,7 +10667,10 @@ fn scrape_diff(
             .user_agent(ATO_USER_AGENT)
             .timeout(Duration::from_secs(30))
             .build()?;
-        let resp = client.get(url).send().with_context(|| format!("fetching {url}"))?;
+        let resp = client
+            .get(url)
+            .send()
+            .with_context(|| format!("fetching {url}"))?;
         if !resp.status().is_success() {
             bail!("HTTP {} fetching {}", resp.status(), url);
         }
@@ -9911,7 +10683,10 @@ fn scrape_diff(
                 continue;
             }
             let segments = representative_path_from_docid(&cid, &e.title, e.heading.as_deref());
-            let cat = segments.first().cloned().unwrap_or_else(|| "(uncategorized)".to_string());
+            let cat = segments
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "(uncategorized)".to_string());
             *by_category.entry(cat).or_insert(0) += 1;
             let rec = json!({
                 "canonical_id": cid,
@@ -9962,10 +10737,8 @@ fn bundle_localize_manifest(
     packs_dir: &Path,
     model_bundle: &Path,
 ) -> Result<()> {
-    let mut manifest: JsonValue = serde_json::from_str(
-        &fs::read_to_string(manifest_path)?,
-    )
-    .with_context(|| format!("parsing {}", manifest_path.display()))?;
+    let mut manifest: JsonValue = serde_json::from_str(&fs::read_to_string(manifest_path)?)
+        .with_context(|| format!("parsing {}", manifest_path.display()))?;
 
     if let Some(packs) = manifest.get_mut("packs").and_then(|v| v.as_array_mut()) {
         for pack in packs {
@@ -9985,9 +10758,8 @@ fn bundle_localize_manifest(
             }
             pack["url"] = JsonValue::String(format!("packs/{filename}"));
             pack["sha256"] = JsonValue::String(sha256_file(&pack_path)?);
-            pack["size"] = JsonValue::Number(serde_json::Number::from(
-                fs::metadata(&pack_path)?.len(),
-            ));
+            pack["size"] =
+                JsonValue::Number(serde_json::Number::from(fs::metadata(&pack_path)?.len()));
         }
     }
 
@@ -9998,11 +10770,13 @@ fn bundle_localize_manifest(
     if let Some(model) = manifest.get_mut("model") {
         model["url"] = JsonValue::String(model_filename.to_string());
         model["sha256"] = JsonValue::String(sha256_file(model_bundle)?);
-        model["size"] = JsonValue::Number(serde_json::Number::from(
-            fs::metadata(model_bundle)?.len(),
-        ));
+        model["size"] =
+            JsonValue::Number(serde_json::Number::from(fs::metadata(model_bundle)?.len()));
     }
 
+    let manifest_typed: Manifest = serde_json::from_value(manifest.clone())
+        .with_context(|| format!("validating {}", manifest_path.display()))?;
+    let manifest_fingerprint = manifest_fingerprint(&manifest_typed)?;
     fs::write(manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
 
     let summary = json!({
@@ -10010,7 +10784,6 @@ fn bundle_localize_manifest(
         "index_version": manifest.get("index_version").cloned().unwrap_or(JsonValue::Null),
         "min_client_version": manifest.get("min_client_version").cloned().unwrap_or(JsonValue::String(String::new())),
         "model": manifest.get("model").cloned().unwrap_or(JsonValue::Null),
-        "reranker": manifest.get("reranker").cloned().unwrap_or(JsonValue::Null),
         "document_count": manifest
             .get("documents")
             .and_then(|v| v.as_array())
@@ -10021,6 +10794,7 @@ fn bundle_localize_manifest(
             .and_then(|v| v.as_array())
             .map(|a| a.len())
             .unwrap_or(0),
+        "manifest_fingerprint": manifest_fingerprint,
     });
     let summary_path = manifest_path
         .parent()
@@ -10033,34 +10807,6 @@ fn bundle_localize_manifest(
         manifest_path.display(),
         summary_path.display(),
     );
-    Ok(())
-}
-
-fn backfill_citations(db: Option<&Path>) -> Result<()> {
-    let default_path = dirs::data_dir()
-        .map(|d| d.join("ato-mcp").join("live").join("ato.db"))
-        .ok_or_else(|| anyhow!("no data dir"))?;
-    let db_path = db.unwrap_or(default_path.as_path());
-    if !db_path.exists() {
-        bail!("db not found: {}", db_path.display());
-    }
-    let conn = open_write_at(db_path)?;
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS citations (
-            source_chunk_id  INTEGER NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
-            source_doc_id    TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
-            target_doc_id    TEXT NOT NULL,
-            PRIMARY KEY (source_chunk_id, target_doc_id)
-        )",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_citations_target ON citations(target_doc_id)",
-        [],
-    )?;
-    let t0 = std::time::Instant::now();
-    derive_citations(&conn)?;
-    eprintln!("backfill complete in {:.1}s", t0.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -10096,8 +10842,7 @@ fn is_github_url(url: &str) -> bool {
 }
 
 fn is_hf_url(url: &str) -> bool {
-    url.starts_with("https://huggingface.co/")
-        || url.starts_with("http://huggingface.co/")
+    url.starts_with("https://huggingface.co/") || url.starts_with("http://huggingface.co/")
 }
 
 fn publish_release(args: PublishReleaseArgs) -> Result<()> {
@@ -10146,7 +10891,10 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
 
         let (sha256, size) = if needs_default {
             model_url = EMBEDDINGGEMMA_HF_URL.to_string();
-            (EMBEDDINGGEMMA_HF_FINGERPRINT.to_string(), EMBEDDINGGEMMA_HF_SIZE)
+            (
+                EMBEDDINGGEMMA_HF_FINGERPRINT.to_string(),
+                EMBEDDINGGEMMA_HF_SIZE,
+            )
         } else if is_hf_url(&model_url) {
             (
                 args.model_sha256
@@ -10202,7 +10950,6 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
         index_version: manifest.index_version.clone(),
         min_client_version: manifest.min_client_version.clone(),
         model: manifest.model.clone(),
-        reranker: manifest.reranker.clone(),
         document_count: manifest.documents.len(),
         pack_count: manifest.packs.len(),
         manifest_fingerprint: Some(manifest_fingerprint(&manifest)?),
@@ -10215,9 +10962,7 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
     artifacts.extend(pack_files.iter().cloned());
 
     if let Some(sign_key) = args.sign_key.as_deref() {
-        let sig_path = args
-            .out_dir
-            .join("manifest.json.minisig");
+        let sig_path = args.out_dir.join("manifest.json.minisig");
         let status = std::process::Command::new("minisign")
             .args([
                 "-S".as_ref(),
@@ -10292,15 +11037,6 @@ fn model_info_matches(left: &ModelInfo, right: &ModelInfo) -> bool {
         && left.sha256 == right.sha256
         && left.size == right.size
         && left.url == right.url
-        && left.tokenizer_sha256 == right.tokenizer_sha256
-}
-
-fn optional_model_info_matches(left: Option<&ModelInfo>, right: Option<&ModelInfo>) -> bool {
-    match (left, right) {
-        (None, None) => true,
-        (Some(left), Some(right)) => model_info_matches(left, right),
-        _ => false,
-    }
 }
 
 fn embedding_model_marker_value(info: &ModelInfo) -> String {
@@ -10321,17 +11057,6 @@ fn embedding_model_installed_matches(info: &ModelInfo) -> Result<bool> {
         && tokenizer_path()?.exists()
         && marker.exists()
         && fs::read_to_string(marker)?.trim() == marker_value)
-}
-
-fn reranker_installed_matches(info: &ModelInfo) -> Result<bool> {
-    if info.sha256.is_empty() {
-        return Ok(false);
-    }
-    let marker = live_dir()?.join(".reranker.sha256");
-    Ok(reranker_model_path()?.exists()
-        && reranker_tokenizer_path()?.exists()
-        && marker.exists()
-        && fs::read_to_string(marker)?.trim() == info.sha256)
 }
 
 /// Compute the (added, changed, removed) doc-set difference between the
@@ -10622,149 +11347,8 @@ fn install_hf_embedding_model(repo: &str, revision: &str, staging: &Path) -> Res
     Ok(())
 }
 
-/// Download (or refresh) the optional cross-encoder reranker into
-/// `live_dir()`. Caller is responsible for checking `manifest.reranker
-/// .is_some()` before invoking. Mirrors `ensure_model`'s caching:
-/// if the local files match the manifest's sha256 we skip the download.
-///
-/// Two download shapes are accepted:
-///   1. `hf://owner/repo[@revision]` — fetch `onnx/model_quantized.onnx` +
-///      `tokenizer.json` from the Hugging Face mirror, sha-verify the model.
-///   2. Any other URL — treated as a tar.zst bundle (the EmbeddingGemma
-///      pattern). The bundle MUST contain `reranker.onnx` AND
-///      `reranker_tokenizer.json` at the archive root. The bundle's
-///      sha256 is verified against `manifest.reranker.sha256`.
-fn ensure_reranker(manifest: &Manifest, context: &UrlContext, staging: &Path) -> Result<()> {
-    let info = manifest
-        .reranker
-        .as_ref()
-        .ok_or_else(|| anyhow!("ensure_reranker called with no reranker entry in manifest"))?;
-    let live_model = reranker_model_path()?;
-    let live_tokenizer = reranker_tokenizer_path()?;
-    let marker = live_dir()?.join(".reranker.sha256");
-    let marker_value = info.sha256.as_str();
-    if !marker_value.is_empty()
-        && live_model.exists()
-        && live_tokenizer.exists()
-        && marker.exists()
-        && fs::read_to_string(&marker)?.trim() == marker_value
-    {
-        return Ok(());
-    }
-
-    if let Some((repo, revision)) = parse_hf_model_url(&info.url) {
-        install_hf_reranker(repo, revision, info, staging)?;
-        if !marker_value.is_empty() {
-            fs::write(marker, marker_value)?;
-        }
-        return Ok(());
-    }
-
-    let bundle_url = resolve_manifest_asset(&info.url, context);
-    let bundle = staging.join("reranker-bundle.tar.zst.part");
-    fetch_to_file(&bundle_url, context, &bundle)?;
-    if !info.sha256.is_empty() {
-        verify_sha256_file(&bundle, &info.sha256)?;
-    }
-    let extract_dir = staging.join("reranker-bundle-extracted");
-    if extract_dir.exists() {
-        fs::remove_dir_all(&extract_dir)?;
-    }
-    fs::create_dir_all(&extract_dir)?;
-    let bundle_file = File::open(&bundle)?;
-    let decoder = zstd::stream::read::Decoder::new(bundle_file)?;
-    let mut archive = tar::Archive::new(decoder);
-    archive.unpack(&extract_dir)?;
-
-    let staged_model = extract_dir.join("reranker.onnx");
-    let staged_tokenizer = extract_dir.join("reranker_tokenizer.json");
-    if !staged_model.exists() || !staged_tokenizer.exists() {
-        bail!(
-            "reranker bundle is missing required files (expected reranker.onnx + reranker_tokenizer.json)"
-        );
-    }
-    if live_model.exists() {
-        fs::remove_file(&live_model)?;
-    }
-    if live_tokenizer.exists() {
-        fs::remove_file(&live_tokenizer)?;
-    }
-    fs::rename(&staged_model, &live_model)?;
-    fs::rename(&staged_tokenizer, &live_tokenizer)?;
-    if !marker_value.is_empty() {
-        fs::write(marker, marker_value)?;
-    }
-    let _ = fs::remove_file(bundle);
-    let _ = fs::remove_dir_all(extract_dir);
-    Ok(())
-}
-
-fn install_hf_reranker(repo: &str, revision: &str, info: &ModelInfo, staging: &Path) -> Result<()> {
-    fs::create_dir_all(staging)?;
-    let model_part = download_hf_reranker_model(repo, revision, info, staging)?;
-    let tokenizer_part = staging.join("reranker_tokenizer.json.part");
-    let tokenizer_url = hf_resolve_url(repo, revision, "tokenizer.json");
-    fetch_http_to_file(&tokenizer_url, &tokenizer_part)
-        .with_context(|| format!("downloading reranker tokenizer from {repo}"))?;
-    let expected_tokenizer_sha = info
-        .tokenizer_sha256
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("reranker manifest is missing tokenizer_sha256 for {repo}"))?;
-    verify_sha256_file(&tokenizer_part, expected_tokenizer_sha)
-        .with_context(|| format!("verifying reranker tokenizer from {repo}"))?;
-
-    let live_model = reranker_model_path()?;
-    let live_tokenizer = reranker_tokenizer_path()?;
-    if live_model.exists() {
-        fs::remove_file(&live_model)?;
-    }
-    if live_tokenizer.exists() {
-        fs::remove_file(&live_tokenizer)?;
-    }
-    fs::rename(&model_part, &live_model)?;
-    fs::rename(&tokenizer_part, &live_tokenizer)?;
-    Ok(())
-}
-
-fn download_hf_reranker_model(
-    repo: &str,
-    revision: &str,
-    info: &ModelInfo,
-    staging: &Path,
-) -> Result<PathBuf> {
-    download_hf_reranker_model_with(repo, revision, info, staging, |url, dest| {
-        fetch_http_to_file(url, dest)
-    })
-}
-
-fn download_hf_reranker_model_with<F>(
-    repo: &str,
-    revision: &str,
-    info: &ModelInfo,
-    staging: &Path,
-    mut fetch: F,
-) -> Result<PathBuf>
-where
-    F: FnMut(&str, &Path) -> Result<u64>,
-{
-    fs::create_dir_all(staging)?;
-    let model_part = staging.join("reranker.onnx.part");
-    let url = hf_resolve_url(repo, revision, RERANKER_HF_MODEL_PATH);
-    if let Err(err) = fetch(&url, &model_part) {
-        let _ = fs::remove_file(&model_part);
-        bail!("downloading reranker model {RERANKER_HF_MODEL_PATH} from {repo}: {err}");
-    }
-    if !info.sha256.is_empty() {
-        if let Err(err) = verify_sha256_file(&model_part, &info.sha256) {
-            let _ = fs::remove_file(&model_part);
-            bail!("verifying reranker model {RERANKER_HF_MODEL_PATH} from {repo}: {err}");
-        }
-    }
-    Ok(model_part)
-}
-
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PackRecord {
     doc_id: String,
     #[serde(default, rename = "type")]
@@ -10802,6 +11386,7 @@ struct PackRecord {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PackAsset {
     asset_ref: String,
     source_path: String,
@@ -10815,6 +11400,7 @@ struct PackAsset {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PackDefinition {
     definition_id: String,
     term: String,
@@ -10831,6 +11417,7 @@ struct PackDefinition {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PackChunk {
     ord: i64,
     #[serde(default)]
@@ -10841,6 +11428,7 @@ struct PackChunk {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PackDocAnchor {
     ord: i64,
     kind: String,
@@ -11130,7 +11718,10 @@ fn spawn_daemon_detached(cfg: &HttpConfig) -> Result<()> {
             if early_lines.is_empty() {
                 bail!("daemon exited before becoming ready");
             }
-            bail!("daemon exited before becoming ready: {}", early_lines.trim());
+            bail!(
+                "daemon exited before becoming ready: {}",
+                early_lines.trim()
+            );
         }
         if line.contains(&needle) {
             break;
@@ -11142,11 +11733,7 @@ fn spawn_daemon_detached(cfg: &HttpConfig) -> Result<()> {
     // background thread so the pipe buffer never fills.
     if let Ok(log_path) = daemon_log_path() {
         std::thread::spawn(move || {
-            if let Ok(mut log) = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-            {
+            if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(&log_path) {
                 let mut buf = [0u8; 4096];
                 while let Ok(n) = reader.get_mut().read(&mut buf) {
                     if n == 0 {
@@ -11277,12 +11864,7 @@ fn daemon(state: Arc<ServerState>) -> Result<()> {
 fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<()> {
     use tiny_http::{Header, Method, Response};
 
-    let path = request
-        .url()
-        .split('?')
-        .next()
-        .unwrap_or("/")
-        .to_string();
+    let path = request.url().split('?').next().unwrap_or("/").to_string();
     let is_mcp = path == "/mcp" || path == "/mcp/";
 
     if !is_mcp {
@@ -11319,9 +11901,8 @@ fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<(
     };
 
     let body = serde_json::to_string(&value)?;
-    let resp = Response::from_string(body).with_header(
-        Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
-    );
+    let resp = Response::from_string(body)
+        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
     request.respond(resp).map_err(|e| anyhow!("respond: {e}"))?;
     Ok(())
 }
@@ -11643,17 +12224,14 @@ fn get_chunks(chunk_ids: &[i64], opts: GetChunksOptions) -> Result<String> {
             break;
         }
     }
-    let next_call = truncated_at.as_ref().map(|chunk| {
-        format!("get_chunks(chunk_ids=[{}])", chunk.chunk_id)
-    });
+    let next_call = truncated_at
+        .as_ref()
+        .map(|chunk| format!("get_chunks(chunk_ids=[{}])", chunk.chunk_id));
     let mut meta = serde_json::Map::new();
     if truncated_at.is_some() {
         meta.insert("truncated".to_string(), JsonValue::Bool(true));
         if let Some(call) = next_call.as_ref() {
-            meta.insert(
-                "next_call".to_string(),
-                JsonValue::String(call.to_string()),
-            );
+            meta.insert("next_call".to_string(), JsonValue::String(call.to_string()));
         }
     }
     let mut response = serde_json::Map::new();
@@ -11842,10 +12420,7 @@ fn get_doc_anchors(doc_id: &str) -> Result<String> {
                     entry.insert("label".to_string(), JsonValue::String(label));
                     entry.insert("doc_id".to_string(), JsonValue::String(target.clone()));
                     if let Some(pit) = target_pit.as_deref() {
-                        entry.insert(
-                            "pit".to_string(),
-                            JsonValue::String(pit.to_string()),
-                        );
+                        entry.insert("pit".to_string(), JsonValue::String(pit.to_string()));
                         if let Some(date) = pit_to_date(pit) {
                             entry.insert("date".to_string(), JsonValue::String(date));
                         }
@@ -11903,12 +12478,8 @@ const CITED_BY_LIMIT: usize = 100;
 /// over the live file; freshly-inserted chunks carry no citation rows, so
 /// every row must be derived here before the swap.
 fn derive_citations(conn: &Connection) -> Result<()> {
-    if !table_exists(conn, "citations")? {
-        return Ok(());
-    }
     static DOC_MARKER_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let re = DOC_MARKER_RE
-        .get_or_init(|| Regex::new(r"\[doc:([^\s\]@]+)").expect("valid regex"));
+    let re = DOC_MARKER_RE.get_or_init(|| Regex::new(r"\[doc:([^\s\]@]+)").expect("valid regex"));
 
     conn.execute("DELETE FROM citations", [])?;
     let mut select = conn.prepare("SELECT chunk_id, doc_id, text FROM chunks")?;
@@ -11945,12 +12516,6 @@ fn derive_citations(conn: &Connection) -> Result<()> {
 }
 
 fn load_cited_by(conn: &Connection, doc_id: &str) -> Result<(Vec<JsonValue>, i64)> {
-    // Gracefully no-op on older corpora that predate the citations table.
-    // The next maintainer build (or local `scripts/backfill-citations.py`)
-    // populates it; until then this tool just returns an empty list.
-    if !table_exists(conn, "citations")? {
-        return Ok((Vec::new(), 0));
-    }
     let total: i64 = conn.query_row(
         "SELECT COUNT(DISTINCT source_doc_id) FROM citations WHERE target_doc_id = ?",
         [doc_id],
@@ -12403,14 +12968,6 @@ mod tests {
         assert_eq!(out[1].chunk_id, 1, "A should rank second");
     }
 
-    #[test]
-    fn rerank_head_count_bounds_cpu_work() {
-        assert_eq!(rerank_head_count(5, 86), 24);
-        assert_eq!(rerank_head_count(1, 50), 12);
-        assert_eq!(rerank_head_count(8, 10), 10);
-        assert_eq!(rerank_head_count(50, 200), RERANK_CANDIDATE_LIMIT);
-    }
-
     // ----- shared in-memory corpus helpers -----
 
     /// Build an in-memory test corpus, return the open Connection.
@@ -12500,6 +13057,14 @@ mod tests {
             None
         );
         assert_eq!(direct_doc_id_from_query("not/a<script>"), None);
+    }
+
+    #[test]
+    fn metadata_extract_pub_date_handles_utf8_boundary() {
+        let mut text = "a".repeat(1999);
+        text.push('•');
+        text.push_str(" 1 January 2024");
+        assert_eq!(metadata_extract_pub_date(&text), None);
     }
 
     #[test]
@@ -12600,23 +13165,67 @@ mod tests {
 
     #[test]
     fn manifest_compat_accepts_current_schema() {
-        let m = sample_manifest(MAX_SUPPORTED_MANIFEST_VERSION as i64, "");
+        let m = sample_manifest(SUPPORTED_MANIFEST_VERSION as i64, "");
         assert!(enforce_manifest_compatibility(&m).is_ok());
     }
 
     #[test]
     fn manifest_compat_rejects_newer_schema() {
-        let m = sample_manifest((MAX_SUPPORTED_MANIFEST_VERSION + 1) as i64, "");
+        let m = sample_manifest((SUPPORTED_MANIFEST_VERSION + 1) as i64, "");
         let err = enforce_manifest_compatibility(&m).unwrap_err();
         assert!(
-            err.to_string().contains("upgrade the ato-mcp binary"),
-            "expected upgrade-binary message, got: {err}"
+            err.to_string().contains("not supported"),
+            "expected unsupported-schema message, got: {err}"
         );
     }
 
     #[test]
+    fn manifest_compat_rejects_older_schema() {
+        let m = sample_manifest((SUPPORTED_MANIFEST_VERSION - 1) as i64, "");
+        let err = enforce_manifest_compatibility(&m).unwrap_err();
+        assert!(
+            err.to_string().contains("not supported"),
+            "expected unsupported-schema message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn manifest_json_rejects_legacy_or_unknown_fields() -> Result<()> {
+        let mut with_reranker = serde_json::to_value(sample_manifest(
+            SUPPORTED_MANIFEST_VERSION as i64,
+            env!("CARGO_PKG_VERSION"),
+        ))?;
+        with_reranker["reranker"] = JsonValue::Null;
+        assert!(
+            serde_json::from_value::<Manifest>(with_reranker).is_err(),
+            "legacy reranker field must not be silently ignored"
+        );
+
+        let mut with_legacy_docs = serde_json::to_value(sample_manifest(
+            SUPPORTED_MANIFEST_VERSION as i64,
+            env!("CARGO_PKG_VERSION"),
+        ))?;
+        with_legacy_docs["docs"] = json!([]);
+        assert!(
+            serde_json::from_value::<Manifest>(with_legacy_docs).is_err(),
+            "legacy docs field must not be silently ignored"
+        );
+
+        let mut with_tokenizer_sha = serde_json::to_value(sample_manifest(
+            SUPPORTED_MANIFEST_VERSION as i64,
+            env!("CARGO_PKG_VERSION"),
+        ))?;
+        with_tokenizer_sha["model"]["tokenizer_sha256"] = json!("legacy");
+        assert!(
+            serde_json::from_value::<Manifest>(with_tokenizer_sha).is_err(),
+            "legacy tokenizer_sha256 field must not be silently ignored"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn manifest_compat_rejects_higher_min_client_version() {
-        let m = sample_manifest(MAX_SUPPORTED_MANIFEST_VERSION as i64, "999.0.0");
+        let m = sample_manifest(SUPPORTED_MANIFEST_VERSION as i64, "999.0.0");
         let err = enforce_manifest_compatibility(&m).unwrap_err();
         assert!(
             err.to_string().contains("999"),
@@ -12628,9 +13237,9 @@ mod tests {
     fn manifest_compat_accepts_min_client_version_at_or_below_current() {
         // Any version that's <= the current binary's version should pass.
         let current = env!("CARGO_PKG_VERSION");
-        let m = sample_manifest(MAX_SUPPORTED_MANIFEST_VERSION as i64, current);
+        let m = sample_manifest(SUPPORTED_MANIFEST_VERSION as i64, current);
         assert!(enforce_manifest_compatibility(&m).is_ok());
-        let m = sample_manifest(MAX_SUPPORTED_MANIFEST_VERSION as i64, "0.0.1");
+        let m = sample_manifest(SUPPORTED_MANIFEST_VERSION as i64, "0.0.1");
         assert!(enforce_manifest_compatibility(&m).is_ok());
     }
 
@@ -12644,7 +13253,7 @@ mod tests {
                 offset: 0,
                 length: 10,
             }],
-            ..sample_manifest(MAX_SUPPORTED_MANIFEST_VERSION as i64, "")
+            ..sample_manifest(SUPPORTED_MANIFEST_VERSION as i64, "")
         };
         let new = Manifest {
             documents: vec![DocRef {
@@ -12654,7 +13263,7 @@ mod tests {
                 offset: 0,
                 length: 11,
             }],
-            ..sample_manifest(MAX_SUPPORTED_MANIFEST_VERSION as i64, "")
+            ..sample_manifest(SUPPORTED_MANIFEST_VERSION as i64, "")
         };
 
         let (added, changed, removed) = diff_manifests(Some(&old), &new);
@@ -12747,11 +13356,7 @@ mod tests {
         // body window. Heading text now lives inside chunk.text so there
         // is no separate prefix.
         let text = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor";
-        let snippet = highlight_snippet(
-            text,
-            "completely unrelated query terms",
-            SNIPPET_CHARS,
-        );
+        let snippet = highlight_snippet(text, "completely unrelated query terms", SNIPPET_CHARS);
         assert!(!snippet.is_empty(), "snippet should not be empty");
         assert!(
             !snippet.contains(" — "),
@@ -12799,9 +13404,7 @@ mod tests {
                 sha256: "0".to_string(),
                 size: 0,
                 url: "https://example.com".to_string(),
-                tokenizer_sha256: None,
             },
-            reranker: None,
             documents: Vec::new(),
             packs: Vec::new(),
         }
@@ -12823,10 +13426,7 @@ mod tests {
                 text.contains("ato-mcp update"),
                 "missing install command in: {text}"
             );
-            assert!(
-                text.contains("4 GB"),
-                "missing size hint in: {text}"
-            );
+            assert!(text.contains("4 GB"), "missing size hint in: {text}");
         });
         Ok(())
     }
@@ -12861,8 +13461,7 @@ mod tests {
         let _lock = TEST_DB_LOCK.lock().unwrap();
         let prev = std::env::var("ATO_MCP_OFFLINE").ok();
         std::env::set_var("ATO_MCP_OFFLINE", "1");
-        let result =
-            check_for_update_availability("https://example.invalid/manifest.json");
+        let result = check_for_update_availability("https://example.invalid/manifest.json");
         if let Some(value) = prev {
             std::env::set_var("ATO_MCP_OFFLINE", value);
         } else {
@@ -12903,7 +13502,7 @@ mod tests {
         let manifest_path = release_dir.join("manifest.json");
 
         let installed = Manifest {
-            schema_version: MAX_SUPPORTED_MANIFEST_VERSION as i64,
+            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
             index_version: "test-installed".to_string(),
             created_at: "2026-05-04T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -12912,18 +13511,15 @@ mod tests {
                 sha256: "installed-sha".to_string(),
                 size: 5,
                 url: "model-bundle.tar.zst".to_string(),
-                tokenizer_sha256: None,
             },
-            reranker: None,
             documents: Vec::new(),
             packs: Vec::new(),
         };
         let summary = UpdateSummary {
-            schema_version: (MAX_SUPPORTED_MANIFEST_VERSION + 1) as i64,
+            schema_version: (SUPPORTED_MANIFEST_VERSION + 1) as i64,
             index_version: "test-future".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
             model: installed.model.clone(),
-            reranker: None,
             document_count: 0,
             pack_count: 0,
             manifest_fingerprint: Some("future-fingerprint".to_string()),
@@ -12961,7 +13557,7 @@ mod tests {
         let manifest_path = release_dir.join("manifest.json");
         let model_sha = "current-probe-sha";
         let manifest = Manifest {
-            schema_version: MAX_SUPPORTED_MANIFEST_VERSION as i64,
+            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
             index_version: "test-probe-current".to_string(),
             created_at: "2026-05-04T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -12970,9 +13566,7 @@ mod tests {
                 sha256: model_sha.to_string(),
                 size: 5,
                 url: "model-bundle.tar.zst".to_string(),
-                tokenizer_sha256: None,
             },
-            reranker: None,
             documents: Vec::new(),
             packs: Vec::new(),
         };
@@ -12981,7 +13575,6 @@ mod tests {
             index_version: manifest.index_version.clone(),
             min_client_version: manifest.min_client_version.clone(),
             model: manifest.model.clone(),
-            reranker: None,
             document_count: 0,
             pack_count: 0,
             manifest_fingerprint: Some(manifest_fingerprint(&manifest)?),
@@ -13331,12 +13924,8 @@ mod tests {
             let filter = build_doc_filter("d", None, None, None, None, false, true);
             let hits = collect_title_hits(&conn, "PAC/19970038/203-50", 5, &filter)?;
             assert_eq!(hits[0].doc_id, "PAC/19970038/203-50");
-            let hits = collect_title_hits(
-                &conn,
-                "Income Tax Assessment Act 1997 s 8-1",
-                5,
-                &filter,
-            )?;
+            let hits =
+                collect_title_hits(&conn, "Income Tax Assessment Act 1997 s 8-1", 5, &filter)?;
             assert_eq!(hits[0].doc_id, "PAC/19970038/8-1");
             Ok(())
         })?;
@@ -13862,7 +14451,9 @@ mod tests {
             assert_eq!(history[0]["date"], json!("2020-01-01"));
             assert_eq!(
                 history[0]["url"],
-                json!("https://www.ato.gov.au/law/view/document?docid=DOC_HISTORY&PiT=20200101000000")
+                json!(
+                    "https://www.ato.gov.au/law/view/document?docid=DOC_HISTORY&PiT=20200101000000"
+                )
             );
             Ok(())
         })?;
@@ -13893,7 +14484,9 @@ mod tests {
             assert_eq!(history[0]["date"], json!("1996-03-20"));
             assert_eq!(
                 history[0]["url"],
-                json!("https://www.ato.gov.au/law/view/document?docid=TR_1996_X&PiT=19960320000001")
+                json!(
+                    "https://www.ato.gov.au/law/view/document?docid=TR_1996_X&PiT=19960320000001"
+                )
             );
             Ok(())
         })?;
@@ -13902,9 +14495,15 @@ mod tests {
 
     #[test]
     fn test_pit_to_date_handles_short_or_non_numeric_input() {
-        assert_eq!(pit_to_date("19960320000001"), Some("1996-03-20".to_string()));
+        assert_eq!(
+            pit_to_date("19960320000001"),
+            Some("1996-03-20".to_string())
+        );
         assert_eq!(pit_to_date("19960320"), Some("1996-03-20".to_string()));
-        assert!(pit_to_date("1996032").is_none(), "shorter than 8 chars returns None");
+        assert!(
+            pit_to_date("1996032").is_none(),
+            "shorter than 8 chars returns None"
+        );
         assert!(pit_to_date("abcd0320000000").is_none());
     }
 
@@ -13953,7 +14552,7 @@ mod tests {
         fs::write(&pack_path, &pack_bytes)?;
 
         let manifest = Manifest {
-            schema_version: MAX_SUPPORTED_MANIFEST_VERSION as i64,
+            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
             index_version: "test-real-update".to_string(),
             created_at: "2026-05-01T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -13962,9 +14561,7 @@ mod tests {
                 sha256: sha256_hex(&model_bundle_bytes),
                 size: model_bundle_bytes.len() as u64,
                 url: "model-bundle.tar.zst".to_string(),
-                tokenizer_sha256: None,
             },
-            reranker: None,
             documents: vec![DocRef {
                 doc_id: "DOC_UPDATE_REAL".to_string(),
                 content_hash: "hash-real-update".to_string(),
@@ -14059,7 +14656,7 @@ mod tests {
         fs::write(packs_dir.join("pack-citation.bin.zst"), &pack_bytes)?;
 
         let manifest = Manifest {
-            schema_version: MAX_SUPPORTED_MANIFEST_VERSION as i64,
+            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
             index_version: "test-citation".to_string(),
             created_at: "2026-05-01T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -14068,9 +14665,7 @@ mod tests {
                 sha256: sha256_hex(&model_bundle_bytes),
                 size: model_bundle_bytes.len() as u64,
                 url: "model-bundle.tar.zst".to_string(),
-                tokenizer_sha256: None,
             },
-            reranker: None,
             documents: vec![DocRef {
                 doc_id: "DOC_CITATION_SOURCE".to_string(),
                 content_hash: "citation-source-hash".to_string(),
@@ -14149,7 +14744,7 @@ mod tests {
         fs::write(packs_dir.join("pack-olddefs.bin.zst"), &old_pack_bytes)?;
 
         let old_manifest = Manifest {
-            schema_version: MAX_SUPPORTED_MANIFEST_VERSION as i64,
+            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
             index_version: "defs-v1".to_string(),
             created_at: "2026-05-01T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -14158,9 +14753,7 @@ mod tests {
                 sha256: sha256_hex(&model_bundle_bytes),
                 size: model_bundle_bytes.len() as u64,
                 url: "model-bundle.tar.zst".to_string(),
-                tokenizer_sha256: None,
             },
-            reranker: None,
             documents: vec![DocRef {
                 doc_id: "DOC_DEF_REPACK".to_string(),
                 content_hash: "same-content-hash".to_string(),
@@ -14217,7 +14810,6 @@ mod tests {
                 index_version: new_manifest.index_version.clone(),
                 min_client_version: new_manifest.min_client_version.clone(),
                 model: new_manifest.model.clone(),
-                reranker: new_manifest.reranker.clone(),
                 document_count: new_manifest.documents.len(),
                 pack_count: new_manifest.packs.len(),
                 manifest_fingerprint: Some(manifest_fingerprint(&new_manifest)?),
@@ -14248,7 +14840,7 @@ mod tests {
         let manifest_path = release_dir.join("manifest.json");
         let model_sha = "abc123";
         let manifest = Manifest {
-            schema_version: MAX_SUPPORTED_MANIFEST_VERSION as i64,
+            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
             index_version: "test-summary-fast-path".to_string(),
             created_at: "2026-05-04T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -14257,9 +14849,7 @@ mod tests {
                 sha256: model_sha.to_string(),
                 size: 5,
                 url: "model-bundle.tar.zst".to_string(),
-                tokenizer_sha256: None,
             },
-            reranker: None,
             documents: Vec::new(),
             packs: Vec::new(),
         };
@@ -14268,7 +14858,6 @@ mod tests {
             index_version: manifest.index_version.clone(),
             min_client_version: manifest.min_client_version.clone(),
             model: manifest.model.clone(),
-            reranker: None,
             document_count: 0,
             pack_count: 0,
             manifest_fingerprint: Some(manifest_fingerprint(&manifest)?),
@@ -14348,7 +14937,7 @@ mod tests {
         fs::write(&pack_path, &pack_bytes)?;
 
         let manifest = Manifest {
-            schema_version: MAX_SUPPORTED_MANIFEST_VERSION as i64,
+            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
             index_version: "test-rebuild-schema".to_string(),
             created_at: "2026-05-03T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -14357,9 +14946,7 @@ mod tests {
                 sha256: sha256_hex(&model_bundle_bytes),
                 size: model_bundle_bytes.len() as u64,
                 url: "model-bundle.tar.zst".to_string(),
-                tokenizer_sha256: None,
             },
-            reranker: None,
             documents: vec![DocRef {
                 doc_id: "DOC_REBUILD_SCHEMA".to_string(),
                 content_hash: "hash-rebuild-schema".to_string(),
@@ -14385,7 +14972,7 @@ mod tests {
             fs::write(
                 installed_manifest_path()?,
                 serde_json::to_vec_pretty(&sample_manifest(
-                    MAX_SUPPORTED_MANIFEST_VERSION as i64,
+                    SUPPORTED_MANIFEST_VERSION as i64,
                     env!("CARGO_PKG_VERSION"),
                 ))?,
             )?;
@@ -14409,7 +14996,7 @@ mod tests {
         Ok(())
     }
 
-    // ===== Wave 3-B Reranker ===============================================
+    // ===== Slim Search Surface ============================================
 
     /// Helper: build a Hit with the slim contract. Tests below pin that the
     /// wire shape stays slim (no score, no ord, no debug metadata).
@@ -14436,315 +15023,9 @@ mod tests {
     #[test]
     fn hit_json_is_slim_no_score_no_ord_no_debug() {
         let hit = make_test_hit();
-        let json_str = serde_json::to_string(&hit).unwrap();
-        for forbidden in [
-            "\"score\"",
-            "\"ord\"",
-            "\"ranking\"",
-            "reranker_score",
-            "embedding_model_id",
-        ] {
-            assert!(
-                !json_str.contains(forbidden),
-                "slim Hit JSON must not carry `{forbidden}`; got {json_str}"
-            );
-        }
-    }
-
-    #[test]
-    fn reranker_disabled_when_env_var_set() {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        // Snapshot+restore so concurrent tests in the same process don't
-        // inherit the kill-switch.
-        let prev = std::env::var("ATO_MCP_DISABLE_RERANKER").ok();
-        std::env::set_var("ATO_MCP_DISABLE_RERANKER", "1");
-        let state = ServerState::default();
-        let candidates: Vec<(i64, &str)> = vec![(1, "doc one"), (2, "doc two")];
-        let result = state
-            .rerank_candidates("query", &candidates)
-            .expect("env-disable returns Ok(None)");
-        assert!(
-            result.is_none(),
-            "ATO_MCP_DISABLE_RERANKER=1 must short-circuit to RRF"
-        );
-        // After the env-toggle path runs, state should be Disabled.
-        assert!(matches!(*state.reranker_state.lock().unwrap(), RerankerState::Disabled));
-        if let Some(p) = prev {
-            std::env::set_var("ATO_MCP_DISABLE_RERANKER", p);
-        } else {
-            std::env::remove_var("ATO_MCP_DISABLE_RERANKER");
-        }
-    }
-
-    #[test]
-    fn reranker_disabled_when_model_files_missing() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        // Make sure env kill-switch is off so we exercise the
-        // missing-files branch, not the env branch.
-        let env_prev = std::env::var("ATO_MCP_DISABLE_RERANKER").ok();
-        std::env::remove_var("ATO_MCP_DISABLE_RERANKER");
-        let dir = tempdir()?;
-        with_data_dir(dir.path(), || -> Result<()> {
-            // live/ exists (it's auto-created by live_dir()), but neither
-            // reranker.onnx nor reranker_tokenizer.json do.
-            assert!(!reranker_model_path()?.exists());
-            assert!(!reranker_tokenizer_path()?.exists());
-            let state = ServerState::default();
-            let candidates: Vec<(i64, &str)> = vec![(1, "alpha"), (2, "beta")];
-            let result = state.rerank_candidates("q", &candidates)?;
-            assert!(result.is_none(), "missing model -> Ok(None)");
-            assert!(matches!(*state.reranker_state.lock().unwrap(), RerankerState::Disabled));
-            // Second call must NOT re-attempt load — Disabled is sticky.
-            let result2 = state.rerank_candidates("q", &candidates)?;
-            assert!(result2.is_none());
-            Ok(())
-        })?;
-        if let Some(p) = env_prev {
-            std::env::set_var("ATO_MCP_DISABLE_RERANKER", p);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn reranker_disabled_after_failed_load() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let env_prev = std::env::var("ATO_MCP_DISABLE_RERANKER").ok();
-        std::env::remove_var("ATO_MCP_DISABLE_RERANKER");
-        let dir = tempdir()?;
-        with_data_dir(dir.path(), || -> Result<()> {
-            // Plant garbage file contents so the path-exists check passes
-            // but the loader bails — this simulates a corrupted download.
-            fs::write(reranker_model_path()?, b"not really an onnx model")?;
-            fs::write(reranker_tokenizer_path()?, b"not really a tokenizer json")?;
-            let state = ServerState::default();
-            let candidates: Vec<(i64, &str)> = vec![(1, "alpha")];
-            // First call: load attempt triggers, fails, transitions to Disabled.
-            let result = state.rerank_candidates("q", &candidates)?;
-            assert!(result.is_none(), "failed load -> Ok(None)");
-            assert!(matches!(*state.reranker_state.lock().unwrap(), RerankerState::Disabled));
-            // Second call: still Disabled, no retry.
-            let result2 = state.rerank_candidates("q", &candidates)?;
-            assert!(result2.is_none());
-            Ok(())
-        })?;
-        if let Some(p) = env_prev {
-            std::env::set_var("ATO_MCP_DISABLE_RERANKER", p);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn reranker_returns_empty_for_empty_candidates() {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let env_prev = std::env::var("ATO_MCP_DISABLE_RERANKER").ok();
-        std::env::remove_var("ATO_MCP_DISABLE_RERANKER");
-        let state = ServerState::default();
-        // Empty candidates short-circuit before the load path so we get
-        // Some(empty) and never touch the model files.
-        let result = state.rerank_candidates("q", &[]).expect("ok");
-        assert_eq!(result, Some(Vec::new()));
-        if let Some(p) = env_prev {
-            std::env::set_var("ATO_MCP_DISABLE_RERANKER", p);
-        }
-    }
-
-    // ----- I3: env-var falsy values do NOT disable the reranker ------------
-    //
-    // env_truthy() is the gate for ATO_MCP_DISABLE_RERANKER. Anything other
-    // than the recognised truthy spellings (`1`, `true`, `TRUE`, `yes`,
-    // `YES`, `on`, `ON`) is a no-op — including the empty string, `0`,
-    // `false`, and unusual spellings like `True` (mixed-case Python style).
-    // A regression here would silently disable the reranker for users who
-    // copied an env-var template and left a benign value in place.
-
-    #[test]
-    fn reranker_env_var_falsy_does_not_disable() {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let env_prev = std::env::var("ATO_MCP_DISABLE_RERANKER").ok();
-        // Each value below MUST NOT trigger the kill-switch.
-        for value in [
-            "0", "false", "False", "FALSE", "", "True", "no", "off", "disabled",
-        ] {
-            std::env::set_var("ATO_MCP_DISABLE_RERANKER", value);
-            // Use empty candidates so we don't hit the load path (which
-            // would also disable us via missing-files in this test env).
-            // The empty-candidates short-circuit only runs AFTER the env
-            // gate, so this still tells us the gate didn't fire.
-            let state = ServerState::default();
-            let out = state
-                .rerank_candidates("q", &[])
-                .expect("rerank_candidates returns Ok for empty input");
-            assert_eq!(
-                out,
-                Some(Vec::new()),
-                "ATO_MCP_DISABLE_RERANKER={value:?} must NOT short-circuit; \
-                 falsy/unknown values should leave reranker eligible"
-            );
-            assert!(
-                !matches!(*state.reranker_state.lock().unwrap(), RerankerState::Disabled),
-                "state must stay Pending for ATO_MCP_DISABLE_RERANKER={value:?}"
-            );
-        }
-        if let Some(p) = env_prev {
-            std::env::set_var("ATO_MCP_DISABLE_RERANKER", p);
-        } else {
-            std::env::remove_var("ATO_MCP_DISABLE_RERANKER");
-        }
-    }
-
-    #[test]
-    fn cli_keyword_search_skips_reranker_state_machine() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let env_prev = std::env::var("ATO_MCP_DISABLE_RERANKER").ok();
-        std::env::remove_var("ATO_MCP_DISABLE_RERANKER");
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
-        insert_doc(&conn, "DOC_CLI_RERANK")?;
-        let text = "Research and development tax incentive material for CLI search.";
-        insert_chunk(&conn, 1, "DOC_CLI_RERANK", 0, text)?;
-        conn.execute(
-            "INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)",
-            params![1_i64, text],
-        )?;
-        drop(conn);
-
-        let result = with_data_dir(dir.path(), || -> Result<(String, ServerState)> {
-            search_cli(
-                "research development",
-                SearchOptions {
-                    k: 1,
-                    types: None,
-                    date_from: None,
-                    date_to: None,
-                    doc_scope: None,
-                    mode: SearchMode::Keyword,
-                    sort_by: SortBy::Relevance,
-                    include_old: false,
-                    current_only: true,
-                    max_per_doc: DEFAULT_MAX_PER_DOC,
-                    include_snippet: true,
-                    similar_to_chunk_id: None,
-                    seed_text: None,
-                },
-            )
-        });
-        if let Some(p) = env_prev {
-            std::env::set_var("ATO_MCP_DISABLE_RERANKER", p);
-        } else {
-            std::env::remove_var("ATO_MCP_DISABLE_RERANKER");
-        }
-
-        let (json_str, state) = result?;
-        assert!(
-            matches!(*state.reranker_state.lock().unwrap(), RerankerState::Pending),
-            "keyword search should stay lexical-only and avoid touching the reranker"
-        );
-        let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-        assert_eq!(parsed["hits"][0]["doc_id"], json!("DOC_CLI_RERANK"));
-        // Slim response: no `ranking` block, no reranker debug metadata
-        // surfaces to the agent.
-        assert!(parsed.get("ranking").is_none(), "ranking block must not be exposed");
-        Ok(())
-    }
-
-    #[test]
-    fn hf_reranker_download_reports_model_path_failure() -> Result<()> {
-        let dir = tempdir()?;
-        let info = ModelInfo {
-            id: "rerank-id".to_string(),
-            sha256: "a".repeat(64),
-            size: 1,
-            url: "hf://example/repo@rev".to_string(),
-            tokenizer_sha256: None,
-        };
-        let err = download_hf_reranker_model_with(
-            "example/repo",
-            "rev",
-            &info,
-            dir.path(),
-            |url, _dest| Err(anyhow!("404 for {url}")),
-        )
-        .expect_err("download should fail");
-        let msg = err.to_string();
-        assert!(
-            msg.contains(RERANKER_HF_MODEL_PATH),
-            "error should include canonical model path; got: {msg}"
-        );
-        assert!(
-            !dir.path().join("reranker.onnx.part").exists(),
-            "failed download should clean partial model file"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn hf_reranker_download_rejects_sha_mismatch() -> Result<()> {
-        let dir = tempdir()?;
-        let expected = b"correct model bytes";
-        let info = ModelInfo {
-            id: "rerank-id".to_string(),
-            sha256: sha256_hex(expected),
-            size: expected.len() as u64,
-            url: "hf://example/repo@rev".to_string(),
-            tokenizer_sha256: None,
-        };
-        let mut calls = Vec::new();
-        let err = download_hf_reranker_model_with(
-            "example/repo",
-            "rev",
-            &info,
-            dir.path(),
-            |url, dest| {
-                calls.push(url.to_string());
-                fs::write(dest, b"wrong model bytes")?;
-                Ok(fs::metadata(dest)?.len())
-            },
-        )
-        .expect_err("sha mismatch must be fatal");
-        assert_eq!(calls.len(), 1, "only the canonical model path is tried");
-        assert!(err.to_string().contains("sha256 mismatch"));
-        assert!(
-            !dir.path().join("reranker.onnx.part").exists(),
-            "failed sha verification should clean partial model file"
-        );
-        Ok(())
-    }
-
-    // ----- I3: slim Hit JSON surface ---------------------------------------
-    //
-    // The slim Hit contract (MT-04 + MT-04-slim) hides internal scoring from
-    // the agent — no `score`, no `ord`, no `ranking` block, no
-    // `reranker_score`. Pins the JSON shape so a future refactor can't
-    // reintroduce internal-metric leakage.
-
-    #[test]
-    fn hit_json_hides_internal_scoring_metadata() {
-        let hit = Hit {
-            doc_id: "DOC".to_string(),
-            title: "doc".to_string(),
-            doc_type: "Public_ruling".to_string(),
-            date: None,
-            anchor: None,
-            snippet: Some("snip".to_string()),
-            canonical_url: "https://x".to_string(),
-            chunk_id: Some(1),
-            next_call: None,
-            withdrawn_date: None,
-            superseded_by: None,
-            replaces: None,
-            has_in_doc_links: None,
-            has_related_docs: None,
-            has_history: None,
-        };
         let parsed: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&hit).unwrap()).unwrap();
-        for forbidden in [
-            "score",
-            "ord",
-            "ranking",
-            "reranker_score",
-            "embedding_model_id",
-        ] {
+        for forbidden in ["score", "ord", "ranking", "embedding_model_id"] {
             assert!(
                 parsed.get(forbidden).is_none(),
                 "slim Hit JSON must not expose `{forbidden}`; got {parsed:?}"
@@ -14752,70 +15033,35 @@ mod tests {
         }
     }
 
-    // ----- I3: dedup behaviour at the mixed-scale boundary ------------------
-    //
-    // The dedup pass picks the BEST chunk per doc, where "best" means the
-    // single highest score — there is no tail-sum aggregation. This test
-    // pins that contract: a doc with one barely-positive head chunk must
-    // still beat a doc with multiple weaker tail chunks, IFF that head
-    // chunk's individual score is higher than every tail chunk's individual
-    // score.
-    //
-    // Synthetic candidates: 50 head-scored chunks (sigmoid range 0.30-0.95)
-    // distributed across many docs, plus tail chunks with RRF scores
-    // (0.010-0.030) for one doc that has no head representation. We confirm
-    // the boundary at 50/51:
-    //   - the strong head chunks dedup naturally to one-per-doc
-    //   - the weak-tail-only doc is correctly placed BELOW any head doc
-    //   - per-doc max selection produces deterministic ordering
-    //
-    // If a future implementation adds tail-sum aggregation, this test will
-    // still pass (the strong head doc still wins on max) — that's correct
-    // and intentional. If a future change instead capriciously promotes
-    // weak head over strong tail, this catches it at the boundary.
-
     #[test]
-    fn reranker_dedup_handles_mixed_scale_boundary() {
-        // Build 50 strong head hits across 10 docs (5 chunks per doc),
-        // sigmoid scores in [0.30, 0.95] descending — interleaved so doc
-        // ordering isn't a sort-stable accident.
-        let mut hits: Vec<VectorHit> = Vec::with_capacity(60);
-        for i in 0..50 {
-            let doc_idx = i % 10;
-            let score = 0.95 - (i as f64) * 0.013; // 0.95 -> 0.30
+    fn dedup_per_doc_uses_best_chunk_score_without_tail_sum() {
+        let mut hits: Vec<VectorHit> = Vec::with_capacity(15);
+        for i in 0..10 {
             hits.push(VectorHit {
-                chunk_id: i as i64 + 1, // 1..=50
-                score,
+                chunk_id: i as i64 + 1,
+                score: 0.95 - (i as f64) * 0.02,
             });
-            // candidate_meta entry built below.
-            let _ = doc_idx;
         }
-        // Now add 5 weak-tail chunks for DOC_TAIL_ONLY (chunk_ids 51..=55).
-        // RRF scores in [0.010, 0.030]. Each individual score is well below
-        // every head chunk's score.
         for j in 0..5 {
             hits.push(VectorHit {
-                chunk_id: 51 + j as i64,
-                score: 0.010 + (j as f64) * 0.005, // 0.010..=0.030
+                chunk_id: 11 + j as i64,
+                score: 0.010 + (j as f64) * 0.005,
             });
         }
 
-        // Build candidate_meta: head chunks belong to DOC_H{0..9}; tail
-        // chunks all belong to DOC_TAIL_ONLY.
         let mut meta: HashMap<i64, CandidateMeta> = HashMap::new();
-        for i in 0..50 {
-            let doc_idx = i % 10;
+        for i in 0..10 {
             meta.insert(
                 i as i64 + 1,
                 CandidateMeta {
-                    doc_id: format!("DOC_H{doc_idx}"),
+                    doc_id: format!("DOC_H{i}"),
                     is_intro: false,
                 },
             );
         }
         for j in 0..5 {
             meta.insert(
-                51 + j as i64,
+                11 + j as i64,
                 CandidateMeta {
                     doc_id: "DOC_TAIL_ONLY".to_string(),
                     is_intro: false,
@@ -14823,52 +15069,13 @@ mod tests {
             );
         }
 
-        // Frontier 11 (just enough to cover the 10 head docs + the tail
-        // doc). max_per_doc=1 so each doc contributes exactly one chunk —
-        // confirming each head doc earns its slot via per-doc max, and the
-        // weak tail doc still appears LAST despite having more candidate
-        // chunks than any individual head doc.
         let deduped = dedup_per_doc(hits, &meta, 11, 1);
+        let tail_position = deduped
+            .iter()
+            .position(|hit| meta[&hit.chunk_id].doc_id == "DOC_TAIL_ONLY")
+            .expect("tail-only doc should appear in frontier");
+        assert_eq!(tail_position, 10);
 
-        // Confirm DOC_TAIL_ONLY appears at most once in the deduped output
-        // (per-doc dedup), and confirm at least one head chunk from each
-        // DOC_H{0..9} appears.
-        let mut head_doc_count = std::collections::HashSet::new();
-        let mut tail_seen = false;
-        let mut tail_position = None;
-        for (idx, hit) in deduped.iter().enumerate() {
-            let doc_id = &meta[&hit.chunk_id].doc_id;
-            if doc_id == "DOC_TAIL_ONLY" {
-                tail_seen = true;
-                tail_position = Some(idx);
-            } else {
-                head_doc_count.insert(doc_id.clone());
-            }
-        }
-        assert_eq!(
-            head_doc_count.len(),
-            10,
-            "all 10 head docs should be represented; got: {:?}",
-            head_doc_count
-        );
-        assert!(
-            tail_seen,
-            "DOC_TAIL_ONLY (weak tail) should still appear in frontier=11"
-        );
-        // The weak tail doc must rank LAST (after all 10 head docs whose
-        // best chunk score >= 0.30 > 0.030 max tail score). This pins the
-        // per-doc-max behaviour: the head's barely-positive chunk wins
-        // over the tail's sum-of-weak chunks.
-        let pos = tail_position.expect("tail position recorded above");
-        assert!(
-            pos >= 10,
-            "DOC_TAIL_ONLY should rank below all 10 head docs; \
-             got position {pos}/{} — implementation may have started \
-             promoting weak-head over strong-tail (regression)",
-            deduped.len()
-        );
-
-        // No doc should appear more than max_per_doc times.
         let mut counts: HashMap<&str, usize> = HashMap::new();
         for hit in &deduped {
             *counts
@@ -14876,181 +15083,19 @@ mod tests {
                 .or_insert(0) += 1;
         }
         for (doc, n) in &counts {
-            assert!(*n <= 1, "max_per_doc=1 violated for {doc}: {n} chunks");
+            assert_eq!(*n, 1, "max_per_doc=1 violated for {doc}: {n} chunks");
         }
-    }
-
-    #[test]
-    fn manifest_compat_accepts_v3_with_reranker() -> Result<()> {
-        let mut m = sample_manifest(3, "");
-        m.reranker = Some(ModelInfo {
-            id: "ms-marco-MiniLM-L-6-v2".to_string(),
-            sha256: "abc".to_string(),
-            size: 25_000_000,
-            url: "hf://cross-encoder/ms-marco-MiniLM-L-6-v2".to_string(),
-            tokenizer_sha256: None,
-        });
-        enforce_manifest_compatibility(&m)?;
-        Ok(())
     }
 
     #[test]
     fn manifest_compat_rejects_newer_manifest_format() {
-        let m = sample_manifest((MAX_SUPPORTED_MANIFEST_VERSION + 1) as i64, "");
+        let m = sample_manifest((SUPPORTED_MANIFEST_VERSION + 1) as i64, "");
         let err =
             enforce_manifest_compatibility(&m).expect_err("newer manifest should be rejected");
         assert!(
-            err.to_string().contains("upgrade the ato-mcp binary"),
-            "expected upgrade-binary error, got: {err}"
+            err.to_string().contains("not supported"),
+            "expected unsupported-schema error, got: {err}"
         );
-    }
-
-    #[test]
-    fn manifest_round_trips_reranker_field() -> Result<()> {
-        // Ensure serde round-trips the optional reranker entry without
-        // losing the inner ModelInfo shape (the contract Python depends on).
-        let mut m = sample_manifest(3, "0.6.0");
-        m.reranker = Some(ModelInfo {
-            id: "rerank-id".to_string(),
-            sha256: "deadbeef".to_string(),
-            size: 1234,
-            url: "https://example.com/reranker.tar.zst".to_string(),
-            tokenizer_sha256: Some("cafef00d".to_string()),
-        });
-        let json_str = serde_json::to_string(&m)?;
-        let v: serde_json::Value = serde_json::from_str(&json_str)?;
-        assert_eq!(v["reranker"]["id"], json!("rerank-id"));
-        assert_eq!(v["reranker"]["sha256"], json!("deadbeef"));
-        assert_eq!(v["reranker"]["size"], json!(1234));
-        assert_eq!(
-            v["reranker"]["url"],
-            json!("https://example.com/reranker.tar.zst")
-        );
-        // C4: tokenizer_sha256 round-trips through the manifest when set.
-        assert_eq!(v["reranker"]["tokenizer_sha256"], json!("cafef00d"));
-        let parsed: Manifest = serde_json::from_str(&json_str)?;
-        assert!(parsed.reranker.is_some());
-        let rr = parsed.reranker.as_ref().unwrap();
-        assert_eq!(rr.tokenizer_sha256.as_deref(), Some("cafef00d"));
-        Ok(())
-    }
-
-    #[test]
-    fn manifest_omits_reranker_when_none() -> Result<()> {
-        let m = sample_manifest(3, "0.6.0");
-        assert!(m.reranker.is_none());
-        let json_str = serde_json::to_string(&m)?;
-        // skip_serializing_if drops the key entirely when None — Python
-        // side relies on this so v2 manifests round-trip identically.
-        assert!(
-            !json_str.contains("reranker"),
-            "reranker key must be omitted when None; json={json_str}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn extract_rerank_logits_handles_batch_one_shape() {
-        let logits = extract_rerank_logits(&[3, 1], &[0.1, 0.2, 0.3], 3).unwrap();
-        assert_eq!(logits, vec![0.1, 0.2, 0.3]);
-    }
-
-    #[test]
-    fn extract_rerank_logits_handles_flat_batch_shape() {
-        let logits = extract_rerank_logits(&[3], &[0.1, 0.2, 0.3], 3).unwrap();
-        assert_eq!(logits, vec![0.1, 0.2, 0.3]);
-    }
-
-    #[test]
-    fn extract_rerank_logits_picks_positive_class_for_two_class_output() {
-        // Some MS-MARCO exports emit `[batch, 2]` (negative, positive).
-        // We must take index 1 — the positive class.
-        let logits = extract_rerank_logits(&[2, 2], &[0.1, 0.9, 0.2, 0.8], 2).unwrap();
-        assert_eq!(logits, vec![0.9, 0.8]);
-    }
-
-    #[test]
-    fn extract_rerank_logits_rejects_unexpected_shape() {
-        let err = extract_rerank_logits(&[2, 2, 2], &[0.0; 8], 2).unwrap_err();
-        assert!(err.to_string().contains("unexpected reranker output shape"));
-    }
-
-    #[test]
-    fn sigmoid_squashes_into_unit_interval() {
-        assert!((sigmoid(0.0) - 0.5).abs() < 1e-9);
-        assert!(sigmoid(10.0) > 0.9999);
-        assert!(sigmoid(-10.0) < 0.0001);
-    }
-
-    /// Integration test: actually load the reranker model and score a
-    /// small batch. Skipped automatically when no model is installed —
-    /// CI without a reranker bundle will simply log "skipped" rather
-    /// than fail.
-    #[test]
-    fn reranker_scores_real_batch_when_model_present() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let model = match dirs::data_dir() {
-            Some(mut p) => {
-                p.push(APP_NAME);
-                p.push("live");
-                p.push("reranker.onnx");
-                p
-            }
-            None => return Ok(()),
-        };
-        let tokenizer = model.parent().unwrap().join("reranker_tokenizer.json");
-        if !model.exists() || !tokenizer.exists() {
-            eprintln!(
-                "(skipped: reranker model not installed at {})",
-                model.display()
-            );
-            return Ok(());
-        }
-        let mut reranker = Reranker::load()?;
-        let candidates: Vec<(i64, &str)> = vec![
-            (
-                1,
-                "Income tax assessment of foreign superannuation lump sums.",
-            ),
-            (2, "Recipe for spaghetti bolognese with garlic bread."),
-            (
-                3,
-                "Tax treatment of foreign superannuation transfers under section 305-70.",
-            ),
-        ];
-        let scores = reranker.rerank("how are foreign super transfers taxed?", &candidates)?;
-        assert_eq!(scores.len(), 3);
-        for (_, s) in &scores {
-            assert!(*s >= 0.0 && *s <= 1.0, "sigmoid score out of range: {s}");
-        }
-        // The off-topic recipe should score lowest. Order isn't strict
-        // but the worst score should be <= the best by a healthy margin.
-        let recipe_score = scores.iter().find(|(id, _)| *id == 2).unwrap().1;
-        let best = scores.iter().map(|(_, s)| *s).fold(0.0_f64, f64::max);
-        assert!(
-            best - recipe_score > 0.05,
-            "expected non-trivial gap between best and off-topic; got best={best}, recipe={recipe_score}"
-        );
-
-        // Cheap latency sanity check: 50 pairs in well under 5s on any
-        // dev box. We keep the bound generous so CI doesn't flake.
-        let many: Vec<(i64, &str)> = (0..50)
-            .map(|i| {
-                (
-                    i as i64,
-                    "Section 8-1 deduction for expenses incurred in earning assessable income.",
-                )
-            })
-            .collect();
-        let start = std::time::Instant::now();
-        let _ = reranker.rerank("section 8-1 deductions", &many)?;
-        let elapsed = start.elapsed();
-        eprintln!("rerank-50-pair latency: {:?} (informational)", elapsed);
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "50-pair rerank took {elapsed:?}; check ONNX runtime config"
-        );
-        Ok(())
     }
 
     #[test]
@@ -15144,28 +15189,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_doc_anchors_cited_by_empty_when_no_table() -> Result<()> {
-        // Older corpora that predate the citations table should degrade
-        // gracefully — `cited_by` is just an empty array.
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
-        conn.execute("DROP TABLE IF EXISTS citations", [])?;
-        insert_doc(&conn, "NOCITES")?;
-        drop(conn);
-
-        with_data_dir(dir.path(), || -> Result<()> {
-            let json_str = get_doc_anchors("NOCITES")?;
-            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-            let cited_by = parsed["cited_by"].as_array().unwrap();
-            assert!(cited_by.is_empty());
-            assert!(parsed.get("cited_by_total").is_none());
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    #[test]
     fn test_load_chunk_embedding_roundtrip() -> Result<()> {
         let _lock = TEST_DB_LOCK.lock().unwrap();
         let (dir, _db) = make_test_db()?;
@@ -15193,7 +15216,10 @@ mod tests {
         let conn = open_write_at(&dir.path().join("live/ato.db"))?;
         let err = load_chunk_embedding(&conn, 99999).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("no stored embedding"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("no stored embedding"),
+            "unexpected error: {msg}"
+        );
         Ok(())
     }
 
@@ -15240,17 +15266,6 @@ mod tests {
                 (10, "SRC".to_string(), "T2".to_string()),
             ]
         );
-        Ok(())
-    }
-
-    #[test]
-    fn test_derive_citations_handles_missing_table() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
-        conn.execute("DROP TABLE citations", [])?;
-        // Should no-op without erroring.
-        derive_citations(&conn)?;
         Ok(())
     }
 

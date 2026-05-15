@@ -57,9 +57,30 @@ FORCE_REBUILD="${ATO_MCP_FORCE_REBUILD:-}"
 TAG_PREFIX="${ATO_MCP_RELEASE_TAG:-index}"
 
 cd "$REPO_DIR"
+if [[ -n "${ATO_MCP_CUDA_LIB_PATH:-}" ]]; then
+    export LD_LIBRARY_PATH="$ATO_MCP_CUDA_LIB_PATH:${LD_LIBRARY_PATH:-}"
+else
+    CUDA_LIB_DIRS=()
+    shopt -s nullglob
+    for nvidia_root in \
+        "$REPO_DIR"/.venv/lib/python*/site-packages/nvidia \
+        "$HOME"/.local/lib/python*/site-packages/nvidia; do
+        for component in cuda_runtime cublas cudnn cufft curand; do
+            if [[ -d "$nvidia_root/$component/lib" ]]; then
+                CUDA_LIB_DIRS+=("$nvidia_root/$component/lib")
+            fi
+        done
+    done
+    shopt -u nullglob
+    if (( ${#CUDA_LIB_DIRS[@]} > 0 )); then
+        CUDA_LIB_PATH=$(IFS=:; echo "${CUDA_LIB_DIRS[*]}")
+        export LD_LIBRARY_PATH="$CUDA_LIB_PATH:${LD_LIBRARY_PATH:-}"
+    fi
+fi
+
 ATO_MCP="${ATO_MCP_BIN:-$REPO_DIR/target/release/ato-mcp}"
 if [[ ! -x "$ATO_MCP" ]]; then
-    echo "ato-mcp binary not found at $ATO_MCP — run: cargo build --release" >&2
+    echo "ato-mcp binary not found at $ATO_MCP — run: cargo build --release --features cuda" >&2
     exit 2
 fi
 
@@ -158,7 +179,8 @@ echo "== build corpus =="
 "$ATO_MCP" build \
     --pages-dir "$PAGES_DIR" \
     --db-path   "$RELEASE_DIR/ato.db" \
-    --out-dir   "$RELEASE_DIR"
+    --out-dir   "$RELEASE_DIR" \
+    --gpu
 
 echo "== publish release $TAG =="
 "$ATO_MCP" publish-release \

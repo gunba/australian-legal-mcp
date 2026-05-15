@@ -146,9 +146,9 @@ and `scripts/maintainer-sync.sh` do this automatically through `systemd-inhibit`
 or `caffeinate` when available.
 
 `build-index` consumes local embedding model files and writes corpus artifacts.
-Do not thread hosted model URLs, reranker URLs, or other distribution metadata
-through corpus building. The `release` step owns model/reranker distribution
-metadata and final manifest publication.
+Do not thread hosted model URLs or other distribution metadata through corpus
+building. The `release` step owns model distribution metadata and final
+manifest publication.
 
 Do not run `refresh-source`, `catch-up`, `build-index`, or `release` on a
 user install. Those commands require the maintainer checkout and model

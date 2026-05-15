@@ -33,7 +33,7 @@ Build:
   walks `index.jsonl`, runs cleaning + chunker + embedder, writes
   `documents`, `chunks`, `chunk_embeddings`, `chunks_fts`, `title_fts`,
   `doc_anchors`, `definitions`, `citations`, plus pack file +
-  `manifest.json` + per-doc asset blobs
+  `manifest.json` + `update.json` + per-doc asset blobs
 
 Release:
 - `ato-mcp publish-release --out-dir ... --tag ... --repo ...` —
@@ -43,8 +43,6 @@ Release:
 - `ato-mcp bundle-localize-manifest --manifest ... --packs-dir ...
   --model-bundle ...` — rewrite a manifest for an offline air-gapped
   bundle (recompute SHA256 + size from local files, emit `update.json`)
-- `ato-mcp backfill-citations [--db PATH]` — recompute the citations
-  table on an existing DB
 
 Lower-level helpers (used by tests + scripts):
 - `extract`, `extract-anchors`, `extract-definitions`, `extract-currency`

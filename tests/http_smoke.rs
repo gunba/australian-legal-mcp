@@ -148,7 +148,13 @@ fn initialize_and_tools_list_over_http() -> Result<()> {
         .iter()
         .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
         .collect();
-    for expected in ["search", "get_chunks", "get_doc_anchors", "fetch_external_doc", "stats"] {
+    for expected in [
+        "search",
+        "get_chunks",
+        "get_doc_anchors",
+        "fetch_external_doc",
+        "stats",
+    ] {
         assert!(
             names.iter().any(|n| n == expected),
             "expected `{expected}` in tool list, got {names:?}"

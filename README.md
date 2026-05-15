@@ -248,8 +248,8 @@ ato-mcp doctor
 ```
 
 Update first fetches the small `update.json` release summary. If the installed
-corpus, schema, model, and reranker still match, it exits without downloading
-the manifest. When anything has changed, it downloads `manifest.json`, fetches
+corpus, schema, and model still match, it exits without downloading the
+manifest. When anything has changed, it downloads `manifest.json`, fetches
 the pack assets, rebuilds the live SQLite database in a staging file, and
 atomically renames it over the live DB — leaving the previous database in
 `backups/ato.db.prev` for rollback:
@@ -334,8 +334,8 @@ provided `systemd/ato-mcp-maintainer-sync.service` unit on a GPU host.
 
 Release builds use EmbeddingGemma vectors and should run on the
 maintainer GPU. The Rust end-user runtime does not require a GPU; query
-embedding and reranking must continue to work on ordinary CPU-only
-laptops. The model is not uploaded to GitHub Releases; by default the
+embedding must continue to work on ordinary CPU-only laptops. The model is not
+uploaded to GitHub Releases; by default the
 manifest points at pinned Hugging Face EmbeddingGemma files, and the
 Rust client downloads and verifies them during `ato-mcp update`. The
 model URL can be redirected at release time via `--model-url` /
