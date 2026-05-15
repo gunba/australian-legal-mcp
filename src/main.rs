@@ -2215,9 +2215,14 @@ impl SemanticRuntime {
             .map_err(|err| anyhow!("configuring tokenizer truncation: {err}"))?;
         tokenizer.with_padding(Some(PaddingParams::default()));
 
+        let optimization_level = if use_gpu {
+            GraphOptimizationLevel::All
+        } else {
+            ONLINE_MODEL_OPTIMIZATION_LEVEL
+        };
         let mut builder = Session::builder()
             .map_err(|err| anyhow!("creating ONNX Runtime session: {err}"))?
-            .with_optimization_level(ONLINE_MODEL_OPTIMIZATION_LEVEL)
+            .with_optimization_level(optimization_level)
             .map_err(|err| anyhow!("configuring ONNX Runtime session: {err}"))?;
         if use_gpu {
             builder = configure_cuda_execution_provider(builder)?;
@@ -2245,17 +2250,28 @@ impl SemanticRuntime {
     }
 
     fn encode_queries(&mut self, queries: &[String]) -> Result<Vec<[i8; EMBEDDING_DIM]>> {
+        let (embeddings, _stats) = self.encode_queries_with_stats(queries)?;
+        Ok(embeddings)
+    }
+
+    fn encode_queries_with_stats(
+        &mut self,
+        queries: &[String],
+    ) -> Result<(Vec<[i8; EMBEDDING_DIM]>, SemanticEncodeStats)> {
         if queries.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), SemanticEncodeStats::default()));
         }
         let prefixed: Vec<String> = queries
             .iter()
             .map(|query| format!("{QUERY_PREFIX}{query}"))
             .collect();
+        let mut stats = SemanticEncodeStats::default();
+        let started = std::time::Instant::now();
         let encodings = self
             .tokenizer
             .encode_batch(prefixed, true)
             .map_err(|err| anyhow!("tokenizing queries: {err}"))?;
+        stats.tokenize += started.elapsed();
         let batch = encodings.len();
         if batch != queries.len() {
             bail!(
@@ -2271,6 +2287,8 @@ impl SemanticRuntime {
         if seq_len == 0 {
             bail!("semantic search unavailable: query produced no tokens");
         }
+        stats.record_batch(batch, seq_len);
+        let started = std::time::Instant::now();
         let mut input_ids = Vec::with_capacity(batch * seq_len);
         let mut attention_mask = Vec::with_capacity(batch * seq_len);
         for encoding in &encodings {
@@ -2293,6 +2311,8 @@ impl SemanticRuntime {
             TensorRef::from_array_view(([batch, seq_len], input_ids.as_slice()))?;
         let attention_mask_tensor =
             TensorRef::from_array_view(([batch, seq_len], attention_mask.as_slice()))?;
+        stats.prepare += started.elapsed();
+        let started = std::time::Instant::now();
         let outputs = if self.has_token_type_ids {
             let token_type_ids = vec![0i64; batch * seq_len];
             let token_type_ids_tensor =
@@ -2308,26 +2328,31 @@ impl SemanticRuntime {
                 "attention_mask" => attention_mask_tensor,
             })?
         };
+        stats.run += started.elapsed();
+        let started = std::time::Instant::now();
         let output = outputs
             .get("sentence_embedding")
             .unwrap_or_else(|| &outputs[0]);
         let (shape, data) = output.try_extract_tensor::<f32>()?;
         let embeddings = pooled_embeddings(shape, data, &attention_mask, batch, seq_len)?;
-        embeddings
+        let embeddings = embeddings
             .iter()
             .map(|embedding| quantize_embedding(embedding))
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        stats.postprocess += started.elapsed();
+        Ok((embeddings, stats))
     }
 }
 
 #[cfg(feature = "cuda")]
 fn configure_cuda_execution_provider(builder: SessionBuilder) -> Result<SessionBuilder> {
+    let cuda = ep::CUDA::default()
+        .with_device_id(0)
+        .with_conv_algorithm_search(ep::cuda::ConvAlgorithmSearch::Heuristic)
+        .build()
+        .error_on_failure();
     builder
-        .with_execution_providers([ep::CUDA::default()
-            .with_device_id(0)
-            .with_conv_algorithm_search(ep::cuda::ConvAlgorithmSearch::Heuristic)
-            .build()
-            .error_on_failure()])
+        .with_execution_providers([cuda])
         .map_err(|err| anyhow!("registering CUDA execution provider: {err}"))
 }
 
@@ -2364,6 +2389,14 @@ impl ServerState {
     }
 
     fn encode_query_embeddings(&self, queries: &[String]) -> Result<Vec<[i8; EMBEDDING_DIM]>> {
+        let (embeddings, _stats) = self.encode_query_embeddings_with_stats(queries)?;
+        Ok(embeddings)
+    }
+
+    fn encode_query_embeddings_with_stats(
+        &self,
+        queries: &[String],
+    ) -> Result<(Vec<[i8; EMBEDDING_DIM]>, SemanticEncodeStats)> {
         let mut guard = self
             .semantic_runtime
             .lock()
@@ -2374,7 +2407,7 @@ impl ServerState {
         guard
             .as_mut()
             .expect("semantic runtime was just initialized")
-            .encode_queries(queries)
+            .encode_queries_with_stats(queries)
     }
 }
 
@@ -6655,6 +6688,16 @@ struct BuildProfile {
     sqlite: Duration,
     assets: Duration,
     embedding: Duration,
+    embedding_tokenize: Duration,
+    embedding_prepare: Duration,
+    embedding_run: Duration,
+    embedding_postprocess: Duration,
+    embedding_write: Duration,
+    embedding_batches: usize,
+    embedding_inputs: usize,
+    embedding_padded_tokens: usize,
+    embedding_max_batch: usize,
+    embedding_max_seq_len: usize,
     pack: Duration,
     checkpoint: Duration,
     finalise: Duration,
@@ -6705,6 +6748,64 @@ impl BuildProfile {
             let secs = duration.as_secs_f64();
             eprintln!("  {name:>10}: {secs:>8.2}s {:>5.1}%", secs * 100.0 / total);
         }
+        if self.embedding_batches > 0 {
+            let model_secs = self.embedding_run.as_secs_f64().max(0.000_001);
+            eprintln!(
+                "  embedding batches={} inputs={} padded_tokens={} max_batch={} max_seq_len={} model_tokens_per_s={:.0}",
+                self.embedding_batches,
+                self.embedding_inputs,
+                self.embedding_padded_tokens,
+                self.embedding_max_batch,
+                self.embedding_max_seq_len,
+                self.embedding_padded_tokens as f64 / model_secs,
+            );
+            let rows = [
+                ("embed_tok", self.embedding_tokenize),
+                ("embed_prep", self.embedding_prepare),
+                ("embed_run", self.embedding_run),
+                ("embed_post", self.embedding_postprocess),
+                ("embed_write", self.embedding_write),
+            ];
+            for (name, duration) in rows {
+                let secs = duration.as_secs_f64();
+                eprintln!("  {name:>10}: {secs:>8.2}s {:>5.1}%", secs * 100.0 / total);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct SemanticEncodeStats {
+    tokenize: Duration,
+    prepare: Duration,
+    run: Duration,
+    postprocess: Duration,
+    batches: usize,
+    inputs: usize,
+    padded_tokens: usize,
+    max_batch: usize,
+    max_seq_len: usize,
+}
+
+impl SemanticEncodeStats {
+    fn record_batch(&mut self, batch: usize, seq_len: usize) {
+        self.batches += 1;
+        self.inputs += batch;
+        self.padded_tokens += batch * seq_len;
+        self.max_batch = self.max_batch.max(batch);
+        self.max_seq_len = self.max_seq_len.max(seq_len);
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.tokenize += other.tokenize;
+        self.prepare += other.prepare;
+        self.run += other.run;
+        self.postprocess += other.postprocess;
+        self.batches += other.batches;
+        self.inputs += other.inputs;
+        self.padded_tokens += other.padded_tokens;
+        self.max_batch = self.max_batch.max(other.max_batch);
+        self.max_seq_len = self.max_seq_len.max(other.max_seq_len);
     }
 }
 
@@ -6716,12 +6817,12 @@ fn is_batch_allocation_failure(err: &anyhow::Error) -> bool {
 fn encode_build_embeddings_adaptive(
     state: &ServerState,
     inputs: &[String],
-) -> Result<Vec<[i8; EMBEDDING_DIM]>> {
+) -> Result<(Vec<[i8; EMBEDDING_DIM]>, SemanticEncodeStats)> {
     if inputs.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), SemanticEncodeStats::default()));
     }
-    match state.encode_query_embeddings(inputs) {
-        Ok(embeddings) => Ok(embeddings),
+    match state.encode_query_embeddings_with_stats(inputs) {
+        Ok((embeddings, stats)) => Ok((embeddings, stats)),
         Err(err) if inputs.len() > 1 && is_batch_allocation_failure(&err) => {
             let mid = inputs.len() / 2;
             eprintln!(
@@ -6730,9 +6831,13 @@ fn encode_build_embeddings_adaptive(
                 mid,
                 inputs.len() - mid
             );
-            let mut embeddings = encode_build_embeddings_adaptive(state, &inputs[..mid])?;
-            embeddings.extend(encode_build_embeddings_adaptive(state, &inputs[mid..])?);
-            Ok(embeddings)
+            let (mut embeddings, mut stats) =
+                encode_build_embeddings_adaptive(state, &inputs[..mid])?;
+            let (tail_embeddings, tail_stats) =
+                encode_build_embeddings_adaptive(state, &inputs[mid..])?;
+            embeddings.extend(tail_embeddings);
+            stats.merge(tail_stats);
+            Ok((embeddings, stats))
         }
         Err(err) => Err(err).context(format!("encoding {} chunk embeddings", inputs.len())),
     }
@@ -6753,7 +6858,16 @@ fn flush_pending_build_embeddings(
     order.sort_by_key(|&idx| pending[idx].text.len());
     for batch in order.chunks(BUILD_EMBED_BATCH_SIZE) {
         let inputs: Vec<String> = batch.iter().map(|&idx| pending[idx].text.clone()).collect();
-        let embeddings = encode_build_embeddings_adaptive(state, &inputs)?;
+        let (embeddings, stats) = encode_build_embeddings_adaptive(state, &inputs)?;
+        profile.embedding_tokenize += stats.tokenize;
+        profile.embedding_prepare += stats.prepare;
+        profile.embedding_run += stats.run;
+        profile.embedding_postprocess += stats.postprocess;
+        profile.embedding_batches += stats.batches;
+        profile.embedding_inputs += stats.inputs;
+        profile.embedding_padded_tokens += stats.padded_tokens;
+        profile.embedding_max_batch = profile.embedding_max_batch.max(stats.max_batch);
+        profile.embedding_max_seq_len = profile.embedding_max_seq_len.max(stats.max_seq_len);
         if embeddings.len() != batch.len() {
             bail!(
                 "embedding batch returned {} vectors for {} chunks",
@@ -6761,6 +6875,7 @@ fn flush_pending_build_embeddings(
                 batch.len()
             );
         }
+        let write_started = std::time::Instant::now();
         for (&idx, emb) in batch.iter().zip(embeddings.iter()) {
             let item = &pending[idx];
             let bytes: &[u8] =
@@ -6779,6 +6894,7 @@ fn flush_pending_build_embeddings(
                 .ok_or_else(|| anyhow!("missing pack chunk record for embedded chunk"))?;
             chunk_record["embedding_b64"] = JsonValue::String(emb_b64);
         }
+        profile.embedding_write += write_started.elapsed();
     }
     pending.clear();
     profile.embedding += started.elapsed();
