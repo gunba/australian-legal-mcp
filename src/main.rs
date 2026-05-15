@@ -2287,10 +2287,10 @@ impl SemanticRuntime {
         if seq_len == 0 {
             bail!("semantic search unavailable: query produced no tokens");
         }
-        stats.record_batch(batch, seq_len);
         let started = std::time::Instant::now();
         let mut input_ids = Vec::with_capacity(batch * seq_len);
         let mut attention_mask = Vec::with_capacity(batch * seq_len);
+        let mut active_tokens = 0usize;
         for encoding in &encodings {
             if encoding.get_ids().len() != seq_len {
                 bail!(
@@ -2299,13 +2299,12 @@ impl SemanticRuntime {
                 );
             }
             input_ids.extend(encoding.get_ids().iter().map(|id| i64::from(*id)));
-            attention_mask.extend(
-                encoding
-                    .get_attention_mask()
-                    .iter()
-                    .map(|mask| i64::from(*mask)),
-            );
+            for mask in encoding.get_attention_mask() {
+                active_tokens += usize::try_from(*mask).unwrap_or(0);
+                attention_mask.push(i64::from(*mask));
+            }
         }
+        stats.record_batch(batch, seq_len, active_tokens);
 
         let input_ids_tensor =
             TensorRef::from_array_view(([batch, seq_len], input_ids.as_slice()))?;
@@ -2489,7 +2488,13 @@ fn quantize_embedding(values: &[f32]) -> Result<[i8; EMBEDDING_DIM]> {
         );
     }
     let values = &values[..EMBEDDING_DIM];
+    if values.iter().any(|value| !value.is_finite()) {
+        bail!("model output contains non-finite embedding values");
+    }
     let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if !norm.is_finite() {
+        bail!("model output produced a non-finite embedding norm");
+    }
     if norm <= 1e-12 {
         return Ok([0; EMBEDDING_DIM]);
     }
@@ -6695,6 +6700,7 @@ struct BuildProfile {
     embedding_write: Duration,
     embedding_batches: usize,
     embedding_inputs: usize,
+    embedding_active_tokens: usize,
     embedding_padded_tokens: usize,
     embedding_max_batch: usize,
     embedding_max_seq_len: usize,
@@ -6750,11 +6756,18 @@ impl BuildProfile {
         }
         if self.embedding_batches > 0 {
             let model_secs = self.embedding_run.as_secs_f64().max(0.000_001);
+            let padding_ratio = if self.embedding_padded_tokens == 0 {
+                0.0
+            } else {
+                self.embedding_active_tokens as f64 / self.embedding_padded_tokens as f64
+            };
             eprintln!(
-                "  embedding batches={} inputs={} padded_tokens={} max_batch={} max_seq_len={} model_tokens_per_s={:.0}",
+                "  embedding batches={} inputs={} active_tokens={} padded_tokens={} padding_efficiency={:.1}% max_batch={} max_seq_len={} model_tokens_per_s={:.0}",
                 self.embedding_batches,
                 self.embedding_inputs,
+                self.embedding_active_tokens,
                 self.embedding_padded_tokens,
+                padding_ratio * 100.0,
                 self.embedding_max_batch,
                 self.embedding_max_seq_len,
                 self.embedding_padded_tokens as f64 / model_secs,
@@ -6782,15 +6795,17 @@ struct SemanticEncodeStats {
     postprocess: Duration,
     batches: usize,
     inputs: usize,
+    active_tokens: usize,
     padded_tokens: usize,
     max_batch: usize,
     max_seq_len: usize,
 }
 
 impl SemanticEncodeStats {
-    fn record_batch(&mut self, batch: usize, seq_len: usize) {
+    fn record_batch(&mut self, batch: usize, seq_len: usize, active_tokens: usize) {
         self.batches += 1;
         self.inputs += batch;
+        self.active_tokens += active_tokens;
         self.padded_tokens += batch * seq_len;
         self.max_batch = self.max_batch.max(batch);
         self.max_seq_len = self.max_seq_len.max(seq_len);
@@ -6803,6 +6818,7 @@ impl SemanticEncodeStats {
         self.postprocess += other.postprocess;
         self.batches += other.batches;
         self.inputs += other.inputs;
+        self.active_tokens += other.active_tokens;
         self.padded_tokens += other.padded_tokens;
         self.max_batch = self.max_batch.max(other.max_batch);
         self.max_seq_len = self.max_seq_len.max(other.max_seq_len);
@@ -6865,6 +6881,7 @@ fn flush_pending_build_embeddings(
         profile.embedding_postprocess += stats.postprocess;
         profile.embedding_batches += stats.batches;
         profile.embedding_inputs += stats.inputs;
+        profile.embedding_active_tokens += stats.active_tokens;
         profile.embedding_padded_tokens += stats.padded_tokens;
         profile.embedding_max_batch = profile.embedding_max_batch.max(stats.max_batch);
         profile.embedding_max_seq_len = profile.embedding_max_seq_len.max(stats.max_seq_len);
@@ -12960,6 +12977,16 @@ mod tests {
         let q = [0i8; EMBEDDING_DIM];
         let bad = vec![0u8; EMBEDDING_DIM - 1];
         assert!(dot_i8(&q, &bad).is_err());
+    }
+
+    #[test]
+    fn quantize_embedding_rejects_non_finite_values() {
+        let mut values = vec![0.1f32; EMBEDDING_DIM];
+        values[7] = f32::NAN;
+        assert!(quantize_embedding(&values).is_err());
+
+        values[7] = f32::INFINITY;
+        assert!(quantize_embedding(&values).is_err());
     }
 
     // ----- W1.2 BM25 snippets -----
