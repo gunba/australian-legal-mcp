@@ -7407,20 +7407,27 @@ fn build_corpus(
             let zstd_text =
                 zstd::stream::encode_all(std::io::Cursor::new(chunk.text.as_bytes()), zstd_level)
                     .context("zstd-compressing chunk text")?;
-            tx.execute(
-                "INSERT INTO chunks (doc_id, ord, anchor, text)
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![doc_id, chunk.ord, chunk.anchor, zstd_text],
-            )
-            .context("INSERT chunks")?;
-            let chunk_id: i64 = tx.last_insert_rowid();
+            let chunk_id: i64 = tx
+                .query_row(
+                    "INSERT INTO chunks (doc_id, ord, anchor, text)
+                 VALUES (?1, ?2, ?3, ?4)
+                 RETURNING chunk_id",
+                    rusqlite::params![doc_id, chunk.ord, chunk.anchor, zstd_text],
+                    |row| row.get(0),
+                )
+                .context("INSERT chunks")?;
             chunk_ids.push((chunk_id, chunk.text.clone(), chunk.anchor.clone()));
 
             tx.execute(
                 "INSERT INTO chunks_fts (rowid, text) VALUES (?1, ?2)",
                 rusqlite::params![chunk_id, chunk.text],
             )
-            .context("INSERT chunks_fts")?;
+            .with_context(|| {
+                format!(
+                    "INSERT chunks_fts doc_id={} chunk_id={} ord={}",
+                    doc_id, chunk_id, chunk.ord
+                )
+            })?;
 
             let chunk_idx = chunk_records.len();
             chunk_records.push(json!({
@@ -11691,11 +11698,13 @@ fn insert_record(
     )?;
     for chunk in &record.chunks {
         let blob = compress_text(&chunk.text)?;
-        conn.execute(
-            "INSERT INTO chunks (doc_id, ord, anchor, text) VALUES (?, ?, ?, ?)",
-            params![record.doc_id, chunk.ord, chunk.anchor, blob,],
+        let rowid: i64 = conn.query_row(
+            "INSERT INTO chunks (doc_id, ord, anchor, text)
+             VALUES (?, ?, ?, ?)
+             RETURNING chunk_id",
+            params![record.doc_id, chunk.ord, chunk.anchor, blob],
+            |row| row.get(0),
         )?;
-        let rowid = conn.last_insert_rowid();
         if let Some(embedding_b64) = &chunk.embedding_b64 {
             let embedding = decode_embedding_b64(embedding_b64)?;
             conn.execute(
@@ -11706,7 +11715,13 @@ fn insert_record(
         conn.execute(
             "INSERT INTO chunks_fts (rowid, text) VALUES (?, ?)",
             params![rowid, chunk.text],
-        )?;
+        )
+        .with_context(|| {
+            format!(
+                "INSERT chunks_fts doc_id={} chunk_id={} ord={}",
+                record.doc_id, rowid, chunk.ord
+            )
+        })?;
     }
     for anchor in &record.anchors {
         conn.execute(
