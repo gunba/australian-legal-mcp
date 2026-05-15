@@ -207,17 +207,109 @@ fi
 
 TAG="$TAG_PREFIX-$(date -u +%Y.%m.%d)"
 RELEASE_DIR="$REPO_DIR/release/$TAG"
-mkdir -p "$RELEASE_DIR"
 BASE_RELEASE_ARG=()
 LATEST_RELEASE="$REPO_DIR/release/.latest"
-if [[ -d "$LATEST_RELEASE" ]]; then
-    LATEST_REAL=$(realpath "$LATEST_RELEASE")
-    RELEASE_REAL=$(realpath -m "$RELEASE_DIR")
-    if [[ "$LATEST_REAL" != "$RELEASE_REAL" ]]; then
-        BASE_RELEASE_ARG=(--base-release-dir "$LATEST_RELEASE")
+
+try_base_release() {
+    local candidate="$1"
+    local label="$2"
+    if [[ ! -d "$candidate" ]]; then
+        return 1
+    fi
+    local candidate_real release_real
+    candidate_real=$(realpath "$candidate")
+    release_real=$(realpath -m "$RELEASE_DIR")
+    if [[ "$candidate_real" == "$release_real" ]]; then
+        return 1
+    fi
+    local check_output
+    if check_output=$("$ATO_MCP" check-base-release "$candidate" 2>&1); then
+        echo "$check_output"
+        BASE_RELEASE_ARG=(--base-release-dir "$candidate")
+        return 0
+    fi
+    echo "base release not usable ($label): $check_output"
+    return 1
+}
+
+try_local_base_releases() {
+    if try_base_release "$LATEST_RELEASE" "release/.latest"; then
+        return 0
+    fi
+    local candidate
+    while IFS= read -r candidate; do
+        if try_base_release "$candidate" "$candidate"; then
+            rm -rf "$LATEST_RELEASE"
+            ln -s "$candidate" "$LATEST_RELEASE"
+            echo "restored release/.latest -> $candidate"
+            return 0
+        fi
+    done < <(find "$REPO_DIR/release" -maxdepth 1 -mindepth 1 -type d -name "$TAG_PREFIX-*" | sort -r)
+    return 1
+}
+
+try_remote_base_releases() {
+    if ! command -v gh >/dev/null 2>&1; then
+        echo "gh CLI not available; cannot materialize a published base release"
+        return 1
+    fi
+    local remote_tag candidate_tmp candidate
+    while IFS= read -r remote_tag; do
+        [[ -z "$remote_tag" || "$remote_tag" == "$TAG" ]] && continue
+        candidate="$REPO_DIR/release/$remote_tag"
+        if try_base_release "$candidate" "$candidate"; then
+            rm -rf "$LATEST_RELEASE"
+            ln -s "$candidate" "$LATEST_RELEASE"
+            echo "restored release/.latest -> $candidate"
+            return 0
+        fi
+        candidate_tmp="$REPO_DIR/release/.materialize-$remote_tag"
+        rm -rf "$candidate_tmp"
+        echo "checking published corpus base $remote_tag"
+        if "$ATO_MCP" materialize-base-release \
+            --manifest-url "https://github.com/$GH_REPO/releases/download/$remote_tag/manifest.json" \
+            --out-dir "$candidate_tmp"; then
+            rm -rf "$candidate"
+            mv "$candidate_tmp" "$candidate"
+            rm -rf "$LATEST_RELEASE"
+            ln -s "$candidate" "$LATEST_RELEASE"
+            BASE_RELEASE_ARG=(--base-release-dir "$LATEST_RELEASE")
+            echo "materialized release/.latest from published corpus $remote_tag"
+            return 0
+        fi
+        rm -rf "$candidate_tmp"
+        echo "published corpus base $remote_tag is not usable with this binary"
+    done < <(gh release list --repo "$GH_REPO" --limit 50 --json tagName,publishedAt \
+        --jq ".[] | select(.tagName | startswith(\"$TAG_PREFIX-\")) | .tagName")
+    return 1
+}
+
+try_resumable_build_checkpoint() {
+    local candidate check_output
+    while IFS= read -r candidate; do
+        [[ -z "$candidate" ]] && continue
+        [[ -f "$candidate/build-state.json" ]] || continue
+        if check_output=$("$ATO_MCP" check-build-checkpoint \
+            --release-dir "$candidate" \
+            --source-index-sha256 "$AFTER_HASH" \
+            --zstd-level 3 2>&1); then
+            echo "$check_output"
+            TAG=$(basename "$candidate")
+            RELEASE_DIR="$candidate"
+            echo "resuming interrupted build checkpoint in $RELEASE_DIR"
+            return 0
+        fi
+    done < <(find "$REPO_DIR/release" -maxdepth 1 -mindepth 1 -type d -name "$TAG_PREFIX-*" | sort -r)
+    return 1
+}
+
+if ! try_local_base_releases && ! try_remote_base_releases; then
+    if ! try_resumable_build_checkpoint; then
+        echo "no compatible current-model base release or resumable checkpoint found; this build will embed every changed source doc"
     fi
 fi
 
+mkdir -p "$RELEASE_DIR"
 echo "== build corpus =="
 "$ATO_MCP" build \
     --pages-dir "$PAGES_DIR" \
@@ -225,7 +317,8 @@ echo "== build corpus =="
     --model-dir "$MODEL_DIR" \
     "${BASE_RELEASE_ARG[@]}" \
     --out-dir   "$RELEASE_DIR" \
-    --gpu
+    --gpu \
+    --profile
 
 echo "== publish release $TAG =="
 "$ATO_MCP" publish-release \

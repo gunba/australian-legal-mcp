@@ -334,6 +334,30 @@ enum Command {
         #[arg(long)]
         profile: bool,
     },
+    /// Maintainer-only: validate that a release dir can seed the current
+    /// build without falling off the fast path.
+    #[command(hide = true)]
+    CheckBaseRelease { release_dir: PathBuf },
+    /// Maintainer-only: reconstruct a local base release from a published
+    /// manifest and pack assets without running the embedding model.
+    #[command(hide = true)]
+    MaterializeBaseRelease {
+        #[arg(long)]
+        manifest_url: String,
+        #[arg(long)]
+        out_dir: PathBuf,
+    },
+    /// Maintainer-only: validate that a build output dir has a checkpoint
+    /// compatible with the current source index/model settings.
+    #[command(hide = true)]
+    CheckBuildCheckpoint {
+        #[arg(long)]
+        release_dir: PathBuf,
+        #[arg(long)]
+        source_index_sha256: String,
+        #[arg(long, default_value_t = 3)]
+        zstd_level: i32,
+    },
     /// [SS-01] Source acquisition is split into whats-new + scrape-diff
     /// incremental, tree-crawl + snapshot-reduce full, and deduped catch-up.
     /// Fetch the ATO "What's New" feed and return the deduped doc entries
@@ -1073,6 +1097,16 @@ fn main() -> Result<()> {
             use_gpu: gpu,
             profile_enabled: profile,
         }),
+        Command::CheckBaseRelease { release_dir } => check_base_release(&release_dir),
+        Command::MaterializeBaseRelease {
+            manifest_url,
+            out_dir,
+        } => materialize_base_release(&manifest_url, &out_dir),
+        Command::CheckBuildCheckpoint {
+            release_dir,
+            source_index_sha256,
+            zstd_level,
+        } => check_build_checkpoint(&release_dir, &source_index_sha256, zstd_level),
         Command::WhatsNew {
             url,
             timeout_seconds,
@@ -6928,6 +6962,21 @@ impl BuildProfile {
     }
 }
 
+fn maybe_report_build_progress(
+    processed: usize,
+    rebuilt: usize,
+    reused: usize,
+    started_at: std::time::Instant,
+) {
+    if processed > 0 && processed.is_multiple_of(1000) {
+        let elapsed = started_at.elapsed().as_secs_f64().max(0.000_001);
+        eprintln!(
+            "ato-mcp build: processed {processed} source docs ({:.1}/s, rebuilt {rebuilt}, reused {reused})",
+            processed as f64 / elapsed
+        );
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct SemanticEncodeStats {
     tokenize: Duration,
@@ -7251,6 +7300,51 @@ fn load_build_checkpoint(
     Ok(Some(checkpoint))
 }
 
+fn check_build_checkpoint(
+    out_dir: &Path,
+    source_index_sha256: &str,
+    zstd_level: i32,
+) -> Result<()> {
+    // Maintainer scripts can resume interrupted build outputs only when the
+    // checkpoint, source index, model, and DB agree exactly.
+    let checkpoint =
+        load_build_checkpoint(out_dir, source_index_sha256, zstd_level)?.ok_or_else(|| {
+            anyhow!(
+                "build checkpoint missing {}",
+                build_checkpoint_path(out_dir).display()
+            )
+        })?;
+    let db_path = out_dir.join("ato.db");
+    if !db_path.exists() {
+        bail!("build checkpoint missing {}", db_path.display());
+    }
+    let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("opening {}", db_path.display()))?;
+    enforce_db_schema_version(&conn)
+        .with_context(|| format!("validating DB schema in {}", db_path.display()))?;
+    let pending_docs = pending_build_doc_count(&conn)?;
+    if pending_docs > 0 {
+        bail!(
+            "build checkpoint has {pending_docs} uncheckpointed PENDING documents at {}",
+            db_path.display()
+        );
+    }
+    let committed_docs = committed_build_doc_count(&conn)?;
+    if committed_docs != checkpoint.documents.len() {
+        bail!(
+            "build checkpoint has {} documents but DB has {committed_docs}",
+            checkpoint.documents.len()
+        );
+    }
+    println!(
+        "build checkpoint resumable: {} ({} docs, {} packs)",
+        out_dir.display(),
+        checkpoint.documents.len(),
+        checkpoint.packs.len()
+    );
+    Ok(())
+}
+
 struct SaveBuildCheckpointArgs<'a> {
     out_dir: &'a Path,
     source_index_sha256: &'a str,
@@ -7497,6 +7591,167 @@ fn pack_filename(url: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("pack URL has no filename: {url}"))
 }
 
+fn validate_base_release_manifest(manifest: &Manifest) -> Result<()> {
+    // Maintainer base seeding accepts only the current manifest and embedding
+    // model shape, so old corpus releases fail before build starts.
+    enforce_manifest_compatibility(manifest)?;
+    if manifest.model.id != EMBEDDING_MODEL_ID {
+        bail!(
+            "base release uses embedding model `{}`; expected `{EMBEDDING_MODEL_ID}`",
+            manifest.model.id
+        );
+    }
+    if parse_hf_model_url(&manifest.model.url).is_some()
+        && manifest.model.sha256 != EMBEDDING_MODEL_FINGERPRINT
+    {
+        bail!("base release embedding fingerprint differs from the current pinned model");
+    }
+    Ok(())
+}
+
+fn check_base_release(base_dir: &Path) -> Result<()> {
+    let manifest_path = base_dir.join("manifest.json");
+    let db_path = base_dir.join("ato.db");
+    let packs_dir = base_dir.join("packs");
+    if !manifest_path.exists() {
+        bail!("base release missing {}", manifest_path.display());
+    }
+    if !db_path.exists() {
+        bail!("base release missing {}", db_path.display());
+    }
+    if !packs_dir.is_dir() {
+        bail!("base release missing {}", packs_dir.display());
+    }
+    let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("opening {}", db_path.display()))?;
+    enforce_db_schema_version(&conn)
+        .with_context(|| format!("validating DB schema in {}", db_path.display()))?;
+    let manifest: Manifest = serde_json::from_slice(&fs::read(&manifest_path)?)
+        .with_context(|| format!("parsing {}", manifest_path.display()))?;
+    validate_base_release_manifest(&manifest)?;
+    for pack in &manifest.packs {
+        let filename = pack_filename(&pack.url)?;
+        let path = packs_dir.join(&filename);
+        if !path.exists() {
+            bail!("base release missing pack {}", path.display());
+        }
+        let len = fs::metadata(&path)?.len();
+        if pack.size != 0 && len != pack.size {
+            bail!(
+                "base release pack size mismatch for {}: got {}, expected {}",
+                path.display(),
+                len,
+                pack.size
+            );
+        }
+    }
+    println!(
+        "base release usable: {} ({} docs, {} packs)",
+        base_dir.display(),
+        manifest.documents.len(),
+        manifest.packs.len()
+    );
+    Ok(())
+}
+
+fn materialize_base_release(manifest_url: &str, out_dir: &Path) -> Result<()> {
+    // A published current-model corpus can be reconstructed locally from
+    // manifest + packs without re-running transformer embeddings.
+    if out_dir.exists() {
+        bail!("--out-dir already exists: {}", out_dir.display());
+    }
+    let source_context = UrlContext::from_manifest_url(manifest_url);
+    let manifest_bytes = fetch_bytes(manifest_url, &source_context)
+        .with_context(|| format!("fetching manifest from {manifest_url}"))?;
+    let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
+        .with_context(|| format!("parsing manifest from {manifest_url}"))?;
+    validate_base_release_manifest(&manifest)?;
+
+    let packs_dir = out_dir.join("packs");
+    fs::create_dir_all(&packs_dir).with_context(|| format!("creating {}", packs_dir.display()))?;
+    let mut local_manifest = manifest;
+    let mut bytes_downloaded = manifest_bytes.len() as u64;
+    for pack in &mut local_manifest.packs {
+        let filename = pack_filename(&pack.url)?;
+        let pack_url = resolve_manifest_asset(&pack.url, &source_context);
+        let pack_bytes = fetch_bytes(&pack_url, &source_context)
+            .with_context(|| format!("fetching {pack_url}"))?;
+        if !pack.sha256.is_empty() {
+            verify_sha256_bytes(&pack_bytes, &pack.sha256)
+                .with_context(|| format!("verifying {}", pack.url))?;
+        }
+        if pack.size != 0 && pack_bytes.len() as u64 != pack.size {
+            bail!(
+                "pack size mismatch for {}: got {}, expected {}",
+                pack.url,
+                pack_bytes.len(),
+                pack.size
+            );
+        }
+        bytes_downloaded += pack_bytes.len() as u64;
+        fs::write(packs_dir.join(&filename), &pack_bytes)
+            .with_context(|| format!("writing {}", packs_dir.join(&filename).display()))?;
+        pack.url = format!("packs/{filename}");
+    }
+
+    let manifest_path = out_dir.join("manifest.json");
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&local_manifest)?)
+        .with_context(|| format!("writing {}", manifest_path.display()))?;
+    let summary = UpdateSummary {
+        schema_version: local_manifest.schema_version,
+        index_version: local_manifest.index_version.clone(),
+        min_client_version: local_manifest.min_client_version.clone(),
+        model: local_manifest.model.clone(),
+        document_count: local_manifest.documents.len(),
+        pack_count: local_manifest.packs.len(),
+        manifest_fingerprint: Some(manifest_fingerprint(&local_manifest)?),
+    };
+    let summary_path = out_dir.join("update.json");
+    fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?)
+        .with_context(|| format!("writing {}", summary_path.display()))?;
+
+    let db_path = out_dir.join("ato.db");
+    let conn = open_write_at(&db_path)?;
+    init_db(&conn)?;
+    let local_context = UrlContext {
+        manifest_dir: Some(out_dir.to_path_buf()),
+        manifest_base_url: None,
+    };
+    let tx = conn.unchecked_transaction()?;
+    let mut bytes_read_from_local_packs = 0_u64;
+    let apply_result = (|| -> Result<()> {
+        insert_docs_from_packs(
+            &tx,
+            &local_manifest,
+            &local_context,
+            &local_manifest.documents,
+            &mut bytes_read_from_local_packs,
+            out_dir,
+        )?;
+        set_meta(&tx, "index_version", &local_manifest.index_version)?;
+        set_meta(&tx, "embedding_model_id", &local_manifest.model.id)?;
+        set_meta(&tx, "last_update_at", &Utc::now().to_rfc3339())?;
+        derive_citations(&tx)?;
+        verify_semantic_install(&tx, &local_manifest)?;
+        Ok(())
+    })();
+    if let Err(err) = apply_result {
+        tx.rollback()?;
+        return Err(err);
+    }
+    tx.commit()?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    eprintln!(
+        "ato-mcp materialize-base-release: wrote {} from {} ({} docs, {} packs, {} bytes)",
+        out_dir.display(),
+        manifest_url,
+        local_manifest.documents.len(),
+        local_manifest.packs.len(),
+        bytes_downloaded
+    );
+    Ok(())
+}
+
 fn seed_build_from_base_release(
     base_dir: &Path,
     out_dir: &Path,
@@ -7524,17 +7779,7 @@ fn seed_build_from_base_release(
     }
     let manifest: Manifest = serde_json::from_slice(&fs::read(&manifest_path)?)
         .with_context(|| format!("parsing {}", manifest_path.display()))?;
-    if manifest.model.id != EMBEDDING_MODEL_ID {
-        bail!(
-            "base release uses embedding model `{}`; expected `{EMBEDDING_MODEL_ID}`",
-            manifest.model.id
-        );
-    }
-    if parse_hf_model_url(&manifest.model.url).is_some()
-        && manifest.model.sha256 != EMBEDDING_MODEL_FINGERPRINT
-    {
-        bail!("base release embedding fingerprint differs from the current pinned model");
-    }
+    validate_base_release_manifest(&manifest)?;
     let base_packs_dir = base_dir.join("packs");
     let mut source_hash_by_doc_id = HashMap::new();
     let pack_index: HashMap<String, PackInfo> = manifest
@@ -7744,6 +7989,7 @@ fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
     let mut changed_base_docs: usize = 0;
     let mut removed_base_docs: usize = 0;
     let mut tx = conn.unchecked_transaction()?;
+    let progress_started = std::time::Instant::now();
 
     // Pack records collected for this build. Each record is the full doc
     // payload the Rust updater can ingest from `pack-<sha8>.bin.zst`.
@@ -7782,6 +8028,12 @@ fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         if !source_doc_ids.insert(doc_id.clone()) {
             if checkpoint_verified {
                 processed += 1;
+                maybe_report_build_progress(
+                    processed,
+                    profile.docs,
+                    reused_base_docs,
+                    progress_started,
+                );
                 continue;
             }
             skipped_duplicate_doc_ids += 1;
@@ -7789,6 +8041,12 @@ fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         }
         if checkpoint_verified {
             processed += 1;
+            maybe_report_build_progress(
+                processed,
+                profile.docs,
+                reused_base_docs,
+                progress_started,
+            );
             continue;
         }
 
@@ -7938,6 +8196,12 @@ fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
             if base_source_hash == &source_hash {
                 reused_base_docs += 1;
                 processed += 1;
+                maybe_report_build_progress(
+                    processed,
+                    profile.docs,
+                    reused_base_docs,
+                    progress_started,
+                );
                 continue;
             }
             remove_build_doc(&tx, &doc_id)
@@ -8212,9 +8476,7 @@ fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
 
         processed += 1;
         profile.docs += 1;
-        if processed.is_multiple_of(50) {
-            eprintln!("ato-mcp build: processed {processed} docs");
-        }
+        maybe_report_build_progress(processed, profile.docs, reused_base_docs, progress_started);
     }
 
     if base_seeded {
@@ -14432,6 +14694,75 @@ mod tests {
         assert!(
             serde_json::from_value::<Manifest>(with_tokenizer_sha).is_err(),
             "legacy tokenizer_sha256 field must not be silently ignored"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn base_release_manifest_rejects_non_current_embedding_model() {
+        let m = sample_manifest(SUPPORTED_MANIFEST_VERSION as i64, env!("CARGO_PKG_VERSION"));
+        let err = validate_base_release_manifest(&m).unwrap_err();
+        assert!(
+            err.to_string().contains(EMBEDDING_MODEL_ID),
+            "expected current-model base release rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_base_release_accepts_current_local_shape() -> Result<()> {
+        let dir = tempdir()?;
+        let base = dir.path();
+        let packs = base.join("packs");
+        fs::create_dir_all(&packs)?;
+        let conn = open_write_at(&base.join("ato.db"))?;
+        init_db(&conn)?;
+        drop(conn);
+        fs::write(packs.join("pack-test.bin.zst"), [])?;
+        let mut manifest =
+            sample_manifest(SUPPORTED_MANIFEST_VERSION as i64, env!("CARGO_PKG_VERSION"));
+        manifest.model = ModelInfo {
+            id: EMBEDDING_MODEL_ID.to_string(),
+            sha256: EMBEDDING_MODEL_FINGERPRINT.to_string(),
+            size: EMBEDDING_MODEL_HF_SIZE,
+            url: EMBEDDING_MODEL_HF_URL.to_string(),
+        };
+        manifest.packs.push(PackInfo {
+            sha8: "test".to_string(),
+            sha256: String::new(),
+            size: 0,
+            url: "packs/pack-test.bin.zst".to_string(),
+        });
+        fs::write(
+            base.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest)?,
+        )?;
+        check_base_release(base)?;
+        Ok(())
+    }
+
+    #[test]
+    fn check_build_checkpoint_requires_matching_source_hash() -> Result<()> {
+        let dir = tempdir()?;
+        let conn = open_write_at(&dir.path().join("ato.db"))?;
+        init_db(&conn)?;
+        drop(conn);
+        let verified = HashSet::new();
+        let base_hashes = HashMap::new();
+        save_build_checkpoint(SaveBuildCheckpointArgs {
+            out_dir: dir.path(),
+            source_index_sha256: "source-a",
+            zstd_level: 3,
+            documents: &[],
+            packs: &[],
+            base_documents: &[],
+            base_source_hash_by_doc_id: &base_hashes,
+            verified_source_doc_ids: &verified,
+        })?;
+        check_build_checkpoint(dir.path(), "source-a", 3)?;
+        let err = check_build_checkpoint(dir.path(), "source-b", 3).unwrap_err();
+        assert!(
+            err.to_string().contains("source index hash differs"),
+            "expected source-hash mismatch, got: {err}"
         );
         Ok(())
     }

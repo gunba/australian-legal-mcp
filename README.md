@@ -314,7 +314,8 @@ cargo build --release --features cuda
   --model-dir /path/to/granite-embedding-small-r2 \
   --base-release-dir ./release/.latest \
   --out-dir   ./release \
-  --gpu
+  --gpu \
+  --profile
 
 ./target/release/ato-mcp publish-release \
   --out-dir ./release \
@@ -334,6 +335,12 @@ For full crawls (rare, hours):
 `scripts/maintainer-sync.sh` wraps all three modes (`incremental`,
 `catch_up`, `full`) and handles release publication. Drive it from the
 provided `systemd/ato-mcp-maintainer-weekly.service` unit on a GPU host.
+The script validates `release/.latest` before using it, restores the pointer
+from another local compatible corpus release when possible, and can
+materialize a compatible published corpus release locally from manifest and
+pack assets without running the embedding model. If a build was interrupted,
+the script can also resume a matching checkpointed output directory instead
+of starting a new full embedding pass after the date tag changes.
 
 Release builds use Granite embedding vectors and should run on the
 maintainer GPU. The Rust end-user runtime does not require a GPU; query

@@ -35,7 +35,7 @@ scripts/maintainer-sync.sh
    then always run the incremental What's New refresh as the final
    pre-build source step.
 2. Build `release/<tag>/ato.db`, packs, and `manifest.json` via
-   `ato-mcp build`.
+   `ato-mcp build --profile`.
 3. Build embeddings from `ATO_MCP_MODEL_DIR` and write the pinned Hugging
    Face Granite embedding source into the manifest, unless `ATO_MCP_MODEL_URL`
    points at an approved mirror.
@@ -50,12 +50,20 @@ diagnostics unless a live document URL is known to have gained content.
 
 The script skips rebuilds when the refreshed `index.jsonl` hash is unchanged,
 except in `ATO_MCP_MODE=full`. Set `ATO_MCP_FORCE_REBUILD=1` for schema or
-model-only publications. After a successful publication,
-`release/.latest` points at the whole release directory so the next
-incremental run passes it as `--base-release-dir`; the builder copies the
-previous DB/packs, re-cleans source docs to compare source-derived content
-hashes, and only re-embeds documents whose cleaned content changed or whose
-doc_id is new.
+model-only publications. Before rebuilding, the script validates that
+`release/.latest` is a current-model base release the running binary can
+parse. If the pointer is missing, it scans local corpus release directories
+and, when possible, materializes a compatible published corpus release from
+its manifest and pack assets without running the embedding model. If no base
+release exists but an interrupted output directory has a matching checkpoint,
+the script resumes that checkpoint, even if the date-derived release tag has
+rolled over. After a successful publication, `release/.latest` points at the
+whole release directory so the next incremental run passes it as
+`--base-release-dir`; the builder copies the previous DB/packs, re-cleans
+source docs to compare source-derived content hashes, and only re-embeds
+documents whose cleaned content changed or whose doc_id is new. Build logs
+include stage timing, embedding token throughput, padding efficiency, and
+source-doc progress.
 
 The script requires `nvidia-smi`/CUDA to be available so the Rust
 binary's bundled `ort` runtime can use the CUDA execution provider. If
