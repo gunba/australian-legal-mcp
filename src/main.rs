@@ -62,6 +62,7 @@ const EMBEDDING_MODEL_ID: &str = "granite-embedding-small-r2-fp16-256d";
 const BUILD_EMBED_BATCH_SIZE: usize = 64;
 const BUILD_EMBED_PENDING_FLUSH_CHUNKS: usize = 4096;
 const BUILD_PACK_RECORDS_PER_SHARD: usize = 4096;
+const BUILD_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_MAX_PER_DOC: usize = 2;
 const HARD_MAX_PER_DOC: usize = 3;
 // Avoid expensive online transformer graph rewrites on every fresh CLI/MCP
@@ -7003,6 +7004,11 @@ struct BuildCheckpoint {
     schema_version: u32,
     source_index_sha256: String,
     zstd_level: i32,
+    embedding_model_id: String,
+    embedding_model_fingerprint: String,
+    embedding_dim: usize,
+    embedding_input_max_tokens: usize,
+    chunker_format_version: u32,
     documents: Vec<DocRef>,
     packs: Vec<PackInfo>,
 }
@@ -7023,7 +7029,7 @@ fn load_build_checkpoint(
     let raw = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let checkpoint: BuildCheckpoint =
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
-    if checkpoint.schema_version != 1 {
+    if checkpoint.schema_version != BUILD_CHECKPOINT_SCHEMA_VERSION {
         bail!(
             "unsupported build checkpoint schema {} in {}",
             checkpoint.schema_version,
@@ -7045,6 +7051,44 @@ fn load_build_checkpoint(
             path.display()
         );
     }
+    if checkpoint.embedding_model_id != EMBEDDING_MODEL_ID {
+        bail!(
+            "build checkpoint embedding model `{}` differs from requested `{}`; remove {} to start a fresh build",
+            checkpoint.embedding_model_id,
+            EMBEDDING_MODEL_ID,
+            path.display()
+        );
+    }
+    if checkpoint.embedding_model_fingerprint != EMBEDDING_MODEL_FINGERPRINT {
+        bail!(
+            "build checkpoint embedding model fingerprint differs from requested model; remove {} to start a fresh build",
+            path.display()
+        );
+    }
+    if checkpoint.embedding_dim != EMBEDDING_DIM {
+        bail!(
+            "build checkpoint embedding dim {} differs from requested {}; remove {} to start a fresh build",
+            checkpoint.embedding_dim,
+            EMBEDDING_DIM,
+            path.display()
+        );
+    }
+    if checkpoint.embedding_input_max_tokens != EMBEDDING_INPUT_MAX_TOKENS {
+        bail!(
+            "build checkpoint embedding input max {} differs from requested {}; remove {} to start a fresh build",
+            checkpoint.embedding_input_max_tokens,
+            EMBEDDING_INPUT_MAX_TOKENS,
+            path.display()
+        );
+    }
+    if checkpoint.chunker_format_version != CHUNKER_FORMAT_VERSION {
+        bail!(
+            "build checkpoint chunker format {} differs from requested {}; remove {} to start a fresh build",
+            checkpoint.chunker_format_version,
+            CHUNKER_FORMAT_VERSION,
+            path.display()
+        );
+    }
     Ok(Some(checkpoint))
 }
 
@@ -7056,9 +7100,14 @@ fn save_build_checkpoint(
     packs: &[PackInfo],
 ) -> Result<()> {
     let checkpoint = BuildCheckpoint {
-        schema_version: 1,
+        schema_version: BUILD_CHECKPOINT_SCHEMA_VERSION,
         source_index_sha256: source_index_sha256.to_string(),
         zstd_level,
+        embedding_model_id: EMBEDDING_MODEL_ID.to_string(),
+        embedding_model_fingerprint: EMBEDDING_MODEL_FINGERPRINT.to_string(),
+        embedding_dim: EMBEDDING_DIM,
+        embedding_input_max_tokens: EMBEDDING_INPUT_MAX_TOKENS,
+        chunker_format_version: CHUNKER_FORMAT_VERSION,
         documents: documents.to_vec(),
         packs: packs.to_vec(),
     };
