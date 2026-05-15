@@ -59,7 +59,7 @@ const SUPPORTED_SCHEMA_VERSION: u32 = 8;
 /// ingests. No legacy manifest layouts are accepted.
 const SUPPORTED_MANIFEST_VERSION: u32 = 4;
 const EMBEDDING_MODEL_ID: &str = "granite-embedding-small-r2-fp16-256d";
-const BUILD_EMBED_BATCH_SIZE: usize = 64;
+const BUILD_EMBED_BATCH_SIZE: usize = 32;
 const BUILD_EMBED_PENDING_FLUSH_CHUNKS: usize = 4096;
 const BUILD_PACK_RECORDS_PER_SHARD: usize = 4096;
 const BUILD_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
