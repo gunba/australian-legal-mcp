@@ -41,8 +41,14 @@ const MAX_K: usize = 50;
 /// fills the rest.
 const TITLE_HITS_K: usize = 10;
 const SNIPPET_CHARS: usize = 280;
+// [EM-05] Stored semantic vectors are the first 256 dimensions of the
+// model output after normalization + int8 quantization.
 const EMBEDDING_DIM: usize = 256;
+// [EM-03] The tokenizer truncates semantic inputs and pads dynamically to
+// each batch's max sequence length.
 const EMBEDDING_INPUT_MAX_TOKENS: usize = 1024;
+// [EM-02] Granite ONNX inputs use source-derived text directly; no
+// query/passage prompt prefix is stored in chunks or added at runtime.
 const EMBEDDING_TEXT_PREFIX: &str = "";
 const EMBEDDING_MODEL_FINGERPRINT: &str =
     "granite-small-r2-fp16:ee200de55cb2f94e858aabca54be7697a9c0805a14c858ee26ad0922b05f57d7:28d16e29cd623f25cc6fa0968700c5bc31036466091a5fa06d1353c1777f050e:feeb83348dcb033bc6b9d2e1f7906ca9eb2d122845000c9416d894d7c2927149";
@@ -61,6 +67,8 @@ const SUPPORTED_MANIFEST_VERSION: u32 = 4;
 const EMBEDDING_MODEL_ID: &str = "granite-embedding-small-r2-fp16-256d";
 const BUILD_EMBED_BATCH_SIZE: usize = 32;
 const BUILD_EMBED_PENDING_FLUSH_CHUNKS: usize = 4096;
+// [IB-10] Build pack shards are bounded by document count, not target
+// bytes, so downloads stay tractable while pack offsets remain stable.
 const BUILD_PACK_RECORDS_PER_SHARD: usize = 4096;
 const BUILD_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_MAX_PER_DOC: usize = 2;
@@ -88,6 +96,11 @@ struct Cli {
     command: Command,
 }
 
+// [CC-01] One Rust binary owns both end-user commands and maintainer-only
+// source/corpus commands; AGENTS.md documents which commands require the
+// maintainer checkout, source corpus, model assets, and GPU.
+// [CC-06] The external CLI is a closed clap enum: every command is explicit
+// here, with no dynamic plugin subcommands or shell-completion surface.
 #[derive(Subcommand)]
 enum Command {
     /// stdio MCP shim. Auto-spawns the HTTP daemon on first use and proxies
@@ -256,7 +269,7 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         level: i32,
     },
-    /// Fetch a node list from the ATO browse-content API. Mirrors
+    /// [SS-02] Fetch a node list from the ATO browse-content API. Mirrors
     /// src/ato_mcp/scraper/client.py:AtoBrowseClient.fetch_nodes.
     /// JSON out: [{...}, ...] (verbatim ATO response).
     AtoFetchNodes {
@@ -290,13 +303,23 @@ enum Command {
     /// chunk_embeddings, chunks_fts, title_fts, doc_anchors, definitions
     /// and citations tables, then writes pack files, per-doc asset blobs,
     /// manifest.json, and update.json to --out-dir.
-    /// MISSING from this version vs build.py: incremental reuse from a
-    /// prior pack and multi-process parallelism.
+    /// Supports same-output-dir checkpoint resume and previous-release
+    /// seeding through --base-release-dir.
+    /// [CC-05] Source refresh/download and corpus build are separate
+    /// commands: the same ato_pages/ tree can feed repeated builds,
+    /// base-release seeded builds, or release dry runs.
     Build {
         #[arg(long)]
         pages_dir: PathBuf,
         #[arg(long)]
         db_path: PathBuf,
+        /// Granite embedding model checkout. Must contain tokenizer.json,
+        /// onnx/model_fp16.onnx, and onnx/model_fp16.onnx_data.
+        #[arg(long)]
+        model_dir: PathBuf,
+        /// Previous release directory to seed unchanged documents/packs from.
+        #[arg(long)]
+        base_release_dir: Option<PathBuf>,
         /// Output directory for pack files, asset blobs, manifest.json, and update.json.
         #[arg(long)]
         out_dir: PathBuf,
@@ -311,6 +334,8 @@ enum Command {
         #[arg(long)]
         profile: bool,
     },
+    /// [SS-01] Source acquisition is split into whats-new + scrape-diff
+    /// incremental, tree-crawl + snapshot-reduce full, and deduped catch-up.
     /// Fetch the ATO "What's New" feed and return the deduped doc entries
     /// as JSON. Mirrors src/ato_mcp/scraper/whats_new.py:WhatsNewFetcher.
     WhatsNew {
@@ -363,6 +388,8 @@ enum Command {
         #[arg(long)]
         out_dir: Option<PathBuf>,
     },
+    /// [SS-04] Maintainer source download defaults to 0.05s request pacing
+    /// and four link-download workers; the rate lock serializes HTTP issuance.
     /// Download deduped ATO links to local payloads/<Category>/<slug>.html
     /// + index.jsonl. Mirrors src/ato_mcp/scraper/downloader.py:LinkDownloader.
     LinkDownload {
@@ -1028,14 +1055,24 @@ fn main() -> Result<()> {
         Command::Build {
             pages_dir,
             db_path,
+            model_dir,
+            base_release_dir,
             out_dir,
             zstd_level,
             limit,
             gpu,
             profile,
-        } => build_corpus(
-            &pages_dir, &db_path, &out_dir, zstd_level, limit, gpu, profile,
-        ),
+        } => build_corpus(BuildCorpusArgs {
+            pages_dir: &pages_dir,
+            db_path: &db_path,
+            model_dir: &model_dir,
+            base_release_dir: base_release_dir.as_deref(),
+            out_dir: &out_dir,
+            zstd_level,
+            limit,
+            use_gpu: gpu,
+            profile_enabled: profile,
+        }),
         Command::WhatsNew {
             url,
             timeout_seconds,
@@ -1208,8 +1245,63 @@ fn model_path() -> Result<PathBuf> {
     Ok(live_dir()?.join("model_fp16.onnx"))
 }
 
+fn model_data_path() -> Result<PathBuf> {
+    Ok(live_dir()?.join("model_fp16.onnx_data"))
+}
+
 fn tokenizer_path() -> Result<PathBuf> {
     Ok(live_dir()?.join("tokenizer.json"))
+}
+
+fn model_marker_path() -> Result<PathBuf> {
+    Ok(live_dir()?.join(".model.sha256"))
+}
+
+#[derive(Clone, Debug)]
+struct SemanticModelPaths {
+    model: PathBuf,
+    tokenizer: PathBuf,
+}
+
+impl SemanticModelPaths {
+    fn live() -> Result<Self> {
+        let model = model_path()?;
+        let model_data = model_data_path()?;
+        let tokenizer = tokenizer_path()?;
+        for path in [&model, &model_data, &tokenizer] {
+            if !path.is_file() {
+                bail!("missing installed Granite model file at {}", path.display());
+            }
+        }
+        Ok(Self { model, tokenizer })
+    }
+
+    fn from_model_dir(model_dir: &Path) -> Result<Self> {
+        for file in EMBEDDING_MODEL_HF_FILES {
+            let path = model_dir.join(file.path);
+            validate_embedding_model_file(&path, file)?;
+        }
+        let model = model_dir.join("onnx").join("model_fp16.onnx");
+        let tokenizer = model_dir.join("tokenizer.json");
+        Ok(Self { model, tokenizer })
+    }
+}
+
+fn validate_embedding_model_file(path: &Path, file: &HfModelFile) -> Result<()> {
+    if !path.is_file() {
+        bail!("missing Granite model file at {}", path.display());
+    }
+    let size = path.metadata()?.len();
+    if size != file.size {
+        bail!(
+            "size mismatch for Granite model file {}: got {}, expected {}",
+            path.display(),
+            size,
+            file.size
+        );
+    }
+    verify_sha256_file(path, file.sha256)
+        .with_context(|| format!("verifying Granite model file {}", path.display()))
 }
 
 fn lock_file() -> Result<File> {
@@ -1236,6 +1328,8 @@ fn open_read() -> Result<Connection> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .context("opening local corpus database")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // [SL-05] Read-only handles skip WAL/synchronous mutation pragmas but
+    // still use in-memory temp storage for query work.
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     enforce_db_schema_version(&conn)?;
     Ok(conn)
@@ -1247,6 +1341,8 @@ fn open_write_at(path: &Path) -> Result<Connection> {
     }
     let conn = Connection::open(path).context("opening local corpus database for writing")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // [SL-05] Write handles enable WAL + synchronous=NORMAL and temp_store
+    // MEMORY before schema initialization or mutation.
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
@@ -1321,6 +1417,8 @@ fn init_db(conn: &Connection) -> Result<()> {
             doc_id        TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
             ord           INTEGER NOT NULL,
             anchor        TEXT,
+            -- [SL-03] Chunk bodies are zstd-compressed UTF-8 BLOBs; heading
+            -- and inline markers are part of the stored chunk text.
             text          BLOB NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id);
@@ -1355,6 +1453,8 @@ fn init_db(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_assets_doc ON document_assets(doc_id);
 
         CREATE TABLE IF NOT EXISTS doc_anchors (
+            -- [SL-10] Build-time anchors cover in-doc, sister-doc, and
+            -- historical-version navigation for get_doc_anchors.
             doc_id           TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
             ord              INTEGER NOT NULL,
             kind             TEXT NOT NULL,
@@ -1367,6 +1467,8 @@ fn init_db(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_doc_anchors_doc ON doc_anchors(doc_id);
 
         CREATE TABLE IF NOT EXISTS citations (
+            -- [SL-11] Reverse citations are derived from [doc:X] markers
+            -- and keyed by source chunk + target doc.
             source_chunk_id  INTEGER NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
             source_doc_id    TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
             target_doc_id    TEXT NOT NULL,
@@ -1380,6 +1482,8 @@ fn init_db(conn: &Connection) -> Result<()> {
         );
 
         CREATE VIRTUAL TABLE IF NOT EXISTS title_fts USING fts5(
+            -- [SL-04] FTS uses porter unicode61 with diacritic folding for
+            -- English legal text in titles/headings and chunks.
             doc_id UNINDEXED,
             title,
             headings,
@@ -2021,16 +2125,18 @@ fn ensure_vector_search_ready(conn: &Connection) -> Result<()> {
             "semantic search unavailable: installed corpus uses unsupported embedding model `{model_id}`; install a {EMBEDDING_MODEL_ID} corpus"
         );
     }
-    if !model_path()?.exists() {
+    let installed = load_installed_manifest()?.ok_or_else(|| {
+        anyhow!("semantic search unavailable: installed manifest missing; run `ato-mcp update`")
+    })?;
+    if installed.model.id != model_id {
         bail!(
-            "semantic search unavailable: model file missing at {}",
-            model_path()?.display()
+            "semantic search unavailable: installed manifest model `{}` does not match corpus metadata `{model_id}`",
+            installed.model.id
         );
     }
-    if !tokenizer_path()?.exists() {
+    if !embedding_model_installed_matches(&installed.model)? {
         bail!(
-            "semantic search unavailable: tokenizer missing at {}",
-            tokenizer_path()?.display()
+            "semantic search unavailable: installed semantic model files do not match installed_manifest.json; run `ato-mcp update`"
         );
     }
     if !table_exists(conn, "chunk_embeddings")? {
@@ -2205,8 +2311,8 @@ struct SemanticRuntime {
 }
 
 impl SemanticRuntime {
-    fn load(use_gpu: bool) -> Result<Self> {
-        let mut tokenizer = Tokenizer::from_file(tokenizer_path()?)
+    fn load(use_gpu: bool, model_paths: &SemanticModelPaths) -> Result<Self> {
+        let mut tokenizer = Tokenizer::from_file(&model_paths.tokenizer)
             .map_err(|err| anyhow!("loading tokenizer: {err}"))?;
         tokenizer
             .with_truncation(Some(TruncationParams {
@@ -2226,10 +2332,12 @@ impl SemanticRuntime {
             .with_optimization_level(optimization_level)
             .map_err(|err| anyhow!("configuring ONNX Runtime session: {err}"))?;
         if use_gpu {
+            // [EM-01] CPU is the default runtime; maintainer GPU builds
+            // require the cuda feature and fail if CUDA EP registration fails.
             builder = configure_cuda_execution_provider(builder)?;
         }
         let session = builder
-            .commit_from_file(model_path()?)
+            .commit_from_file(&model_paths.model)
             .map_err(|err| anyhow!("loading ONNX model: {err}"))?;
         let has_token_type_ids = session
             .inputs()
@@ -2333,6 +2441,8 @@ impl SemanticRuntime {
         let output = outputs
             .get("sentence_embedding")
             .unwrap_or_else(|| &outputs[0]);
+        // [EM-04] Prefer sentence_embedding when present; otherwise
+        // pooled_embeddings mean-pools 3D token outputs with the attention mask.
         let (shape, data) = output.try_extract_tensor::<f32>()?;
         let embeddings = pooled_embeddings(shape, data, &attention_mask, batch, seq_len)?;
         let embeddings = embeddings
@@ -2368,6 +2478,7 @@ fn configure_cuda_execution_provider(_builder: SessionBuilder) -> Result<Session
 // concurrently.
 struct ServerState {
     semantic_runtime: Mutex<Option<SemanticRuntime>>,
+    semantic_model_paths: Option<SemanticModelPaths>,
     update_notice: Option<UpdateAvailability>,
     use_gpu: bool,
 }
@@ -2376,6 +2487,16 @@ impl ServerState {
     fn new(use_gpu: bool) -> Self {
         Self {
             semantic_runtime: Mutex::new(None),
+            semantic_model_paths: None,
+            update_notice: None,
+            use_gpu,
+        }
+    }
+
+    fn with_model_paths(use_gpu: bool, semantic_model_paths: SemanticModelPaths) -> Self {
+        Self {
+            semantic_runtime: Mutex::new(None),
+            semantic_model_paths: Some(semantic_model_paths),
             update_notice: None,
             use_gpu,
         }
@@ -2402,7 +2523,13 @@ impl ServerState {
             .lock()
             .expect("semantic_runtime mutex");
         if guard.is_none() {
-            *guard = Some(SemanticRuntime::load(self.use_gpu)?);
+            // [SW-04] ServerState lazily loads SemanticRuntime on the first
+            // semantic query and reuses it for the process lifetime.
+            let model_paths = match &self.semantic_model_paths {
+                Some(paths) => paths.clone(),
+                None => SemanticModelPaths::live()?,
+            };
+            *guard = Some(SemanticRuntime::load(self.use_gpu, &model_paths)?);
         }
         guard
             .as_mut()
@@ -2418,7 +2545,8 @@ impl Default for ServerState {
 }
 
 fn encode_query_embedding(query: &str) -> Result<[i8; EMBEDDING_DIM]> {
-    let mut runtime = SemanticRuntime::load(false)?;
+    let model_paths = SemanticModelPaths::live()?;
+    let mut runtime = SemanticRuntime::load(false, &model_paths)?;
     runtime.encode_query(query)
 }
 
@@ -2499,6 +2627,8 @@ fn quantize_embedding(values: &[f32]) -> Result<[i8; EMBEDDING_DIM]> {
     if norm <= 1e-12 {
         return Ok([0; EMBEDDING_DIM]);
     }
+    // [EM-06] After L2 normalisation, values are clipped, scaled by 127,
+    // rounded, and stored as int8 bytes.
     let mut out = [0i8; EMBEDDING_DIM];
     for (idx, value) in values.iter().enumerate() {
         out[idx] = ((*value / norm).clamp(-1.0, 1.0) * 127.0).round() as i8;
@@ -2941,8 +3071,8 @@ const ATO_USER_AGENT: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "; +https://github.com/gunba/ato-mcp)"
 );
-// Containers ATO has used over the years. First match wins; falls back to
-// <main>/<body> if none match. Mirrors extract.py:_pick_container.
+// [IB-06] Containers ATO has used over the years. First selector match wins;
+// pick_container_html falls back to <main>/<body> if none match.
 const ATO_CONTAINER_SELECTORS: &[&str] =
     &["#LawContent", "#lawContents", "#LawContents", "#contents"];
 // Strip these wholesale before any text extraction. Mirrors extract.py:_strip_noise.
@@ -3456,6 +3586,8 @@ fn extract_leading_headings(container_html: &str) -> Vec<String> {
     out.into_iter().take(4).collect()
 }
 
+// [IB-07] Titles are composed from leading headings with adjacent prefix
+// overlap suppression, then fall back to source title/doc_id in the build path.
 fn extract_compose_title(headings: &[String]) -> Option<String> {
     let cleaned: Vec<String> = headings
         .iter()
@@ -4178,6 +4310,8 @@ fn normalise_named_anchors(html: &str) -> String {
 // shape (_Block, Chunk).
 
 #[allow(dead_code)]
+// [IB-21] Checkpoints pin CHUNKER_FORMAT_VERSION; changing output shape
+// forces an explicit fresh build instead of resuming stale chunk records.
 const CHUNKER_FORMAT_VERSION: u32 = 3;
 const EMBED_MAX_TOKENS: usize = 1024;
 
@@ -4836,6 +4970,8 @@ fn chunker_pack(blocks: Vec<ChunkBlock>, max_tokens: usize) -> Vec<Chunk> {
             }
             continue;
         }
+        // [IB-22] Project token count from accumulated raw words, not summed
+        // per-block integer token estimates, so truncation drift cannot build up.
         let projected_tokens =
             std::cmp::max(1, (((current_words + block_words) as f64) * 1.3) as usize);
         if projected_tokens > max_tokens && !current_text.is_empty() {
@@ -4929,6 +5065,8 @@ fn metadata_extract_docid_path(canonical_id: &str) -> Option<String> {
     None
 }
 
+// [IB-18] doc_id preserves the ATO docid query path verbatim; malformed or
+// missing URLs fall back to the canonical_id so every source row has a key.
 fn metadata_doc_id_for(canonical_id: &str) -> String {
     metadata_extract_docid_path(canonical_id).unwrap_or_else(|| canonical_id.to_string())
 }
@@ -5120,7 +5258,7 @@ fn rewrite_links_html(html: &str) -> String {
 
 // ----- Pack file writer (port of src/ato_mcp/indexer/pack.py) -----
 //
-// A pack is a single .bin.zst blob: many records back-to-back, each
+// [IB-09] A pack is a single .bin.zst blob: many records back-to-back, each
 //   length:uint32 (LE) | zstd(orjson(record))
 // Trailer: index_blob (zstd(json([{doc_id, offset, length}, ...]))) followed by
 //   MAGIC(6) | count:u32 | index_offset:u64 | index_len:u32
@@ -6670,7 +6808,7 @@ mod rules_tests {
 // documents + chunks + chunk_embeddings + chunks_fts + title_fts +
 // doc_anchors + definitions + citations rows, then writes pack files,
 // asset blobs, manifest.json, and update.json to --out-dir. Missing vs
-// build.py: incremental reuse, resume, parallelism.
+// build.py: release seeding, checkpoint resume, parallelism.
 
 struct PendingBuildEmbedding {
     chunk_id: i64,
@@ -6729,6 +6867,8 @@ impl BuildProfile {
         if !self.enabled {
             return;
         }
+        // [IB-19] --profile reports stage timing plus embedding batch,
+        // token, padding, and model-throughput counters for build tuning.
         let total = self.elapsed().as_secs_f64().max(0.000_001);
         eprintln!(
             "ato-mcp build profile: docs={} chunks={} html_mb={:.1} total_s={:.2} docs_per_s={:.2}",
@@ -6903,6 +7043,8 @@ fn flush_pending_build_embeddings(
                 rusqlite::params![item.chunk_id, bytes],
             )
             .context("INSERT chunk_embeddings")?;
+            // [IB-11] Pack records carry base64 raw int8 embeddings; install
+            // decode length-checks them against EMBEDDING_DIM.
             let emb_b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
             let chunk_record = pack_records
                 .get_mut(item.doc_idx)
@@ -6919,15 +7061,19 @@ fn flush_pending_build_embeddings(
     Ok(())
 }
 
-fn write_build_pack_shard(
-    out_dir: &Path,
+struct BuildPackShardContext<'a> {
+    out_dir: &'a Path,
     zstd_level: i32,
+    doc_hashes: &'a HashMap<String, String>,
+    documents: &'a mut Vec<DocRef>,
+    packs: &'a mut Vec<PackInfo>,
+    profile: &'a mut BuildProfile,
+}
+
+fn write_build_pack_shard(
     shard_idx: usize,
     pack_records: &mut Vec<(String, JsonValue)>,
-    doc_hashes: &HashMap<String, String>,
-    documents: &mut Vec<DocRef>,
-    packs: &mut Vec<PackInfo>,
-    profile: &mut BuildProfile,
+    ctx: &mut BuildPackShardContext<'_>,
 ) -> Result<()> {
     if pack_records.is_empty() {
         return Ok(());
@@ -6938,16 +7084,20 @@ fn write_build_pack_shard(
         shard_idx + 1,
         pack_records.len()
     );
-    let tmp_pack = out_dir
+    let tmp_pack = ctx
+        .out_dir
         .join("packs")
         .join(format!(".pack-{shard_idx:04}-writing.bin.zst.tmp"));
-    let pack_meta = write_pack(&tmp_pack, zstd_level, pack_records.drain(..).map(Ok))?;
+    let pack_meta = write_pack(&tmp_pack, ctx.zstd_level, pack_records.drain(..).map(Ok))?;
     let sha8 = pack_meta
         .get("sha8")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("write_pack returned no sha8"))?
         .to_string();
-    let final_pack = out_dir.join("packs").join(format!("pack-{sha8}.bin.zst"));
+    let final_pack = ctx
+        .out_dir
+        .join("packs")
+        .join(format!("pack-{sha8}.bin.zst"));
     fs::rename(&tmp_pack, &final_pack)?;
 
     let refs = pack_meta
@@ -6960,11 +7110,12 @@ fn write_build_pack_shard(
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("pack ref missing doc_id"))?
             .to_string();
-        let content_hash = doc_hashes
+        let content_hash = ctx
+            .doc_hashes
             .get(&doc_id)
             .cloned()
             .ok_or_else(|| anyhow!("missing content hash for packed doc {doc_id}"))?;
-        documents.push(DocRef {
+        ctx.documents.push(DocRef {
             doc_id,
             content_hash,
             pack_sha8: sha8.clone(),
@@ -6988,19 +7139,21 @@ fn write_build_pack_shard(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("write_pack returned no sha256"))?
         .to_string();
-    packs.push(PackInfo {
+    ctx.packs.push(PackInfo {
         sha8: sha8.clone(),
         sha256: pack_sha256,
         size: pack_size,
         url: format!("packs/pack-{sha8}.bin.zst"),
     });
-    profile.pack += started.elapsed();
+    ctx.profile.pack += started.elapsed();
     Ok(())
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct BuildCheckpoint {
+    // [IB-13] Checkpoints persist source/model/chunker gates plus committed
+    // doc refs, packs, and base-release verification state.
     schema_version: u32,
     source_index_sha256: String,
     zstd_level: i32,
@@ -7011,6 +7164,12 @@ struct BuildCheckpoint {
     chunker_format_version: u32,
     documents: Vec<DocRef>,
     packs: Vec<PackInfo>,
+    #[serde(default)]
+    base_documents: Vec<DocRef>,
+    #[serde(default)]
+    base_source_hash_by_doc_id: HashMap<String, String>,
+    #[serde(default)]
+    verified_source_doc_ids: Vec<String>,
 }
 
 fn build_checkpoint_path(out_dir: &Path) -> PathBuf {
@@ -7092,26 +7251,37 @@ fn load_build_checkpoint(
     Ok(Some(checkpoint))
 }
 
-fn save_build_checkpoint(
-    out_dir: &Path,
-    source_index_sha256: &str,
+struct SaveBuildCheckpointArgs<'a> {
+    out_dir: &'a Path,
+    source_index_sha256: &'a str,
     zstd_level: i32,
-    documents: &[DocRef],
-    packs: &[PackInfo],
-) -> Result<()> {
+    documents: &'a [DocRef],
+    packs: &'a [PackInfo],
+    base_documents: &'a [DocRef],
+    base_source_hash_by_doc_id: &'a HashMap<String, String>,
+    verified_source_doc_ids: &'a HashSet<String>,
+}
+
+fn save_build_checkpoint(args: SaveBuildCheckpointArgs<'_>) -> Result<()> {
+    let mut verified_source_doc_ids: Vec<String> =
+        args.verified_source_doc_ids.iter().cloned().collect();
+    verified_source_doc_ids.sort();
     let checkpoint = BuildCheckpoint {
         schema_version: BUILD_CHECKPOINT_SCHEMA_VERSION,
-        source_index_sha256: source_index_sha256.to_string(),
-        zstd_level,
+        source_index_sha256: args.source_index_sha256.to_string(),
+        zstd_level: args.zstd_level,
         embedding_model_id: EMBEDDING_MODEL_ID.to_string(),
         embedding_model_fingerprint: EMBEDDING_MODEL_FINGERPRINT.to_string(),
         embedding_dim: EMBEDDING_DIM,
         embedding_input_max_tokens: EMBEDDING_INPUT_MAX_TOKENS,
         chunker_format_version: CHUNKER_FORMAT_VERSION,
-        documents: documents.to_vec(),
-        packs: packs.to_vec(),
+        documents: args.documents.to_vec(),
+        packs: args.packs.to_vec(),
+        base_documents: args.base_documents.to_vec(),
+        base_source_hash_by_doc_id: args.base_source_hash_by_doc_id.clone(),
+        verified_source_doc_ids,
     };
-    let path = build_checkpoint_path(out_dir);
+    let path = build_checkpoint_path(args.out_dir);
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, serde_json::to_vec_pretty(&checkpoint)?)
         .with_context(|| format!("writing {}", tmp.display()))?;
@@ -7170,26 +7340,313 @@ fn update_pack_sha8_for_docs(conn: &Connection, docs: &[DocRef]) -> Result<()> {
     Ok(())
 }
 
-fn build_corpus(
-    pages_dir: &Path,
-    db_path: &Path,
+fn remove_build_doc(conn: &Connection, doc_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM chunks_fts WHERE rowid IN (SELECT chunk_id FROM chunks WHERE doc_id = ?1)",
+        [doc_id],
+    )?;
+    conn.execute("DELETE FROM title_fts WHERE doc_id = ?1", [doc_id])?;
+    conn.execute("DELETE FROM citations WHERE target_doc_id = ?1", [doc_id])?;
+    conn.execute("DELETE FROM documents WHERE doc_id = ?1", [doc_id])?;
+    Ok(())
+}
+
+fn copy_or_hard_link(src: &Path, dst: &Path) -> Result<()> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if dst.exists() {
+        return Ok(());
+    }
+    match fs::hard_link(src, dst) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            fs::copy(src, dst)
+                .with_context(|| format!("copying {} to {}", src.display(), dst.display()))?;
+            Ok(())
+        }
+    }
+}
+
+struct BaseReleaseSeed {
+    documents: Vec<DocRef>,
+    packs: Vec<PackInfo>,
+    by_doc_id: HashMap<String, DocRef>,
+    source_hash_by_doc_id: HashMap<String, String>,
+}
+
+struct BuildSourceFingerprint<'a> {
+    doc_id: &'a str,
+    doc_type: &'a str,
+    title: &'a str,
+    date: &'a Option<String>,
+    html: &'a str,
+    currency: &'a CurrencyInfo,
+    has_in_doc_links: bool,
+    has_related_docs: bool,
+    has_history: bool,
+    anchor_refs: &'a [AnchorRef],
+    definitions: &'a [JsonValue],
+    chunks: &'a [Chunk],
+    assets: &'a [ExtractedAsset],
+}
+
+fn source_fingerprint_hash(value: &JsonValue) -> Result<String> {
+    let mut h = Sha256::new();
+    h.update(serde_json::to_vec(value)?);
+    let digest = h.finalize();
+    let hex = digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    Ok(format!("sha256:{hex}"))
+}
+
+fn build_source_fingerprint_value(input: BuildSourceFingerprint<'_>) -> JsonValue {
+    json!({
+        "doc_id": input.doc_id,
+        "type": input.doc_type,
+        "title": input.title,
+        "date": input.date,
+        "html": input.html,
+        "withdrawn_date": &input.currency.withdrawn_date,
+        "superseded_by": &input.currency.superseded_by,
+        "replaces": &input.currency.replaces,
+        "has_in_doc_links": input.has_in_doc_links as i64,
+        "has_related_docs": input.has_related_docs as i64,
+        "has_history": input.has_history as i64,
+        "anchors": input.anchor_refs.iter().map(|r| json!({
+            "kind": &r.kind,
+            "label": &r.label,
+            "target_doc_id": &r.target_doc_id,
+            "target_pit": &r.target_pit,
+        })).collect::<Vec<_>>(),
+        "definitions": input.definitions,
+        "chunks": input.chunks.iter().map(|chunk| json!({
+            "ord": chunk.ord,
+            "anchor": &chunk.anchor,
+            "text": &chunk.text,
+        })).collect::<Vec<_>>(),
+        "assets": input.assets.iter().map(|asset| json!({
+            "asset_ref": &asset.asset_ref,
+            "source_path": &asset.source_path,
+            "relative_path": &asset.relative_path,
+            "media_type": &asset.media_type,
+            "alt": &asset.alt,
+            "title": &asset.title,
+            "sha256": &asset.sha256,
+            "size": asset.size,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn pack_record_source_fingerprint_value(record: &PackRecord) -> JsonValue {
+    json!({
+        "doc_id": &record.doc_id,
+        "type": &record.doc_type,
+        "title": &record.title,
+        "date": &record.date,
+        "html": &record.html,
+        "withdrawn_date": &record.withdrawn_date,
+        "superseded_by": &record.superseded_by,
+        "replaces": &record.replaces,
+        "has_in_doc_links": record.has_in_doc_links,
+        "has_related_docs": record.has_related_docs,
+        "has_history": record.has_history,
+        "anchors": record.anchors.iter().map(|anchor| json!({
+            "kind": &anchor.kind,
+            "label": &anchor.label,
+            "target_doc_id": &anchor.target_doc_id,
+            "target_pit": &anchor.target_pit,
+        })).collect::<Vec<_>>(),
+        "definitions": record.definitions.iter().map(|definition| json!({
+            "definition_id": &definition.definition_id,
+            "term": &definition.term,
+            "norm_term": &definition.norm_term,
+            "doc_id": &definition.doc_id,
+            "source_title": &definition.source_title,
+            "source_type": &definition.source_type,
+            "scope": &definition.scope,
+            "anchor": &definition.anchor,
+            "ord": definition.ord,
+            "body": &definition.body,
+        })).collect::<Vec<_>>(),
+        "chunks": record.chunks.iter().map(|chunk| json!({
+            "ord": chunk.ord,
+            "anchor": &chunk.anchor,
+            "text": &chunk.text,
+        })).collect::<Vec<_>>(),
+        "assets": record.assets.iter().map(|asset| json!({
+            "asset_ref": &asset.asset_ref,
+            "source_path": &asset.source_path,
+            "relative_path": &asset.relative_path,
+            "media_type": &asset.media_type,
+            "alt": &asset.alt,
+            "title": &asset.title,
+            "sha256": &asset.sha256,
+            "size": asset.size,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn pack_filename(url: &str) -> Result<String> {
+    Path::new(url)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("pack URL has no filename: {url}"))
+}
+
+fn seed_build_from_base_release(
+    base_dir: &Path,
     out_dir: &Path,
+    db_path: &Path,
+) -> Result<BaseReleaseSeed> {
+    if out_dir.exists()
+        && base_dir.exists()
+        && out_dir.canonicalize().ok() == base_dir.canonicalize().ok()
+    {
+        bail!("--base-release-dir must not point at --out-dir");
+    }
+    if db_path.exists() {
+        bail!(
+            "--base-release-dir requires an absent --db-path; remove {} before seeding",
+            db_path.display()
+        );
+    }
+    let manifest_path = base_dir.join("manifest.json");
+    let db_src = base_dir.join("ato.db");
+    if !manifest_path.exists() {
+        bail!("base release missing {}", manifest_path.display());
+    }
+    if !db_src.exists() {
+        bail!("base release missing {}", db_src.display());
+    }
+    let manifest: Manifest = serde_json::from_slice(&fs::read(&manifest_path)?)
+        .with_context(|| format!("parsing {}", manifest_path.display()))?;
+    if manifest.model.id != EMBEDDING_MODEL_ID {
+        bail!(
+            "base release uses embedding model `{}`; expected `{EMBEDDING_MODEL_ID}`",
+            manifest.model.id
+        );
+    }
+    if parse_hf_model_url(&manifest.model.url).is_some()
+        && manifest.model.sha256 != EMBEDDING_MODEL_FINGERPRINT
+    {
+        bail!("base release embedding fingerprint differs from the current pinned model");
+    }
+    let base_packs_dir = base_dir.join("packs");
+    let mut source_hash_by_doc_id = HashMap::new();
+    let pack_index: HashMap<String, PackInfo> = manifest
+        .packs
+        .iter()
+        .map(|pack| (pack.sha8.clone(), pack.clone()))
+        .collect();
+    let mut docs_by_pack: HashMap<String, Vec<&DocRef>> = HashMap::new();
+    for doc in &manifest.documents {
+        docs_by_pack
+            .entry(doc.pack_sha8.clone())
+            .or_default()
+            .push(doc);
+    }
+    for (sha8, docs) in docs_by_pack {
+        let pack = pack_index
+            .get(&sha8)
+            .ok_or_else(|| anyhow!("base manifest missing pack info for {sha8}"))?;
+        let filename = pack_filename(&pack.url)?;
+        let pack_path = base_packs_dir.join(filename);
+        let pack_bytes =
+            fs::read(&pack_path).with_context(|| format!("reading {}", pack_path.display()))?;
+        if !pack.sha256.is_empty() {
+            verify_sha256_bytes(&pack_bytes, &pack.sha256)
+                .with_context(|| format!("verifying {}", pack_path.display()))?;
+        }
+        if pack.size != 0 && pack_bytes.len() as u64 != pack.size {
+            bail!(
+                "base pack size mismatch for {}: got {}, expected {}",
+                pack_path.display(),
+                pack_bytes.len(),
+                pack.size
+            );
+        }
+        for doc in docs {
+            let record = read_record_from_pack_bytes(&pack_bytes, doc.offset, doc.length)
+                .with_context(|| format!("reading base pack record {}", doc.doc_id))?;
+            // [IB-12] Previous-release reuse is keyed by a full
+            // source-derived fingerprint, not just cleaned body text.
+            let source_hash =
+                source_fingerprint_hash(&pack_record_source_fingerprint_value(&record))
+                    .with_context(|| format!("hashing base source record {}", doc.doc_id))?;
+            source_hash_by_doc_id.insert(doc.doc_id.clone(), source_hash);
+        }
+    }
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(&db_src, db_path).with_context(|| {
+        format!(
+            "copying base DB {} to {}",
+            db_src.display(),
+            db_path.display()
+        )
+    })?;
+    let out_packs_dir = out_dir.join("packs");
+    fs::create_dir_all(&out_packs_dir)?;
+    for pack in &manifest.packs {
+        let filename = pack_filename(&pack.url)?;
+        copy_or_hard_link(
+            &base_packs_dir.join(&filename),
+            &out_packs_dir.join(&filename),
+        )?;
+    }
+    let by_doc_id = manifest
+        .documents
+        .iter()
+        .map(|doc| (doc.doc_id.clone(), doc.clone()))
+        .collect();
+    Ok(BaseReleaseSeed {
+        documents: manifest.documents,
+        packs: manifest.packs,
+        by_doc_id,
+        source_hash_by_doc_id,
+    })
+}
+
+struct BuildCorpusArgs<'a> {
+    pages_dir: &'a Path,
+    db_path: &'a Path,
+    model_dir: &'a Path,
+    base_release_dir: Option<&'a Path>,
+    out_dir: &'a Path,
     zstd_level: i32,
     limit: Option<usize>,
     use_gpu: bool,
     profile_enabled: bool,
-) -> Result<()> {
+}
+
+fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
     use std::io::BufRead as _;
 
+    let BuildCorpusArgs {
+        pages_dir,
+        db_path,
+        model_dir,
+        base_release_dir,
+        out_dir,
+        zstd_level,
+        limit,
+        use_gpu,
+        profile_enabled,
+    } = args;
+
+    // [IB-17] Maintainer builds require a local pinned Granite model
+    // checkout; hosted model metadata is owned by publish/release.
+    let semantic_model_paths = SemanticModelPaths::from_model_dir(model_dir)?;
     let index_path = pages_dir.join("index.jsonl");
     let source_index_sha256 = sha256_file(&index_path)?;
     let index_file =
         File::open(&index_path).with_context(|| format!("opening {}", index_path.display()))?;
     let reader = std::io::BufReader::new(index_file);
-
-    let conn = open_write_at(db_path)
-        .with_context(|| format!("opening sqlite at {}", db_path.display()))?;
-    init_db(&conn)?;
 
     fs::create_dir_all(out_dir)
         .with_context(|| format!("creating out_dir {}", out_dir.display()))?;
@@ -7197,6 +7654,12 @@ fn build_corpus(
     fs::create_dir_all(out_dir.join("assets"))?;
 
     let checkpoint = load_build_checkpoint(out_dir, &source_index_sha256, zstd_level)?;
+    let checkpoint_loaded = checkpoint.is_some();
+    let mut base_doc_refs: HashMap<String, DocRef> = HashMap::new();
+    let mut base_documents: Vec<DocRef> = Vec::new();
+    let mut base_source_hash_by_doc_id: HashMap<String, String> = HashMap::new();
+    let mut source_doc_ids: HashSet<String> = HashSet::new();
+    let mut base_seeded = false;
     let (mut documents, mut packs) = match checkpoint {
         Some(checkpoint) => {
             eprintln!(
@@ -7204,14 +7667,42 @@ fn build_corpus(
                 checkpoint.documents.len(),
                 checkpoint.packs.len()
             );
+            if !checkpoint.base_documents.is_empty() {
+                base_documents = checkpoint.base_documents;
+                base_doc_refs = base_documents
+                    .iter()
+                    .map(|doc| (doc.doc_id.clone(), doc.clone()))
+                    .collect();
+                base_source_hash_by_doc_id = checkpoint.base_source_hash_by_doc_id;
+                source_doc_ids = checkpoint.verified_source_doc_ids.into_iter().collect();
+                base_seeded = true;
+            }
             (checkpoint.documents, checkpoint.packs)
         }
         None => {
             fs::remove_file(out_dir.join("manifest.json")).ok();
             fs::remove_file(out_dir.join("update.json")).ok();
-            (Vec::new(), Vec::new())
+            if let Some(base_dir) = base_release_dir {
+                let seed = seed_build_from_base_release(base_dir, out_dir, db_path)?;
+                eprintln!(
+                    "ato-mcp build: seeded from base release {} ({} docs, {} packs)",
+                    base_dir.display(),
+                    seed.documents.len(),
+                    seed.packs.len()
+                );
+                base_doc_refs = seed.by_doc_id;
+                base_documents = seed.documents.clone();
+                base_source_hash_by_doc_id = seed.source_hash_by_doc_id;
+                base_seeded = true;
+                (seed.documents, seed.packs)
+            } else {
+                (Vec::new(), Vec::new())
+            }
         }
     };
+    let conn = open_write_at(db_path)
+        .with_context(|| format!("opening sqlite at {}", db_path.display()))?;
+    init_db(&conn)?;
     clean_stale_build_packs(out_dir, &packs)?;
     let committed_docs = committed_build_doc_count(&conn)?;
     let pending_docs = pending_build_doc_count(&conn)?;
@@ -7228,15 +7719,30 @@ fn build_corpus(
             build_checkpoint_path(out_dir).display()
         );
     }
-    let checkpoint_doc_ids: HashSet<String> =
-        documents.iter().map(|doc| doc.doc_id.clone()).collect();
-    let mut seen_doc_ids = checkpoint_doc_ids.clone();
+    // [IB-14] Resume skips only checkpoint-committed docs (or verified source
+    // doc_ids for a base-seeded checkpoint); PENDING rows abort above.
+    let checkpoint_doc_ids: HashSet<String> = if checkpoint_loaded && base_seeded {
+        source_doc_ids.clone()
+    } else if checkpoint_loaded {
+        documents.iter().map(|doc| doc.doc_id.clone()).collect()
+    } else {
+        HashSet::new()
+    };
 
     let mut profile = BuildProfile::new(profile_enabled);
-    let state = ServerState::new(use_gpu);
-    let mut processed: usize = seen_doc_ids.len();
+    // [IB-16] Corpus build runs as a single Rust process with adaptive
+    // embedding batches and no separate worker-pool build path.
+    let state = ServerState::with_model_paths(use_gpu, semantic_model_paths);
+    let mut processed: usize = if checkpoint_loaded && base_seeded {
+        source_doc_ids.len()
+    } else {
+        checkpoint_doc_ids.len()
+    };
     let mut skipped_no_payload: usize = 0;
     let mut skipped_duplicate_doc_ids: usize = 0;
+    let mut reused_base_docs: usize = 0;
+    let mut changed_base_docs: usize = 0;
+    let mut removed_base_docs: usize = 0;
     let mut tx = conn.unchecked_transaction()?;
 
     // Pack records collected for this build. Each record is the full doc
@@ -7272,10 +7778,17 @@ fn build_corpus(
         }
         let payload_path = pages_dir.join(payload_path_raw);
         let doc_id = metadata_doc_id_for(canonical_id);
-        if !seen_doc_ids.insert(doc_id.clone()) {
-            if !checkpoint_doc_ids.contains(&doc_id) {
-                skipped_duplicate_doc_ids += 1;
+        let checkpoint_verified = checkpoint_doc_ids.contains(&doc_id);
+        if !source_doc_ids.insert(doc_id.clone()) {
+            if checkpoint_verified {
+                processed += 1;
+                continue;
             }
+            skipped_duplicate_doc_ids += 1;
+            continue;
+        }
+        if checkpoint_verified {
+            processed += 1;
             continue;
         }
 
@@ -7370,8 +7883,70 @@ fn build_corpus(
         let has_history = anchor_refs.iter().any(|r| r.kind == "history");
         profile.references += started.elapsed();
 
-        let now = chrono::Utc::now().to_rfc3339();
+        // Definitions are source-derived and needed before the base-release
+        // reuse decision, but their DB rows are inserted after the document row.
+        let started = std::time::Instant::now();
+        let def_chunks: Vec<DefinitionChunk> = chunks
+            .iter()
+            .map(|c| DefinitionChunk {
+                ord: c.ord,
+                anchor: c.anchor.clone(),
+                text: c.text.clone(),
+            })
+            .collect();
+        let defs = extract_definitions(&doc_id, &title, &doc_type, &def_chunks);
+        let definition_records: Vec<JsonValue> = defs
+            .iter()
+            .map(|d| {
+                json!({
+                    "definition_id": d.definition_id.clone(),
+                    "term": d.term.clone(),
+                    "norm_term": d.norm_term.clone(),
+                    "doc_id": d.doc_id.clone(),
+                    "source_title": d.source_title.clone(),
+                    "source_type": d.source_type.clone(),
+                    "scope": d.scope.clone(),
+                    "anchor": d.anchor.clone(),
+                    "ord": d.ord,
+                    "body": d.body.clone(),
+                })
+            })
+            .collect();
+        profile.references += started.elapsed();
+
+        let source_hash =
+            source_fingerprint_hash(&build_source_fingerprint_value(BuildSourceFingerprint {
+                doc_id: &doc_id,
+                doc_type: &doc_type,
+                title: &title,
+                date: &derived_date,
+                html: &final_html,
+                currency: &currency,
+                has_in_doc_links,
+                has_related_docs,
+                has_history,
+                anchor_refs: &anchor_refs,
+                definitions: &definition_records,
+                chunks: &chunks,
+                assets: &assets,
+            }))?;
         let content_hash = metadata_content_hash(&cleaned.text);
+        if base_doc_refs.contains_key(&doc_id) {
+            let base_source_hash = base_source_hash_by_doc_id
+                .get(&doc_id)
+                .ok_or_else(|| anyhow!("base release missing source fingerprint for {doc_id}"))?;
+            if base_source_hash == &source_hash {
+                reused_base_docs += 1;
+                processed += 1;
+                continue;
+            }
+            remove_build_doc(&tx, &doc_id)
+                .with_context(|| format!("removing changed base doc {doc_id}"))?;
+            documents.retain(|doc| doc.doc_id != doc_id);
+            changed_base_docs += 1;
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
         doc_hashes.insert(doc_id.clone(), content_hash.clone());
 
         // Pack sha8 placeholder; finalised after all docs processed.
@@ -7503,34 +8078,6 @@ fn build_corpus(
 
         // Definitions.
         let started = std::time::Instant::now();
-        let def_chunks: Vec<DefinitionChunk> = chunks
-            .iter()
-            .map(|c| DefinitionChunk {
-                ord: c.ord,
-                anchor: c.anchor.clone(),
-                text: c.text.clone(),
-            })
-            .collect();
-        let defs = extract_definitions(&doc_id, &title, &doc_type, &def_chunks);
-        let definition_records: Vec<JsonValue> = defs
-            .iter()
-            .map(|d| {
-                json!({
-                    "definition_id": d.definition_id.clone(),
-                    "term": d.term.clone(),
-                    "norm_term": d.norm_term.clone(),
-                    "doc_id": d.doc_id.clone(),
-                    "source_title": d.source_title.clone(),
-                    "source_type": d.source_type.clone(),
-                    "scope": d.scope.clone(),
-                    "anchor": d.anchor.clone(),
-                    "ord": d.ord,
-                    "body": d.body.clone(),
-                })
-            })
-            .collect();
-        profile.references += started.elapsed();
-        let started = std::time::Instant::now();
         for d in &defs {
             tx.execute(
                 "INSERT OR REPLACE INTO definitions
@@ -7633,25 +8180,30 @@ fn build_corpus(
             )?;
             let first_new_doc = documents.len();
             write_build_pack_shard(
-                out_dir,
-                zstd_level,
                 pack_shard_idx,
                 &mut pack_records,
-                &doc_hashes,
-                &mut documents,
-                &mut packs,
-                &mut profile,
+                &mut BuildPackShardContext {
+                    out_dir,
+                    zstd_level,
+                    doc_hashes: &doc_hashes,
+                    documents: &mut documents,
+                    packs: &mut packs,
+                    profile: &mut profile,
+                },
             )?;
             let started = std::time::Instant::now();
             update_pack_sha8_for_docs(&tx, &documents[first_new_doc..])?;
             tx.commit()?;
-            save_build_checkpoint(
+            save_build_checkpoint(SaveBuildCheckpointArgs {
                 out_dir,
-                &source_index_sha256,
+                source_index_sha256: &source_index_sha256,
                 zstd_level,
-                &documents,
-                &packs,
-            )?;
+                documents: &documents,
+                packs: &packs,
+                base_documents: &base_documents,
+                base_source_hash_by_doc_id: &base_source_hash_by_doc_id,
+                verified_source_doc_ids: &source_doc_ids,
+            })?;
             profile.checkpoint += started.elapsed();
             doc_hashes.clear();
             tx = conn.unchecked_transaction()?;
@@ -7665,6 +8217,24 @@ fn build_corpus(
         }
     }
 
+    if base_seeded {
+        let removed_doc_ids: Vec<String> = documents
+            .iter()
+            .filter(|doc| {
+                base_doc_refs.contains_key(&doc.doc_id) && !source_doc_ids.contains(&doc.doc_id)
+            })
+            .map(|doc| doc.doc_id.clone())
+            .collect();
+        for doc_id in &removed_doc_ids {
+            remove_build_doc(&tx, doc_id)
+                .with_context(|| format!("removing doc absent from source index {doc_id}"))?;
+        }
+        removed_base_docs = removed_doc_ids.len();
+        if removed_base_docs > 0 {
+            documents.retain(|doc| !removed_doc_ids.contains(&doc.doc_id));
+        }
+    }
+
     flush_pending_build_embeddings(
         &state,
         &tx,
@@ -7674,26 +8244,35 @@ fn build_corpus(
     )?;
     let first_new_doc = documents.len();
     write_build_pack_shard(
-        out_dir,
-        zstd_level,
         pack_shard_idx,
         &mut pack_records,
-        &doc_hashes,
-        &mut documents,
-        &mut packs,
-        &mut profile,
+        &mut BuildPackShardContext {
+            out_dir,
+            zstd_level,
+            doc_hashes: &doc_hashes,
+            documents: &mut documents,
+            packs: &mut packs,
+            profile: &mut profile,
+        },
     )?;
     let started = std::time::Instant::now();
     update_pack_sha8_for_docs(&tx, &documents[first_new_doc..])?;
     tx.commit()?;
-    if documents.len() > first_new_doc {
-        save_build_checkpoint(
+    let used_pack_sha8: HashSet<String> =
+        documents.iter().map(|doc| doc.pack_sha8.clone()).collect();
+    packs.retain(|pack| used_pack_sha8.contains(&pack.sha8));
+    clean_stale_build_packs(out_dir, &packs)?;
+    if documents.len() > first_new_doc || base_seeded || removed_base_docs > 0 {
+        save_build_checkpoint(SaveBuildCheckpointArgs {
             out_dir,
-            &source_index_sha256,
+            source_index_sha256: &source_index_sha256,
             zstd_level,
-            &documents,
-            &packs,
-        )?;
+            documents: &documents,
+            packs: &packs,
+            base_documents: &base_documents,
+            base_source_hash_by_doc_id: &base_source_hash_by_doc_id,
+            verified_source_doc_ids: &source_doc_ids,
+        })?;
     }
     profile.checkpoint += started.elapsed();
     if skipped_no_payload > 0 {
@@ -7703,6 +8282,15 @@ fn build_corpus(
         eprintln!(
             "ato-mcp build: skipped {skipped_duplicate_doc_ids} duplicate doc_id index records"
         );
+    }
+    if reused_base_docs > 0 {
+        eprintln!("ato-mcp build: reused {reused_base_docs} unchanged docs from base release");
+    }
+    if changed_base_docs > 0 {
+        eprintln!("ato-mcp build: rebuilt {changed_base_docs} changed docs from base release");
+    }
+    if removed_base_docs > 0 {
+        eprintln!("ato-mcp build: removed {removed_base_docs} base docs absent from source index");
     }
 
     let started = std::time::Instant::now();
@@ -7727,6 +8315,8 @@ fn build_corpus(
     set_meta(&final_tx, "embedding_model_id", &manifest.model.id)?;
     set_meta(&final_tx, "last_update_at", &manifest.created_at)?;
     eprintln!("ato-mcp build: deriving citations…");
+    // [IB-20] Build finalisation derives citations from stored [doc:X]
+    // markers before manifest/update metadata is written.
     derive_citations(&final_tx)?;
     verify_semantic_install(&final_tx, &manifest)?;
     final_tx.commit()?;
@@ -9181,7 +9771,7 @@ const EMBEDDING_MODEL_HF_FILES: &[HfModelFile] = &[
     },
 ];
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default)]
 struct UpdateStats {
     added: usize,
     changed: usize,
@@ -9234,6 +9824,7 @@ fn enforce_manifest_compatibility(manifest: &Manifest) -> Result<()> {
             );
         }
     }
+    validate_manifest_model_source(&manifest.model)?;
     Ok(())
 }
 
@@ -9275,22 +9866,243 @@ fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
     let new_manifest: Manifest = serde_json::from_slice(&manifest_bytes)?;
     enforce_manifest_compatibility(&new_manifest)?;
 
-    ensure_model(&new_manifest, &manifest_context, &staging)?;
-
     // Cheap stats-only diff for the human-readable "+a ~c -r" CLI line.
     // No code path branches on the result — the rebuild always replaces
     // the live DB wholesale.
     let old_manifest = load_installed_manifest()?;
     let (added, changed, removed) = diff_manifests(old_manifest.as_ref(), &new_manifest);
-
-    rebuild_live_db_from_manifest(
+    let update_root = staging.join("update-apply");
+    if update_root.exists() {
+        fs::remove_dir_all(&update_root)?;
+    }
+    fs::create_dir_all(&update_root)?;
+    let staged_model = stage_model(
+        &new_manifest,
+        &manifest_context,
+        &update_root.join("model-stage"),
+    )?;
+    let staged_corpus = stage_live_db_from_manifest_at(
         &new_manifest,
         &manifest_context,
         manifest_bytes.len() as u64,
         added.len(),
         changed.len(),
         removed.len(),
-    )
+        &update_root.join("corpus-rebuild"),
+    )?;
+    let stats = staged_corpus.stats;
+    promote_staged_update(staged_model.as_ref(), staged_corpus, &new_manifest)?;
+    let _ = fs::remove_dir_all(&update_root);
+    Ok(stats)
+}
+
+#[derive(Debug)]
+struct StagedModel {
+    dir: PathBuf,
+    marker_value: String,
+}
+
+struct ModelPromotionGuard {
+    backup_dir: PathBuf,
+    marker_value: String,
+    active: bool,
+}
+
+impl ModelPromotionGuard {
+    fn write_marker(&self) -> Result<()> {
+        fs::write(model_marker_path()?, &self.marker_value)?;
+        Ok(())
+    }
+
+    fn commit(mut self) {
+        self.active = false;
+        let _ = fs::remove_dir_all(&self.backup_dir);
+    }
+}
+
+impl Drop for ModelPromotionGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = restore_model_backup(&self.backup_dir);
+        }
+    }
+}
+
+struct PathPromotionGuard {
+    live_path: PathBuf,
+    backup_path: PathBuf,
+    had_live: bool,
+    active: bool,
+}
+
+impl PathPromotionGuard {
+    fn backup(live_path: PathBuf, backup_path: PathBuf) -> Result<Self> {
+        if let Some(parent) = backup_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        remove_path_if_exists(&backup_path)?;
+        let had_live = live_path.exists();
+        if had_live {
+            fs::rename(&live_path, &backup_path).with_context(|| {
+                format!(
+                    "backing up {} to {}",
+                    live_path.display(),
+                    backup_path.display()
+                )
+            })?;
+        }
+        Ok(Self {
+            live_path,
+            backup_path,
+            had_live,
+            active: true,
+        })
+    }
+
+    fn commit(mut self) {
+        self.active = false;
+        let _ = remove_path_if_exists(&self.backup_path);
+    }
+
+    fn backup_path(&self) -> &Path {
+        &self.backup_path
+    }
+}
+
+impl Drop for PathPromotionGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let _ = remove_path_if_exists(&self.live_path);
+        if self.had_live && self.backup_path.exists() {
+            let _ = fs::rename(&self.backup_path, &self.live_path);
+        }
+    }
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if meta.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+struct StagedCorpusUpdate {
+    staging_root: PathBuf,
+    staged_db: PathBuf,
+    staged_asset_root: PathBuf,
+    stats: UpdateStats,
+}
+
+fn promote_staged_update(
+    staged_model: Option<&StagedModel>,
+    staged_corpus: StagedCorpusUpdate,
+    manifest: &Manifest,
+) -> Result<()> {
+    let model_guard = match staged_model {
+        Some(model) => Some(promote_staged_model_files(
+            model,
+            &staged_corpus.staging_root.join("model-backup"),
+        )?),
+        None => None,
+    };
+    let db_guard = promote_live_db(
+        &staged_corpus.staged_db,
+        &staged_corpus.staging_root.join("ato.db.backup"),
+    )?;
+    let assets_guard = promote_live_assets(
+        &staged_corpus.staged_asset_root,
+        &staged_corpus.staging_root.join("assets.backup"),
+    )?;
+    let manifest_guard = promote_installed_manifest(
+        manifest,
+        &staged_corpus
+            .staging_root
+            .join("installed_manifest.json.backup"),
+    )?;
+    if let Some(guard) = model_guard.as_ref() {
+        guard.write_marker()?;
+    }
+    persist_doctor_db_backup(db_guard.backup_path())?;
+    if let Some(guard) = model_guard {
+        guard.commit();
+    }
+    manifest_guard.commit();
+    assets_guard.commit();
+    db_guard.commit();
+    let _ = fs::remove_dir_all(&staged_corpus.staging_root);
+    Ok(())
+}
+
+fn live_model_file_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = EMBEDDING_MODEL_HF_FILES
+        .iter()
+        .map(|file| file.output_name)
+        .collect();
+    names.push(".model.sha256");
+    names
+}
+
+fn backup_live_model_files(backup_dir: &Path) -> Result<()> {
+    if backup_dir.exists() {
+        fs::remove_dir_all(backup_dir)?;
+    }
+    fs::create_dir_all(backup_dir)?;
+    let live = live_dir()?;
+    for name in live_model_file_names() {
+        let src = live.join(name);
+        if src.exists() {
+            fs::copy(&src, backup_dir.join(name))
+                .with_context(|| format!("backing up {}", src.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn restore_model_backup(backup_dir: &Path) -> Result<()> {
+    let live = live_dir()?;
+    for name in live_model_file_names() {
+        let dest = live.join(name);
+        if dest.exists() {
+            fs::remove_file(&dest).with_context(|| format!("removing {}", dest.display()))?;
+        }
+        let backup = backup_dir.join(name);
+        if backup.exists() {
+            fs::copy(&backup, &dest).with_context(|| format!("restoring {}", dest.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn promote_staged_model_files(
+    staged: &StagedModel,
+    backup_dir: &Path,
+) -> Result<ModelPromotionGuard> {
+    backup_live_model_files(backup_dir)?;
+    let live = live_dir()?;
+    for file in EMBEDDING_MODEL_HF_FILES {
+        let src = staged.dir.join(file.output_name);
+        if !src.is_file() {
+            bail!("staged model missing {}", src.display());
+        }
+        let dest = live.join(file.output_name);
+        if dest.exists() {
+            fs::remove_file(&dest)?;
+        }
+        fs::copy(&src, &dest)
+            .with_context(|| format!("promoting model file {}", dest.display()))?;
+    }
+    Ok(ModelPromotionGuard {
+        backup_dir: backup_dir.to_path_buf(),
+        marker_value: staged.marker_value.clone(),
+        active: true,
+    })
 }
 
 fn live_db_requires_rebuild(path: &Path) -> Result<bool> {
@@ -9308,19 +10120,19 @@ fn live_db_requires_rebuild(path: &Path) -> Result<bool> {
     Ok(parsed != SUPPORTED_SCHEMA_VERSION)
 }
 
-fn rebuild_live_db_from_manifest(
+fn stage_live_db_from_manifest_at(
     manifest: &Manifest,
     context: &UrlContext,
     manifest_bytes: u64,
     added: usize,
     changed: usize,
     removed: usize,
-) -> Result<UpdateStats> {
-    let staging_root = staging_dir()?.join("corpus-rebuild");
+    staging_root: &Path,
+) -> Result<StagedCorpusUpdate> {
     if staging_root.exists() {
-        fs::remove_dir_all(&staging_root)?;
+        fs::remove_dir_all(staging_root)?;
     }
-    fs::create_dir_all(&staging_root)?;
+    fs::create_dir_all(staging_root)?;
     let staged_db = staging_root.join("ato.db");
     let staged_asset_root = staging_root.join("live");
     let conn = open_write_at(&staged_db)?;
@@ -9355,56 +10167,104 @@ fn rebuild_live_db_from_manifest(
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     drop(conn);
 
-    replace_live_db(&staged_db)?;
-    replace_live_assets(&staged_asset_root)?;
-    let manifest_json = serde_json::to_vec_pretty(manifest)?;
-    fs::write(installed_manifest_path()?, manifest_json)?;
-    let _ = fs::remove_dir_all(&staging_root);
-
-    Ok(UpdateStats {
-        added,
-        changed,
-        removed,
-        bytes_downloaded,
+    Ok(StagedCorpusUpdate {
+        staging_root: staging_root.to_path_buf(),
+        staged_db,
+        staged_asset_root,
+        stats: UpdateStats {
+            added,
+            changed,
+            removed,
+            bytes_downloaded,
+        },
     })
 }
 
-fn replace_live_db(staged_db: &Path) -> Result<()> {
+fn promote_live_db(staged_db: &Path, backup: &Path) -> Result<PathPromotionGuard> {
     let live = live_dir()?;
     let db = db_path()?;
-    let backup = backups_dir()?.join("ato.db.prev");
-    if db.exists() {
-        fs::copy(&db, &backup)?;
-    }
     for suffix in ["-wal", "-shm"] {
         let path = live.join(format!("ato.db{suffix}"));
         if path.exists() {
             fs::remove_file(path)?;
         }
     }
-    if db.exists() {
-        fs::remove_file(&db)?;
+    let guard = PathPromotionGuard::backup(db.clone(), backup.to_path_buf())?;
+    fs::rename(staged_db, &db)
+        .with_context(|| format!("promoting staged DB to {}", db.display()))?;
+    Ok(guard)
+}
+
+fn persist_doctor_db_backup(transient_backup: &Path) -> Result<()> {
+    if !transient_backup.exists() {
+        return Ok(());
     }
-    fs::rename(staged_db, &db).inspect_err(|_err| {
-        if backup.exists() {
-            let _ = fs::copy(&backup, &db);
-        }
+    let persistent_backup = backups_dir()?.join("ato.db.prev");
+    let tmp = persistent_backup.with_extension("prev.tmp");
+    let old = persistent_backup.with_extension("prev.old");
+    remove_path_if_exists(&tmp)?;
+    remove_path_if_exists(&old)?;
+    fs::copy(transient_backup, &tmp).with_context(|| {
+        format!(
+            "writing persistent rollback backup {}",
+            persistent_backup.display()
+        )
     })?;
+    replace_file_cross_platform(&tmp, &persistent_backup, &old)?;
     Ok(())
 }
 
-fn replace_live_assets(staged_asset_root: &Path) -> Result<()> {
-    let live_assets = live_dir()?.join("assets");
-    if live_assets.exists() {
-        fs::remove_dir_all(&live_assets)?;
+fn replace_file_cross_platform(src: &Path, dest: &Path, old: &Path) -> Result<()> {
+    if dest.exists() {
+        fs::rename(dest, old)
+            .with_context(|| format!("moving {} to {}", dest.display(), old.display()))?;
     }
+    if let Err(err) = fs::rename(src, dest) {
+        if old.exists() {
+            let _ = fs::rename(old, dest);
+        }
+        return Err(err)
+            .with_context(|| format!("renaming {} to {}", src.display(), dest.display()));
+    }
+    let _ = remove_path_if_exists(old);
+    Ok(())
+}
+
+fn promote_live_assets(staged_asset_root: &Path, backup: &Path) -> Result<PathPromotionGuard> {
+    let live_assets = live_dir()?.join("assets");
+    let guard = PathPromotionGuard::backup(live_assets.clone(), backup.to_path_buf())?;
     let staged_assets = staged_asset_root.join("assets");
     if staged_assets.exists() {
-        fs::rename(staged_assets, &live_assets)?;
+        if !staged_assets.is_dir() {
+            bail!(
+                "staged assets path is not a directory: {}",
+                staged_assets.display()
+            );
+        }
+        fs::rename(staged_assets, &live_assets)
+            .with_context(|| format!("promoting assets to {}", live_assets.display()))?;
     } else {
         fs::create_dir_all(&live_assets)?;
     }
-    Ok(())
+    if !live_assets.is_dir() {
+        bail!(
+            "promoted assets path is not a directory: {}",
+            live_assets.display()
+        );
+    }
+    Ok(guard)
+}
+
+fn promote_installed_manifest(manifest: &Manifest, backup: &Path) -> Result<PathPromotionGuard> {
+    let path = installed_manifest_path()?;
+    let guard = PathPromotionGuard::backup(path.clone(), backup.to_path_buf())?;
+    let tmp = path.with_extension("json.tmp");
+    remove_path_if_exists(&tmp)?;
+    fs::write(&tmp, serde_json::to_vec_pretty(manifest)?)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, &path)
+        .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
+    Ok(guard)
 }
 
 fn insert_docs_from_packs(
@@ -9807,8 +10667,9 @@ fn tree_crawl(
         .timeout(Duration::from_secs_f64(timeout_seconds))
         .build()?;
 
-    // Rate limiter: enforce request_interval_seconds between any two outgoing
-    // calls. Tree crawler can issue thousands per run.
+    // [SS-03] Maintainer ATO API pacing is serialized through this mutex so
+    // tree-crawl/link-download do not issue simultaneous outgoing requests.
+    // Tree crawler can issue thousands per run.
     let last_request = std::sync::Mutex::new(
         std::time::Instant::now()
             .checked_sub(Duration::from_secs(60))
@@ -10014,6 +10875,8 @@ fn snapshot_reduce(nodes_path: &Path, output_dir: Option<&Path>) -> Result<()> {
 
     // node uid → (parent_uid, data_url)
     let mut node_meta: HashMap<u64, (Option<u64>, Option<String>)> = HashMap::new();
+    // [SS-07] Reduction dedupes canonical IDs, chooses a representative
+    // source path, and carries excluded-title descendants into skip output.
     let mut folder_records: HashMap<String, FolderRecord> = HashMap::new();
     let mut folder_children: HashMap<Option<String>, HashSet<String>> = HashMap::new();
     let mut canonical_entries: HashMap<String, CanonicalEntry> = HashMap::new();
@@ -10324,6 +11187,8 @@ fn slug_for(text: &str, fallback: &str) -> String {
 fn build_payload_path(out_dir: &Path, link: &JsonValue) -> PathBuf {
     let payload_dir = out_dir.join("payloads");
     let mut dir = payload_dir;
+    // [SS-06] Catch-up/download payload paths inherit representative_path
+    // from reduced source links.
     if let Some(seg) = link.get("representative_path").and_then(|v| v.as_array()) {
         for s in seg.iter().filter_map(|v| v.as_str()) {
             dir = dir.join(slug_for(s, "node"));
@@ -10418,6 +11283,8 @@ fn link_download(args: LinkDownloadArgs) -> Result<()> {
     ));
     let request_delay = args.request_delay_seconds;
 
+    // [SS-08] Link-download fans out over worker threads with a shared queue,
+    // shared client, shared index writer, and shared request-delay lock.
     let work_queue: Arc<Mutex<Vec<JsonValue>>> = Arc::new(Mutex::new(links));
     let stats_completed = Arc::new(std::sync::atomic::AtomicUsize::new(initial_completed));
     let stats_errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -11009,7 +11876,7 @@ fn bundle_localize_manifest(
 // ----- publish-release (port of src/ato_mcp/indexer/release.py:publish) -----
 
 const EMBEDDING_MODEL_HF_URL: &str =
-    "hf://onnx-community/granite-embedding-small-english-r2-ONNX@main";
+    "hf://onnx-community/granite-embedding-small-english-r2-ONNX@1dc7835ba0cb9c76a3618d0bf0c427c97671b3c8";
 const EMBEDDING_MODEL_HF_SIZE: u64 = 99_732_286;
 
 struct PublishReleaseArgs {
@@ -11037,8 +11904,105 @@ fn is_github_url(url: &str) -> bool {
     url.starts_with("https://github.com/") || url.starts_with("http://github.com/")
 }
 
-fn is_hf_url(url: &str) -> bool {
+fn is_hf_http_url(url: &str) -> bool {
     url.starts_with("https://huggingface.co/") || url.starts_with("http://huggingface.co/")
+}
+
+fn is_hf_scheme_url(url: &str) -> bool {
+    url.starts_with("hf://")
+}
+
+fn is_hf_model_source(url: &str) -> bool {
+    parse_hf_model_url(url).is_some()
+}
+
+fn non_empty_model_sha(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn resolve_publish_model_info(
+    current: &ModelInfo,
+    model_url: Option<&str>,
+    model_sha256: Option<&str>,
+    model_size: Option<u64>,
+) -> Result<ModelInfo> {
+    let mut resolved = current.clone();
+    if current.id != EMBEDDING_MODEL_ID {
+        return Ok(resolved);
+    }
+
+    let explicit_model_url = model_url.is_some();
+    let mut resolved_url = model_url.unwrap_or(&current.url).to_string();
+    let requested_sha = model_sha256.and_then(non_empty_model_sha);
+    let requested_size = model_size.filter(|n| *n > 0);
+    let manifest_sha = non_empty_model_sha(&current.sha256);
+    let manifest_size = (current.size > 0).then_some(current.size);
+
+    let needs_default = is_placeholder_model_url(&resolved_url)
+        || (is_github_url(&resolved_url) && !explicit_model_url);
+
+    let (sha256, size) = if needs_default {
+        resolved_url = EMBEDDING_MODEL_HF_URL.to_string();
+        (
+            EMBEDDING_MODEL_FINGERPRINT.to_string(),
+            EMBEDDING_MODEL_HF_SIZE,
+        )
+    } else if is_hf_model_source(&resolved_url) {
+        if requested_sha
+            .as_deref()
+            .is_some_and(|sha| sha != EMBEDDING_MODEL_FINGERPRINT)
+        {
+            bail!("Hugging Face semantic model sha256 must match the pinned Granite fingerprint");
+        }
+        if requested_size.is_some_and(|size| size != EMBEDDING_MODEL_HF_SIZE) {
+            bail!("Hugging Face semantic model size must match the pinned Granite file set");
+        }
+        if manifest_sha
+            .as_deref()
+            .is_some_and(|sha| sha != EMBEDDING_MODEL_FINGERPRINT)
+        {
+            bail!("Hugging Face semantic model sha256 must match the pinned Granite fingerprint");
+        }
+        if manifest_size.is_some_and(|size| size != EMBEDDING_MODEL_HF_SIZE) {
+            bail!("Hugging Face semantic model size must match the pinned Granite file set");
+        }
+        (
+            EMBEDDING_MODEL_FINGERPRINT.to_string(),
+            EMBEDDING_MODEL_HF_SIZE,
+        )
+    } else {
+        if is_hf_scheme_url(&resolved_url) {
+            bail!("Hugging Face semantic model sources must use hf://repo@revision with an explicit revision");
+        }
+        if is_hf_http_url(&resolved_url) {
+            bail!("Hugging Face semantic model sources must use hf://repo@revision, not HTTPS model URLs");
+        }
+        if is_github_url(&resolved_url) {
+            bail!("semantic model bundles must not be hosted on GitHub");
+        }
+        if explicit_model_url && (requested_sha.is_none() || requested_size.is_none()) {
+            bail!(
+                "non-Hugging Face semantic model mirrors require --model-sha256 and --model-size"
+            );
+        }
+        (
+            requested_sha.or(manifest_sha).unwrap_or_default(),
+            requested_size.or(manifest_size).unwrap_or(0),
+        )
+    };
+
+    if sha256.is_empty() || size == 0 {
+        bail!("semantic model releases require model sha256 and size");
+    }
+    resolved.sha256 = sha256;
+    resolved.size = size;
+    resolved.url = resolved_url;
+    Ok(resolved)
 }
 
 fn publish_release(args: PublishReleaseArgs) -> Result<()> {
@@ -11075,53 +12039,12 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
     let mut manifest: Manifest = serde_json::from_str(&raw)
         .with_context(|| format!("parsing {}", manifest_path.display()))?;
 
-    if manifest.model.id == EMBEDDING_MODEL_ID {
-        let explicit_model_url = args.model_url.is_some();
-        let mut model_url = args
-            .model_url
-            .clone()
-            .unwrap_or_else(|| manifest.model.url.clone());
-
-        let needs_default = is_placeholder_model_url(&model_url)
-            || (is_github_url(&model_url) && !explicit_model_url);
-
-        let (sha256, size) = if needs_default {
-            model_url = EMBEDDING_MODEL_HF_URL.to_string();
-            (
-                EMBEDDING_MODEL_FINGERPRINT.to_string(),
-                EMBEDDING_MODEL_HF_SIZE,
-            )
-        } else if is_hf_url(&model_url) {
-            (
-                args.model_sha256
-                    .clone()
-                    .or_else(|| Some(manifest.model.sha256.clone()))
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| EMBEDDING_MODEL_FINGERPRINT.to_string()),
-                args.model_size
-                    .or(Some(manifest.model.size))
-                    .filter(|n| *n > 0)
-                    .unwrap_or(EMBEDDING_MODEL_HF_SIZE),
-            )
-        } else {
-            if is_github_url(&model_url) {
-                bail!("semantic model bundles must not be hosted on GitHub");
-            }
-            let sha = args
-                .model_sha256
-                .clone()
-                .unwrap_or_else(|| manifest.model.sha256.clone());
-            let sz = args.model_size.unwrap_or(manifest.model.size);
-            (sha, sz)
-        };
-
-        if sha256.is_empty() || size == 0 {
-            bail!("semantic model releases require model sha256 and size");
-        }
-        manifest.model.sha256 = sha256;
-        manifest.model.size = size;
-        manifest.model.url = model_url;
-    }
+    manifest.model = resolve_publish_model_info(
+        &manifest.model,
+        args.model_url.as_deref(),
+        args.model_sha256.as_deref(),
+        args.model_size,
+    )?;
 
     // Rewrite packs[].url in-place to GitHub release URLs.
     for pack in &mut manifest.packs {
@@ -11153,6 +12076,8 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
     let summary_path = args.out_dir.join("update.json");
     fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?)?;
 
+    // [SL-07] Optional release signing shells out to the maintainer minisign
+    // CLI and uploads the generated manifest.json.minisig artifact.
     // Sign manifest if --sign-key provided.
     let mut artifacts: Vec<PathBuf> = vec![manifest_path.clone(), summary_path.clone()];
     artifacts.extend(pack_files.iter().cloned());
@@ -11236,7 +12161,7 @@ fn model_info_matches(left: &ModelInfo, right: &ModelInfo) -> bool {
 }
 
 fn embedding_model_marker_value(info: &ModelInfo) -> String {
-    if info.sha256.is_empty() && parse_hf_model_url(&info.url).is_some() {
+    if parse_hf_model_url(&info.url).is_some() {
         EMBEDDING_MODEL_FINGERPRINT.to_string()
     } else {
         info.sha256.clone()
@@ -11250,6 +12175,7 @@ fn embedding_model_installed_matches(info: &ModelInfo) -> Result<bool> {
     let marker_value = embedding_model_marker_value(info);
     let marker = live_dir()?.join(".model.sha256");
     Ok(model_path()?.exists()
+        && model_data_path()?.exists()
         && tokenizer_path()?.exists()
         && marker.exists()
         && fs::read_to_string(marker)?.trim() == marker_value)
@@ -11260,6 +12186,8 @@ fn embedding_model_installed_matches(info: &ModelInfo) -> Result<bool> {
 /// rebuilds the live DB wholesale; this counter exists only to render the
 /// "+a ~c -r" CLI summary printed by `ato-mcp update`. No code path
 /// branches on the result.
+/// [SL-08] Equality compares content_hash, pack_sha8, offset, and length;
+/// the result is cosmetic update-summary telemetry, not delta-install logic.
 fn diff_manifests(
     old: Option<&Manifest>,
     new: &Manifest,
@@ -11368,6 +12296,9 @@ fn fetch_bytes(url_or_path: &str, context: &UrlContext) -> Result<Vec<u8>> {
                 }
             }
         }
+        if !is_http_url(url_or_path) {
+            bail!("release asset not found: {url_or_path}");
+        }
     }
     let client = http_client()?;
     let mut resp = client.get(url_or_path).send()?.error_for_status().with_context(|| {
@@ -11391,10 +12322,17 @@ fn fetch_to_file(url_or_path: &str, context: &UrlContext, dest: &Path) -> Result
                 }
             }
         }
+        if !is_http_url(url_or_path) {
+            bail!("release asset not found: {url_or_path}");
+        }
         fetch_http_to_file(url_or_path, dest)
     } else {
         fetch_http_to_file(url_or_path, dest)
     }
+}
+
+fn is_http_url(value: &str) -> bool {
+    value.starts_with("http://") || value.starts_with("https://")
 }
 
 fn fetch_http_to_file(url: &str, dest: &Path) -> Result<u64> {
@@ -11408,9 +12346,38 @@ fn fetch_http_to_file(url: &str, dest: &Path) -> Result<u64> {
     Ok(resp.copy_to(&mut file)?)
 }
 
+fn validate_manifest_model_source(model: &ModelInfo) -> Result<()> {
+    if model.id != EMBEDDING_MODEL_ID {
+        return Ok(());
+    }
+    if parse_hf_model_url(&model.url).is_some() {
+        if model.sha256 != EMBEDDING_MODEL_FINGERPRINT {
+            bail!("Hugging Face semantic model sha256 must match the pinned Granite fingerprint");
+        }
+        if model.size != EMBEDDING_MODEL_HF_SIZE {
+            bail!("Hugging Face semantic model size must match the pinned Granite file set");
+        }
+        return Ok(());
+    }
+    if is_hf_scheme_url(&model.url) {
+        bail!(
+            "Hugging Face semantic model sources must use hf://repo@revision with an explicit revision"
+        );
+    }
+    if model.url.starts_with("https://huggingface.co/")
+        || model.url.starts_with("http://huggingface.co/")
+    {
+        bail!("Hugging Face semantic model sources must use hf://repo@revision, not HTTPS URLs");
+    }
+    if model.sha256.trim().is_empty() || model.size == 0 {
+        bail!("non-Hugging Face semantic model sources require sha256 and positive size");
+    }
+    Ok(())
+}
+
 fn parse_hf_model_url(value: &str) -> Option<(&str, &str)> {
     let spec = value.strip_prefix("hf://")?;
-    let (repo, revision) = spec.split_once('@').unwrap_or((spec, "main"));
+    let (repo, revision) = spec.split_once('@')?;
     if repo.is_empty() || revision.is_empty() {
         None
     } else {
@@ -11458,42 +12425,60 @@ fn verify_sha256_file(path: &Path, expected: &str) -> Result<()> {
     Ok(())
 }
 
-fn ensure_model(manifest: &Manifest, context: &UrlContext, staging: &Path) -> Result<()> {
+fn stage_model(
+    manifest: &Manifest,
+    context: &UrlContext,
+    staging: &Path,
+) -> Result<Option<StagedModel>> {
     if manifest.model.id != EMBEDDING_MODEL_ID {
         bail!(
             "semantic search requires a {EMBEDDING_MODEL_ID} model bundle; manifest uses `{}`",
             manifest.model.id,
         );
     }
+    validate_manifest_model_source(&manifest.model)?;
     let live_model = model_path()?;
+    let live_model_data = model_data_path()?;
     let tokenizer = tokenizer_path()?;
     let marker = live_dir()?.join(".model.sha256");
-    let marker_value =
-        if manifest.model.sha256.is_empty() && parse_hf_model_url(&manifest.model.url).is_some() {
-            EMBEDDING_MODEL_FINGERPRINT
-        } else {
-            manifest.model.sha256.as_str()
-        };
+    let marker_value = embedding_model_marker_value(&manifest.model);
     if live_model.exists()
+        && live_model_data.exists()
         && tokenizer.exists()
         && marker.exists()
         && fs::read_to_string(&marker)?.trim() == marker_value
     {
-        return Ok(());
+        return Ok(None);
     }
+    if staging.exists() {
+        fs::remove_dir_all(staging)?;
+    }
+    fs::create_dir_all(staging)?;
 
     if let Some((repo, revision)) = parse_hf_model_url(&manifest.model.url) {
-        install_hf_embedding_model(repo, revision, staging)?;
-        fs::write(marker, marker_value)?;
-        return Ok(());
+        stage_hf_embedding_model(repo, revision, staging)?;
+        return Ok(Some(StagedModel {
+            dir: staging.to_path_buf(),
+            marker_value,
+        }));
+    }
+    if is_hf_scheme_url(&manifest.model.url) {
+        bail!(
+            "Hugging Face semantic model sources must use hf://repo@revision with an explicit revision"
+        );
     }
 
     let bundle_url = resolve_manifest_asset(&manifest.model.url, context);
     let bundle = staging.join("model-bundle.tar.zst.part");
-    fetch_to_file(&bundle_url, context, &bundle)?;
-    if !manifest.model.sha256.is_empty() {
-        verify_sha256_file(&bundle, &manifest.model.sha256)?;
+    let size = fetch_to_file(&bundle_url, context, &bundle)?;
+    if size != manifest.model.size {
+        bail!(
+            "model bundle size mismatch: got {}, expected {}",
+            size,
+            manifest.model.size
+        );
     }
+    verify_sha256_file(&bundle, &manifest.model.sha256)?;
     let extract_dir = staging.join("model-bundle-extracted");
     if extract_dir.exists() {
         fs::remove_dir_all(&extract_dir)?;
@@ -11504,23 +12489,35 @@ fn ensure_model(manifest: &Manifest, context: &UrlContext, staging: &Path) -> Re
     let mut archive = tar::Archive::new(decoder);
     archive.unpack(&extract_dir)?;
 
-    for entry in fs::read_dir(&extract_dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
-            fs::rename(entry.path(), live_dir()?.join(entry.file_name()))?;
+    for file in EMBEDDING_MODEL_HF_FILES {
+        let path = extract_dir.join(file.output_name);
+        if !path.is_file() {
+            bail!("model bundle missing required file {}", file.output_name);
         }
     }
-    fs::write(marker, marker_value)?;
+    for file in EMBEDDING_MODEL_HF_FILES {
+        let source = extract_dir.join(file.output_name);
+        let dest = staging.join(file.output_name);
+        fs::rename(source, dest)?;
+    }
     let _ = fs::remove_file(bundle);
     let _ = fs::remove_dir_all(extract_dir);
-    Ok(())
+    Ok(Some(StagedModel {
+        dir: staging.to_path_buf(),
+        marker_value,
+    }))
 }
 
-fn install_hf_embedding_model(repo: &str, revision: &str, staging: &Path) -> Result<()> {
+fn stage_hf_embedding_model(repo: &str, revision: &str, staging: &Path) -> Result<()> {
     fs::create_dir_all(staging)?;
+    let download_dir = staging.join("hf-model-download");
+    if download_dir.exists() {
+        fs::remove_dir_all(&download_dir)?;
+    }
+    fs::create_dir_all(&download_dir)?;
     for file in EMBEDDING_MODEL_HF_FILES {
         let url = hf_resolve_url(repo, revision, file.path);
-        let part = staging.join(format!("{}.part", file.output_name));
+        let part = download_dir.join(format!("{}.part", file.output_name));
         fetch_http_to_file(&url, &part)
             .with_context(|| format!("downloading Hugging Face model file {}", file.path))?;
         verify_sha256_file(&part, file.sha256)
@@ -11534,12 +12531,14 @@ fn install_hf_embedding_model(repo: &str, revision: &str, staging: &Path) -> Res
                 file.size
             );
         }
-        let dest = live_dir()?.join(file.output_name);
-        if dest.exists() {
-            fs::remove_file(&dest)?;
-        }
-        fs::rename(&part, dest)?;
+        fs::rename(part, download_dir.join(file.output_name))?;
     }
+    for file in EMBEDDING_MODEL_HF_FILES {
+        let source = download_dir.join(file.output_name);
+        let dest = staging.join(file.output_name);
+        fs::rename(source, dest)?;
+    }
+    let _ = fs::remove_dir_all(download_dir);
     Ok(())
 }
 
@@ -13438,6 +14437,132 @@ mod tests {
     }
 
     #[test]
+    fn publish_model_info_rejects_non_hf_mirror_without_metadata() {
+        let current = ModelInfo {
+            id: EMBEDDING_MODEL_ID.to_string(),
+            sha256: EMBEDDING_MODEL_FINGERPRINT.to_string(),
+            size: EMBEDDING_MODEL_HF_SIZE,
+            url: EMBEDDING_MODEL_HF_URL.to_string(),
+        };
+        let err = resolve_publish_model_info(
+            &current,
+            Some("https://mirror.example.com/granite.tar.zst"),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--model-sha256") && err.to_string().contains("--model-size"),
+            "expected explicit mirror metadata error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn publish_model_info_accepts_non_hf_mirror_with_metadata() -> Result<()> {
+        let current = ModelInfo {
+            id: EMBEDDING_MODEL_ID.to_string(),
+            sha256: EMBEDDING_MODEL_FINGERPRINT.to_string(),
+            size: EMBEDDING_MODEL_HF_SIZE,
+            url: EMBEDDING_MODEL_HF_URL.to_string(),
+        };
+        let resolved = resolve_publish_model_info(
+            &current,
+            Some("https://mirror.example.com/granite.tar.zst"),
+            Some("abc123"),
+            Some(42),
+        )?;
+        assert_eq!(resolved.url, "https://mirror.example.com/granite.tar.zst");
+        assert_eq!(resolved.sha256, "abc123");
+        assert_eq!(resolved.size, 42);
+        Ok(())
+    }
+
+    #[test]
+    fn publish_model_info_rejects_https_huggingface_url() {
+        let current = ModelInfo {
+            id: EMBEDDING_MODEL_ID.to_string(),
+            sha256: EMBEDDING_MODEL_FINGERPRINT.to_string(),
+            size: EMBEDDING_MODEL_HF_SIZE,
+            url: EMBEDDING_MODEL_HF_URL.to_string(),
+        };
+        let err = resolve_publish_model_info(
+            &current,
+            Some("https://huggingface.co/onnx-community/granite-embedding-small-english-r2-ONNX/resolve/main/model.tar.zst"),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("hf://repo@revision"),
+            "expected hf:// guidance, got: {err}"
+        );
+    }
+
+    #[test]
+    fn publish_model_info_rejects_hf_url_without_revision() {
+        let current = ModelInfo {
+            id: EMBEDDING_MODEL_ID.to_string(),
+            sha256: EMBEDDING_MODEL_FINGERPRINT.to_string(),
+            size: EMBEDDING_MODEL_HF_SIZE,
+            url: EMBEDDING_MODEL_HF_URL.to_string(),
+        };
+        let err =
+            resolve_publish_model_info(&current, Some("hf://owner/model"), None, None).unwrap_err();
+        assert!(
+            err.to_string().contains("explicit revision"),
+            "expected explicit revision error, got: {err}"
+        );
+        assert!(parse_hf_model_url("hf://owner/model").is_none());
+    }
+
+    #[test]
+    fn publish_model_info_rejects_hf_metadata_mismatch() {
+        let current = ModelInfo {
+            id: EMBEDDING_MODEL_ID.to_string(),
+            sha256: EMBEDDING_MODEL_FINGERPRINT.to_string(),
+            size: EMBEDDING_MODEL_HF_SIZE,
+            url: EMBEDDING_MODEL_HF_URL.to_string(),
+        };
+        let err = resolve_publish_model_info(
+            &current,
+            Some(EMBEDDING_MODEL_HF_URL),
+            Some("wrong-sha"),
+            Some(EMBEDDING_MODEL_HF_SIZE),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("pinned Granite fingerprint"),
+            "expected HF sha mismatch error, got: {err}"
+        );
+        let err = resolve_publish_model_info(
+            &current,
+            Some(EMBEDDING_MODEL_HF_URL),
+            Some(EMBEDDING_MODEL_FINGERPRINT),
+            Some(1),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("pinned Granite file set"),
+            "expected HF size mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn publish_model_info_defaults_placeholder_to_pinned_hf_source() -> Result<()> {
+        let current = ModelInfo {
+            id: EMBEDDING_MODEL_ID.to_string(),
+            sha256: String::new(),
+            size: 0,
+            url: "PENDING".to_string(),
+        };
+        let resolved = resolve_publish_model_info(&current, None, None, None)?;
+        assert_eq!(resolved.url, EMBEDDING_MODEL_HF_URL);
+        assert_eq!(resolved.sha256, EMBEDDING_MODEL_FINGERPRINT);
+        assert_eq!(resolved.size, EMBEDDING_MODEL_HF_SIZE);
+        Ok(())
+    }
+
+    #[test]
     fn manifest_compat_rejects_higher_min_client_version() {
         let m = sample_manifest(SUPPORTED_MANIFEST_VERSION as i64, "999.0.0");
         let err = enforce_manifest_compatibility(&m).unwrap_err();
@@ -13455,6 +14580,81 @@ mod tests {
         assert!(enforce_manifest_compatibility(&m).is_ok());
         let m = sample_manifest(SUPPORTED_MANIFEST_VERSION as i64, "0.0.1");
         assert!(enforce_manifest_compatibility(&m).is_ok());
+    }
+
+    #[test]
+    fn manifest_compat_rejects_non_hf_model_without_metadata() {
+        let mut m = sample_manifest(SUPPORTED_MANIFEST_VERSION as i64, "");
+        m.model = ModelInfo {
+            id: EMBEDDING_MODEL_ID.to_string(),
+            sha256: String::new(),
+            size: 0,
+            url: "model-bundle.tar.zst".to_string(),
+        };
+        let err = enforce_manifest_compatibility(&m).unwrap_err();
+        assert!(
+            err.to_string().contains("sha256 and positive size"),
+            "expected non-HF model metadata error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn manifest_compat_rejects_hf_model_metadata_mismatch() {
+        let mut m = sample_manifest(SUPPORTED_MANIFEST_VERSION as i64, "");
+        m.model = ModelInfo {
+            id: EMBEDDING_MODEL_ID.to_string(),
+            sha256: "wrong-sha".to_string(),
+            size: EMBEDDING_MODEL_HF_SIZE,
+            url: EMBEDDING_MODEL_HF_URL.to_string(),
+        };
+        let err = enforce_manifest_compatibility(&m).unwrap_err();
+        assert!(
+            err.to_string().contains("pinned Granite fingerprint"),
+            "expected HF sha mismatch error, got: {err}"
+        );
+        m.model.sha256 = EMBEDDING_MODEL_FINGERPRINT.to_string();
+        m.model.size = 1;
+        let err = enforce_manifest_compatibility(&m).unwrap_err();
+        assert!(
+            err.to_string().contains("pinned Granite file set"),
+            "expected HF size mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn stage_model_rejects_wrong_non_hf_bundle_size() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let data = tempdir()?;
+        let release = tempdir()?;
+        let model_bundle = release.path().join("model-bundle.tar.zst");
+        let bundle_bytes = write_test_model_bundle(&model_bundle)?;
+        let manifest = Manifest {
+            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
+            index_version: "wrong-model-size".to_string(),
+            created_at: "2026-05-04T00:00:00Z".to_string(),
+            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
+            model: ModelInfo {
+                id: EMBEDDING_MODEL_ID.to_string(),
+                sha256: sha256_hex(&bundle_bytes),
+                size: bundle_bytes.len() as u64 + 1,
+                url: "model-bundle.tar.zst".to_string(),
+            },
+            documents: Vec::new(),
+            packs: Vec::new(),
+        };
+        let context = UrlContext {
+            manifest_dir: Some(release.path().to_path_buf()),
+            manifest_base_url: None,
+        };
+        with_data_dir(data.path(), || -> Result<()> {
+            let err = stage_model(&manifest, &context, &staging_dir()?).unwrap_err();
+            assert!(
+                err.to_string().contains("model bundle size mismatch"),
+                "expected model size validation error, got: {err}"
+            );
+            Ok(())
+        })?;
+        Ok(())
     }
 
     #[test]
@@ -13498,6 +14698,166 @@ mod tests {
     }
 
     #[test]
+    fn build_model_dir_rejects_wrong_model_bytes() -> Result<()> {
+        let dir = tempdir()?;
+        fs::create_dir_all(dir.path().join("onnx"))?;
+        fs::write(dir.path().join("onnx/model_fp16.onnx"), b"wrong onnx")?;
+        fs::write(dir.path().join("onnx/model_fp16.onnx_data"), b"wrong data")?;
+        fs::write(dir.path().join("tokenizer.json"), b"wrong tokenizer")?;
+
+        let err = SemanticModelPaths::from_model_dir(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("size mismatch"),
+            "expected build model-dir size validation error, got: {err}"
+        );
+        Ok(())
+    }
+
+    fn source_hash_test_record(title: &str) -> PackRecord {
+        PackRecord {
+            doc_id: "DOC_HASH".to_string(),
+            doc_type: "Public_ruling".to_string(),
+            title: title.to_string(),
+            date: Some("2026-05-01".to_string()),
+            downloaded_at: "2026-05-01T00:00:00Z".to_string(),
+            content_hash: "same-cleaned-text-hash".to_string(),
+            html: "<h1>Heading</h1><p>Same body</p>".to_string(),
+            withdrawn_date: None,
+            superseded_by: None,
+            replaces: None,
+            has_in_doc_links: 0,
+            has_related_docs: 0,
+            has_history: 0,
+            anchors: Vec::new(),
+            definitions: Vec::new(),
+            assets: Vec::new(),
+            chunks: vec![PackChunk {
+                ord: 0,
+                anchor: None,
+                text: "Same body".to_string(),
+                embedding_b64: Some("ignored-by-source-hash".to_string()),
+            }],
+        }
+    }
+
+    #[test]
+    fn source_fingerprint_catches_non_body_metadata_changes() -> Result<()> {
+        let first = source_hash_test_record("Original title");
+        let changed = source_hash_test_record("Changed title");
+        let first_hash = source_fingerprint_hash(&pack_record_source_fingerprint_value(&first))?;
+        let changed_hash =
+            source_fingerprint_hash(&pack_record_source_fingerprint_value(&changed))?;
+        assert_ne!(
+            first_hash, changed_hash,
+            "base-release reuse must notice source-derived metadata changes even when body text hash is unchanged"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn base_seed_checkpoint_preserves_verified_source_ids() -> Result<()> {
+        let dir = tempdir()?;
+        let base_documents = vec![DocRef {
+            doc_id: "BASE_DOC".to_string(),
+            content_hash: "body-hash".to_string(),
+            pack_sha8: "basepack".to_string(),
+            offset: 0,
+            length: 10,
+        }];
+        let mut source_hashes = HashMap::new();
+        source_hashes.insert("BASE_DOC".to_string(), "source-hash".to_string());
+        let verified: HashSet<String> = ["BASE_DOC".to_string()].into_iter().collect();
+
+        save_build_checkpoint(SaveBuildCheckpointArgs {
+            out_dir: dir.path(),
+            source_index_sha256: "source-index-sha",
+            zstd_level: 3,
+            documents: &base_documents,
+            packs: &[],
+            base_documents: &base_documents,
+            base_source_hash_by_doc_id: &source_hashes,
+            verified_source_doc_ids: &verified,
+        })?;
+        let loaded = load_build_checkpoint(dir.path(), "source-index-sha", 3)?
+            .expect("checkpoint should load");
+        assert_eq!(loaded.base_documents.len(), 1);
+        assert_eq!(
+            loaded.base_source_hash_by_doc_id.get("BASE_DOC"),
+            Some(&"source-hash".to_string())
+        );
+        assert_eq!(loaded.verified_source_doc_ids, vec!["BASE_DOC".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn base_seed_allows_non_hf_mirror_model_checksum() -> Result<()> {
+        let base = tempdir()?;
+        let out = tempdir()?;
+        let db_path = out.path().join("ato.db");
+        let packs_dir = base.path().join("packs");
+        fs::create_dir_all(&packs_dir)?;
+
+        let record = json!({
+            "doc_id": "BASE_MIRROR_DOC",
+            "type": "Public_ruling",
+            "title": "Mirror base",
+            "date": "2026-05-01",
+            "downloaded_at": "2026-05-01T00:00:00Z",
+            "content_hash": "body-hash",
+            "html": "<h1>Mirror base</h1>",
+            "withdrawn_date": null,
+            "superseded_by": null,
+            "replaces": null,
+            "has_in_doc_links": 0,
+            "has_related_docs": 0,
+            "has_history": 0,
+            "anchors": [],
+            "definitions": [],
+            "chunks": [{"ord": 0, "anchor": null, "text": "Mirror base", "embedding_b64": null}],
+            "assets": [],
+        });
+        let pack_bytes = encode_test_pack_record(&record)?;
+        fs::write(packs_dir.join("pack-mirror.bin.zst"), &pack_bytes)?;
+        let manifest = Manifest {
+            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
+            index_version: "mirror-base".to_string(),
+            created_at: "2026-05-01T00:00:00Z".to_string(),
+            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
+            model: ModelInfo {
+                id: EMBEDDING_MODEL_ID.to_string(),
+                sha256: "published-mirror-bundle-sha".to_string(),
+                size: 123,
+                url: "model-bundle.tar.zst".to_string(),
+            },
+            documents: vec![DocRef {
+                doc_id: "BASE_MIRROR_DOC".to_string(),
+                content_hash: "body-hash".to_string(),
+                pack_sha8: "mirror".to_string(),
+                offset: 0,
+                length: pack_bytes.len() as u64,
+            }],
+            packs: vec![PackInfo {
+                sha8: "mirror".to_string(),
+                sha256: sha256_hex(&pack_bytes),
+                size: pack_bytes.len() as u64,
+                url: "packs/pack-mirror.bin.zst".to_string(),
+            }],
+        };
+        fs::write(
+            base.path().join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest)?,
+        )?;
+        let conn = open_write_at(&base.path().join("ato.db"))?;
+        init_db(&conn)?;
+        drop(conn);
+
+        let seed = seed_build_from_base_release(base.path(), out.path(), &db_path)?;
+        assert_eq!(seed.documents.len(), 1);
+        assert!(seed.source_hash_by_doc_id.contains_key("BASE_MIRROR_DOC"));
+        Ok(())
+    }
+
+    #[test]
     fn open_read_rejects_unsupported_schema_version() -> Result<()> {
         let _lock = TEST_DB_LOCK.lock().unwrap();
         let (dir, db) = make_test_db()?;
@@ -13531,6 +14891,50 @@ mod tests {
             assert!(
                 msg.contains("corrupt or incomplete") && msg.contains("ato-mcp update"),
                 "expected corrupt/incomplete error with init hint, got: {msg}"
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn vector_search_requires_model_marker_match() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
+        set_meta(&conn, "embedding_model_id", EMBEDDING_MODEL_ID)?;
+        drop(conn);
+        let model_sha = "expected-model-marker";
+        let manifest = Manifest {
+            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
+            index_version: "test-marker-readiness".to_string(),
+            created_at: "2026-05-04T00:00:00Z".to_string(),
+            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
+            model: ModelInfo {
+                id: EMBEDDING_MODEL_ID.to_string(),
+                sha256: model_sha.to_string(),
+                size: 5,
+                url: "model-bundle.tar.zst".to_string(),
+            },
+            documents: Vec::new(),
+            packs: Vec::new(),
+        };
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            fs::write(
+                installed_manifest_path()?,
+                serde_json::to_vec_pretty(&manifest)?,
+            )?;
+            fs::write(model_path()?, b"model")?;
+            fs::write(model_data_path()?, b"model-data")?;
+            fs::write(tokenizer_path()?, br#"{"version":"1.0"}"#)?;
+            fs::write(live_dir()?.join(".model.sha256"), "wrong-marker")?;
+
+            let conn = open_read()?;
+            let err = ensure_vector_search_ready(&conn).unwrap_err();
+            assert!(
+                err.to_string().contains("installed semantic model files"),
+                "expected model marker readiness error, got: {err}"
             );
             Ok(())
         })?;
@@ -13605,6 +15009,16 @@ mod tests {
         let encoder = archive.into_inner()?;
         encoder.finish()?;
         Ok(())
+    }
+
+    fn write_test_model_bundle(path: &Path) -> Result<Vec<u8>> {
+        let files: &[(&str, &[u8])] = &[
+            ("model_fp16.onnx", b"dummy onnx bytes"),
+            ("model_fp16.onnx_data", b"dummy external data"),
+            ("tokenizer.json", br#"{"version":"1.0","truncation":null}"#),
+        ];
+        write_test_tar_zst(path, files)?;
+        fs::read(path).map_err(Into::into)
     }
 
     fn sample_manifest(schema_version: i64, min_client_version: &str) -> Manifest {
@@ -13809,6 +15223,7 @@ mod tests {
                 serde_json::to_vec_pretty(&manifest)?,
             )?;
             fs::write(model_path()?, b"model")?;
+            fs::write(model_data_path()?, b"model-data")?;
             fs::write(live_dir()?.join("tokenizer.json"), br#"{"version":"1.0"}"#)?;
             fs::write(live_dir()?.join(".model.sha256"), model_sha)?;
             check_for_update_availability(manifest_path.to_str().expect("utf-8 path"))
@@ -14731,14 +16146,7 @@ mod tests {
         fs::create_dir_all(&packs_dir)?;
 
         let model_bundle = release_dir.join("model-bundle.tar.zst");
-        write_test_tar_zst(
-            &model_bundle,
-            &[
-                ("model_fp16.onnx", b"dummy onnx bytes"),
-                ("tokenizer.json", br#"{"version":"1.0","truncation":null}"#),
-            ],
-        )?;
-        let model_bundle_bytes = fs::read(&model_bundle)?;
+        let model_bundle_bytes = write_test_model_bundle(&model_bundle)?;
 
         let embedding_b64 =
             base64::engine::general_purpose::STANDARD.encode(vec![0u8; EMBEDDING_DIM]);
@@ -14799,6 +16207,10 @@ mod tests {
             assert_eq!(stats.changed, 0);
             assert_eq!(stats.removed, 0);
             assert!(model_path()?.exists(), "model should be installed");
+            assert!(
+                model_data_path()?.exists(),
+                "model data should be installed"
+            );
             assert!(tokenizer_path()?.exists(), "tokenizer should be installed");
             assert!(
                 installed_manifest_path()?.exists(),
@@ -14839,14 +16251,7 @@ mod tests {
         fs::create_dir_all(&packs_dir)?;
 
         let model_bundle = release_dir.join("model-bundle.tar.zst");
-        write_test_tar_zst(
-            &model_bundle,
-            &[
-                ("model_fp16.onnx", b"dummy onnx bytes"),
-                ("tokenizer.json", br#"{"version":"1.0","truncation":null}"#),
-            ],
-        )?;
-        let model_bundle_bytes = fs::read(&model_bundle)?;
+        let model_bundle_bytes = write_test_model_bundle(&model_bundle)?;
         let embedding_b64 =
             base64::engine::general_purpose::STANDARD.encode(vec![0u8; EMBEDDING_DIM]);
 
@@ -14927,14 +16332,7 @@ mod tests {
         fs::create_dir_all(&packs_dir)?;
 
         let model_bundle = release_dir.join("model-bundle.tar.zst");
-        write_test_tar_zst(
-            &model_bundle,
-            &[
-                ("model_fp16.onnx", b"dummy onnx bytes"),
-                ("tokenizer.json", br#"{"version":"1.0","truncation":null}"#),
-            ],
-        )?;
-        let model_bundle_bytes = fs::read(&model_bundle)?;
+        let model_bundle_bytes = write_test_model_bundle(&model_bundle)?;
         let embedding_b64 =
             base64::engine::general_purpose::STANDARD.encode(vec![0u8; EMBEDDING_DIM]);
 
@@ -15090,6 +16488,7 @@ mod tests {
                 serde_json::to_vec_pretty(&manifest)?,
             )?;
             fs::write(model_path()?, b"model")?;
+            fs::write(model_data_path()?, b"model-data")?;
             fs::write(live_dir()?.join("tokenizer.json"), br#"{"version":"1.0"}"#)?;
             fs::write(live_dir()?.join(".model.sha256"), model_sha)?;
 
@@ -15107,14 +16506,373 @@ mod tests {
     }
 
     #[test]
-    fn apply_update_locked_rebuilds_unsupported_schema_db() -> Result<()> {
+    fn apply_update_locked_does_not_skip_when_model_data_missing() -> Result<()> {
         let _lock = TEST_DB_LOCK.lock().unwrap();
         let data = tempdir()?;
         let release = tempdir()?;
         let release_dir = release.path();
-        let packs_dir = release_dir.join("packs");
-        fs::create_dir_all(&packs_dir)?;
+        let manifest_path = release_dir.join("manifest.json");
+        let model_bundle = release_dir.join("model-bundle.tar.zst");
+        let model_bundle_bytes = write_test_model_bundle(&model_bundle)?;
+        let manifest = Manifest {
+            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
+            index_version: "test-missing-model-data".to_string(),
+            created_at: "2026-05-04T00:00:00Z".to_string(),
+            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
+            model: ModelInfo {
+                id: EMBEDDING_MODEL_ID.to_string(),
+                sha256: sha256_hex(&model_bundle_bytes),
+                size: model_bundle_bytes.len() as u64,
+                url: "model-bundle.tar.zst".to_string(),
+            },
+            documents: Vec::new(),
+            packs: Vec::new(),
+        };
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+        fs::write(&manifest_path, &manifest_bytes)?;
+        let summary = UpdateSummary {
+            schema_version: manifest.schema_version,
+            index_version: manifest.index_version.clone(),
+            min_client_version: manifest.min_client_version.clone(),
+            model: manifest.model.clone(),
+            document_count: 0,
+            pack_count: 0,
+            manifest_fingerprint: Some(manifest_fingerprint(&manifest)?),
+        };
+        let summary_bytes = serde_json::to_vec_pretty(&summary)?;
+        fs::write(release_dir.join("update.json"), &summary_bytes)?;
 
+        with_data_dir(data.path(), || -> Result<()> {
+            let conn = open_write_at(&db_path()?)?;
+            init_db(&conn)?;
+            drop(conn);
+            fs::write(
+                installed_manifest_path()?,
+                serde_json::to_vec_pretty(&manifest)?,
+            )?;
+            fs::write(model_path()?, b"model")?;
+            fs::write(live_dir()?.join("tokenizer.json"), br#"{"version":"1.0"}"#)?;
+            fs::write(live_dir()?.join(".model.sha256"), &manifest.model.sha256)?;
+
+            let stats = apply_update_locked(manifest_path.to_str().expect("utf-8 path"))?;
+            assert_eq!(
+                stats.bytes_downloaded,
+                manifest_bytes.len() as u64,
+                "missing model_fp16.onnx_data must force manifest fetch instead of update.json fast-path"
+            );
+            assert!(
+                model_data_path()?.exists(),
+                "full update should install the missing external model data file"
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn write_installed_model_marker(data_dir: &Path, marker_value: &str) -> Result<()> {
+        with_data_dir(data_dir, || -> Result<()> {
+            fs::write(model_path()?, b"old-model")?;
+            fs::write(model_data_path()?, b"old-model-data")?;
+            fs::write(tokenizer_path()?, br#"{"version":"1.0"}"#)?;
+            fs::write(model_marker_path()?, marker_value)?;
+            Ok(())
+        })
+    }
+
+    fn old_installed_manifest(marker_value: &str) -> Manifest {
+        Manifest {
+            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
+            index_version: "old-install".to_string(),
+            created_at: "2026-05-01T00:00:00Z".to_string(),
+            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
+            model: ModelInfo {
+                id: EMBEDDING_MODEL_ID.to_string(),
+                sha256: marker_value.to_string(),
+                size: 1,
+                url: "old-model-bundle.tar.zst".to_string(),
+            },
+            documents: Vec::new(),
+            packs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn failed_model_fetch_keeps_existing_model_marker() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let data = tempdir()?;
+        let release = tempdir()?;
+        let release_dir = release.path();
+        let old_marker = "old-good-marker";
+        let new_manifest = Manifest {
+            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
+            index_version: "failed-model-fetch".to_string(),
+            created_at: "2026-05-04T00:00:00Z".to_string(),
+            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
+            model: ModelInfo {
+                id: EMBEDDING_MODEL_ID.to_string(),
+                sha256: "new-model-sha".to_string(),
+                size: 123,
+                url: "missing-model-bundle.tar.zst".to_string(),
+            },
+            documents: Vec::new(),
+            packs: Vec::new(),
+        };
+        let manifest_path = release_dir.join("manifest.json");
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&new_manifest)?)?;
+        write_installed_model_marker(data.path(), old_marker)?;
+
+        with_data_dir(data.path(), || -> Result<()> {
+            fs::write(
+                installed_manifest_path()?,
+                serde_json::to_vec_pretty(&old_installed_manifest(old_marker))?,
+            )?;
+            let err = apply_update_locked(manifest_path.to_str().expect("utf-8 path")).unwrap_err();
+            assert!(
+                err.to_string().contains("missing-model-bundle"),
+                "expected missing model bundle error, got: {err}"
+            );
+            assert_eq!(fs::read_to_string(model_marker_path()?)?, old_marker);
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_db_rebuild_after_model_staging_keeps_existing_model_marker() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let data = tempdir()?;
+        let release = tempdir()?;
+        let release_dir = release.path();
+        let model_bundle = release_dir.join("model-bundle.tar.zst");
+        let model_bundle_bytes = write_test_model_bundle(&model_bundle)?;
+        let old_marker = "old-good-marker";
+        let manifest = Manifest {
+            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
+            index_version: "failed-db-rebuild".to_string(),
+            created_at: "2026-05-04T00:00:00Z".to_string(),
+            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
+            model: ModelInfo {
+                id: EMBEDDING_MODEL_ID.to_string(),
+                sha256: sha256_hex(&model_bundle_bytes),
+                size: model_bundle_bytes.len() as u64,
+                url: "model-bundle.tar.zst".to_string(),
+            },
+            documents: vec![DocRef {
+                doc_id: "DOC_MISSING_PACK".to_string(),
+                content_hash: "missing-pack-doc".to_string(),
+                pack_sha8: "missingpack".to_string(),
+                offset: 0,
+                length: 10,
+            }],
+            packs: vec![PackInfo {
+                sha8: "missingpack".to_string(),
+                sha256: String::new(),
+                size: 10,
+                url: "packs/pack-missingpack.bin.zst".to_string(),
+            }],
+        };
+        let manifest_path = release_dir.join("manifest.json");
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+        write_installed_model_marker(data.path(), old_marker)?;
+
+        with_data_dir(data.path(), || -> Result<()> {
+            fs::write(
+                installed_manifest_path()?,
+                serde_json::to_vec_pretty(&old_installed_manifest(old_marker))?,
+            )?;
+            let err = apply_update_locked(manifest_path.to_str().expect("utf-8 path")).unwrap_err();
+            assert!(
+                err.to_string().contains("pack-missingpack"),
+                "expected missing pack error, got: {err}"
+            );
+            assert_eq!(fs::read_to_string(model_marker_path()?)?, old_marker);
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn promotion_rolls_back_db_when_assets_promotion_fails() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let data = tempdir()?;
+        with_data_dir(data.path(), || -> Result<()> {
+            let conn = open_write_at(&db_path()?)?;
+            init_db(&conn)?;
+            set_meta(&conn, "index_version", "old-db")?;
+            drop(conn);
+            let live_assets = live_dir()?.join("assets");
+            fs::create_dir_all(&live_assets)?;
+            fs::write(live_assets.join("old.txt"), b"old asset")?;
+            let rollback_backup = backups_dir()?.join("ato.db.prev");
+            fs::write(&rollback_backup, b"previous rollback target")?;
+
+            let staging_root = staging_dir()?.join("promotion-rollback-test");
+            remove_path_if_exists(&staging_root)?;
+            fs::create_dir_all(&staging_root)?;
+            let staged_db = staging_root.join("ato.db");
+            let staged_conn = open_write_at(&staged_db)?;
+            init_db(&staged_conn)?;
+            set_meta(&staged_conn, "index_version", "new-db")?;
+            drop(staged_conn);
+            let staged_asset_root = staging_root.join("live");
+            fs::create_dir_all(&staged_asset_root)?;
+            fs::write(staged_asset_root.join("assets"), b"not a directory")?;
+
+            let manifest = old_installed_manifest("old-marker");
+            let err = promote_staged_update(
+                None,
+                StagedCorpusUpdate {
+                    staging_root,
+                    staged_db,
+                    staged_asset_root,
+                    stats: UpdateStats::default(),
+                },
+                &manifest,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("staged assets path is not a directory"),
+                "expected assets promotion error, got: {err}"
+            );
+
+            let conn = open_read()?;
+            assert_eq!(get_meta(&conn, "index_version")?.as_deref(), Some("old-db"));
+            assert!(live_assets.join("old.txt").exists());
+            assert!(
+                !installed_manifest_path()?.exists(),
+                "manifest must not be written after failed promotion"
+            );
+            assert_eq!(
+                fs::read(&rollback_backup)?,
+                b"previous rollback target",
+                "failed promotion must not replace the previous doctor rollback backup"
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn promotion_rolls_back_model_when_persistent_backup_fails() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let data = tempdir()?;
+        with_data_dir(data.path(), || -> Result<()> {
+            let conn = open_write_at(&db_path()?)?;
+            init_db(&conn)?;
+            set_meta(&conn, "index_version", "old-db")?;
+            drop(conn);
+            fs::write(model_path()?, b"old-model")?;
+            fs::write(model_data_path()?, b"old-model-data")?;
+            fs::write(tokenizer_path()?, b"old-tokenizer")?;
+            fs::write(model_marker_path()?, "old-marker")?;
+
+            let staging_root = staging_dir()?.join("promotion-model-rollback-test");
+            remove_path_if_exists(&staging_root)?;
+            fs::create_dir_all(&staging_root)?;
+            let staged_db = staging_root.join("ato.db");
+            let staged_conn = open_write_at(&staged_db)?;
+            init_db(&staged_conn)?;
+            set_meta(&staged_conn, "index_version", "new-db")?;
+            drop(staged_conn);
+            let staged_asset_root = staging_root.join("live");
+            fs::create_dir_all(staged_asset_root.join("assets"))?;
+            let staged_model_dir = staging_root.join("model-stage");
+            fs::create_dir_all(&staged_model_dir)?;
+            fs::write(staged_model_dir.join("model_fp16.onnx"), b"new-model")?;
+            fs::write(
+                staged_model_dir.join("model_fp16.onnx_data"),
+                b"new-model-data",
+            )?;
+            fs::write(staged_model_dir.join("tokenizer.json"), b"new-tokenizer")?;
+            let staged_model = StagedModel {
+                dir: staged_model_dir,
+                marker_value: "new-marker".to_string(),
+            };
+            fs::write(data.path().join("backups"), b"not a directory")?;
+
+            let manifest = old_installed_manifest("new-marker");
+            let err = promote_staged_update(
+                Some(&staged_model),
+                StagedCorpusUpdate {
+                    staging_root,
+                    staged_db,
+                    staged_asset_root,
+                    stats: UpdateStats::default(),
+                },
+                &manifest,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("File exists"),
+                "expected persistent backup failure, got: {err}"
+            );
+            assert_eq!(fs::read(model_path()?)?, b"old-model");
+            assert_eq!(fs::read(model_data_path()?)?, b"old-model-data");
+            assert_eq!(fs::read(tokenizer_path()?)?, b"old-tokenizer");
+            assert_eq!(fs::read_to_string(model_marker_path()?)?, "old-marker");
+            let conn = open_read()?;
+            assert_eq!(get_meta(&conn, "index_version")?.as_deref(), Some("old-db"));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn successful_update_keeps_persistent_doctor_rollback_backup() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let data = tempdir()?;
+        with_data_dir(data.path(), || -> Result<()> {
+            let conn = open_write_at(&db_path()?)?;
+            init_db(&conn)?;
+            set_meta(&conn, "index_version", "old-db")?;
+            drop(conn);
+            fs::write(backups_dir()?.join("ato.db.prev"), b"previous backup")?;
+
+            let staging_root = staging_dir()?.join("promotion-success-test");
+            remove_path_if_exists(&staging_root)?;
+            fs::create_dir_all(&staging_root)?;
+            let staged_db = staging_root.join("ato.db");
+            let staged_conn = open_write_at(&staged_db)?;
+            init_db(&staged_conn)?;
+            set_meta(&staged_conn, "index_version", "new-db")?;
+            drop(staged_conn);
+            let staged_asset_root = staging_root.join("live");
+            fs::create_dir_all(staged_asset_root.join("assets"))?;
+
+            let manifest = old_installed_manifest("old-marker");
+            promote_staged_update(
+                None,
+                StagedCorpusUpdate {
+                    staging_root,
+                    staged_db,
+                    staged_asset_root,
+                    stats: UpdateStats::default(),
+                },
+                &manifest,
+            )?;
+            assert!(
+                backups_dir()?.join("ato.db.prev").exists(),
+                "successful promotion must keep doctor rollback backup"
+            );
+            {
+                let conn = open_read()?;
+                assert_eq!(get_meta(&conn, "index_version")?.as_deref(), Some("new-db"));
+            }
+            doctor(true)?;
+            let conn = open_read()?;
+            assert_eq!(get_meta(&conn, "index_version")?.as_deref(), Some("old-db"));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn ensure_model_rejects_incomplete_bundle_before_marker() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let data = tempdir()?;
+        let release = tempdir()?;
+        let release_dir = release.path();
         let model_bundle = release_dir.join("model-bundle.tar.zst");
         write_test_tar_zst(
             &model_bundle,
@@ -15124,6 +16882,55 @@ mod tests {
             ],
         )?;
         let model_bundle_bytes = fs::read(&model_bundle)?;
+        let manifest = Manifest {
+            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
+            index_version: "test-incomplete-model-bundle".to_string(),
+            created_at: "2026-05-04T00:00:00Z".to_string(),
+            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
+            model: ModelInfo {
+                id: EMBEDDING_MODEL_ID.to_string(),
+                sha256: sha256_hex(&model_bundle_bytes),
+                size: model_bundle_bytes.len() as u64,
+                url: "model-bundle.tar.zst".to_string(),
+            },
+            documents: Vec::new(),
+            packs: Vec::new(),
+        };
+        let context = UrlContext {
+            manifest_dir: Some(release_dir.to_path_buf()),
+            manifest_base_url: None,
+        };
+
+        with_data_dir(data.path(), || -> Result<()> {
+            let err = stage_model(&manifest, &context, &staging_dir()?).unwrap_err();
+            assert!(
+                err.to_string().contains("model_fp16.onnx_data"),
+                "expected missing model data error, got: {err}"
+            );
+            assert!(
+                !live_dir()?.join(".model.sha256").exists(),
+                "incomplete bundle must not mark the model installed"
+            );
+            assert!(
+                !model_data_path()?.exists(),
+                "incomplete bundle must not partially install model data"
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn apply_update_locked_rebuilds_unsupported_schema_db() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let data = tempdir()?;
+        let release = tempdir()?;
+        let release_dir = release.path();
+        let packs_dir = release_dir.join("packs");
+        fs::create_dir_all(&packs_dir)?;
+
+        let model_bundle = release_dir.join("model-bundle.tar.zst");
+        let model_bundle_bytes = write_test_model_bundle(&model_bundle)?;
 
         let embedding_b64 =
             base64::engine::general_purpose::STANDARD.encode(vec![0u8; EMBEDDING_DIM]);

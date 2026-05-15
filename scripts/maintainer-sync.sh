@@ -9,8 +9,11 @@
 #   ATO_MCP_REPO_DIR   absolute path to this repo checkout
 #   ATO_MCP_PAGES_DIR  absolute path to ato_pages/ (default: $ATO_MCP_REPO_DIR/../ato_pages)
 #   ATO_MCP_MODEL_DIR  absolute path to the Granite embedding dir holding
-#                      tokenizer.json and onnx/model_fp16.onnx
+#                      tokenizer.json, onnx/model_fp16.onnx, and
+#                      onnx/model_fp16.onnx_data
 #   ATO_MCP_MODEL_URL  optional approved model mirror URL
+#   ATO_MCP_MODEL_SHA256 required with a non-Hugging Face ATO_MCP_MODEL_URL
+#   ATO_MCP_MODEL_SIZE   required with a non-Hugging Face ATO_MCP_MODEL_URL
 #   ATO_MCP_FORCE_REBUILD set to 1/true/yes/on to rebuild even when source did not change
 #   ATO_MCP_RELEASE_TAG  tag prefix (default: index)
 #   ATO_MCP_GH_REPO    owner/name (default: gunba/ato-mcp)
@@ -44,11 +47,38 @@ REPO_DIR="${ATO_MCP_REPO_DIR:?set ATO_MCP_REPO_DIR}"
 PAGES_DIR="${ATO_MCP_PAGES_DIR:-$REPO_DIR/../ato_pages}"
 MODEL_DIR="${ATO_MCP_MODEL_DIR:?set ATO_MCP_MODEL_DIR (path to Granite embedding checkout)}"
 MODEL_ONNX="$MODEL_DIR/onnx/model_fp16.onnx"
+MODEL_ONNX_DATA="$MODEL_DIR/onnx/model_fp16.onnx_data"
 TOKENIZER="$MODEL_DIR/tokenizer.json"
 MODEL_URL="${ATO_MCP_MODEL_URL:-}"
-MODEL_URL_ARG=()
+MODEL_SHA256="${ATO_MCP_MODEL_SHA256:-}"
+MODEL_SIZE="${ATO_MCP_MODEL_SIZE:-}"
+MODEL_RELEASE_ARGS=()
 if [ -n "$MODEL_URL" ]; then
-    MODEL_URL_ARG=(--model-url "$MODEL_URL")
+    MODEL_RELEASE_ARGS+=(--model-url "$MODEL_URL")
+fi
+if [ -n "$MODEL_SHA256" ]; then
+    MODEL_RELEASE_ARGS+=(--model-sha256 "$MODEL_SHA256")
+fi
+if [ -n "$MODEL_SIZE" ]; then
+    MODEL_RELEASE_ARGS+=(--model-size "$MODEL_SIZE")
+fi
+if [[ "$MODEL_URL" == https://huggingface.co/* || "$MODEL_URL" == http://huggingface.co/* ]]; then
+    echo "ATO_MCP_MODEL_URL must use hf://repo@revision for Hugging Face sources, not HTTPS" >&2
+    exit 2
+fi
+if [[ "$MODEL_URL" == hf://* ]]; then
+    HF_SPEC="${MODEL_URL#hf://}"
+    if [[ "$HF_SPEC" != *@* || "$HF_SPEC" == *@ ]]; then
+        echo "ATO_MCP_MODEL_URL must include an explicit Hugging Face revision: hf://repo@revision" >&2
+        exit 2
+    fi
+fi
+if [[ "$MODEL_URL" != "" \
+    && "$MODEL_URL" != hf://* ]]; then
+    if [[ -z "$MODEL_SHA256" || ! "$MODEL_SIZE" =~ ^[1-9][0-9]*$ ]]; then
+        echo "non-Hugging Face ATO_MCP_MODEL_URL requires ATO_MCP_MODEL_SHA256 and positive numeric ATO_MCP_MODEL_SIZE" >&2
+        exit 2
+    fi
 fi
 
 GH_REPO="${ATO_MCP_GH_REPO:-gunba/ato-mcp}"
@@ -81,6 +111,12 @@ if [[ ! -x "$ATO_MCP" ]]; then
     echo "ato-mcp binary not found at $ATO_MCP — run: cargo build --release --features cuda" >&2
     exit 2
 fi
+for model_file in "$MODEL_ONNX" "$MODEL_ONNX_DATA" "$TOKENIZER"; do
+    if [[ ! -f "$model_file" ]]; then
+        echo "required Granite model file not found: $model_file" >&2
+        exit 2
+    fi
+done
 
 LOG="$REPO_DIR/logs/maintainer-sync-$(date -u +%Y%m%dT%H%M%SZ).log"
 mkdir -p "$(dirname "$LOG")"
@@ -172,11 +208,22 @@ fi
 TAG="$TAG_PREFIX-$(date -u +%Y.%m.%d)"
 RELEASE_DIR="$REPO_DIR/release/$TAG"
 mkdir -p "$RELEASE_DIR"
+BASE_RELEASE_ARG=()
+LATEST_RELEASE="$REPO_DIR/release/.latest"
+if [[ -d "$LATEST_RELEASE" ]]; then
+    LATEST_REAL=$(realpath "$LATEST_RELEASE")
+    RELEASE_REAL=$(realpath -m "$RELEASE_DIR")
+    if [[ "$LATEST_REAL" != "$RELEASE_REAL" ]]; then
+        BASE_RELEASE_ARG=(--base-release-dir "$LATEST_RELEASE")
+    fi
+fi
 
 echo "== build corpus =="
 "$ATO_MCP" build \
     --pages-dir "$PAGES_DIR" \
     --db-path   "$RELEASE_DIR/ato.db" \
+    --model-dir "$MODEL_DIR" \
+    "${BASE_RELEASE_ARG[@]}" \
     --out-dir   "$RELEASE_DIR" \
     --gpu
 
@@ -186,7 +233,7 @@ echo "== publish release $TAG =="
     --tag     "$TAG" \
     --repo    "$GH_REPO" \
     --overwrite \
-    "${MODEL_URL_ARG[@]}"
+    "${MODEL_RELEASE_ARGS[@]}"
 
 # Promote to "latest" so /releases/latest/download resolves to this tag.
 gh release edit "$TAG" --repo "$GH_REPO" --latest --prerelease=false

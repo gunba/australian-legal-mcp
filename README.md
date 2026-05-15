@@ -16,11 +16,11 @@ external URL recorded in the release manifest.
 | Tool | Purpose |
 |---|---|
 | `search` | Hybrid semantic-plus-lexical search over the GPU-built corpus. Defaults exclude Edited Private Advice and very old non-legislation content. |
-| `search_titles` | Fast title lookup, plus exact `doc_id` and ATO document-link lookup. |
-| `get_document` | Fetch cleaned source HTML for a document. Internal ATO document links are `data-doc-id` attributes. |
-| `get_asset` | Resolve a retained image `data-asset-ref` to a local file path and source metadata. |
+| `get_doc_anchors` | Return in-document anchors, related documents, historical-version URLs, and reverse citations for a corpus document. |
 | `get_chunks` | Fetch exact chunks returned by `search`, with optional neighbor context. |
 | `get_definition` | Fetch compact statutory definitions for a term, with labelled ordinary-meaning fallback when no statutory definition is found. |
+| `get_asset` | Resolve a retained image `data-asset-ref` to a local file path and source metadata. |
+| `fetch_external_doc` | Fetch a live ATO document by `doc_id` and optional point-in-time parameters when a referenced document is outside the local corpus. |
 | `stats` | Index version, counts, and default search policy. |
 
 JSON results include the ATO `canonical_url`. Document bodies are exposed as
@@ -229,9 +229,9 @@ Examples:
 
 ```bash
 ato-mcp search "R&D tax incentive eligibility" --k 5
-ato-mcp search-titles "TR 2024 3"
-ato-mcp search-titles "PAC/19970038/203-50"
-ato-mcp get-document PAC/19970038/203-50 --format html --max-chars 20000
+ato-mcp search "TR 2024 3" --k 5
+ato-mcp search "PAC/19970038/203-50" --k 5
+ato-mcp fetch-external-doc PAC/19970038/203-50
 ato-mcp get-definition "corporate tax gross-up rate" --context-doc-id PAC/19970038/203-50
 ato-mcp search "section 8-1 repairs" --mode keyword
 ato-mcp search "royalties withholding old cases" --include-old --types Cases
@@ -311,7 +311,10 @@ cargo build --release --features cuda
 ./target/release/ato-mcp build \
   --pages-dir /path/to/ato_pages \
   --db-path   ./release/ato.db \
-  --out-dir   ./release
+  --model-dir /path/to/granite-embedding-small-r2 \
+  --base-release-dir ./release/.latest \
+  --out-dir   ./release \
+  --gpu
 
 ./target/release/ato-mcp publish-release \
   --out-dir ./release \
@@ -330,7 +333,7 @@ For full crawls (rare, hours):
 
 `scripts/maintainer-sync.sh` wraps all three modes (`incremental`,
 `catch_up`, `full`) and handles release publication. Drive it from the
-provided `systemd/ato-mcp-maintainer-sync.service` unit on a GPU host.
+provided `systemd/ato-mcp-maintainer-weekly.service` unit on a GPU host.
 
 Release builds use Granite embedding vectors and should run on the
 maintainer GPU. The Rust end-user runtime does not require a GPU; query
@@ -339,7 +342,8 @@ uploaded to GitHub Releases; by default the
 manifest points at pinned Hugging Face Granite embedding files, and the
 Rust client downloads and verifies them during `ato-mcp update`. The
 model URL can be redirected at release time via `--model-url` /
-`--model-sha256` / `--model-size`.
+`--model-sha256` / `--model-size`; non-Hugging Face mirrors must supply
+both hash and size.
 
 Corpus releases must come from `ato-mcp build`; DB-derived repack
 scripts are not a supported release path. The optional

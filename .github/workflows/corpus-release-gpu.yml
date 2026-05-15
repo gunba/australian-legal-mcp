@@ -18,7 +18,7 @@ jobs:
     env:
       ATO_MCP_REPO_DIR: ${{ github.workspace }}
       ATO_MCP_PAGES_DIR: ${{ github.workspace }}/../ato_pages
-      ATO_MCP_MODEL_DIR: ${{ github.workspace }}/models/granite-embedding-small-r2
+      ATO_MCP_MODEL_DIR: ${{ vars.ATO_MCP_MODEL_DIR || '/opt/ato-mcp/models/granite-embedding-small-r2' }}
       ATO_MCP_GH_REPO: ${{ github.repository }}
       ATO_MCP_MODE: incremental
       ATO_MCP_RELEASE_TAG: index

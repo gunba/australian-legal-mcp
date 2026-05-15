@@ -29,7 +29,7 @@ Source refresh:
 - `ato-mcp normalize-doc-href <href>` — canonicalise an ATO doc URL
 
 Build:
-- `ato-mcp build --pages-dir ... --db-path ... --out-dir ...` —
+- `ato-mcp build --pages-dir ... --db-path ... --model-dir ... [--base-release-dir ...] --out-dir ... --gpu` —
   walks `index.jsonl`, runs cleaning + chunker + embedder, writes
   `documents`, `chunks`, `chunk_embeddings`, `chunks_fts`, `title_fts`,
   `doc_anchors`, `definitions`, `citations`, plus pack file +
@@ -62,8 +62,7 @@ are now all bit-identical with the Python pipeline output.
 
 ## Tests
 
-- `cargo test --locked`: 95 pass (90 inline unit tests + 3 stdio_shim
-  + 2 http_smoke). The Python `pytest` suite (212 tests) is gone but
-  the relevant assertions are mirrored in the Rust unit tests, including
-  12 new `rules_tests` covering shape classification, template routing,
-  and title composition.
+- `cargo test --locked` is the authoritative Rust suite. The Python
+  `pytest` suite (212 tests) is gone but the relevant assertions are
+  mirrored in Rust tests, including `rules_tests` coverage for shape
+  classification, template routing, and title composition.

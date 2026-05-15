@@ -36,8 +36,9 @@ scripts/maintainer-sync.sh
    pre-build source step.
 2. Build `release/<tag>/ato.db`, packs, and `manifest.json` via
    `ato-mcp build`.
-3. Write the pinned Hugging Face Granite embedding source into the manifest,
-   unless `ATO_MCP_MODEL_URL` points at an approved mirror.
+3. Build embeddings from `ATO_MCP_MODEL_DIR` and write the pinned Hugging
+   Face Granite embedding source into the manifest, unless `ATO_MCP_MODEL_URL`
+   points at an approved mirror.
 4. Upload the corpus assets via `ato-mcp publish-release`.
 5. Mark the release latest.
 
@@ -51,7 +52,10 @@ The script skips rebuilds when the refreshed `index.jsonl` hash is unchanged,
 except in `ATO_MCP_MODE=full`. Set `ATO_MCP_FORCE_REBUILD=1` for schema or
 model-only publications. After a successful publication,
 `release/.latest` points at the whole release directory so the next
-incremental run can reuse both `manifest.json` and prior `packs/`.
+incremental run passes it as `--base-release-dir`; the builder copies the
+previous DB/packs, re-cleans source docs to compare source-derived content
+hashes, and only re-embeds documents whose cleaned content changed or whose
+doc_id is new.
 
 The script requires `nvidia-smi`/CUDA to be available so the Rust
 binary's bundled `ort` runtime can use the CUDA execution provider. If
@@ -92,7 +96,9 @@ scripts/publish-release.sh v0.3.0 gunba/ato-mcp
 ```
 
 Set `ATO_MCP_MODEL_URL` only when publishing against an approved model mirror.
-By default the manifest points at pinned Hugging Face Granite embedding files.
+For non-Hugging Face mirrors, also set `ATO_MCP_MODEL_SHA256` and
+`ATO_MCP_MODEL_SIZE`. By default the manifest points at pinned Hugging Face
+Granite embedding files.
 This uploads manifest and packs to GitHub Releases; it does not upload the
 model to GitHub or duplicate the corpus into an offline bundle by default.
 Do not publish DB-derived repacks.

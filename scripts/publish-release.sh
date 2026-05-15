@@ -8,6 +8,8 @@
 #   - ato-mcp build has finished; release/ contains packs/ and manifest.json
 #   - target/release/ato-mcp built (or ATO_MCP_BIN points at one)
 #   - optional ATO_MCP_MODEL_URL for an approved model mirror
+#   - ATO_MCP_MODEL_SHA256 and ATO_MCP_MODEL_SIZE when that mirror is not
+#     a Hugging Face source
 #   - optional ATO_MCP_SIGN_KEY for manifest signing (minisign secret key)
 #   - gh authenticated for the maintainer account
 #
