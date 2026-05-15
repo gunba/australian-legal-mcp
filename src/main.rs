@@ -7228,8 +7228,9 @@ fn build_corpus(
             build_checkpoint_path(out_dir).display()
         );
     }
-    let mut seen_doc_ids: HashSet<String> =
+    let checkpoint_doc_ids: HashSet<String> =
         documents.iter().map(|doc| doc.doc_id.clone()).collect();
+    let mut seen_doc_ids = checkpoint_doc_ids.clone();
 
     let mut profile = BuildProfile::new(profile_enabled);
     let state = ServerState::new(use_gpu);
@@ -7272,7 +7273,9 @@ fn build_corpus(
         let payload_path = pages_dir.join(payload_path_raw);
         let doc_id = metadata_doc_id_for(canonical_id);
         if !seen_doc_ids.insert(doc_id.clone()) {
-            skipped_duplicate_doc_ids += 1;
+            if !checkpoint_doc_ids.contains(&doc_id) {
+                skipped_duplicate_doc_ids += 1;
+            }
             continue;
         }
 
