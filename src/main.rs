@@ -7228,13 +7228,14 @@ fn build_corpus(
             build_checkpoint_path(out_dir).display()
         );
     }
-    let mut completed_doc_ids: HashSet<String> =
+    let mut seen_doc_ids: HashSet<String> =
         documents.iter().map(|doc| doc.doc_id.clone()).collect();
 
     let mut profile = BuildProfile::new(profile_enabled);
     let state = ServerState::new(use_gpu);
-    let mut processed: usize = completed_doc_ids.len();
+    let mut processed: usize = seen_doc_ids.len();
     let mut skipped_no_payload: usize = 0;
+    let mut skipped_duplicate_doc_ids: usize = 0;
     let mut tx = conn.unchecked_transaction()?;
 
     // Pack records collected for this build. Each record is the full doc
@@ -7270,7 +7271,8 @@ fn build_corpus(
         }
         let payload_path = pages_dir.join(payload_path_raw);
         let doc_id = metadata_doc_id_for(canonical_id);
-        if completed_doc_ids.contains(&doc_id) {
+        if !seen_doc_ids.insert(doc_id.clone()) {
+            skipped_duplicate_doc_ids += 1;
             continue;
         }
 
@@ -7374,7 +7376,7 @@ fn build_corpus(
 
         let started = std::time::Instant::now();
         tx.execute(
-            "INSERT OR REPLACE INTO documents
+            "INSERT INTO documents
                 (doc_id, type, title, date, downloaded_at, content_hash, pack_sha8,
                  html, withdrawn_date, superseded_by, replaces,
                  has_in_doc_links, has_related_docs, has_history)
@@ -7648,9 +7650,6 @@ fn build_corpus(
                 &packs,
             )?;
             profile.checkpoint += started.elapsed();
-            for doc in &documents[first_new_doc..] {
-                completed_doc_ids.insert(doc.doc_id.clone());
-            }
             doc_hashes.clear();
             tx = conn.unchecked_transaction()?;
             pack_shard_idx += 1;
@@ -7696,6 +7695,11 @@ fn build_corpus(
     profile.checkpoint += started.elapsed();
     if skipped_no_payload > 0 {
         eprintln!("ato-mcp build: skipped {skipped_no_payload} index records without payload_path");
+    }
+    if skipped_duplicate_doc_ids > 0 {
+        eprintln!(
+            "ato-mcp build: skipped {skipped_duplicate_doc_ids} duplicate doc_id index records"
+        );
     }
 
     let started = std::time::Instant::now();
