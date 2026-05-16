@@ -14117,126 +14117,7 @@ fn load_cited_by(conn: &Connection, doc_id: &str) -> Result<(Vec<JsonValue>, i64
     Ok((out, total))
 }
 
-const ATO_MCP_USE_INSTRUCTIONS: &str = r##"## ATO MCP Use Instructions
-
-Use the ATO MCP as the primary retrieval layer for Australian tax research involving ATO-administered law, rulings, determinations, ATO IDs, practice statements, guidance, and related interpretive material. Treat it as an authority-finding and context-retrieval tool, not as a calculator or final legal reasoner.
-
-The MCP is strongest for:
-- Australian income tax, GST, FBT, PAYG, superannuation, consolidation, losses, CGT, R&D tax incentive, and ATO administrative guidance.
-- Locating legislation, rulings, determinations, ATO IDs, practice statements, tax guidance, related documents, cited-by material, and document history links.
-- Finding relevant law by section number, phrase, ruling identifier, or tax concept.
-
-The MCP may need external supplementation for:
-- Tax treaty existence and treaty rates.
-- Annual thresholds, rates, and indexed amounts where the relevant year matters.
-- Treasury explanatory memoranda, bills, second reading speeches, non-ATO regulator materials, TPB/TASA material, court judgments, or state taxes.
-- Historical point-in-time versions where the MCP only exposes links to older versions rather than storing the old text itself.
-
-### Tool Surface
-
-1. `search`
-- Use this first. Returns two parallel arrays: `hits` (chunk-level) and `title_hits` (document-level, up to 10).
-- `hits` are slim chunk pointers — `chunk_id`, `doc_id`, anchor/title metadata, snippets, and flags showing whether related navigation may be useful. Fetch the actual text via `get_chunks`.
-- `title_hits` is a sidebar of strongly-matching whole documents (ranked by title, plus exact `doc_id` / ATO-document-link lookups). Use it to recognise when a single authoritative document IS the answer, then `search` again with `doc_scope=<doc_id>` or read it chunk-by-chunk.
-- Search works best with section numbers, defined terms, ruling IDs, and exact tax phrases.
-- Default search is current-focused and excludes some older, withdrawn, private, or non-current material.
-- Use `doc_scope` to restrict search to one document ID, or a prefix pattern like `<PREFIX>/%` for a document family.
-- Use `current_only=false` and `include_old=true` when old, withdrawn, transitional, repealed, or historical material may matter.
-- Use `similar_to_chunk_id` after finding a good chunk to locate semantically similar chunks without writing a new query (returns no `title_hits`).
-- Use `seed_text` to do the same with arbitrary text rather than a corpus `chunk_id` — for example, paste a chunk returned by `fetch_external_doc` to pull related corpus material. The text is runtime-embedded as the query vector (returns no `title_hits`).
-
-2. `get_chunks`
-- Use this after `search` to retrieve the actual text of promising hits.
-- Fetch by `chunk_id`.
-- Request neighbouring chunks before and after the hit when statutory context, exceptions, calculation steps, examples, or notes may matter.
-- Do not rely on snippets alone for final conclusions.
-
-3. `get_doc_anchors`
-- Use this when a hit indicates related navigation is available, or when the issue depends on document structure.
-- Retrieves useful document anchors and navigation entries.
-- Also surfaces related documents, history links, and `cited_by` documents where available.
-- Use this to move from a single chunk to surrounding sections, related rulings, amendments, explanatory links, or later materials citing the document.
-
-4. `fetch_external_doc`
-- Use this when a `[doc:X]` marker in chunk text points at an id the local corpus does not index — subdivisions, paragraph-level references, footnote pointers, or historical point-in-time pointers (the `url` in `get_doc_anchors` historical_versions).
-- Returns the live ATO document as the same `{ord, anchor, text}` chunk shape `search`/`get_chunks` use, so it reads like a corpus document.
-- To pivot from an external chunk back into the corpus, pass its text to `search` as `seed_text`.
-- Network-dependent and slower than the local corpus tools — prefer `search` for anything indexed.
-
-### Standard Research Workflow
-
-1. Start with targeted searches.
-Prefer searches like `s 25-90 foreign branch income deduction`, `Subdivision 768-G active foreign business asset percentage`, `TR 2008/7 royalty withholding tax`, or `GIC deduction incurred after 1 July 2025`. Avoid relying only on broad natural-language searches like "is this deductible?" Scan both `hits` and `title_hits` — a strong `title_hits` entry often names the controlling document directly.
-
-2. Open the best chunks.
-Use `get_chunks` on multiple promising hits. Include neighbouring chunks where the answer may depend on nearby exceptions, formulas, definitions, or notes.
-
-3. Follow the document structure.
-If the result has document anchors, history, related docs, or cited-by flags, call `get_doc_anchors`. Tax answers often depend on adjacent provisions or related interpretive material. When a `[doc:X]` marker or a historical-version URL points outside the corpus, follow it with `fetch_external_doc`.
-
-4. Confirm the full rule, not just the headline rule.
-For each issue, check the operative rule, exceptions, definitions, timing rule, calculation method, rounding rule, transitional or commencement rule, interaction with other regimes, and administrative guidance where relevant.
-
-5. For quantitative issues, retrieve the calculation provision.
-Do not calculate from memory after finding only a general explanation. Confirm the statutory formula, rounding convention, caps, thresholds, rate year, and ordering rules.
-
-6. For historical or date-sensitive issues, deliberately widen the search.
-Use `current_only=false` and `include_old=true` where transitional provisions, commencement dates, historical thresholds or rates, repealed law, old ATO IDs, withdrawn guidance, acquisition dates, joining times, loss years, income years, or FBT years matter.
-
-7. For multi-step regimes, search each step separately.
-This is especially important for consolidation, tax losses, R&D tax incentive, CGT cost base modifications, foreign income / NANE rules, franking, debt/equity rules, withholding tax, GST input tax credit limits, and FBT exemptions and taxable value calculations.
-
-8. For multiple-choice or issue-spotting tasks, test each plausible answer.
-Search the concepts behind each suspicious option. Do not stop after proving one option sounds right; there may be a more specific rule.
-
-### Reliability Rules
-
-- Never cite a search snippet as authority. Retrieve the chunk text first.
-- Never assume the first relevant hit is the controlling rule.
-- If a provision has a formula, retrieve the formula.
-- If a rule has a date, retrieve the commencement or transitional material.
-- If an amount depends on a year, verify the threshold or rate for that exact year.
-- If the MCP result is current law but the facts are historical, explicitly check whether historical law or transitional treatment matters.
-- If the MCP does not clearly answer an issue, say so and use official external sources where appropriate.
-
-### External Source Fallback
-
-Use official sources first when the MCP is insufficient:
-- ATO website and ATO legal database.
-- Treasury, Federal Register of Legislation, explanatory memoranda, and bills.
-- TPB for tax agent services / Code of Professional Conduct material.
-- Official treaty databases or Treasury treaty pages for double tax agreements.
-- Court or tribunal databases for case law.
-
-When using external sources, prefer primary or official materials over commentary.
-
-### Good Search Habits
-
-Prefer searches like:
-- `s 8-1 incurred presently existing liability`
-- `s 110-45 Division 43 cost base reduction`
-- `s 110-37 indexation cost base reduction`
-- `s 23AH deduction foreign branch income`
-- `s 25-90 debt deduction NANE income`
-- `Subdivision 768-G active foreign business asset percentage rounding`
-- `s 355-480 associate R&D payment`
-- `s 355-315 balancing adjustment R&D`
-- `s 701-30 non-membership period`
-- `s 716-850 threshold gross up`
-- `CGT event L4 allocable cost amount excess`
-- `franking benchmark rule underfranking debit`
-
-After finding a strong chunk, use `similar_to_chunk_id` to find neighbouring interpretive materials or related provisions that may not share the same wording.
-
-### Output Discipline
-
-When answering from MCP research:
-- State the rule and the source type relied on.
-- Apply the rule to the facts.
-- Identify unresolved assumptions, especially dates, thresholds, rates, or calculation conventions.
-- Separate legal conclusion from arithmetic.
-- For material calculations, show the formula and inputs.
-- Do not overstate certainty where the MCP produced nearby but not decisive authority."##;
+const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first. Search hits are chunk pointers, not authority; call `get_chunks` before relying on text. Use `get_doc_anchors` for in-doc navigation, related/history links, and cited-by. Use `fetch_external_doc` only for unindexed `[doc:X]` links; pass fetched chunk text to `search(seed_text=...)` to pivot back into the corpus. For historical or withdrawn material, set `current_only=false` and `include_old=true`."##;
 
 fn server_instructions(update_notice: Option<&UpdateAvailability>) -> String {
     // [SW-02] Instructions are generated from live corpus stats.
@@ -14276,7 +14157,7 @@ fn tool_descriptors() -> JsonValue {
     json!([
         {
             "name": "search",
-            "description": "Hybrid semantic+lexical search over the ATO corpus. Returns two parallel result arrays: `hits` — chunk-level pointer hits (chunk_id, doc_id, anchor, optional snippet); fetch bodies via get_chunks. `title_hits` — up to 10 document-level hits ranked by title (no chunk_id), including exact doc_id / ATO-document-link lookups; treat as a sidebar of strongly-matching whole documents. doc_scope filters by full doc_id (in-doc search) or \"<PREFIX>/%\" (family). mode=keyword forces lexical-only; hybrid/vector require the semantic index. Set include_snippet=false when the caller will follow up with get_chunks. Pass similar_to_chunk_id to find chunks semantically close to one the agent already has (skips query encoding, ignores `query`, forces vector-only mode, filters the seed chunk out of results, and returns no title_hits). Pass seed_text to do the same with arbitrary text rather than a corpus chunk_id — e.g. a chunk returned by fetch_external_doc — to pull related corpus material; it is runtime-embedded as the query vector, forces vector-only mode, and returns no title_hits. similar_to_chunk_id wins if both are set. Hits in both arrays include navigation hints: has_in_doc_links (doc has paragraph anchors / contents entries — call get_doc_anchors to navigate), has_related_docs (doc has companion documents like errata / addenda), has_history (doc has earlier point-in-time versions — get_doc_anchors lists their URLs).",
+            "description": "Search the local ATO corpus. Returns slim `hits` with chunk_id plus `title_hits`; fetch hit bodies with get_chunks. Use doc_scope for a doc_id or prefix like `PAC/%`. `seed_text` or `similar_to_chunk_id` runs vector-only related search.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -14289,10 +14170,10 @@ fn tool_descriptors() -> JsonValue {
                     "mode": {"type": "string", "enum": ["hybrid", "vector", "keyword"]},
                     "sort_by": {"type": "string", "enum": ["relevance", "recency"]},
                     "include_old": {"type": "boolean"},
-                    "current_only": {"type": "boolean", "description": "When true (default), excludes withdrawn rulings. Set false to include withdrawn material with a visible marker."},
-                    "similar_to_chunk_id": {"type": "integer", "description": "When set, use this chunk's stored embedding as the query vector (skips encoding `query`, forces mode=vector, excludes the seed chunk from results, returns no title_hits)."},
-                    "seed_text": {"type": "string", "description": "When set, runtime-embed this text as the query vector instead of `query` (e.g. a chunk from fetch_external_doc). Forces mode=vector, returns no title_hits. Ignored when similar_to_chunk_id is also set."},
-                    "include_snippet": {"type": "boolean", "description": "When true (default), each hit carries a BM25-windowed snippet. Set false to omit the snippet field entirely — useful when the caller will fetch full text via get_chunks."},
+                    "current_only": {"type": "boolean"},
+                    "similar_to_chunk_id": {"type": "integer"},
+                    "seed_text": {"type": "string"},
+                    "include_snippet": {"type": "boolean"},
                     "format": {"type": "string", "enum": ["json"], "default": "json"}
                 },
                 "required": ["query"]
@@ -14300,7 +14181,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_asset",
-            "description": "Resolve an image asset reference (from [asset:X] markers in plaintext or data-asset-ref attributes in HTML) to a local file path plus source metadata.",
+            "description": "Resolve an `[asset:X]` reference to a local file path and metadata.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -14311,7 +14192,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_doc_anchors",
-            "description": "Return the navigation map for a document: in-doc anchors (paragraph references, contents-table entries), sister documents (errata, addenda, withdrawal notices), historical versions (earlier point-in-time publications), and reverse citations (other documents whose chunks carry a [doc:X] marker pointing AT this doc). Slim search hits surface `has_in_doc_links`, `has_related_docs`, or `has_history` when this tool would return useful entries — call it then to navigate. `in_doc` entries carry chunk_id (pass to get_chunks); `related_docs` carry doc_id (pass to search/get_chunks); `historical_versions` carry {doc_id, pit, date, url}; `cited_by` carries [{doc_id, title, type, date}] ordered by source date DESC and capped at 100 — when more citers exist, `cited_by_total` reports the full count. The corpus does not store historical content; use the historical-version `url` field with fetch_external_doc to retrieve an older version when needed.",
+            "description": "Return in-doc anchors, related/history links, and cited-by docs for a doc_id. `in_doc` entries carry chunk_id for get_chunks.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -14322,7 +14203,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_chunks",
-            "description": "Fetch chunk bodies by chunk_id. before/after expand the response with ordinal neighbour chunks within the same doc (0-20 each). Plaintext carries [doc:X] cross-reference markers (resolve via search, or fetch_external_doc when not indexed) and [asset:X] image markers (resolve via get_asset). On max_chars truncation, truncated_at + next_call point at the next chunk_id to continue scrolling.",
+            "description": "Fetch chunk bodies by chunk_id, with optional before/after neighbour chunks. Text may contain `[doc:X]` and `[asset:X]` markers.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -14337,7 +14218,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_definition",
-            "description": "Fetch compact statutory definitions for a term. Returns only matching definition entries, not whole dictionary provisions. If no statutory definition is found, returns a labelled non-statutory ordinary meaning from the configured dictionary source or Open English WordNet.",
+            "description": "Fetch compact statutory definitions for a term, with ordinary-meaning fallback when none are indexed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -14351,7 +14232,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "stats",
-            "description": "Index version, document counts, default search policy, and per-prefix corpus breakdown. Use the prefix breakdown to discover the canonical filter idiom doc_scope=\"<PREFIX>/%\" for narrowing searches by document family.",
+            "description": "Return index version, counts, search policy, and prefix breakdown.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -14361,13 +14242,13 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "fetch_external_doc",
-            "description": "Fetch a document FROM ATO's live website by doc_id and return it as deterministic chunks — the same {ord, anchor, text} chunk shape `search`/`get_chunks` work with, so an external doc reads like a corpus doc. Use this when a [doc:X] marker in chunk text points at an id the local corpus doesn't index — typically subdivisions (PAC/<act>/SDiv*), paragraph-level references (PAC/<act>/<section>(N)), footnote pointers (.../fpN), or historical PiT-qualified pointers. URL is https://www.ato.gov.au/law/view/document?docid=<doc_id>[&PiT=<pit>][&db=<view>]. Stateless: the chunks are not persisted and carry no chunk_id; all of them are returned inline. Network-dependent and slower than local corpus tools — prefer search for anything indexed.",
+            "description": "Fetch an unindexed live ATO doc_id as `{ord, anchor, text}` chunks. Use for specific `[doc:X]` links; some TOC/container ids are not externally fetchable.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "doc_id": {"type": "string"},
-                    "pit": {"type": "string", "description": "Optional PiT timestamp (e.g. 99991231235958 for current view)."},
-                    "view": {"type": "string", "description": "Optional db= view qualifier (e.g. HISTFT for amendment-history view)."}
+                    "pit": {"type": "string"},
+                    "view": {"type": "string"}
                 },
                 "required": ["doc_id"]
             }
@@ -15510,6 +15391,69 @@ mod tests {
                 "missing update command in: {text}"
             );
         });
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_startup_guidance_stays_compact() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let data = tempdir()?;
+        with_data_dir(data.path(), || {
+            let static_chars = ATO_MCP_USE_INSTRUCTIONS.chars().count();
+            let static_words = ATO_MCP_USE_INSTRUCTIONS.split_whitespace().count();
+            assert!(
+                static_chars <= 600,
+                "static MCP use instructions are too large: {static_chars} chars"
+            );
+            assert!(
+                static_words <= 100,
+                "static MCP use instructions are too large: {static_words} words"
+            );
+
+            let text = server_instructions(None);
+            let boot_chars = text.chars().count();
+            assert!(
+                boot_chars <= 1_100,
+                "missing-corpus startup instructions are too large: {boot_chars} chars"
+            );
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_tool_descriptors_stay_compact() -> Result<()> {
+        let tools = tool_descriptors();
+        let array = tools
+            .as_array()
+            .expect("tool_descriptors must return an array");
+        let mut total_chars = 0usize;
+        for tool in array {
+            let name = tool
+                .get("name")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("<unnamed>");
+            let desc_chars = tool
+                .get("description")
+                .and_then(JsonValue::as_str)
+                .map(|description| description.chars().count())
+                .unwrap_or(0);
+            assert!(
+                desc_chars <= 300,
+                "{name} tool description is too large: {desc_chars} chars"
+            );
+
+            let schema_chars = serde_json::to_string(
+                tool.get("inputSchema")
+                    .expect("tool descriptor must include inputSchema"),
+            )?
+            .chars()
+            .count();
+            total_chars += desc_chars + schema_chars;
+        }
+        assert!(
+            total_chars <= 3_000,
+            "MCP tool descriptor payload is too large: {total_chars} chars"
+        );
         Ok(())
     }
 
