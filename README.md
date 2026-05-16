@@ -7,9 +7,10 @@ Taxation Office legal corpus.
 ATO material and apply professional judgment before relying on an answer.
 
 The installed server is a Rust binary. End users do not need Python, pip,
-pipx, uv, a compiler, `gh`, or an API key. The corpus is shipped as GitHub
-release assets, while the Granite embedding query encoder is downloaded from the
-external URL recorded in the release manifest.
+pipx, uv, a compiler, `gh`, or an API key. Each release tag carries the
+platform binary archives plus a single pre-built corpus artifact
+(`ato.db.zst`); the Granite embedding query encoder is downloaded from
+the external URL recorded in the release manifest.
 
 ## Tools
 
@@ -99,7 +100,7 @@ to delay or block first run:
   CA before running `ato-mcp update`.
 
 - **Egress allow-list.** `ato-mcp update` fetches from two hosts:
-  `github.com` (release manifest + pack assets) and `huggingface.co`
+  `github.com` (release manifest + `ato.db.zst`) and `huggingface.co`
   (Granite embedding model). Both need to be reachable. The release URL
   base can be overridden with `ATO_MCP_RELEASES_URL` to point at an
   internal mirror; the model URL is recorded in `manifest.model.url` and
@@ -249,10 +250,11 @@ ato-mcp doctor
 
 Update first fetches the small `update.json` release summary. If the installed
 corpus, schema, and model still match, it exits without downloading the
-manifest. When anything has changed, it downloads `manifest.json`, fetches
-the pack assets, rebuilds the live SQLite database in a staging file, and
-atomically renames it over the live DB — leaving the previous database in
-`backups/ato.db.prev` for rollback:
+manifest. When the corpus has changed, it fetches `manifest.json`, downloads
+the single `ato.db.zst` artifact, verifies its sha256, decompresses it into a
+staging file, rebuilds the FTS5 indexes in-place, and atomically renames it
+over the live DB — leaving the previous database in `backups/ato.db.prev`
+for rollback:
 
 ```bash
 ato-mcp doctor --rollback
@@ -291,7 +293,7 @@ ato-mcp/
 
 The Rust binary is the end-user product **and** the maintainer tool. The
 Python pipeline that used to do scraping, metadata extraction, vector
-generation, pack building, and release publication has been retired —
+generation, corpus building, and release publication has been retired —
 all of it now ships as `ato-mcp` subcommands.
 
 Local GPU release build:
@@ -312,17 +314,29 @@ cargo build --release --features cuda
   --pages-dir /path/to/ato_pages \
   --db-path   ./release/ato.db \
   --model-dir /path/to/granite-embedding-small-r2 \
-  --base-release-dir ./release/.latest \
   --out-dir   ./release \
   --gpu \
   --profile
 
+./target/release/ato-mcp package-corpus \
+  --db-path  ./release/ato.db \
+  --out      ./release/ato.db.zst \
+  --manifest ./release/manifest.json
+
 ./target/release/ato-mcp publish-release \
   --out-dir ./release \
-  --tag     v0.8.0 \
+  --tag     v0.13.0 \
   --repo    gunba/ato-mcp \
   --overwrite
 ```
+
+`scripts/publish-release.sh <tag>` wraps the `package-corpus` +
+`publish-release` steps and is what the maintainer host actually runs.
+The whole release lives on a single rolling tag: binary archives are
+published by `.github/workflows/release-binaries.yml` on tag push, and
+the maintainer GPU host adds `manifest.json`, `update.json`, and
+`ato.db.zst` to the same tag. End users always hit
+`releases/latest/download/manifest.json` regardless of the tag name.
 
 For full crawls (rare, hours):
 
@@ -332,31 +346,20 @@ For full crawls (rare, hours):
 ./target/release/ato-mcp link-download --deduped-links snapshots/.../deduped_links.jsonl --out-dir /path/to/ato_pages
 ```
 
-`scripts/maintainer-sync.sh` wraps all three modes (`incremental`,
-`catch_up`, `full`) and handles release publication. Drive it from the
-provided `systemd/ato-mcp-maintainer-weekly.service` unit on a GPU host.
-The script validates `release/.latest` before using it, restores the pointer
-from another local compatible corpus release when possible, and can
-materialize a compatible published corpus release locally from manifest and
-pack assets without running the embedding model. If a build was interrupted,
-the script can also resume a matching checkpointed output directory instead
-of starting a new full embedding pass after the date tag changes.
-
 Release builds use Granite embedding vectors and should run on the
 maintainer GPU. The Rust end-user runtime does not require a GPU; query
-embedding must continue to work on ordinary CPU-only laptops. The model is not
-uploaded to GitHub Releases; by default the
-manifest points at pinned Hugging Face Granite embedding files, and the
-Rust client downloads and verifies them during `ato-mcp update`. The
-model URL can be redirected at release time via `--model-url` /
-`--model-sha256` / `--model-size`; non-Hugging Face mirrors must supply
-both hash and size.
+embedding must continue to work on ordinary CPU-only laptops. The model
+is not uploaded to GitHub Releases; by default the manifest points at
+pinned Hugging Face Granite embedding files, and the Rust client
+downloads and verifies them during `ato-mcp update`. The model URL can
+be redirected at release time via `--model-url` / `--model-sha256` /
+`--model-size`; non-Hugging Face mirrors must supply both hash and size.
 
-Corpus releases must come from `ato-mcp build`; DB-derived repack
-scripts are not a supported release path. The optional
-`corpus release (gpu)` workflow targets a self-hosted runner labelled
-`gpu` and fails if `nvidia-smi` is unavailable. It is not scheduled by
-default, so it does not spend hosted GPU minutes.
+Corpus releases must come from `ato-mcp build` + `ato-mcp
+package-corpus`. The optional `corpus release (gpu)` workflow targets a
+self-hosted runner labelled `gpu` and fails if `nvidia-smi` is
+unavailable. It is not scheduled by default, so it does not spend hosted
+GPU minutes.
 
 ## Development
 
