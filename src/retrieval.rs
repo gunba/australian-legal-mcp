@@ -916,7 +916,7 @@ pub(crate) fn resolve_in_doc_anchor_chunks(conn: &Connection, doc_id: &str) -> R
 /// citers and would otherwise dominate the response. Order by source date
 /// DESC so the agent sees the most recent citations first; the total count
 /// lives on `cited_by_total` when truncation occurs.
-
+///
 /// [UM-07] Streams `chunks.text` once, regex-extracts every `[doc:X]` marker
 /// (PiT / view qualifiers collapse to the base doc_id), and INSERT OR
 /// IGNORE-batches into `citations`. Idempotent: clears first.

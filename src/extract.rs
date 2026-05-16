@@ -1026,7 +1026,6 @@ pub(crate) fn rewrite_images_html(
     doc_id: Option<&str>,
     source_path: Option<&Path>,
 ) -> (String, Vec<ExtractedAsset>) {
-    use base64::Engine as _;
     let img_re = Regex::new(r#"(?is)<img\b([^>]*)>"#).unwrap();
     let mut assets: Vec<ExtractedAsset> = Vec::new();
     let mut image_ord: u32 = 0;

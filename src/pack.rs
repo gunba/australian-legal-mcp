@@ -46,7 +46,6 @@ pub(crate) fn write_pack(
     level: i32,
     records: impl Iterator<Item = Result<(String, serde_json::Value)>>,
 ) -> Result<JsonValue> {
-    use std::io::Write as _;
     if let Some(parent) = out_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }

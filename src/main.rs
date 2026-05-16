@@ -1,13 +1,17 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+#[allow(unused_imports)]
 use fs2::FileExt;
 use reqwest::blocking::Client;
+#[allow(unused_imports)]
 use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension};
+#[allow(unused_imports)]
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
+#[allow(unused_imports)]
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -903,7 +907,6 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
     // Manifest schema 5+ ships a single ato.db.zst artifact. Schema 4
     // ships per-doc packs. Detect which shape we have and upload accordingly.
     let mut artifacts: Vec<PathBuf> = vec![manifest_path.clone()];
-    let mut pack_files: Vec<PathBuf> = Vec::new();
 
     if let Some(db_info) = manifest.db.as_mut() {
         let filename = std::path::Path::new(&db_info.url)
@@ -928,7 +931,7 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
         if !packs_dir.exists() {
             bail!("no packs/ dir at {} and manifest.db is unset", packs_dir.display());
         }
-        pack_files = fs::read_dir(&packs_dir)?
+        let mut pack_files: Vec<PathBuf> = fs::read_dir(&packs_dir)?
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| {
                 p.file_name()
@@ -951,7 +954,7 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
                 tag = args.tag,
             );
         }
-        artifacts.extend(pack_files.iter().cloned());
+        artifacts.extend(pack_files);
     }
 
     // Save updated manifest.
@@ -2063,6 +2066,7 @@ mod tests {
     use crate::config::*;
     use crate::db::*;
     use crate::extract::*;
+    #[allow(unused_imports)]
     use crate::html::*;
     use crate::pack::*;
     use crate::retrieval::*;

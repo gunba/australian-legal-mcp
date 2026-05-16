@@ -28,7 +28,6 @@ use crate::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
-use fs2::FileExt;
 use reqwest::blocking::Client;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -36,7 +35,7 @@ use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
-use std::io::{BufRead, Cursor, Read, Write};
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
