@@ -1,13 +1,5 @@
-__pycache__/
-*.py[cod]
-*.egg-info/
-.pytest_cache/
-.ruff_cache/
-dist/
 build/
 target/
-.venv/
-venv/
 .env
 .claude/*
 !.claude/rules/

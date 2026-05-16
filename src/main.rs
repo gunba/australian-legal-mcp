@@ -171,133 +171,6 @@ enum Command {
         #[arg(long)]
         view: Option<String>,
     },
-    /// Run the Rust HTML cleaner on a saved doc and emit JSON. Used by the
-    /// Python build pipeline as a subprocess (replaces the in-process call
-    /// to ato_mcp.indexer.extract.extract). Reads HTML from --html-file
-    /// (or stdin if omitted) and writes
-    /// {text, html, title, html_title} to stdout.
-    Extract {
-        /// Path to the source HTML. Reads stdin if absent.
-        #[arg(long)]
-        html_file: Option<PathBuf>,
-        /// doc_id is reserved for future asset-extraction support; ignored today.
-        #[arg(long)]
-        doc_id: Option<String>,
-        /// source_path is reserved for future asset-resolution support; ignored today.
-        #[arg(long)]
-        source_path: Option<PathBuf>,
-    },
-    /// Extract definitions from a list of pre-chunked DefinitionChunks.
-    /// Reads JSON from --input-file (or stdin) of the shape
-    /// {doc_id, source_title, source_type, chunks: [{ord, anchor, text}, ...]}.
-    /// Writes a JSON array of Definition records to stdout.
-    /// Mirrors src/ato_mcp/indexer/definitions.py:extract_definitions.
-    ExtractDefinitions {
-        #[arg(long)]
-        input_file: Option<PathBuf>,
-    },
-    /// Extract doc-navigation anchors from cleaned HTML. Mirrors
-    /// src/ato_mcp/indexer/anchors.py:extract_anchors. JSON out:
-    /// [{kind, label, target_anchor?, target_doc_id?, target_pit?}, ...].
-    ExtractAnchors {
-        /// Path to the cleaned HTML. Reads stdin if absent.
-        #[arg(long)]
-        html_file: Option<PathBuf>,
-        /// doc_id of the source doc — needed to filter self-links.
-        #[arg(long)]
-        source_doc_id: String,
-    },
-    /// Extract currency / withdrawal markers from raw doc HTML. Mirrors
-    /// src/ato_mcp/indexer/extract.py:extract_currency. JSON out:
-    /// {withdrawn_date, superseded_by, replaces}.
-    ExtractCurrency {
-        #[arg(long)]
-        html_file: Option<PathBuf>,
-    },
-    /// Block-aware chunker for cleaned ATO HTML. Mirrors
-    /// src/ato_mcp/indexer/chunk.py:chunk_html. JSON out:
-    /// [{ord, anchor, text, definition_text}, ...].
-    ChunkHtml {
-        #[arg(long)]
-        html_file: Option<PathBuf>,
-        #[arg(long)]
-        root_title: Option<String>,
-        #[arg(long, default_value_t = 1024)]
-        max_tokens: usize,
-    },
-    /// Derive metadata fields from an ATO canonical_id / doc_id. Mirrors
-    /// src/ato_mcp/indexer/metadata.py public helpers. JSON out:
-    /// {doc_id, type_prefix, year, human_code}.
-    DocMeta { canonical_id: String },
-    /// Parse an ATO link href into (doc_id, pit, view). Mirrors
-    /// extract.py:_doc_id_from_ato_link. JSON out: null OR
-    /// {doc_id, pit, view}.
-    DocIdFromLink { href: String },
-    /// Write a pack file from a JSONL stream of {"doc_id": str, "record": {...}}
-    /// records on stdin. Mirrors src/ato_mcp/indexer/pack.py:PackWriter.
-    /// JSON out on stdout: {pack_path, sha8, sha256, size, refs}.
-    PackWrite {
-        #[arg(long)]
-        out: PathBuf,
-        #[arg(long, default_value_t = 3)]
-        level: i32,
-    },
-    /// Rewrite the `packs[*].url` in a manifest.json to point at GitHub
-    /// release asset download URLs. Mirrors
-    /// src/ato_mcp/indexer/release.py:rewrite_manifest_urls.
-    ManifestRewriteUrls {
-        #[arg(long)]
-        manifest: PathBuf,
-        #[arg(long)]
-        repo: String,
-        #[arg(long)]
-        tag: String,
-    },
-    /// Bundle the embedding model + tokenizer into a single `.tar.zst`.
-    /// Mirrors src/ato_mcp/indexer/release.py:bundle_model. JSON out:
-    /// {sha256, size}.
-    BundleModel {
-        #[arg(long)]
-        model_dir: PathBuf,
-        #[arg(long)]
-        out: PathBuf,
-        /// Files to include. Names starting with `model_`
-        /// are looked up under `<model_dir>/onnx/`; others under `<model_dir>/`.
-        #[arg(long, value_delimiter = ',', default_values_t = vec![
-            "model_fp16.onnx".to_string(),
-            "model_fp16.onnx_data".to_string(),
-            "tokenizer.json".to_string(),
-        ])]
-        include: Vec<String>,
-        #[arg(long, default_value_t = 3)]
-        level: i32,
-    },
-    /// [SS-02] Fetch a node list from the ATO browse-content API. Mirrors
-    /// src/ato_mcp/scraper/client.py:AtoBrowseClient.fetch_nodes.
-    /// JSON out: [{...}, ...] (verbatim ATO response).
-    AtoFetchNodes {
-        /// Either a raw query string or "key=value,key=value,..." pairs.
-        query: String,
-        #[arg(
-            long,
-            default_value = "https://www.ato.gov.au/API/v1/law/lawservices/browse-content/"
-        )]
-        base_url: String,
-        #[arg(long, default_value_t = 30.0)]
-        timeout_seconds: f64,
-    },
-    /// Encode each input line as a quantized semantic embedding.
-    /// Reads texts (one per line) from stdin or --input-file. Emits a JSON
-    /// array of base64-encoded raw int8 byte strings (256 dims, 256 bytes
-    /// per embedding) to stdout — same shape the build pipeline writes
-    /// into pack records.
-    Embed {
-        #[arg(long)]
-        input_file: Option<PathBuf>,
-        /// Use the CUDA execution provider. Requires a binary built with --features cuda.
-        #[arg(long)]
-        gpu: bool,
-    },
     /// In-binary build orchestrator (port of build.py). Reads
     /// `pages_dir/index.jsonl` (one record per line, with the fields
     /// canonical_id and payload_path), runs each doc through the cleaning
@@ -361,23 +234,6 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         zstd_level: i32,
     },
-    /// [SS-01] Source acquisition is split into whats-new + scrape-diff
-    /// incremental, tree-crawl + snapshot-reduce full, and deduped catch-up.
-    /// Fetch the ATO "What's New" feed and return the deduped doc entries
-    /// as JSON. Mirrors src/ato_mcp/scraper/whats_new.py:WhatsNewFetcher.
-    WhatsNew {
-        #[arg(
-            long,
-            default_value = "https://www.ato.gov.au/law/view/whatsnew.htm?fid=whatsnew"
-        )]
-        url: String,
-        #[arg(long, default_value_t = 30.0)]
-        timeout_seconds: f64,
-    },
-    /// Normalise an ATO law/view/document href to its canonical relative
-    /// form (drops PiT, decodes percent-encoded docid, etc.). Mirrors
-    /// src/ato_mcp/scraper/whats_new.py:normalize_doc_href.
-    NormalizeDocHref { href: String },
     /// Fetch compact statutory definitions for a term.
     GetDefinition {
         term: String,
@@ -436,11 +292,8 @@ enum Command {
         force: bool,
     },
     /// Compute the subset of dedup-style link records not already present
-    /// in an existing index.jsonl. Used by maintainer-sync.sh for both
-    /// incremental (input from `ato-mcp whats-new`) and catch_up
-    /// (input from `ato-mcp snapshot-reduce`'s deduped_links.jsonl).
-    /// Mirrors src/ato_mcp/scraper/pipeline.py:_run_whats_new
-    /// and pipeline.py:_run_catch_up's diff step.
+    /// in an existing index.jsonl. Used by maintainer-sync.sh for incremental
+    /// (--whats-new-url) and catch-up (--deduped from snapshot-reduce) runs.
     ScrapeDiff {
         /// Existing payloads index.jsonl. Each line has canonical_id;
         /// any link already present here is skipped.
@@ -711,374 +564,6 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
-        Command::Extract {
-            html_file,
-            doc_id,
-            source_path,
-        } => {
-            let html = match html_file.as_ref() {
-                Some(p) => {
-                    fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?
-                }
-                None => {
-                    let mut s = String::new();
-                    std::io::stdin()
-                        .read_to_string(&mut s)
-                        .context("reading stdin")?;
-                    s
-                }
-            };
-            let cleaned = clean_ato_html(&html);
-            // EM front-matter + leading-heading title composition read raw
-            // (pre-mutation) container HTML, matching Python.
-            let leading = extract_leading_headings(&cleaned.html);
-            let composed_title = extract_compose_title(&leading);
-            let title = composed_title.or(cleaned.title.clone());
-            let (fm_refs, fm_phrase) = extract_em_front_matter(&cleaned.html);
-            // Mutation chain on the cleaned container HTML, mirroring Python's
-            // _rewrite_images_html + _normalise_named_anchors + _strip_attributes.
-            let (rewritten_html, assets) = if doc_id.is_some() && source_path.is_some() {
-                rewrite_images_html(&cleaned.html, doc_id.as_deref(), source_path.as_deref())
-            } else {
-                (cleaned.html.clone(), Vec::new())
-            };
-            let normalised = normalise_named_anchors(&rewritten_html);
-            let with_links = rewrite_links_html(&normalised);
-            let final_html = strip_attributes(&with_links);
-            // Re-render text from the mutated HTML using the chunker's walker
-            // so [asset:X] markers (from rewrite_images_html spans) appear and
-            // tables render as pipe-separated rows — matches Python's
-            // chunk.html_to_text used by extract.extract().
-            let text = chunker_html_to_text(&final_html);
-            // Headings + heading_levels + anchors are read AFTER mutations.
-            let final_doc = scraper::Html::parse_fragment(&final_html);
-            let heading_sel = scraper::Selector::parse("h1, h2, h3, h4, h5, h6").unwrap();
-            let mut headings: Vec<String> = Vec::new();
-            let mut heading_levels: Vec<u32> = Vec::new();
-            for h in final_doc.select(&heading_sel) {
-                let t = anchors_node_text(h);
-                headings.push(t);
-                let lvl: u32 = h.value().name()[1..].parse().unwrap_or(0);
-                heading_levels.push(lvl);
-            }
-            let anchors_pairs = extract_collect_anchors(&final_doc);
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "text": text,
-                    "html": final_html,
-                    "title": title,
-                    "html_title": cleaned.title,
-                    "headings": headings,
-                    "heading_levels": heading_levels,
-                    "anchors": anchors_pairs,
-                    "front_matter_refs": fm_refs,
-                    "front_matter_phrase": fm_phrase,
-                    "assets": assets,
-                }))?
-            );
-            Ok(())
-        }
-        Command::ExtractDefinitions { input_file } => {
-            #[derive(Deserialize)]
-            struct Input {
-                doc_id: String,
-                source_title: String,
-                source_type: String,
-                chunks: Vec<DefinitionChunk>,
-            }
-            let raw = match input_file {
-                Some(p) => {
-                    fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?
-                }
-                None => {
-                    let mut s = String::new();
-                    std::io::stdin()
-                        .read_to_string(&mut s)
-                        .context("reading stdin")?;
-                    s
-                }
-            };
-            let input: Input =
-                serde_json::from_str(&raw).context("parsing extract-definitions input")?;
-            let defs = extract_definitions(
-                &input.doc_id,
-                &input.source_title,
-                &input.source_type,
-                &input.chunks,
-            );
-            println!("{}", serde_json::to_string_pretty(&defs)?);
-            Ok(())
-        }
-        Command::ExtractAnchors {
-            html_file,
-            source_doc_id,
-        } => {
-            let html = match html_file {
-                Some(p) => {
-                    fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?
-                }
-                None => {
-                    let mut s = String::new();
-                    std::io::stdin()
-                        .read_to_string(&mut s)
-                        .context("reading stdin")?;
-                    s
-                }
-            };
-            let refs = extract_anchors(&html, &source_doc_id);
-            println!("{}", serde_json::to_string_pretty(&refs)?);
-            Ok(())
-        }
-        Command::ExtractCurrency { html_file } => {
-            let html = match html_file {
-                Some(p) => {
-                    fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?
-                }
-                None => {
-                    let mut s = String::new();
-                    std::io::stdin()
-                        .read_to_string(&mut s)
-                        .context("reading stdin")?;
-                    s
-                }
-            };
-            let info = extract_currency(&html);
-            println!("{}", serde_json::to_string_pretty(&info)?);
-            Ok(())
-        }
-        Command::ChunkHtml {
-            html_file,
-            root_title,
-            max_tokens,
-        } => {
-            let html = match html_file {
-                Some(p) => {
-                    fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?
-                }
-                None => {
-                    let mut s = String::new();
-                    std::io::stdin()
-                        .read_to_string(&mut s)
-                        .context("reading stdin")?;
-                    s
-                }
-            };
-            let chunks = chunk_html(&html, root_title.as_deref(), max_tokens);
-            println!("{}", serde_json::to_string_pretty(&chunks)?);
-            Ok(())
-        }
-        Command::DocMeta { canonical_id } => {
-            let doc_id = metadata_doc_id_for(&canonical_id);
-            let type_prefix = metadata_parse_docid(&canonical_id);
-            let year = metadata_year_for_docid(&canonical_id);
-            let human_code = metadata_human_code_for_doc_id(&doc_id);
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "doc_id": doc_id,
-                    "type_prefix": type_prefix,
-                    "year": year,
-                    "human_code": human_code,
-                }))?
-            );
-            Ok(())
-        }
-        Command::DocIdFromLink { href } => {
-            let resolved = doc_id_from_ato_link(&href);
-            let value = match resolved {
-                Some((doc_id, pit, view)) => json!({
-                    "doc_id": doc_id,
-                    "pit": pit,
-                    "view": view,
-                }),
-                None => JsonValue::Null,
-            };
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            Ok(())
-        }
-        Command::PackWrite { out, level } => {
-            use std::io::BufRead as _;
-            let stdin = std::io::stdin();
-            let lock = stdin.lock();
-            let records = lock.lines().map(|line_res| -> Result<(String, JsonValue)> {
-                let line = line_res?;
-                if line.trim().is_empty() {
-                    bail!("empty JSONL line");
-                }
-                let v: JsonValue = serde_json::from_str(&line)?;
-                let doc_id = v
-                    .get("doc_id")
-                    .and_then(|s| s.as_str())
-                    .ok_or_else(|| anyhow!("missing 'doc_id' in JSONL record"))?
-                    .to_string();
-                let record = v
-                    .get("record")
-                    .cloned()
-                    .ok_or_else(|| anyhow!("missing 'record' in JSONL record"))?;
-                Ok((doc_id, record))
-            });
-            let summary = write_pack(&out, level, records)?;
-            println!("{}", serde_json::to_string_pretty(&summary)?);
-            Ok(())
-        }
-        Command::ManifestRewriteUrls {
-            manifest,
-            repo,
-            tag,
-        } => {
-            let raw = fs::read_to_string(&manifest)
-                .with_context(|| format!("reading {}", manifest.display()))?;
-            let mut value: JsonValue = serde_json::from_str(&raw)
-                .with_context(|| format!("parsing {}", manifest.display()))?;
-            if let Some(packs) = value.get_mut("packs").and_then(|v| v.as_array_mut()) {
-                for pack in packs {
-                    if let Some(url) = pack.get("url").and_then(|v| v.as_str()) {
-                        let filename = std::path::Path::new(url)
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or(url)
-                            .to_string();
-                        let new_url =
-                            format!("https://github.com/{repo}/releases/download/{tag}/{filename}");
-                        pack["url"] = JsonValue::String(new_url);
-                    }
-                }
-            }
-            let pretty = serde_json::to_vec_pretty(&value)?;
-            fs::write(&manifest, pretty)
-                .with_context(|| format!("writing {}", manifest.display()))?;
-            Ok(())
-        }
-        Command::BundleModel {
-            model_dir,
-            out,
-            include,
-            level,
-        } => {
-            use std::io::Write as _;
-            if let Some(parent) = out.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {}", parent.display()))?;
-            }
-            // Build the uncompressed tar in memory.
-            let mut tar_buf: Vec<u8> = Vec::new();
-            {
-                let mut builder = tar::Builder::new(&mut tar_buf);
-                for name in &include {
-                    let candidate = if name.starts_with("model_") {
-                        model_dir.join("onnx").join(name)
-                    } else {
-                        model_dir.join(name)
-                    };
-                    if !candidate.exists() {
-                        bail!("model bundle missing {}", candidate.display());
-                    }
-                    let mut f = File::open(&candidate)
-                        .with_context(|| format!("opening {}", candidate.display()))?;
-                    builder.append_file(name, &mut f)?;
-                }
-                builder.finish()?;
-            }
-            // Stream zstd-compress to disk + sha256 the output.
-            let compressed = zstd::stream::encode_all(std::io::Cursor::new(&tar_buf), level)?;
-            let mut file =
-                File::create(&out).with_context(|| format!("creating {}", out.display()))?;
-            file.write_all(&compressed)?;
-            file.flush()?;
-            let mut hasher = Sha256::new();
-            hasher.update(&compressed);
-            let digest = hasher.finalize();
-            let sha256_hex = digest
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>();
-            let size = fs::metadata(&out)?.len();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "sha256": sha256_hex,
-                    "size": size,
-                }))?
-            );
-            Ok(())
-        }
-        Command::AtoFetchNodes {
-            query,
-            base_url,
-            timeout_seconds,
-        } => {
-            // Build the URL — accept either a raw "key=value&key=value" query
-            // string or a "key=value,key=value" comma-form (same as Python
-            // accepts `Union[str, Dict[str, str]]`).
-            let query_string = if query.contains('=') && !query.contains('&') {
-                if query.contains(',') {
-                    query.replace(',', "&")
-                } else {
-                    query.clone()
-                }
-            } else {
-                query.trim_start_matches('?').to_string()
-            };
-            let url = if query_string.is_empty() {
-                base_url.clone()
-            } else {
-                format!("{}?{}", base_url.trim_end_matches('?'), query_string)
-            };
-            let client = reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs_f64(timeout_seconds))
-                .build()?;
-            let resp = client
-                .get(&url)
-                .send()
-                .with_context(|| format!("fetching {url}"))?;
-            let status = resp.status();
-            if !status.is_success() {
-                bail!("ATO API returned HTTP {status} for {url}");
-            }
-            let body = resp.text().context("reading ATO API body")?;
-            let payload: JsonValue = serde_json::from_str(&body).context("parsing ATO API JSON")?;
-            if !payload.is_array() {
-                bail!("ATO response payload is not a list");
-            }
-            println!("{}", serde_json::to_string_pretty(&payload)?);
-            Ok(())
-        }
-        Command::Embed { input_file, gpu } => {
-            use base64::Engine as _;
-            let raw = match input_file.as_ref() {
-                Some(p) => {
-                    fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?
-                }
-                None => {
-                    let mut s = String::new();
-                    std::io::stdin()
-                        .read_to_string(&mut s)
-                        .context("reading stdin")?;
-                    s
-                }
-            };
-            let state = ServerState::new(gpu);
-            let inputs: Vec<String> = raw
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(str::to_string)
-                .collect();
-            let embeddings = state
-                .encode_query_embeddings(&inputs)
-                .context("encoding embeddings")?;
-            let mut out: Vec<JsonValue> = Vec::with_capacity(embeddings.len());
-            for emb in embeddings {
-                let bytes: &[u8] =
-                    unsafe { std::slice::from_raw_parts(emb.as_ptr() as *const u8, emb.len()) };
-                out.push(JsonValue::String(
-                    base64::engine::general_purpose::STANDARD.encode(bytes),
-                ));
-            }
-            println!("{}", serde_json::to_string_pretty(&out)?);
-            Ok(())
-        }
         Command::Build {
             pages_dir,
             db_path,
@@ -1110,31 +595,6 @@ fn main() -> Result<()> {
             source_index_sha256,
             zstd_level,
         } => check_build_checkpoint(&release_dir, &source_index_sha256, zstd_level),
-        Command::WhatsNew {
-            url,
-            timeout_seconds,
-        } => {
-            let client = reqwest::blocking::Client::builder()
-                .user_agent(ATO_USER_AGENT)
-                .timeout(Duration::from_secs_f64(timeout_seconds))
-                .build()?;
-            let resp = client
-                .get(&url)
-                .send()
-                .with_context(|| format!("fetching {url}"))?;
-            let status = resp.status();
-            if !status.is_success() {
-                bail!("ATO whatsnew returned HTTP {status} for {url}");
-            }
-            let html = resp.text().context("reading whatsnew body")?;
-            let entries = parse_whats_new(&html, "https://www.ato.gov.au")?;
-            println!("{}", serde_json::to_string_pretty(&entries)?);
-            Ok(())
-        }
-        Command::NormalizeDocHref { href } => {
-            println!("{}", normalize_doc_href(&href));
-            Ok(())
-        }
     }
 }
 
@@ -3158,7 +2618,7 @@ struct Definition {
     body: String,
 }
 
-fn defs_normalise_term(term: &str) -> String {
+fn normalize_definition_term(term: &str) -> String {
     let t: String = term.replace("\\*", "*").replace("\\&", "&");
     let t = t.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\r' | '\n' | ':' | '*'));
     let mut out = String::with_capacity(t.len());
@@ -3211,7 +2671,7 @@ fn defs_definition_id(doc_id: &str, ord: i64, term: &str, body: &str, offset: us
     h.update(b"\0");
     h.update(offset.to_string().as_bytes());
     h.update(b"\0");
-    h.update(defs_normalise_term(term).as_bytes());
+    h.update(normalize_definition_term(term).as_bytes());
     h.update(b"\0");
     h.update(body.as_bytes());
     let digest = h.finalize();
@@ -3283,7 +2743,7 @@ fn extract_definitions(
             if body.len() < 4 || cue_re.find(&body).is_none() {
                 continue;
             }
-            let norm = defs_normalise_term(&term);
+            let norm = normalize_definition_term(&term);
             let key = (norm.clone(), doc_id.to_string(), body.clone());
             if seen.contains(&key) {
                 continue;
@@ -3325,15 +2785,6 @@ struct AnchorRef {
     target_doc_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     target_pit: Option<String>,
-}
-
-fn anchors_pit_to_date(pit: &str) -> String {
-    let s = pit.trim();
-    if s.len() >= 8 && s[..8].chars().all(|c| c.is_ascii_digit()) {
-        format!("{}-{}-{}", &s[..4], &s[4..6], &s[6..8])
-    } else {
-        s.to_string()
-    }
 }
 
 fn anchors_collect_targets(doc: &scraper::Html) -> std::collections::HashSet<String> {
@@ -3489,7 +2940,7 @@ fn extract_anchors(html: &str, source_doc_id: &str) -> Vec<AnchorRef> {
             }
         }
         if let Some(p) = pit {
-            let date = anchors_pit_to_date(&p);
+            let date = pit_to_date(&p).unwrap_or_else(|| p.trim().to_string());
             let label = anchors_resolve_label(a, Some(&date));
             let key = (
                 "history".to_string(),
@@ -3539,35 +2990,6 @@ fn extract_anchors(html: &str, source_doc_id: &str) -> Vec<AnchorRef> {
 // Ports of src/ato_mcp/indexer/extract.py:
 //   _collect_anchors, _leading_headings, _compose_title,
 //   _collect_em_front_matter
-
-fn extract_collect_anchors(doc: &scraper::Html) -> Vec<(String, String)> {
-    use scraper::Selector;
-    let heading_sel = Selector::parse("h1, h2, h3, h4, h5, h6").unwrap();
-    let inner_a = Selector::parse("a").unwrap();
-    let mut out: Vec<(String, String)> = Vec::new();
-    for heading in doc.select(&heading_sel) {
-        let mut anchor: Option<String> = heading
-            .value()
-            .attr("id")
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
-        if anchor.is_none() {
-            for a in heading.select(&inner_a) {
-                if let Some(name) = a.value().attr("name").or_else(|| a.value().attr("id")) {
-                    if !name.is_empty() {
-                        anchor = Some(name.to_string());
-                        break;
-                    }
-                }
-            }
-        }
-        if let Some(a) = anchor {
-            let text = anchors_node_text(heading);
-            out.push((text, a));
-        }
-    }
-    out
-}
 
 fn extract_leading_headings(container_html: &str) -> Vec<String> {
     use scraper::Selector;
@@ -3791,45 +3213,64 @@ fn currency_date_prose_pattern() -> &'static str {
     r"\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}|\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2}"
 }
 
-fn currency_re_withdrawn_prose() -> Regex {
-    let date = currency_date_prose_pattern();
-    let prefix = r"\b(?:was|is|were|are|been|being|has\s+been|have\s+been)?\s*withdrawn(?:\s+(?:with\s+effect)?\s*(?:from|on|as\s+of))?\s+";
-    Regex::new(&format!(r"(?i){prefix}(?P<date>{date})")).unwrap()
+fn currency_re_withdrawn_prose() -> &'static Regex {
+    static R: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    R.get_or_init(|| {
+        let date = currency_date_prose_pattern();
+        let prefix = r"\b(?:was|is|were|are|been|being|has\s+been|have\s+been)?\s*withdrawn(?:\s+(?:with\s+effect)?\s*(?:from|on|as\s+of))?\s+";
+        Regex::new(&format!(r"(?i){prefix}(?P<date>{date})")).unwrap()
+    })
 }
 
-fn currency_re_withdrawn_by_prose() -> Regex {
-    let date = currency_date_prose_pattern();
-    let prefix = r"\b(?:was|is|were|are|been|being|has\s+been|have\s+been)?\s*withdrawn(?:\s+(?:with\s+effect)?\s*(?:from|on|as\s+of))?\s+";
-    let cite = currency_citation_pattern();
-    Regex::new(&format!(
-        r"(?i){prefix}(?P<date>{date})\s+by\b(?:\s+(?:draft\s+)?(?:Taxation|Class|Product|Practical|GST)?\s*(?:Ruling|Determination|Guideline|Practice\s+Statement)?)?\s+(?P<cite>{cite})"
-    )).unwrap()
+fn currency_re_withdrawn_by_prose() -> &'static Regex {
+    static R: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    R.get_or_init(|| {
+        let date = currency_date_prose_pattern();
+        let prefix = r"\b(?:was|is|were|are|been|being|has\s+been|have\s+been)?\s*withdrawn(?:\s+(?:with\s+effect)?\s*(?:from|on|as\s+of))?\s+";
+        let cite = currency_citation_pattern();
+        Regex::new(&format!(
+            r"(?i){prefix}(?P<date>{date})\s+by\b(?:\s+(?:draft\s+)?(?:Taxation|Class|Product|Practical|GST)?\s*(?:Ruling|Determination|Guideline|Practice\s+Statement)?)?\s+(?P<cite>{cite})"
+        )).unwrap()
+    })
 }
 
-fn currency_re_replacement_verb() -> Regex {
-    Regex::new(r"(?i)\b(replaces|replaced\s+by|supersed(?:e|es|ed|ing)|in\s+lieu\s+of)\b").unwrap()
+fn currency_re_replacement_verb() -> &'static Regex {
+    static R: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r"(?i)\b(replaces|replaced\s+by|supersed(?:e|es|ed|ing)|in\s+lieu\s+of)\b").unwrap()
+    })
 }
 
-fn currency_re_self_anchor() -> Regex {
-    Regex::new(r"(?i)\bthis\s+(?:Ruling|Determination|Guideline|Practice\s+Statement)\b").unwrap()
+fn currency_re_self_anchor() -> &'static Regex {
+    static R: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r"(?i)\bthis\s+(?:Ruling|Determination|Guideline|Practice\s+Statement)\b").unwrap()
+    })
 }
 
-fn currency_re_sentence_split() -> Regex {
-    Regex::new(r"[.;\n]+").unwrap()
+fn currency_re_sentence_split() -> &'static Regex {
+    static R: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    R.get_or_init(|| Regex::new(r"[.;\n]+").unwrap())
 }
 
-fn currency_re_replaces_prose() -> Regex {
-    let cite = currency_citation_pattern();
-    Regex::new(&format!(
-        r"(?i)\b(?:this\s+(?:Ruling|Determination|Guideline|Practice\s+Statement)\s+)?replaces\b(?:\s+(?:draft\s+)?(?:Taxation|Class|Product|Practical|GST)?\s*(?:Ruling|Determination|Guideline|Practice\s+Statement)?)?\s+(?P<cite>{cite})"
-    )).unwrap()
+fn currency_re_replaces_prose() -> &'static Regex {
+    static R: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    R.get_or_init(|| {
+        let cite = currency_citation_pattern();
+        Regex::new(&format!(
+            r"(?i)\b(?:this\s+(?:Ruling|Determination|Guideline|Practice\s+Statement)\s+)?replaces\b(?:\s+(?:draft\s+)?(?:Taxation|Class|Product|Practical|GST)?\s*(?:Ruling|Determination|Guideline|Practice\s+Statement)?)?\s+(?P<cite>{cite})"
+        )).unwrap()
+    })
 }
 
-fn currency_re_superseded_by_prose() -> Regex {
-    let cite = currency_citation_pattern();
-    Regex::new(&format!(
-        r"(?i)\b(?:replaced|superseded)\s+by\b(?:\s+(?:draft\s+)?(?:Taxation|Class|Product|Practical|GST)?\s*(?:Ruling|Determination|Guideline|Practice\s+Statement)?)?\s+(?P<cite>{cite})"
-    )).unwrap()
+fn currency_re_superseded_by_prose() -> &'static Regex {
+    static R: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    R.get_or_init(|| {
+        let cite = currency_citation_pattern();
+        Regex::new(&format!(
+            r"(?i)\b(?:replaced|superseded)\s+by\b(?:\s+(?:draft\s+)?(?:Taxation|Class|Product|Practical|GST)?\s*(?:Ruling|Determination|Guideline|Practice\s+Statement)?)?\s+(?P<cite>{cite})"
+        )).unwrap()
+    })
 }
 
 fn currency_withdrawal_fragment_is_self(fragment: &str, withdrawn_start: usize) -> bool {
@@ -4349,7 +3790,6 @@ fn normalise_named_anchors(html: &str) -> String {
 // public API (chunk_html, html_to_text, approx_tokens) and intermediate
 // shape (_Block, Chunk).
 
-#[allow(dead_code)]
 // [IB-21] Checkpoints pin CHUNKER_FORMAT_VERSION; changing output shape
 // forces an explicit fresh build instead of resuming stale chunk records.
 const CHUNKER_FORMAT_VERSION: u32 = 3;
@@ -5058,37 +4498,9 @@ fn chunk_html(html: &str, root_title: Option<&str>, max_tokens: usize) -> Vec<Ch
     chunker_pack(blocks, max_tokens)
 }
 
-/// Mirror of chunk.py:html_to_text — walks the doc into _Blocks (with empty
-/// referenced anchors) and joins block texts with `\n\n`. Used by the
-/// extract CLI's `text` field so the output matches Python's behaviour
-/// (table rows as pipe-separated, blockquote `> `, list items `- `, etc.)
-/// rather than the looser per-block-tag newlines that subtree_text emits.
-fn chunker_html_to_text(html: &str) -> String {
-    if html.trim().is_empty() {
-        return String::new();
-    }
-    let doc = scraper::Html::parse_fragment(html);
-    let referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let body_sel = scraper::Selector::parse("body").unwrap();
-    let walk_root = doc.select(&body_sel).next().unwrap_or(doc.root_element());
-    let mut blocks: Vec<ChunkBlock> = Vec::new();
-    chunker_walk(walk_root, &mut blocks, &referenced, None);
-    blocks
-        .into_iter()
-        .filter(|b| !b.text.is_empty())
-        .map(|b| b.text)
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
 // ----- end chunker -----
 
 // ----- Metadata helpers (port of src/ato_mcp/indexer/metadata.py) -----
-
-#[allow(dead_code)]
-const METADATA_OTHER_CATEGORY: &str = "Other_ATO_documents";
-#[allow(dead_code)]
-const METADATA_PACK_FORMAT_VERSION: u32 = 2;
 
 fn metadata_extract_docid_path(canonical_id: &str) -> Option<String> {
     let parsed = url::Url::parse(canonical_id)
@@ -5119,19 +4531,6 @@ fn metadata_parse_docid(canonical_id: &str) -> Option<String> {
         .map(|s| s.to_uppercase())
 }
 
-fn metadata_year_for_docid(canonical_id: &str) -> Option<String> {
-    let docid = metadata_extract_docid_path(canonical_id)?;
-    let year_re = Regex::new(r"(?:19|20)\d{2}").unwrap();
-    let segments: Vec<&str> = docid.split('/').filter(|s| !s.is_empty()).collect();
-    for seg in segments.iter().take(2) {
-        if let Some(m) = year_re.find(seg) {
-            return Some(m.as_str().to_string());
-        }
-    }
-    None
-}
-
-#[allow(dead_code)]
 fn metadata_extract_pub_date(text: &str) -> Option<String> {
     let date_re = Regex::new(
         r"(?i)\b(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})\b",
@@ -5146,69 +4545,6 @@ fn metadata_extract_pub_date(text: &str) -> Option<String> {
     Some(format!("{year:04}-{month:02}-{day:02}"))
 }
 
-fn metadata_human_code_for_doc_id(doc_id: &str) -> Option<String> {
-    let segments: Vec<&str> = doc_id.split('/').filter(|s| !s.is_empty()).collect();
-    if segments.len() < 2 {
-        return None;
-    }
-    let body = segments[1];
-    // Year-series codes, longest-first to avoid prefix collisions.
-    let year_series: Vec<&str> = vec![
-        "SMSFRB", "SMSFR", "SMSFD", "GSTR", "GSTD", "FBTR", "WETR", "WETD", "LCR", "SGR", "FTR",
-        "PCG", "LCG", "PRR", "CLR", "COG", "TXD", "TPA", "FBT", "CR", "PR", "TR", "TD", "MT", "TA",
-        "LI", "LG", "WT",
-    ];
-    let alt = year_series.join("|");
-    // Modern 4-digit year form: TR20243 -> TR 2024/3
-    let re_y4 = Regex::new(&format!(r"^({alt})(\d{{4}})(D?)(\d+)$")).unwrap();
-    if let Some(c) = re_y4.captures(body) {
-        let series = c.get(1)?.as_str();
-        let year = c.get(2)?.as_str();
-        let draft = c.get(3)?.as_str();
-        let number = c.get(4)?.as_str();
-        return Some(format!("{series} {year}/{draft}{number}"));
-    }
-    // PS LA final
-    let re_psla = Regex::new(r"^PSLA(\d{4})(\d+)$").unwrap();
-    if let Some(c) = re_psla.captures(body) {
-        return Some(format!(
-            "PS LA {}/{}",
-            c.get(1)?.as_str(),
-            c.get(2)?.as_str()
-        ));
-    }
-    // PS LA draft
-    let re_psla_d = Regex::new(r"^PSD(\d{4})D?(\d+)$").unwrap();
-    if let Some(c) = re_psla_d.captures(body) {
-        return Some(format!(
-            "PS LA {}/D{}",
-            c.get(1)?.as_str(),
-            c.get(2)?.as_str()
-        ));
-    }
-    // ATO ID
-    let re_atoid = Regex::new(r"^(?:ATOID|AID)(\d{4})(\d+)$").unwrap();
-    if let Some(c) = re_atoid.captures(body) {
-        return Some(format!(
-            "ATO ID {}/{}",
-            c.get(1)?.as_str(),
-            c.get(2)?.as_str()
-        ));
-    }
-    // Legacy 2-digit-year form: TR9725 -> TR 97/25 (year starts with 8 or 9)
-    let re_y2 = Regex::new(&format!(r"^({alt})([89]\d)(\d+)$")).unwrap();
-    if let Some(c) = re_y2.captures(body) {
-        return Some(format!(
-            "{} {}/{}",
-            c.get(1)?.as_str(),
-            c.get(2)?.as_str(),
-            c.get(3)?.as_str()
-        ));
-    }
-    None
-}
-
-#[allow(dead_code)]
 fn metadata_content_hash(text: &str) -> String {
     let mut h = Sha256::new();
     h.update(text.as_bytes());
@@ -5218,39 +4554,6 @@ fn metadata_content_hash(text: &str) -> String {
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
     format!("sha256:{hex}")
-}
-
-#[allow(dead_code)]
-const METADATA_SIG_KEYS: &[&str] = &[
-    "title",
-    "type",
-    "date",
-    "withdrawn_date",
-    "superseded_by",
-    "replaces",
-    "pack_format_version",
-];
-
-#[allow(dead_code)]
-fn metadata_signature(fields: &serde_json::Map<String, JsonValue>) -> String {
-    let mut h = Sha256::new();
-    for key in METADATA_SIG_KEYS {
-        let value = fields.get(*key);
-        h.update(b"\0");
-        h.update(key.as_bytes());
-        h.update(b"=");
-        if let Some(v) = value {
-            if !v.is_null() {
-                let s = match v {
-                    JsonValue::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                h.update(s.as_bytes());
-            }
-        }
-    }
-    let digest = h.finalize();
-    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Rewrite ATO doc-link `<a href="...">` tags to `<a data-doc-id="X" data-pit="..." data-view="...">`
@@ -8822,7 +8125,7 @@ fn clean_ato_html(html: &str) -> CleanedAtoDoc {
         .next()
         .map(|n| n.text().collect::<String>());
     let title = raw_title
-        .map(|t| normalise_ws(&t))
+        .map(|t| collapse_ws(&t))
         .filter(|t| !t.is_empty());
 
     // Pick container — first match wins; fallback to <main> then <body>.
@@ -9365,30 +8668,13 @@ fn doc_id_from_ato_link(target: &str) -> Option<(String, Option<String>, Option<
     Some((doc_id, pit, view))
 }
 
-fn normalise_ws(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut prev_ws = true;
-    for c in s.chars() {
-        if c.is_whitespace() {
-            if !prev_ws {
-                out.push(' ');
-            }
-            prev_ws = true;
-        } else {
-            out.push(c);
-            prev_ws = false;
-        }
-    }
-    out.trim().to_string()
-}
-
 fn normalise_paragraph_breaks(s: &str) -> String {
     // Within each line, collapse runs of whitespace to one space.
     // Between lines, allow at most one blank line.
     let mut out_lines: Vec<String> = Vec::new();
     let mut last_blank = false;
     for line in s.split('\n') {
-        let collapsed = normalise_ws(line);
+        let collapsed = collapse_ws(line);
         if collapsed.is_empty() {
             if !last_blank && !out_lines.is_empty() {
                 out_lines.push(String::new());
@@ -9452,18 +8738,6 @@ struct DictionaryEntry {
     source: Option<String>,
     #[serde(default)]
     part_of_speech: Option<String>,
-}
-
-fn normalize_definition_term(term: &str) -> String {
-    let cleaned = term
-        .replace("\\*", "*")
-        .trim_matches(|ch: char| ch.is_whitespace() || ch == ':' || ch == '*')
-        .to_string();
-    cleaned
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
 }
 
 fn context_prefix(context_doc_id: Option<&str>) -> Option<String> {
@@ -10689,23 +9963,7 @@ fn http_probe_client() -> Result<Client> {
 }
 
 fn fetch_bytes_probe(url_or_path: &str, context: &UrlContext) -> Result<Vec<u8>> {
-    if let Some(path) = local_path_from_urlish(url_or_path) {
-        return Ok(fs::read(path)?);
-    }
-    if let Some(dir) = &context.manifest_dir {
-        if let Some(name) = url_or_path.rsplit('/').next() {
-            for candidate in [dir.join(name), dir.join("packs").join(name)] {
-                if candidate.exists() {
-                    return Ok(fs::read(candidate)?);
-                }
-            }
-        }
-    }
-    let client = http_probe_client()?;
-    let mut resp = client.get(url_or_path).send()?.error_for_status()?;
-    let mut out = Vec::new();
-    resp.copy_to(&mut out)?;
-    Ok(out)
+    fetch_bytes_with(url_or_path, context, &http_probe_client()?)
 }
 
 /// Non-mutating availability probe. Returns `Some(UpdateAvailability)` only
@@ -12563,7 +11821,11 @@ fn local_path_from_urlish(value: &str) -> Option<PathBuf> {
 }
 
 fn fetch_bytes(url_or_path: &str, context: &UrlContext) -> Result<Vec<u8>> {
-    // [UM-04] The Rust downloader is credential-free: no GitHub token env vars and no gh shell-out.
+    fetch_bytes_with(url_or_path, context, &http_client()?)
+}
+
+// [UM-04] The Rust downloader is credential-free: no GitHub token env vars and no gh shell-out.
+fn fetch_bytes_with(url_or_path: &str, context: &UrlContext, client: &Client) -> Result<Vec<u8>> {
     if let Some(path) = local_path_from_urlish(url_or_path) {
         return Ok(fs::read(path)?);
     }
@@ -12579,7 +11841,6 @@ fn fetch_bytes(url_or_path: &str, context: &UrlContext) -> Result<Vec<u8>> {
             bail!("release asset not found: {url_or_path}");
         }
     }
-    let client = http_client()?;
     let mut resp = client.get(url_or_path).send()?.error_for_status().with_context(|| {
         format!(
             "download failed for {url_or_path}. This Rust client does not read GitHub tokens or invoke gh; use a public release, an authenticated mirror, or a file URL."

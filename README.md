@@ -365,12 +365,6 @@ cargo test --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
 ```
 
-Published corpus/install smoke test:
-
-```bash
-ATO_MCP_MANIFEST_URL=https://.../manifest.json scripts/smoke-rust-install.sh
-```
-
 Offline bundles are materialized through the Rust installer:
 
 ```bash
