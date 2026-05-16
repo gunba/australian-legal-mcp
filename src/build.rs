@@ -1,8 +1,8 @@
 //! Corpus build orchestrator: walks ato_pages/index.jsonl, runs cleaning +
 //! chunker + rules-engine + embedder pipeline in-process, writes documents/
-//! chunks/embeddings/anchors/definitions/citations, packs, manifest, and
-//! update.json. Plus base-release seeding, checkpoint resume, and
-//! `bundle_localize_manifest` for offline bundles.
+//! chunks/embeddings/anchors/definitions/citations, manifest, ato.db.zst, and
+//! update.json. Plus checkpoint resume and `bundle_localize_manifest` for
+//! offline bundles.
 
 use crate::chunker::{chunk_html, Chunk, CHUNKER_FORMAT_VERSION, EMBED_MAX_TOKENS};
 use crate::db::{
@@ -15,28 +15,52 @@ use crate::extract::{
     DefinitionChunk, ExtractedAsset,
 };
 use crate::html::{clean_ato_html, normalise_named_anchors, rewrite_links_html, strip_attributes};
-use crate::pack::{
-    read_record_from_pack_bytes, write_pack, PackRecord,
-};
 use crate::retrieval::derive_citations;
 use crate::rules::{derive_metadata, RuleInputs};
 use crate::semantic::{
     SemanticEncodeStats, SemanticModelPaths,
 };
 use crate::source::{
-    enforce_manifest_compatibility, insert_docs_from_packs, manifest_fingerprint,
-    verify_semantic_install, DocRef, Manifest, ModelInfo, PackInfo, UpdateSummary,
+    manifest_fingerprint, verify_semantic_install, Manifest, ManifestDb, ModelInfo, UpdateSummary,
 };
+
+// BuildCheckpoint carries minimal per-doc records purely for resume tracking.
+// The original pack-based fields are kept as opaque JSON to stay
+// forward-compatible with any pre-v0.13 partial checkpoints sitting on disk.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DocRef {
+    pub(crate) doc_id: String,
+    #[serde(default)]
+    pub(crate) content_hash: String,
+    #[serde(default)]
+    pub(crate) pack_sha8: String,
+    #[serde(default)]
+    pub(crate) offset: u64,
+    #[serde(default)]
+    pub(crate) length: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PackInfo {
+    #[serde(default)]
+    pub(crate) sha8: String,
+    #[serde(default)]
+    pub(crate) sha256: String,
+    #[serde(default)]
+    pub(crate) size: u64,
+    #[serde(default)]
+    pub(crate) url: String,
+}
 use crate::{
-    enforce_db_schema_version, fetch_bytes, parse_hf_model_url,
-    resolve_manifest_asset, verify_sha256_bytes, ServerState, UrlContext, EMBEDDING_DIM,
+    enforce_db_schema_version, ServerState, EMBEDDING_DIM,
     EMBEDDING_INPUT_MAX_TOKENS, EMBEDDING_MODEL_FINGERPRINT, EMBEDDING_MODEL_HF_SIZE,
     EMBEDDING_MODEL_HF_URL, EMBEDDING_MODEL_ID, SUPPORTED_MANIFEST_VERSION,
 };
 use rusqlite::OpenFlags;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
-use chrono::Utc;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
@@ -48,9 +72,6 @@ use std::time::Duration;
 
 pub(crate) const BUILD_EMBED_BATCH_SIZE: usize = 32;
 pub(crate) const BUILD_EMBED_PENDING_FLUSH_CHUNKS: usize = 4096;
-// [IB-10] Build pack shards are bounded by document count, not target
-// bytes, so downloads stay tractable while pack offsets remain stable.
-pub(crate) const BUILD_PACK_RECORDS_PER_SHARD: usize = 4096;
 pub(crate) const BUILD_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 
 // ----- Build orchestrator (port of src/ato_mcp/indexer/build.py) -----
@@ -64,8 +85,6 @@ pub(crate) const BUILD_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 
 pub(crate) struct PendingBuildEmbedding {
     pub(crate) chunk_id: i64,
-    pub(crate) doc_idx: usize,
-    pub(crate) chunk_idx: usize,
     pub(crate) text: String,
 }
 
@@ -233,7 +252,6 @@ pub(crate) fn flush_pending_build_embeddings(
     state: &ServerState,
     conn: &Connection,
     pending: &mut Vec<PendingBuildEmbedding>,
-    pack_records: &mut [(String, JsonValue)],
     profile: &mut BuildProfile,
 ) -> Result<()> {
     if pending.is_empty() {
@@ -272,16 +290,6 @@ pub(crate) fn flush_pending_build_embeddings(
                 rusqlite::params![item.chunk_id, bytes],
             )
             .context("INSERT chunk_embeddings")?;
-            // [IB-11] Pack records carry base64 raw int8 embeddings; install
-            // decode length-checks them against EMBEDDING_DIM.
-            let emb_b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-            let chunk_record = pack_records
-                .get_mut(item.doc_idx)
-                .and_then(|(_doc_id, record)| record.get_mut("chunks"))
-                .and_then(|chunks| chunks.as_array_mut())
-                .and_then(|chunks| chunks.get_mut(item.chunk_idx))
-                .ok_or_else(|| anyhow!("missing pack chunk record for embedded chunk"))?;
-            chunk_record["embedding_b64"] = JsonValue::String(emb_b64);
         }
         profile.embedding_write += write_started.elapsed();
     }
@@ -290,93 +298,7 @@ pub(crate) fn flush_pending_build_embeddings(
     Ok(())
 }
 
-pub(crate) struct BuildPackShardContext<'a> {
-    pub(crate) out_dir: &'a Path,
-    pub(crate) zstd_level: i32,
-    pub(crate) doc_hashes: &'a HashMap<String, String>,
-    pub(crate) documents: &'a mut Vec<DocRef>,
-    pub(crate) packs: &'a mut Vec<PackInfo>,
-    pub(crate) profile: &'a mut BuildProfile,
-}
 
-pub(crate) fn write_build_pack_shard(
-    shard_idx: usize,
-    pack_records: &mut Vec<(String, JsonValue)>,
-    ctx: &mut BuildPackShardContext<'_>,
-) -> Result<()> {
-    if pack_records.is_empty() {
-        return Ok(());
-    }
-    let started = std::time::Instant::now();
-    eprintln!(
-        "ato-mcp build: writing pack shard {} ({} docs)",
-        shard_idx + 1,
-        pack_records.len()
-    );
-    let tmp_pack = ctx
-        .out_dir
-        .join("packs")
-        .join(format!(".pack-{shard_idx:04}-writing.bin.zst.tmp"));
-    let pack_meta = write_pack(&tmp_pack, ctx.zstd_level, pack_records.drain(..).map(Ok))?;
-    let sha8 = pack_meta
-        .get("sha8")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("write_pack returned no sha8"))?
-        .to_string();
-    let final_pack = ctx
-        .out_dir
-        .join("packs")
-        .join(format!("pack-{sha8}.bin.zst"));
-    fs::rename(&tmp_pack, &final_pack)?;
-
-    let refs = pack_meta
-        .get("refs")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("write_pack returned no refs"))?;
-    for r in refs {
-        let doc_id = r
-            .get("doc_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("pack ref missing doc_id"))?
-            .to_string();
-        let content_hash = ctx
-            .doc_hashes
-            .get(&doc_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("missing content hash for packed doc {doc_id}"))?;
-        ctx.documents.push(DocRef {
-            doc_id,
-            content_hash,
-            pack_sha8: sha8.clone(),
-            offset: r
-                .get("offset")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| anyhow!("pack ref missing offset"))?,
-            length: r
-                .get("length")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| anyhow!("pack ref missing length"))?,
-        });
-    }
-
-    let pack_size = pack_meta
-        .get("size")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow!("write_pack returned no size"))?;
-    let pack_sha256 = pack_meta
-        .get("sha256")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("write_pack returned no sha256"))?
-        .to_string();
-    ctx.packs.push(PackInfo {
-        sha8: sha8.clone(),
-        sha256: pack_sha256,
-        size: pack_size,
-        url: format!("packs/pack-{sha8}.bin.zst"),
-    });
-    ctx.profile.pack += started.elapsed();
-    Ok(())
-}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -564,29 +486,6 @@ pub(crate) fn save_build_checkpoint(args: SaveBuildCheckpointArgs<'_>) -> Result
     Ok(())
 }
 
-pub(crate) fn clean_stale_build_packs(out_dir: &Path, packs: &[PackInfo]) -> Result<()> {
-    let packs_dir = out_dir.join("packs");
-    if !packs_dir.exists() {
-        return Ok(());
-    }
-    let keep: HashSet<String> = packs
-        .iter()
-        .map(|pack| format!("pack-{}.bin.zst", pack.sha8))
-        .collect();
-    for entry in fs::read_dir(&packs_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let is_pack = name.starts_with("pack-") && name.ends_with(".bin.zst");
-        let is_tmp = name.starts_with(".pack-") && name.ends_with(".tmp");
-        if is_tmp || (is_pack && !keep.contains(name)) {
-            fs::remove_file(&path).with_context(|| format!("removing stale {}", path.display()))?;
-        }
-    }
-    Ok(())
-}
 
 pub(crate) fn committed_build_doc_count(conn: &Connection) -> Result<usize> {
     let count: i64 = conn.query_row(
@@ -606,13 +505,6 @@ pub(crate) fn pending_build_doc_count(conn: &Connection) -> Result<usize> {
     Ok(count as usize)
 }
 
-pub(crate) fn update_pack_sha8_for_docs(conn: &Connection, docs: &[DocRef]) -> Result<()> {
-    let mut update = conn.prepare("UPDATE documents SET pack_sha8 = ?1 WHERE doc_id = ?2")?;
-    for doc in docs {
-        update.execute(rusqlite::params![&doc.pack_sha8, &doc.doc_id])?;
-    }
-    Ok(())
-}
 
 pub(crate) fn remove_build_doc(conn: &Connection, doc_id: &str) -> Result<()> {
     conn.execute(
@@ -625,29 +517,6 @@ pub(crate) fn remove_build_doc(conn: &Connection, doc_id: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn copy_or_hard_link(src: &Path, dst: &Path) -> Result<()> {
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if dst.exists() {
-        return Ok(());
-    }
-    match fs::hard_link(src, dst) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            fs::copy(src, dst)
-                .with_context(|| format!("copying {} to {}", src.display(), dst.display()))?;
-            Ok(())
-        }
-    }
-}
-
-pub(crate) struct BaseReleaseSeed {
-    pub(crate) documents: Vec<DocRef>,
-    pub(crate) packs: Vec<PackInfo>,
-    pub(crate) by_doc_id: HashMap<String, DocRef>,
-    pub(crate) source_hash_by_doc_id: HashMap<String, String>,
-}
 
 pub(crate) struct BuildSourceFingerprint<'a> {
     pub(crate) doc_id: &'a str,
@@ -714,330 +583,11 @@ pub(crate) fn build_source_fingerprint_value(input: BuildSourceFingerprint<'_>) 
     })
 }
 
-pub(crate) fn pack_record_source_fingerprint_value(record: &PackRecord) -> JsonValue {
-    json!({
-        "doc_id": &record.doc_id,
-        "type": &record.doc_type,
-        "title": &record.title,
-        "date": &record.date,
-        "html": &record.html,
-        "withdrawn_date": &record.withdrawn_date,
-        "superseded_by": &record.superseded_by,
-        "replaces": &record.replaces,
-        "has_in_doc_links": record.has_in_doc_links,
-        "has_related_docs": record.has_related_docs,
-        "has_history": record.has_history,
-        "anchors": record.anchors.iter().map(|anchor| json!({
-            "kind": &anchor.kind,
-            "label": &anchor.label,
-            "target_doc_id": &anchor.target_doc_id,
-            "target_pit": &anchor.target_pit,
-        })).collect::<Vec<_>>(),
-        "definitions": record.definitions.iter().map(|definition| json!({
-            "definition_id": &definition.definition_id,
-            "term": &definition.term,
-            "norm_term": &definition.norm_term,
-            "doc_id": &definition.doc_id,
-            "source_title": &definition.source_title,
-            "source_type": &definition.source_type,
-            "scope": &definition.scope,
-            "anchor": &definition.anchor,
-            "ord": definition.ord,
-            "body": &definition.body,
-        })).collect::<Vec<_>>(),
-        "chunks": record.chunks.iter().map(|chunk| json!({
-            "ord": chunk.ord,
-            "anchor": &chunk.anchor,
-            "text": &chunk.text,
-        })).collect::<Vec<_>>(),
-        "assets": record.assets.iter().map(|asset| json!({
-            "asset_ref": &asset.asset_ref,
-            "source_path": &asset.source_path,
-            "relative_path": &asset.relative_path,
-            "media_type": &asset.media_type,
-            "alt": &asset.alt,
-            "title": &asset.title,
-            "sha256": &asset.sha256,
-            "size": asset.size,
-        })).collect::<Vec<_>>(),
-    })
-}
 
-pub(crate) fn pack_filename(url: &str) -> Result<String> {
-    Path::new(url)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(str::to_string)
-        .ok_or_else(|| anyhow!("pack URL has no filename: {url}"))
-}
 
-pub(crate) fn validate_base_release_manifest(manifest: &Manifest) -> Result<()> {
-    // Maintainer base seeding accepts only the current manifest and embedding
-    // model shape, so old corpus releases fail before build starts.
-    enforce_manifest_compatibility(manifest)?;
-    if manifest.model.id != EMBEDDING_MODEL_ID {
-        bail!(
-            "base release uses embedding model `{}`; expected `{EMBEDDING_MODEL_ID}`",
-            manifest.model.id
-        );
-    }
-    if parse_hf_model_url(&manifest.model.url).is_some()
-        && manifest.model.sha256 != EMBEDDING_MODEL_FINGERPRINT
-    {
-        bail!("base release embedding fingerprint differs from the current pinned model");
-    }
-    Ok(())
-}
 
-pub(crate) fn check_base_release(base_dir: &Path) -> Result<()> {
-    let manifest_path = base_dir.join("manifest.json");
-    let db_path = base_dir.join("ato.db");
-    let packs_dir = base_dir.join("packs");
-    if !manifest_path.exists() {
-        bail!("base release missing {}", manifest_path.display());
-    }
-    if !db_path.exists() {
-        bail!("base release missing {}", db_path.display());
-    }
-    if !packs_dir.is_dir() {
-        bail!("base release missing {}", packs_dir.display());
-    }
-    let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("opening {}", db_path.display()))?;
-    enforce_db_schema_version(&conn)
-        .with_context(|| format!("validating DB schema in {}", db_path.display()))?;
-    let manifest: Manifest = serde_json::from_slice(&fs::read(&manifest_path)?)
-        .with_context(|| format!("parsing {}", manifest_path.display()))?;
-    validate_base_release_manifest(&manifest)?;
-    for pack in &manifest.packs {
-        let filename = pack_filename(&pack.url)?;
-        let path = packs_dir.join(&filename);
-        if !path.exists() {
-            bail!("base release missing pack {}", path.display());
-        }
-        let len = fs::metadata(&path)?.len();
-        if pack.size != 0 && len != pack.size {
-            bail!(
-                "base release pack size mismatch for {}: got {}, expected {}",
-                path.display(),
-                len,
-                pack.size
-            );
-        }
-    }
-    println!(
-        "base release usable: {} ({} docs, {} packs)",
-        base_dir.display(),
-        manifest.documents.len(),
-        manifest.packs.len()
-    );
-    Ok(())
-}
 
-pub(crate) fn materialize_base_release(manifest_url: &str, out_dir: &Path) -> Result<()> {
-    // A published current-model corpus can be reconstructed locally from
-    // manifest + packs without re-running transformer embeddings.
-    if out_dir.exists() {
-        bail!("--out-dir already exists: {}", out_dir.display());
-    }
-    let source_context = UrlContext::from_manifest_url(manifest_url);
-    let manifest_bytes = fetch_bytes(manifest_url, &source_context)
-        .with_context(|| format!("fetching manifest from {manifest_url}"))?;
-    let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
-        .with_context(|| format!("parsing manifest from {manifest_url}"))?;
-    validate_base_release_manifest(&manifest)?;
 
-    let packs_dir = out_dir.join("packs");
-    fs::create_dir_all(&packs_dir).with_context(|| format!("creating {}", packs_dir.display()))?;
-    let mut local_manifest = manifest;
-    let mut bytes_downloaded = manifest_bytes.len() as u64;
-    for pack in &mut local_manifest.packs {
-        let filename = pack_filename(&pack.url)?;
-        let pack_url = resolve_manifest_asset(&pack.url, &source_context);
-        let pack_bytes = fetch_bytes(&pack_url, &source_context)
-            .with_context(|| format!("fetching {pack_url}"))?;
-        if !pack.sha256.is_empty() {
-            verify_sha256_bytes(&pack_bytes, &pack.sha256)
-                .with_context(|| format!("verifying {}", pack.url))?;
-        }
-        if pack.size != 0 && pack_bytes.len() as u64 != pack.size {
-            bail!(
-                "pack size mismatch for {}: got {}, expected {}",
-                pack.url,
-                pack_bytes.len(),
-                pack.size
-            );
-        }
-        bytes_downloaded += pack_bytes.len() as u64;
-        fs::write(packs_dir.join(&filename), &pack_bytes)
-            .with_context(|| format!("writing {}", packs_dir.join(&filename).display()))?;
-        pack.url = format!("packs/{filename}");
-    }
-
-    let manifest_path = out_dir.join("manifest.json");
-    fs::write(&manifest_path, serde_json::to_vec_pretty(&local_manifest)?)
-        .with_context(|| format!("writing {}", manifest_path.display()))?;
-    let summary = UpdateSummary {
-        schema_version: local_manifest.schema_version,
-        index_version: local_manifest.index_version.clone(),
-        min_client_version: local_manifest.min_client_version.clone(),
-        model: local_manifest.model.clone(),
-        document_count: local_manifest.documents.len(),
-        pack_count: local_manifest.packs.len(),
-        db_sha256: local_manifest.db.as_ref().map(|d| d.sha256.clone()),
-        db_size: local_manifest.db.as_ref().map(|d| d.size),
-        manifest_fingerprint: Some(manifest_fingerprint(&local_manifest)?),
-    };
-    let summary_path = out_dir.join("update.json");
-    fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?)
-        .with_context(|| format!("writing {}", summary_path.display()))?;
-
-    let db_path = out_dir.join("ato.db");
-    let conn = open_write_at(&db_path)?;
-    init_db(&conn)?;
-    let local_context = UrlContext {
-        manifest_dir: Some(out_dir.to_path_buf()),
-        manifest_base_url: None,
-    };
-    let tx = conn.unchecked_transaction()?;
-    let mut bytes_read_from_local_packs = 0_u64;
-    let apply_result = (|| -> Result<()> {
-        insert_docs_from_packs(
-            &tx,
-            &local_manifest,
-            &local_context,
-            &local_manifest.documents,
-            &mut bytes_read_from_local_packs,
-            out_dir,
-        )?;
-        set_meta(&tx, "index_version", &local_manifest.index_version)?;
-        set_meta(&tx, "embedding_model_id", &local_manifest.model.id)?;
-        set_meta(&tx, "last_update_at", &Utc::now().to_rfc3339())?;
-        derive_citations(&tx)?;
-        verify_semantic_install(&tx, &local_manifest)?;
-        Ok(())
-    })();
-    if let Err(err) = apply_result {
-        tx.rollback()?;
-        return Err(err);
-    }
-    tx.commit()?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
-    eprintln!(
-        "ato-mcp materialize-base-release: wrote {} from {} ({} docs, {} packs, {} bytes)",
-        out_dir.display(),
-        manifest_url,
-        local_manifest.documents.len(),
-        local_manifest.packs.len(),
-        bytes_downloaded
-    );
-    Ok(())
-}
-
-pub(crate) fn seed_build_from_base_release(
-    base_dir: &Path,
-    out_dir: &Path,
-    db_path: &Path,
-) -> Result<BaseReleaseSeed> {
-    if out_dir.exists()
-        && base_dir.exists()
-        && out_dir.canonicalize().ok() == base_dir.canonicalize().ok()
-    {
-        bail!("--base-release-dir must not point at --out-dir");
-    }
-    if db_path.exists() {
-        bail!(
-            "--base-release-dir requires an absent --db-path; remove {} before seeding",
-            db_path.display()
-        );
-    }
-    let manifest_path = base_dir.join("manifest.json");
-    let db_src = base_dir.join("ato.db");
-    if !manifest_path.exists() {
-        bail!("base release missing {}", manifest_path.display());
-    }
-    if !db_src.exists() {
-        bail!("base release missing {}", db_src.display());
-    }
-    let manifest: Manifest = serde_json::from_slice(&fs::read(&manifest_path)?)
-        .with_context(|| format!("parsing {}", manifest_path.display()))?;
-    validate_base_release_manifest(&manifest)?;
-    let base_packs_dir = base_dir.join("packs");
-    let mut source_hash_by_doc_id = HashMap::new();
-    let pack_index: HashMap<String, PackInfo> = manifest
-        .packs
-        .iter()
-        .map(|pack| (pack.sha8.clone(), pack.clone()))
-        .collect();
-    let mut docs_by_pack: HashMap<String, Vec<&DocRef>> = HashMap::new();
-    for doc in &manifest.documents {
-        docs_by_pack
-            .entry(doc.pack_sha8.clone())
-            .or_default()
-            .push(doc);
-    }
-    for (sha8, docs) in docs_by_pack {
-        let pack = pack_index
-            .get(&sha8)
-            .ok_or_else(|| anyhow!("base manifest missing pack info for {sha8}"))?;
-        let filename = pack_filename(&pack.url)?;
-        let pack_path = base_packs_dir.join(filename);
-        let pack_bytes =
-            fs::read(&pack_path).with_context(|| format!("reading {}", pack_path.display()))?;
-        if !pack.sha256.is_empty() {
-            verify_sha256_bytes(&pack_bytes, &pack.sha256)
-                .with_context(|| format!("verifying {}", pack_path.display()))?;
-        }
-        if pack.size != 0 && pack_bytes.len() as u64 != pack.size {
-            bail!(
-                "base pack size mismatch for {}: got {}, expected {}",
-                pack_path.display(),
-                pack_bytes.len(),
-                pack.size
-            );
-        }
-        for doc in docs {
-            let record = read_record_from_pack_bytes(&pack_bytes, doc.offset, doc.length)
-                .with_context(|| format!("reading base pack record {}", doc.doc_id))?;
-            // [IB-12] Previous-release reuse is keyed by a full
-            // source-derived fingerprint, not just cleaned body text.
-            let source_hash =
-                source_fingerprint_hash(&pack_record_source_fingerprint_value(&record))
-                    .with_context(|| format!("hashing base source record {}", doc.doc_id))?;
-            source_hash_by_doc_id.insert(doc.doc_id.clone(), source_hash);
-        }
-    }
-    if let Some(parent) = db_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::copy(&db_src, db_path).with_context(|| {
-        format!(
-            "copying base DB {} to {}",
-            db_src.display(),
-            db_path.display()
-        )
-    })?;
-    let out_packs_dir = out_dir.join("packs");
-    fs::create_dir_all(&out_packs_dir)?;
-    for pack in &manifest.packs {
-        let filename = pack_filename(&pack.url)?;
-        copy_or_hard_link(
-            &base_packs_dir.join(&filename),
-            &out_packs_dir.join(&filename),
-        )?;
-    }
-    let by_doc_id = manifest
-        .documents
-        .iter()
-        .map(|doc| (doc.doc_id.clone(), doc.clone()))
-        .collect();
-    Ok(BaseReleaseSeed {
-        documents: manifest.documents,
-        packs: manifest.packs,
-        by_doc_id,
-        source_hash_by_doc_id,
-    })
-}
 
 pub(crate) struct BuildCorpusArgs<'a> {
     pub(crate) pages_dir: &'a Path,
@@ -1087,7 +637,7 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
     let mut base_source_hash_by_doc_id: HashMap<String, String> = HashMap::new();
     let mut source_doc_ids: HashSet<String> = HashSet::new();
     let mut base_seeded = false;
-    let (mut documents, mut packs) = match checkpoint {
+    let (mut documents, packs) = match checkpoint {
         Some(checkpoint) => {
             eprintln!(
                 "ato-mcp build: resuming from checkpoint ({} docs, {} packs)",
@@ -1109,28 +659,18 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         None => {
             fs::remove_file(out_dir.join("manifest.json")).ok();
             fs::remove_file(out_dir.join("update.json")).ok();
-            if let Some(base_dir) = base_release_dir {
-                let seed = seed_build_from_base_release(base_dir, out_dir, db_path)?;
-                eprintln!(
-                    "ato-mcp build: seeded from base release {} ({} docs, {} packs)",
-                    base_dir.display(),
-                    seed.documents.len(),
-                    seed.packs.len()
+            if base_release_dir.is_some() {
+                bail!(
+                    "--base-release-dir is no longer supported (the pack-based seed path was \
+                    removed); run a full build instead."
                 );
-                base_doc_refs = seed.by_doc_id;
-                base_documents = seed.documents.clone();
-                base_source_hash_by_doc_id = seed.source_hash_by_doc_id;
-                base_seeded = true;
-                (seed.documents, seed.packs)
-            } else {
-                (Vec::new(), Vec::new())
             }
+            (Vec::new(), Vec::new())
         }
     };
     let conn = open_write_at(db_path)
         .with_context(|| format!("opening sqlite at {}", db_path.display()))?;
     init_db(&conn)?;
-    clean_stale_build_packs(out_dir, &packs)?;
     let committed_docs = committed_build_doc_count(&conn)?;
     let pending_docs = pending_build_doc_count(&conn)?;
     if pending_docs > 0 {
@@ -1173,14 +713,9 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
     let mut tx = conn.unchecked_transaction()?;
     let progress_started = std::time::Instant::now();
 
-    // Pack records collected for this build. Each record is the full doc
-    // payload the Rust updater can ingest from `pack-<sha8>.bin.zst`.
-    let mut pack_records: Vec<(String, JsonValue)> = Vec::new();
     let mut pending_embeddings: Vec<PendingBuildEmbedding> =
         Vec::with_capacity(BUILD_EMBED_BATCH_SIZE);
     let mut doc_hashes: HashMap<String, String> = HashMap::new();
-    let mut pack_shard_idx: usize = packs.len();
-
     for line_res in reader.lines() {
         if let Some(n) = limit {
             if processed >= n {
@@ -1436,11 +971,8 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         )
         .context("INSERT documents")?;
 
-        // Insert chunks + embeddings + chunks_fts; also collect a record
-        // entry for pack writing.
         let mut chunk_ids: Vec<(i64, String, Option<String>)> = Vec::new();
-        let mut chunk_records: Vec<JsonValue> = Vec::new();
-        let mut doc_pending_embeddings: Vec<(i64, usize, String)> = Vec::new();
+        let mut doc_pending_embeddings: Vec<(i64, String)> = Vec::new();
         for chunk in &chunks {
             let zstd_text =
                 zstd::stream::encode_all(std::io::Cursor::new(chunk.text.as_bytes()), zstd_level)
@@ -1467,14 +999,7 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
                 )
             })?;
 
-            let chunk_idx = chunk_records.len();
-            chunk_records.push(json!({
-                "ord": chunk.ord,
-                "anchor": chunk.anchor.clone(),
-                "text": chunk.text.clone(),
-                "embedding_b64": JsonValue::Null,
-            }));
-            doc_pending_embeddings.push((chunk_id, chunk_idx, chunk.text.clone()));
+            doc_pending_embeddings.push((chunk_id, chunk.text.clone()));
         }
 
         // title_fts: re-use the headings collected before the documents INSERT.
@@ -1569,82 +1094,19 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         }
         profile.assets += started.elapsed();
 
-        // Pack record (in-memory; written at end of build).
-        let started = std::time::Instant::now();
-        let doc_idx = pack_records.len();
-        pack_records.push((
-            doc_id.clone(),
-            json!({
-                "doc_id": doc_id,
-                "type": doc_type,
-                "title": title,
-                "date": derived_date,
-                "downloaded_at": now,
-                "content_hash": content_hash,
-                "html": final_html,
-                "withdrawn_date": currency.withdrawn_date,
-                "superseded_by": currency.superseded_by,
-                "replaces": currency.replaces,
-                "has_in_doc_links": has_in_doc_links as i64,
-                "has_related_docs": has_related_docs as i64,
-                "has_history": has_history as i64,
-                "anchors": anchor_records,
-                "definitions": definition_records,
-                "chunks": chunk_records,
-                "assets": assets.iter().map(|a| json!({
-                    "asset_ref": a.asset_ref.clone(),
-                    "source_path": a.source_path.clone(),
-                    "relative_path": a.relative_path.clone(),
-                    "media_type": a.media_type.clone(),
-                    "alt": a.alt.clone(),
-                    "title": a.title.clone(),
-                    "sha256": a.sha256.clone(),
-                    "size": a.size,
-                    "data_b64": a.data_b64.clone(),
-                })).collect::<Vec<_>>(),
-            }),
-        ));
-        profile.pack += started.elapsed();
-        for (chunk_id, chunk_idx, text) in doc_pending_embeddings {
-            pending_embeddings.push(PendingBuildEmbedding {
-                chunk_id,
-                doc_idx,
-                chunk_idx,
-                text,
-            });
+        for (chunk_id, text) in doc_pending_embeddings {
+            pending_embeddings.push(PendingBuildEmbedding { chunk_id, text });
         }
         if pending_embeddings.len() >= BUILD_EMBED_PENDING_FLUSH_CHUNKS {
             flush_pending_build_embeddings(
                 &state,
                 &tx,
                 &mut pending_embeddings,
-                &mut pack_records,
                 &mut profile,
             )?;
-        }
-        if pack_records.len() >= BUILD_PACK_RECORDS_PER_SHARD {
-            flush_pending_build_embeddings(
-                &state,
-                &tx,
-                &mut pending_embeddings,
-                &mut pack_records,
-                &mut profile,
-            )?;
-            let first_new_doc = documents.len();
-            write_build_pack_shard(
-                pack_shard_idx,
-                &mut pack_records,
-                &mut BuildPackShardContext {
-                    out_dir,
-                    zstd_level,
-                    doc_hashes: &doc_hashes,
-                    documents: &mut documents,
-                    packs: &mut packs,
-                    profile: &mut profile,
-                },
-            )?;
+            // Checkpoint periodically so a long build can resume from an
+            // interrupted partial DB.
             let started = std::time::Instant::now();
-            update_pack_sha8_for_docs(&tx, &documents[first_new_doc..])?;
             tx.commit()?;
             save_build_checkpoint(SaveBuildCheckpointArgs {
                 out_dir,
@@ -1659,7 +1121,6 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
             profile.checkpoint += started.elapsed();
             doc_hashes.clear();
             tx = conn.unchecked_transaction()?;
-            pack_shard_idx += 1;
         }
 
         processed += 1;
@@ -1689,41 +1150,20 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         &state,
         &tx,
         &mut pending_embeddings,
-        &mut pack_records,
         &mut profile,
     )?;
-    let first_new_doc = documents.len();
-    write_build_pack_shard(
-        pack_shard_idx,
-        &mut pack_records,
-        &mut BuildPackShardContext {
-            out_dir,
-            zstd_level,
-            doc_hashes: &doc_hashes,
-            documents: &mut documents,
-            packs: &mut packs,
-            profile: &mut profile,
-        },
-    )?;
-    let started = std::time::Instant::now();
-    update_pack_sha8_for_docs(&tx, &documents[first_new_doc..])?;
     tx.commit()?;
-    let used_pack_sha8: HashSet<String> =
-        documents.iter().map(|doc| doc.pack_sha8.clone()).collect();
-    packs.retain(|pack| used_pack_sha8.contains(&pack.sha8));
-    clean_stale_build_packs(out_dir, &packs)?;
-    if documents.len() > first_new_doc || base_seeded || removed_base_docs > 0 {
-        save_build_checkpoint(SaveBuildCheckpointArgs {
-            out_dir,
-            source_index_sha256: &source_index_sha256,
-            zstd_level,
-            documents: &documents,
-            packs: &packs,
-            base_documents: &base_documents,
-            base_source_hash_by_doc_id: &base_source_hash_by_doc_id,
-            verified_source_doc_ids: &source_doc_ids,
-        })?;
-    }
+    let started = std::time::Instant::now();
+    save_build_checkpoint(SaveBuildCheckpointArgs {
+        out_dir,
+        source_index_sha256: &source_index_sha256,
+        zstd_level,
+        documents: &documents,
+        packs: &packs,
+        base_documents: &base_documents,
+        base_source_hash_by_doc_id: &base_source_hash_by_doc_id,
+        verified_source_doc_ids: &source_doc_ids,
+    })?;
     profile.checkpoint += started.elapsed();
     if skipped_no_payload > 0 {
         eprintln!("ato-mcp build: skipped {skipped_no_payload} index records without payload_path");
@@ -1756,9 +1196,13 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
             size: EMBEDDING_MODEL_HF_SIZE,
             url: EMBEDDING_MODEL_HF_URL.to_string(),
         },
-        documents,
-        packs,
-        db: None,
+        // package-corpus fills in the real db sha256/size/url after stripping
+        // FTS5 and zstd-compressing the canonical ato.db.
+        db: ManifestDb {
+            url: "ato.db.zst".to_string(),
+            sha256: String::new(),
+            size: 0,
+        },
     };
 
     let final_tx = conn.unchecked_transaction()?;
@@ -1780,10 +1224,8 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         index_version: manifest.index_version.clone(),
         min_client_version: manifest.min_client_version.clone(),
         model: manifest.model.clone(),
-        document_count: manifest.documents.len(),
-        pack_count: manifest.packs.len(),
-        db_sha256: manifest.db.as_ref().map(|d| d.sha256.clone()),
-        db_size: manifest.db.as_ref().map(|d| d.size),
+        db_sha256: manifest.db.sha256.clone(),
+        db_size: manifest.db.size,
         manifest_fingerprint: Some(manifest_fingerprint(&manifest)?),
     };
     let summary_path = out_dir.join("update.json");

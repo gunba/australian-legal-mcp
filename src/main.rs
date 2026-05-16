@@ -9,7 +9,6 @@ use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtensio
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 #[allow(unused_imports)]
 use std::io::{BufRead, Read, Write};
@@ -24,7 +23,6 @@ mod config;
 mod db;
 mod extract;
 mod html;
-mod pack;
 mod retrieval;
 mod rules;
 mod search;
@@ -37,8 +35,8 @@ use config::{
 };
 use db::enforce_db_schema_version;
 use build::{
-    build_corpus, bundle_localize_manifest, check_base_release, check_build_checkpoint,
-    materialize_base_release, package_corpus, update_manifest_with_db, BuildCorpusArgs,
+    build_corpus, bundle_localize_manifest, check_build_checkpoint, package_corpus,
+    update_manifest_with_db, BuildCorpusArgs,
 };
 use retrieval::{
     fetch_external_doc, get_asset_mcp, get_chunks_mcp,
@@ -50,8 +48,8 @@ use search::{
 };
 use source::{
     apply_update, check_for_update_availability, doctor, link_download, manifest_fingerprint,
-    preview_update, scrape_diff, snapshot_reduce, stats, tree_crawl, DocRef, LinkDownloadArgs,
-    Manifest, ModelInfo, StagedModel, UpdateAvailability, UpdateSummary,
+    preview_update, scrape_diff, snapshot_reduce, stats, tree_crawl, LinkDownloadArgs, Manifest,
+    ModelInfo, StagedModel, UpdateAvailability, UpdateSummary,
 };
 use semantic::{
     SemanticEncodeStats, SemanticModelPaths, SemanticRuntime,
@@ -221,19 +219,6 @@ enum Command {
         /// Print cumulative build-stage timings to stderr.
         #[arg(long)]
         profile: bool,
-    },
-    /// Maintainer-only: validate that a release dir can seed the current
-    /// build without falling off the fast path.
-    #[command(hide = true)]
-    CheckBaseRelease { release_dir: PathBuf },
-    /// Maintainer-only: reconstruct a local base release from a published
-    /// manifest and pack assets without running the embedding model.
-    #[command(hide = true)]
-    MaterializeBaseRelease {
-        #[arg(long)]
-        manifest_url: String,
-        #[arg(long)]
-        out_dir: PathBuf,
     },
     /// Maintainer-only: validate that a build output dir has a checkpoint
     /// compatible with the current source index/model settings.
@@ -453,11 +438,8 @@ fn main() -> Result<()> {
             } else {
                 let stats = apply_update(&url)?;
                 println!(
-                    "update complete: +{} ~{} -{} ({:.2} MB downloaded)",
-                    stats.added,
-                    stats.changed,
-                    stats.removed,
-                    stats.bytes_downloaded as f64 / 1_000_000.0
+                    "update complete ({:.2} MB downloaded)",
+                    stats.bytes_downloaded as f64 / 1_000_000.0,
                 );
             }
             Ok(())
@@ -640,11 +622,6 @@ fn main() -> Result<()> {
             use_gpu: gpu,
             profile_enabled: profile,
         }),
-        Command::CheckBaseRelease { release_dir } => check_base_release(&release_dir),
-        Command::MaterializeBaseRelease {
-            manifest_url,
-            out_dir,
-        } => materialize_base_release(&manifest_url, &out_dir),
         Command::CheckBuildCheckpoint {
             release_dir,
             source_index_sha256,
@@ -881,7 +858,6 @@ fn resolve_publish_model_info(
 
 fn publish_release(args: PublishReleaseArgs) -> Result<()> {
     let manifest_path = args.out_dir.join("manifest.json");
-    let packs_dir = args.out_dir.join("packs");
     if !manifest_path.exists() {
         bail!("no manifest at {}", manifest_path.display());
     }
@@ -904,58 +880,28 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
         args.model_size,
     )?;
 
-    // Manifest schema 5+ ships a single ato.db.zst artifact. Schema 4
-    // ships per-doc packs. Detect which shape we have and upload accordingly.
+    // Schema 5+ ships a single ato.db.zst artifact. Rewrite manifest.db.url
+    // to the GitHub release URL and queue the local file for upload.
     let mut artifacts: Vec<PathBuf> = vec![manifest_path.clone()];
-
-    if let Some(db_info) = manifest.db.as_mut() {
-        let filename = std::path::Path::new(&db_info.url)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| db_info.url.clone());
-        let local = args.out_dir.join(&filename);
-        if !local.exists() {
-            bail!(
-                "manifest.db points at {} but {} does not exist; run `ato-mcp package-corpus --manifest <path>` first",
-                filename,
-                local.display()
-            );
-        }
-        db_info.url = format!(
-            "https://github.com/{repo}/releases/download/{tag}/{filename}",
-            tag = args.tag,
+    let db_info = &mut manifest.db;
+    let filename = std::path::Path::new(&db_info.url)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| db_info.url.clone());
+    let local = args.out_dir.join(&filename);
+    if !local.exists() {
+        bail!(
+            "manifest.db points at {} but {} does not exist; run `ato-mcp package-corpus --manifest <path>` first",
+            filename,
+            local.display()
         );
-        artifacts.push(local);
-    } else {
-        if !packs_dir.exists() {
-            bail!("no packs/ dir at {} and manifest.db is unset", packs_dir.display());
-        }
-        let mut pack_files: Vec<PathBuf> = fs::read_dir(&packs_dir)?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|s| s.starts_with("pack-") && s.ends_with(".bin.zst"))
-            })
-            .collect();
-        pack_files.sort();
-        if pack_files.is_empty() {
-            bail!("no pack files and no manifest.db — nothing to upload");
-        }
-        for pack in &mut manifest.packs {
-            let filename = std::path::Path::new(&pack.url)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| pack.url.clone());
-            pack.url = format!(
-                "https://github.com/{repo}/releases/download/{tag}/{filename}",
-                tag = args.tag,
-            );
-        }
-        artifacts.extend(pack_files);
     }
+    db_info.url = format!(
+        "https://github.com/{repo}/releases/download/{tag}/{filename}",
+        tag = args.tag,
+    );
+    artifacts.push(local);
 
     // Save updated manifest.
     let pretty = serde_json::to_vec_pretty(&manifest)?;
@@ -967,10 +913,8 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
         index_version: manifest.index_version.clone(),
         min_client_version: manifest.min_client_version.clone(),
         model: manifest.model.clone(),
-        document_count: manifest.documents.len(),
-        pack_count: manifest.packs.len(),
-        db_sha256: manifest.db.as_ref().map(|d| d.sha256.clone()),
-        db_size: manifest.db.as_ref().map(|d| d.size),
+        db_sha256: manifest.db.sha256.clone(),
+        db_size: manifest.db.size,
         manifest_fingerprint: Some(manifest_fingerprint(&manifest)?),
     };
     let summary_path = args.out_dir.join("update.json");
@@ -1076,49 +1020,6 @@ pub(crate) fn embedding_model_installed_matches(info: &ModelInfo) -> Result<bool
         && tokenizer_path()?.exists()
         && marker.exists()
         && fs::read_to_string(marker)?.trim() == marker_value)
-}
-
-/// Compute the (added, changed, removed) doc-set difference between the
-/// installed manifest and a newly fetched one. The update flow always
-/// rebuilds the live DB wholesale; this counter exists only to render the
-/// "+a ~c -r" CLI summary printed by `ato-mcp update`. No code path
-/// branches on the result.
-/// [SL-08] Equality compares content_hash, pack_sha8, offset, and length;
-/// the result is cosmetic update-summary telemetry, not delta-install logic.
-pub(crate) fn diff_manifests(
-    old: Option<&Manifest>,
-    new: &Manifest,
-) -> (Vec<DocRef>, Vec<DocRef>, Vec<String>) {
-    let old_docs: HashMap<&str, &DocRef> = old
-        .map(|m| m.documents.iter().map(|d| (d.doc_id.as_str(), d)).collect())
-        .unwrap_or_default();
-    let new_docs: HashMap<&str, &DocRef> = new
-        .documents
-        .iter()
-        .map(|d| (d.doc_id.as_str(), d))
-        .collect();
-    let mut added = Vec::new();
-    let mut changed = Vec::new();
-    for doc in &new.documents {
-        match old_docs.get(doc.doc_id.as_str()) {
-            None => added.push(doc.clone()),
-            Some(old_doc) if !doc_ref_matches(old_doc, doc) => changed.push(doc.clone()),
-            _ => {}
-        }
-    }
-    let removed = old_docs
-        .keys()
-        .filter(|doc_id| !new_docs.contains_key(**doc_id))
-        .map(|doc_id| (*doc_id).to_string())
-        .collect();
-    (added, changed, removed)
-}
-
-fn doc_ref_matches(old: &DocRef, new: &DocRef) -> bool {
-    old.content_hash == new.content_hash
-        && old.pack_sha8 == new.pack_sha8
-        && old.offset == new.offset
-        && old.length == new.length
 }
 
 #[derive(Clone)]
@@ -1294,14 +1195,6 @@ fn http_client() -> Result<Client> {
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(120))
         .build()?)
-}
-
-pub(crate) fn verify_sha256_bytes(bytes: &[u8], expected: &str) -> Result<()> {
-    let actual = format!("{:x}", Sha256::digest(bytes));
-    if actual != expected {
-        bail!("sha256 mismatch: got {actual}, expected {expected}");
-    }
-    Ok(())
 }
 
 fn verify_sha256_file(path: &Path, expected: &str) -> Result<()> {
@@ -2068,18 +1961,16 @@ mod tests {
     use crate::extract::*;
     #[allow(unused_imports)]
     use crate::html::*;
-    use crate::pack::*;
     use crate::retrieval::*;
     use crate::search::*;
     use crate::semantic::*;
     use crate::source::*;
-    use base64::Engine as _;
     use chrono::Utc;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use rusqlite::types::Value;
     use rusqlite::Connection;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::io::Cursor;
     use tempfile::tempdir;
 
@@ -2498,48 +2389,6 @@ mod tests {
     }
 
     #[test]
-    fn base_release_manifest_rejects_non_current_embedding_model() {
-        let m = sample_manifest(SUPPORTED_MANIFEST_VERSION as i64, env!("CARGO_PKG_VERSION"));
-        let err = validate_base_release_manifest(&m).unwrap_err();
-        assert!(
-            err.to_string().contains(EMBEDDING_MODEL_ID),
-            "expected current-model base release rejection, got: {err}"
-        );
-    }
-
-    #[test]
-    fn check_base_release_accepts_current_local_shape() -> Result<()> {
-        let dir = tempdir()?;
-        let base = dir.path();
-        let packs = base.join("packs");
-        fs::create_dir_all(&packs)?;
-        let conn = open_write_at(&base.join("ato.db"))?;
-        init_db(&conn)?;
-        drop(conn);
-        fs::write(packs.join("pack-test.bin.zst"), [])?;
-        let mut manifest =
-            sample_manifest(SUPPORTED_MANIFEST_VERSION as i64, env!("CARGO_PKG_VERSION"));
-        manifest.model = ModelInfo {
-            id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: EMBEDDING_MODEL_FINGERPRINT.to_string(),
-            size: EMBEDDING_MODEL_HF_SIZE,
-            url: EMBEDDING_MODEL_HF_URL.to_string(),
-        };
-        manifest.packs.push(PackInfo {
-            sha8: "test".to_string(),
-            sha256: String::new(),
-            size: 0,
-            url: "packs/pack-test.bin.zst".to_string(),
-        });
-        fs::write(
-            base.join("manifest.json"),
-            serde_json::to_vec_pretty(&manifest)?,
-        )?;
-        check_base_release(base)?;
-        Ok(())
-    }
-
-    #[test]
     fn check_build_checkpoint_requires_matching_source_hash() -> Result<()> {
         let dir = tempdir()?;
         let conn = open_write_at(&dir.path().join("ato.db"))?;
@@ -2769,9 +2618,11 @@ mod tests {
                 size: bundle_bytes.len() as u64 + 1,
                 url: "model-bundle.tar.zst".to_string(),
             },
-            documents: Vec::new(),
-            packs: Vec::new(),
-            db: None,
+            db: ManifestDb {
+                url: "ato.db.zst".to_string(),
+                sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                size: 1,
+            },
         };
         let context = UrlContext {
             manifest_dir: Some(release.path().to_path_buf()),
@@ -2786,36 +2637,6 @@ mod tests {
             Ok(())
         })?;
         Ok(())
-    }
-
-    #[test]
-    fn diff_manifests_marks_pack_slot_change_as_changed() {
-        let old = Manifest {
-            documents: vec![DocRef {
-                doc_id: "DOC".to_string(),
-                content_hash: "same-content".to_string(),
-                pack_sha8: "oldpack".to_string(),
-                offset: 0,
-                length: 10,
-            }],
-            ..sample_manifest(SUPPORTED_MANIFEST_VERSION as i64, "")
-        };
-        let new = Manifest {
-            documents: vec![DocRef {
-                doc_id: "DOC".to_string(),
-                content_hash: "same-content".to_string(),
-                pack_sha8: "newpack".to_string(),
-                offset: 0,
-                length: 11,
-            }],
-            ..sample_manifest(SUPPORTED_MANIFEST_VERSION as i64, "")
-        };
-
-        let (added, changed, removed) = diff_manifests(Some(&old), &new);
-        assert!(added.is_empty());
-        assert!(removed.is_empty());
-        assert_eq!(changed.len(), 1);
-        assert_eq!(changed[0].doc_id, "DOC");
     }
 
     #[test]
@@ -2841,151 +2662,6 @@ mod tests {
             err.to_string().contains("size mismatch"),
             "expected build model-dir size validation error, got: {err}"
         );
-        Ok(())
-    }
-
-    fn source_hash_test_record(title: &str) -> PackRecord {
-        PackRecord {
-            doc_id: "DOC_HASH".to_string(),
-            doc_type: "Public_ruling".to_string(),
-            title: title.to_string(),
-            date: Some("2026-05-01".to_string()),
-            downloaded_at: "2026-05-01T00:00:00Z".to_string(),
-            content_hash: "same-cleaned-text-hash".to_string(),
-            html: "<h1>Heading</h1><p>Same body</p>".to_string(),
-            withdrawn_date: None,
-            superseded_by: None,
-            replaces: None,
-            has_in_doc_links: 0,
-            has_related_docs: 0,
-            has_history: 0,
-            anchors: Vec::new(),
-            definitions: Vec::new(),
-            assets: Vec::new(),
-            chunks: vec![PackChunk {
-                ord: 0,
-                anchor: None,
-                text: "Same body".to_string(),
-                embedding_b64: Some("ignored-by-source-hash".to_string()),
-            }],
-        }
-    }
-
-    #[test]
-    fn source_fingerprint_catches_non_body_metadata_changes() -> Result<()> {
-        let first = source_hash_test_record("Original title");
-        let changed = source_hash_test_record("Changed title");
-        let first_hash = source_fingerprint_hash(&pack_record_source_fingerprint_value(&first))?;
-        let changed_hash =
-            source_fingerprint_hash(&pack_record_source_fingerprint_value(&changed))?;
-        assert_ne!(
-            first_hash, changed_hash,
-            "base-release reuse must notice source-derived metadata changes even when body text hash is unchanged"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn base_seed_checkpoint_preserves_verified_source_ids() -> Result<()> {
-        let dir = tempdir()?;
-        let base_documents = vec![DocRef {
-            doc_id: "BASE_DOC".to_string(),
-            content_hash: "body-hash".to_string(),
-            pack_sha8: "basepack".to_string(),
-            offset: 0,
-            length: 10,
-        }];
-        let mut source_hashes = HashMap::new();
-        source_hashes.insert("BASE_DOC".to_string(), "source-hash".to_string());
-        let verified: HashSet<String> = ["BASE_DOC".to_string()].into_iter().collect();
-
-        save_build_checkpoint(SaveBuildCheckpointArgs {
-            out_dir: dir.path(),
-            source_index_sha256: "source-index-sha",
-            zstd_level: 3,
-            documents: &base_documents,
-            packs: &[],
-            base_documents: &base_documents,
-            base_source_hash_by_doc_id: &source_hashes,
-            verified_source_doc_ids: &verified,
-        })?;
-        let loaded = load_build_checkpoint(dir.path(), "source-index-sha", 3)?
-            .expect("checkpoint should load");
-        assert_eq!(loaded.base_documents.len(), 1);
-        assert_eq!(
-            loaded.base_source_hash_by_doc_id.get("BASE_DOC"),
-            Some(&"source-hash".to_string())
-        );
-        assert_eq!(loaded.verified_source_doc_ids, vec!["BASE_DOC".to_string()]);
-        Ok(())
-    }
-
-    #[test]
-    fn base_seed_allows_non_hf_mirror_model_checksum() -> Result<()> {
-        let base = tempdir()?;
-        let out = tempdir()?;
-        let db_path = out.path().join("ato.db");
-        let packs_dir = base.path().join("packs");
-        fs::create_dir_all(&packs_dir)?;
-
-        let record = json!({
-            "doc_id": "BASE_MIRROR_DOC",
-            "type": "Public_ruling",
-            "title": "Mirror base",
-            "date": "2026-05-01",
-            "downloaded_at": "2026-05-01T00:00:00Z",
-            "content_hash": "body-hash",
-            "html": "<h1>Mirror base</h1>",
-            "withdrawn_date": null,
-            "superseded_by": null,
-            "replaces": null,
-            "has_in_doc_links": 0,
-            "has_related_docs": 0,
-            "has_history": 0,
-            "anchors": [],
-            "definitions": [],
-            "chunks": [{"ord": 0, "anchor": null, "text": "Mirror base", "embedding_b64": null}],
-            "assets": [],
-        });
-        let pack_bytes = encode_test_pack_record(&record)?;
-        fs::write(packs_dir.join("pack-mirror.bin.zst"), &pack_bytes)?;
-        let manifest = Manifest {
-            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
-            index_version: "mirror-base".to_string(),
-            created_at: "2026-05-01T00:00:00Z".to_string(),
-            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
-            model: ModelInfo {
-                id: EMBEDDING_MODEL_ID.to_string(),
-                sha256: "published-mirror-bundle-sha".to_string(),
-                size: 123,
-                url: "model-bundle.tar.zst".to_string(),
-            },
-            documents: vec![DocRef {
-                doc_id: "BASE_MIRROR_DOC".to_string(),
-                content_hash: "body-hash".to_string(),
-                pack_sha8: "mirror".to_string(),
-                offset: 0,
-                length: pack_bytes.len() as u64,
-            }],
-            packs: vec![PackInfo {
-                sha8: "mirror".to_string(),
-                sha256: sha256_hex(&pack_bytes),
-                size: pack_bytes.len() as u64,
-                url: "packs/pack-mirror.bin.zst".to_string(),
-            }],
-            db: None,
-        };
-        fs::write(
-            base.path().join("manifest.json"),
-            serde_json::to_vec_pretty(&manifest)?,
-        )?;
-        let conn = open_write_at(&base.path().join("ato.db"))?;
-        init_db(&conn)?;
-        drop(conn);
-
-        let seed = seed_build_from_base_release(base.path(), out.path(), &db_path)?;
-        assert_eq!(seed.documents.len(), 1);
-        assert!(seed.source_hash_by_doc_id.contains_key("BASE_MIRROR_DOC"));
         Ok(())
     }
 
@@ -3048,9 +2724,11 @@ mod tests {
                 size: 5,
                 url: "model-bundle.tar.zst".to_string(),
             },
-            documents: Vec::new(),
-            packs: Vec::new(),
-            db: None,
+            db: ManifestDb {
+                url: "ato.db.zst".to_string(),
+                sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                size: 1,
+            },
         };
 
         with_data_dir(dir.path(), || -> Result<()> {
@@ -3119,15 +2797,6 @@ mod tests {
         format!("{:x}", Sha256::digest(bytes))
     }
 
-    fn encode_test_pack_record(record: &JsonValue) -> Result<Vec<u8>> {
-        let payload = serde_json::to_vec(record)?;
-        let compressed = zstd::stream::encode_all(Cursor::new(payload), 3)?;
-        let mut out = Vec::with_capacity(4 + compressed.len());
-        out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
-        out.extend_from_slice(&compressed);
-        Ok(out)
-    }
-
     fn write_test_tar_zst(path: &Path, files: &[(&str, &[u8])]) -> Result<()> {
         let file = File::create(path)?;
         let encoder = zstd::stream::write::Encoder::new(file, 3)?;
@@ -3166,9 +2835,11 @@ mod tests {
                 size: 0,
                 url: "https://example.com".to_string(),
             },
-            documents: Vec::new(),
-            packs: Vec::new(),
-            db: None,
+            db: ManifestDb {
+                url: "ato.db.zst".to_string(),
+                sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                size: 1,
+            },
         }
     }
 
@@ -3337,19 +3008,19 @@ mod tests {
                 size: 5,
                 url: "model-bundle.tar.zst".to_string(),
             },
-            documents: Vec::new(),
-            packs: Vec::new(),
-            db: None,
+            db: ManifestDb {
+                url: "ato.db.zst".to_string(),
+                sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                size: 1,
+            },
         };
         let summary = UpdateSummary {
             schema_version: (SUPPORTED_MANIFEST_VERSION + 1) as i64,
             index_version: "test-future".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
             model: installed.model.clone(),
-            document_count: 0,
-            pack_count: 0,
-            db_sha256: None,
-            db_size: None,
+            db_sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            db_size: 1,
             manifest_fingerprint: Some("future-fingerprint".to_string()),
         };
         fs::write(
@@ -3395,19 +3066,19 @@ mod tests {
                 size: 5,
                 url: "model-bundle.tar.zst".to_string(),
             },
-            documents: Vec::new(),
-            packs: Vec::new(),
-            db: None,
+            db: ManifestDb {
+                url: "ato.db.zst".to_string(),
+                sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                size: 1,
+            },
         };
         let summary = UpdateSummary {
             schema_version: manifest.schema_version,
             index_version: manifest.index_version.clone(),
             min_client_version: manifest.min_client_version.clone(),
             model: manifest.model.clone(),
-            document_count: 0,
-            pack_count: 0,
-            db_sha256: None,
-            db_size: None,
+            db_sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            db_size: 1,
             manifest_fingerprint: Some(manifest_fingerprint(&manifest)?),
         };
         fs::write(
@@ -3969,231 +3640,6 @@ mod tests {
         ));
     }
 
-    // ----- C1 regression: currency fields survive insert_record -------------
-    //
-    // Earlier currency-filter tests used the
-    // manual `insert_doc_full` seeder, which writes `withdrawn_date` /
-    // `superseded_by` / `replaces` directly. The production code path is
-    // `apply_update_locked → insert_docs_from_packs → read_record_from_pack_bytes
-    // → insert_record`, and the bug they didn't catch was: PackRecord didn't
-    // declare those fields, serde silently dropped them, and the INSERT SQL
-    // didn't bind them either. End result: every ingested row had NULL
-    // currency columns and `current_only=true` never excluded anything.
-    //
-    // This test goes through the production `insert_record` path (NOT the
-    // manual seeder) so a regression in PackRecord struct shape OR the INSERT
-    // SQL OR the currency filter would all fire it.
-
-    #[test]
-    fn currency_fields_round_trip_through_insert_record() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
-
-        let withdrawn_record = PackRecord {
-            doc_id: "TR_2018_WITHDRAWN".to_string(),
-            doc_type: "Public_ruling".to_string(),
-            title: "depreciation effective life rulings".to_string(),
-            date: Some("2018-01-01".to_string()),
-            downloaded_at: Utc::now().to_rfc3339(),
-            content_hash: "deadbeef".to_string(),
-            html: "<div><p>depreciation effective life schedule for plant.</p></div>".to_string(),
-            withdrawn_date: Some("2024-06-15".to_string()),
-            superseded_by: Some("TR 2024/1".to_string()),
-            replaces: None,
-            has_in_doc_links: 0,
-            has_related_docs: 0,
-            has_history: 0,
-            anchors: Vec::new(),
-            definitions: Vec::new(),
-            assets: Vec::new(),
-            chunks: vec![PackChunk {
-                ord: 0,
-                anchor: None,
-                text: "depreciation effective life schedule for plant.".to_string(),
-                embedding_b64: None,
-            }],
-        };
-        let asset_bytes = b"diagram";
-        let asset_sha = format!("{:x}", Sha256::digest(asset_bytes));
-        let asset_b64 = base64::engine::general_purpose::STANDARD.encode(asset_bytes);
-        let current_record = PackRecord {
-            doc_id: "TR_2024_CURRENT".to_string(),
-            doc_type: "Public_ruling".to_string(),
-            title: "depreciation effective life rulings 2024".to_string(),
-            date: Some("2024-01-01".to_string()),
-            downloaded_at: Utc::now().to_rfc3339(),
-            content_hash: "feedface".to_string(),
-            html: "<div><p>depreciation effective life schedule for plant.</p></div>".to_string(),
-            withdrawn_date: None,
-            superseded_by: None,
-            replaces: Some("TR 2018/X".to_string()),
-            has_in_doc_links: 0,
-            has_related_docs: 0,
-            has_history: 0,
-            anchors: Vec::new(),
-            definitions: Vec::new(),
-            assets: vec![PackAsset {
-                asset_ref: "ato-image://TR_2024_CURRENT/0".to_string(),
-                source_path: "assets/source.gif".to_string(),
-                relative_path: "assets/aa/current.gif".to_string(),
-                media_type: Some("image/gif".to_string()),
-                alt: None,
-                title: Some("Current diagram".to_string()),
-                sha256: asset_sha.clone(),
-                size: asset_bytes.len() as i64,
-                data_b64: asset_b64,
-            }],
-            chunks: vec![PackChunk {
-                ord: 0,
-                anchor: None,
-                text: "depreciation effective life schedule for plant.".to_string(),
-                embedding_b64: None,
-            }],
-        };
-        let withdrawn_ref = DocRef {
-            doc_id: "TR_2018_WITHDRAWN".to_string(),
-            content_hash: "deadbeef".to_string(),
-            pack_sha8: "00000000".to_string(),
-            offset: 0,
-            length: 0,
-        };
-        let current_ref = DocRef {
-            doc_id: "TR_2024_CURRENT".to_string(),
-            content_hash: "feedface".to_string(),
-            pack_sha8: "00000000".to_string(),
-            offset: 0,
-            length: 0,
-        };
-
-        // Production insert path — DO NOT swap for `insert_doc_full`.
-        insert_record(
-            &conn,
-            &withdrawn_record,
-            &withdrawn_ref,
-            &dir.path().join("live"),
-        )?;
-        insert_record(
-            &conn,
-            &current_record,
-            &current_ref,
-            &dir.path().join("live"),
-        )?;
-
-        // Sanity: the SELECT returns what insert_record wrote (catches the
-        // INSERT-SQL drop-column bug directly, even before search runs).
-        let (wd, sb, rep): (Option<String>, Option<String>, Option<String>) = conn.query_row(
-            "SELECT withdrawn_date, superseded_by, replaces FROM documents \
-                 WHERE doc_id = 'TR_2018_WITHDRAWN'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        assert_eq!(wd.as_deref(), Some("2024-06-15"));
-        assert_eq!(sb.as_deref(), Some("TR 2024/1"));
-        assert_eq!(rep, None);
-        let (wd2, sb2, rep2): (Option<String>, Option<String>, Option<String>) = conn.query_row(
-            "SELECT withdrawn_date, superseded_by, replaces FROM documents \
-                 WHERE doc_id = 'TR_2024_CURRENT'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        assert_eq!(wd2, None);
-        assert_eq!(sb2, None);
-        assert_eq!(rep2.as_deref(), Some("TR 2018/X"));
-        assert!(dir.path().join("live/assets/aa/current.gif").exists());
-        let stored_asset: String = conn.query_row(
-            "SELECT sha256 FROM document_assets WHERE asset_ref = ?",
-            ["ato-image://TR_2024_CURRENT/0"],
-            |row| row.get(0),
-        )?;
-        assert_eq!(stored_asset, asset_sha);
-        drop(conn);
-
-        with_data_dir(dir.path(), || -> Result<()> {
-            // current_only=true (default) → withdrawn doc must be excluded.
-            // Use Keyword mode so the test doesn't need the embedding model.
-            let json_str = search(
-                "depreciation",
-                SearchOptions {
-                    k: 10,
-                    types: None,
-                    date_from: None,
-                    date_to: None,
-                    doc_scope: None,
-                    mode: SearchMode::Keyword,
-                    sort_by: SortBy::Relevance,
-                    include_old: true,
-                    current_only: true,
-                    max_per_doc: DEFAULT_MAX_PER_DOC,
-                    include_snippet: true,
-                    similar_to_chunk_id: None,
-                    seed_text: None,
-                },
-                None,
-            )?;
-            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-            let doc_ids: Vec<&str> = parsed["hits"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|h| h["doc_id"].as_str().unwrap())
-                .collect();
-            assert!(
-                doc_ids.contains(&"TR_2024_CURRENT"),
-                "current doc should appear with current_only=true; got: {doc_ids:?}"
-            );
-            assert!(
-                !doc_ids.contains(&"TR_2018_WITHDRAWN"),
-                "withdrawn doc must be excluded by current_only=true; got: {doc_ids:?} \
-                 — this is the C1 canary: PackRecord lost the currency fields"
-            );
-
-            // current_only=false → both docs returned, withdrawn one carries
-            // its currency markers through the JSON shape.
-            let json_str = search(
-                "depreciation",
-                SearchOptions {
-                    k: 10,
-                    types: None,
-                    date_from: None,
-                    date_to: None,
-                    doc_scope: None,
-                    mode: SearchMode::Keyword,
-                    sort_by: SortBy::Relevance,
-                    include_old: true,
-                    current_only: false,
-                    max_per_doc: DEFAULT_MAX_PER_DOC,
-                    include_snippet: true,
-                    similar_to_chunk_id: None,
-                    seed_text: None,
-                },
-                None,
-            )?;
-            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-            let withdrawn_hit = parsed["hits"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|h| h["doc_id"].as_str() == Some("TR_2018_WITHDRAWN"))
-                .expect("withdrawn doc should appear when current_only=false");
-            assert_eq!(
-                withdrawn_hit["withdrawn_date"],
-                json!("2024-06-15"),
-                "withdrawn_date must round-trip through insert_record"
-            );
-            assert_eq!(withdrawn_hit["superseded_by"], json!("TR 2024/1"));
-            let current_hit = parsed["hits"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|h| h["doc_id"].as_str() == Some("TR_2024_CURRENT"))
-                .expect("current doc should appear in current_only=false too");
-            assert_eq!(current_hit["replaces"], json!("TR 2018/X"));
-            Ok(())
-        })?;
-        Ok(())
-    }
-
     // ----- Wave 4 navigation flags + doc anchors -----
 
     /// Test helper: insert a document row with the navigation flags set.
@@ -4426,751 +3872,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_update_locked_ingests_real_manifest_and_pack() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let data = tempdir()?;
-        let release = tempdir()?;
-        let release_dir = release.path();
-        let packs_dir = release_dir.join("packs");
-        fs::create_dir_all(&packs_dir)?;
-
-        let model_bundle = release_dir.join("model-bundle.tar.zst");
-        let model_bundle_bytes = write_test_model_bundle(&model_bundle)?;
-
-        let embedding_b64 =
-            base64::engine::general_purpose::STANDARD.encode(vec![0u8; EMBEDDING_DIM]);
-        let record = json!({
-            "doc_id": "DOC_UPDATE_REAL",
-            "type": "Public_ruling",
-            "title": "Real manifest update path",
-            "date": "2026-05-01",
-            "downloaded_at": "2026-05-01T00:00:00Z",
-            "content_hash": "hash-real-update",
-            "html": "<div><p>Research and development tax incentive update path text.</p></div>",
-            "assets": [],
-            "withdrawn_date": "2026-05-02",
-            "superseded_by": "TR 2026/2",
-            "replaces": JsonValue::Null,
-            "chunks": [{
-                "ord": 0,
-                "anchor": "ruling",
-                "text": "Research and development tax incentive update path text.",
-                "embedding_b64": embedding_b64
-            }]
-        });
-        let pack_bytes = encode_test_pack_record(&record)?;
-        let pack_path = packs_dir.join("pack-deadbeef.bin.zst");
-        fs::write(&pack_path, &pack_bytes)?;
-
-        let manifest = Manifest {
-            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
-            index_version: "test-real-update".to_string(),
-            created_at: "2026-05-01T00:00:00Z".to_string(),
-            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
-            model: ModelInfo {
-                id: EMBEDDING_MODEL_ID.to_string(),
-                sha256: sha256_hex(&model_bundle_bytes),
-                size: model_bundle_bytes.len() as u64,
-                url: "model-bundle.tar.zst".to_string(),
-            },
-            documents: vec![DocRef {
-                doc_id: "DOC_UPDATE_REAL".to_string(),
-                content_hash: "hash-real-update".to_string(),
-                pack_sha8: "deadbeef".to_string(),
-                offset: 0,
-                length: pack_bytes.len() as u64,
-            }],
-            packs: vec![PackInfo {
-                sha8: "deadbeef".to_string(),
-                sha256: sha256_hex(&pack_bytes),
-                size: pack_bytes.len() as u64,
-                url: "packs/pack-deadbeef.bin.zst".to_string(),
-            }],
-            db: None,
-        };
-        let manifest_path = release_dir.join("manifest.json");
-        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
-
-        with_data_dir(data.path(), || -> Result<()> {
-            let stats = apply_update_locked(manifest_path.to_str().expect("utf-8 path"))?;
-            assert_eq!(stats.added, 1);
-            assert_eq!(stats.changed, 0);
-            assert_eq!(stats.removed, 0);
-            assert!(model_path()?.exists(), "model should be installed");
-            assert!(
-                model_data_path()?.exists(),
-                "model data should be installed"
-            );
-            assert!(tokenizer_path()?.exists(), "tokenizer should be installed");
-            assert!(
-                installed_manifest_path()?.exists(),
-                "installed manifest should be written"
-            );
-
-            let conn = open_read()?;
-            let row: (String, Option<String>, Option<String>) = conn.query_row(
-                "SELECT title, withdrawn_date, superseded_by FROM documents WHERE doc_id = ?",
-                ["DOC_UPDATE_REAL"],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
-            assert_eq!(row.0, "Real manifest update path");
-            assert_eq!(row.1.as_deref(), Some("2026-05-02"));
-            assert_eq!(row.2.as_deref(), Some("TR 2026/2"));
-
-            let embeddings = chunk_embedding_count(&conn)?;
-            assert_eq!(
-                embeddings, 1,
-                "pack embedding_b64 should populate chunk_embeddings"
-            );
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    /// Regression test for the empty-citations-table-after-full-rebuild bug.
-    /// `apply_update_locked` always routes through `rebuild_live_db_from_manifest`,
-    /// and that path must call `derive_citations` so the live DB ships a
-    /// populated `citations` table on every install.
-    #[test]
-    fn apply_update_locked_derives_citations_after_full_rebuild() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let data = tempdir()?;
-        let release = tempdir()?;
-        let release_dir = release.path();
-        let packs_dir = release_dir.join("packs");
-        fs::create_dir_all(&packs_dir)?;
-
-        let model_bundle = release_dir.join("model-bundle.tar.zst");
-        let model_bundle_bytes = write_test_model_bundle(&model_bundle)?;
-        let embedding_b64 =
-            base64::engine::general_purpose::STANDARD.encode(vec![0u8; EMBEDDING_DIM]);
-
-        let record = json!({
-            "doc_id": "DOC_CITATION_SOURCE",
-            "type": "Public_ruling",
-            "title": "Citation source",
-            "date": "2026-05-01",
-            "downloaded_at": "2026-05-01T00:00:00Z",
-            "content_hash": "citation-source-hash",
-            "html": "<div><p>See <a data-doc-id=\"DOC_CITATION_TARGET\">target</a>.</p></div>",
-            "assets": [],
-            "chunks": [{
-                "ord": 0,
-                "anchor": "ruling",
-                "text": "Refer to [doc:DOC_CITATION_TARGET] for details.",
-                "embedding_b64": embedding_b64
-            }]
-        });
-        let pack_bytes = encode_test_pack_record(&record)?;
-        fs::write(packs_dir.join("pack-citation.bin.zst"), &pack_bytes)?;
-
-        let manifest = Manifest {
-            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
-            index_version: "test-citation".to_string(),
-            created_at: "2026-05-01T00:00:00Z".to_string(),
-            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
-            model: ModelInfo {
-                id: EMBEDDING_MODEL_ID.to_string(),
-                sha256: sha256_hex(&model_bundle_bytes),
-                size: model_bundle_bytes.len() as u64,
-                url: "model-bundle.tar.zst".to_string(),
-            },
-            documents: vec![DocRef {
-                doc_id: "DOC_CITATION_SOURCE".to_string(),
-                content_hash: "citation-source-hash".to_string(),
-                pack_sha8: "citation".to_string(),
-                offset: 0,
-                length: pack_bytes.len() as u64,
-            }],
-            packs: vec![PackInfo {
-                sha8: "citation".to_string(),
-                sha256: sha256_hex(&pack_bytes),
-                size: pack_bytes.len() as u64,
-                url: "packs/pack-citation.bin.zst".to_string(),
-            }],
-            db: None,
-        };
-        let manifest_path = release_dir.join("manifest.json");
-        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
-
-        with_data_dir(data.path(), || -> Result<()> {
-            apply_update_locked(manifest_path.to_str().expect("utf-8 path"))?;
-            let conn = open_read()?;
-            let citations: i64 =
-                conn.query_row("SELECT COUNT(*) FROM citations", [], |row| row.get(0))?;
-            assert_eq!(
-                citations, 1,
-                "rebuild_live_db_from_manifest must call derive_citations so cited_by works"
-            );
-            let target: String = conn.query_row(
-                "SELECT target_doc_id FROM citations WHERE source_doc_id = ?",
-                ["DOC_CITATION_SOURCE"],
-                |row| row.get(0),
-            )?;
-            assert_eq!(target, "DOC_CITATION_TARGET");
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    #[test]
-    fn apply_update_locked_ingests_repacked_definitions_with_same_content_hash() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let data = tempdir()?;
-        let release = tempdir()?;
-        let release_dir = release.path();
-        let packs_dir = release_dir.join("packs");
-        fs::create_dir_all(&packs_dir)?;
-
-        let model_bundle = release_dir.join("model-bundle.tar.zst");
-        let model_bundle_bytes = write_test_model_bundle(&model_bundle)?;
-        let embedding_b64 =
-            base64::engine::general_purpose::STANDARD.encode(vec![0u8; EMBEDDING_DIM]);
-
-        let base_record = json!({
-            "doc_id": "DOC_DEF_REPACK",
-            "type": "Public_ruling",
-            "title": "Definition repack",
-            "date": "2026-05-01",
-            "downloaded_at": "2026-05-01T00:00:00Z",
-            "content_hash": "same-content-hash",
-            "html": "<div><p><strong>test term</strong> means the first definition.</p></div>",
-            "assets": [],
-            "chunks": [{
-                "ord": 0,
-                "anchor": "ruling",
-                "text": "***test term*** means the first definition.",
-                "embedding_b64": embedding_b64
-            }]
-        });
-        let old_pack_bytes = encode_test_pack_record(&base_record)?;
-        fs::write(packs_dir.join("pack-olddefs.bin.zst"), &old_pack_bytes)?;
-
-        let old_manifest = Manifest {
-            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
-            index_version: "defs-v1".to_string(),
-            created_at: "2026-05-01T00:00:00Z".to_string(),
-            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
-            model: ModelInfo {
-                id: EMBEDDING_MODEL_ID.to_string(),
-                sha256: sha256_hex(&model_bundle_bytes),
-                size: model_bundle_bytes.len() as u64,
-                url: "model-bundle.tar.zst".to_string(),
-            },
-            documents: vec![DocRef {
-                doc_id: "DOC_DEF_REPACK".to_string(),
-                content_hash: "same-content-hash".to_string(),
-                pack_sha8: "olddefs".to_string(),
-                offset: 0,
-                length: old_pack_bytes.len() as u64,
-            }],
-            packs: vec![PackInfo {
-                sha8: "olddefs".to_string(),
-                sha256: sha256_hex(&old_pack_bytes),
-                size: old_pack_bytes.len() as u64,
-                url: "packs/pack-olddefs.bin.zst".to_string(),
-            }],
-            db: None,
-        };
-        let manifest_path = release_dir.join("manifest.json");
-        fs::write(&manifest_path, serde_json::to_vec_pretty(&old_manifest)?)?;
-
-        with_data_dir(data.path(), || -> Result<()> {
-            let stats = apply_update_locked(manifest_path.to_str().expect("utf-8 path"))?;
-            assert_eq!(stats.added, 1);
-            let conn = open_read()?;
-            let definitions: i64 =
-                conn.query_row("SELECT COUNT(*) FROM definitions", [], |row| row.get(0))?;
-            assert_eq!(definitions, 0);
-            drop(conn);
-
-            let mut new_record = base_record;
-            new_record["definitions"] = json!([{
-                "definition_id": "def-test-term",
-                "term": "test term",
-                "norm_term": "test term",
-                "doc_id": "DOC_DEF_REPACK",
-                "source_title": "Definition repack",
-                "source_type": "Public_ruling",
-                "scope": "Definition repack",
-                "anchor": "ruling",
-                "ord": 0,
-                "body": "means the first definition."
-            }]);
-            let new_pack_bytes = encode_test_pack_record(&new_record)?;
-            fs::write(packs_dir.join("pack-newdefs.bin.zst"), &new_pack_bytes)?;
-            let mut new_manifest = old_manifest;
-            new_manifest.documents[0].pack_sha8 = "newdefs".to_string();
-            new_manifest.documents[0].length = new_pack_bytes.len() as u64;
-            new_manifest.packs = vec![PackInfo {
-                sha8: "newdefs".to_string(),
-                sha256: sha256_hex(&new_pack_bytes),
-                size: new_pack_bytes.len() as u64,
-                url: "packs/pack-newdefs.bin.zst".to_string(),
-            }];
-            fs::write(&manifest_path, serde_json::to_vec_pretty(&new_manifest)?)?;
-            let summary = UpdateSummary {
-                schema_version: new_manifest.schema_version,
-                index_version: new_manifest.index_version.clone(),
-                min_client_version: new_manifest.min_client_version.clone(),
-                model: new_manifest.model.clone(),
-                document_count: new_manifest.documents.len(),
-                pack_count: new_manifest.packs.len(),
-            db_sha256: None,
-            db_size: None,
-                manifest_fingerprint: Some(manifest_fingerprint(&new_manifest)?),
-            };
-            fs::write(
-                release_dir.join("update.json"),
-                serde_json::to_vec_pretty(&summary)?,
-            )?;
-
-            let stats = apply_update_locked(manifest_path.to_str().expect("utf-8 path"))?;
-            assert_eq!(stats.added, 0);
-            assert_eq!(stats.changed, 1);
-            let conn = open_read()?;
-            let definitions: i64 =
-                conn.query_row("SELECT COUNT(*) FROM definitions", [], |row| row.get(0))?;
-            assert_eq!(definitions, 1);
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    #[test]
-    fn apply_update_locked_skips_full_manifest_when_update_summary_matches() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let data = tempdir()?;
-        let release = tempdir()?;
-        let release_dir = release.path();
-        let manifest_path = release_dir.join("manifest.json");
-        let model_sha = "abc123";
-        let manifest = Manifest {
-            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
-            index_version: "test-summary-fast-path".to_string(),
-            created_at: "2026-05-04T00:00:00Z".to_string(),
-            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
-            model: ModelInfo {
-                id: EMBEDDING_MODEL_ID.to_string(),
-                sha256: model_sha.to_string(),
-                size: 5,
-                url: "model-bundle.tar.zst".to_string(),
-            },
-            documents: Vec::new(),
-            packs: Vec::new(),
-            db: None,
-        };
-        let summary = UpdateSummary {
-            schema_version: manifest.schema_version,
-            index_version: manifest.index_version.clone(),
-            min_client_version: manifest.min_client_version.clone(),
-            model: manifest.model.clone(),
-            document_count: 0,
-            pack_count: 0,
-            db_sha256: None,
-            db_size: None,
-            manifest_fingerprint: Some(manifest_fingerprint(&manifest)?),
-        };
-        fs::write(
-            release_dir.join("update.json"),
-            serde_json::to_vec_pretty(&summary)?,
-        )?;
-
-        with_data_dir(data.path(), || -> Result<()> {
-            let conn = open_write_at(&db_path()?)?;
-            init_db(&conn)?;
-            drop(conn);
-            fs::write(
-                installed_manifest_path()?,
-                serde_json::to_vec_pretty(&manifest)?,
-            )?;
-            fs::write(model_path()?, b"model")?;
-            fs::write(model_data_path()?, b"model-data")?;
-            fs::write(live_dir()?.join("tokenizer.json"), br#"{"version":"1.0"}"#)?;
-            fs::write(live_dir()?.join(".model.sha256"), model_sha)?;
-
-            let stats = apply_update_locked(manifest_path.to_str().expect("utf-8 path"))?;
-            assert_eq!(stats.added, 0);
-            assert_eq!(stats.changed, 0);
-            assert_eq!(stats.removed, 0);
-            assert!(
-                stats.bytes_downloaded < 512,
-                "fast path should fetch only update.json, not the full manifest"
-            );
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    #[test]
-    fn apply_update_locked_does_not_skip_when_model_data_missing() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let data = tempdir()?;
-        let release = tempdir()?;
-        let release_dir = release.path();
-        let manifest_path = release_dir.join("manifest.json");
-        let model_bundle = release_dir.join("model-bundle.tar.zst");
-        let model_bundle_bytes = write_test_model_bundle(&model_bundle)?;
-        let manifest = Manifest {
-            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
-            index_version: "test-missing-model-data".to_string(),
-            created_at: "2026-05-04T00:00:00Z".to_string(),
-            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
-            model: ModelInfo {
-                id: EMBEDDING_MODEL_ID.to_string(),
-                sha256: sha256_hex(&model_bundle_bytes),
-                size: model_bundle_bytes.len() as u64,
-                url: "model-bundle.tar.zst".to_string(),
-            },
-            documents: Vec::new(),
-            packs: Vec::new(),
-            db: None,
-        };
-        let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-        fs::write(&manifest_path, &manifest_bytes)?;
-        let summary = UpdateSummary {
-            schema_version: manifest.schema_version,
-            index_version: manifest.index_version.clone(),
-            min_client_version: manifest.min_client_version.clone(),
-            model: manifest.model.clone(),
-            document_count: 0,
-            pack_count: 0,
-            db_sha256: None,
-            db_size: None,
-            manifest_fingerprint: Some(manifest_fingerprint(&manifest)?),
-        };
-        let summary_bytes = serde_json::to_vec_pretty(&summary)?;
-        fs::write(release_dir.join("update.json"), &summary_bytes)?;
-
-        with_data_dir(data.path(), || -> Result<()> {
-            let conn = open_write_at(&db_path()?)?;
-            init_db(&conn)?;
-            drop(conn);
-            fs::write(
-                installed_manifest_path()?,
-                serde_json::to_vec_pretty(&manifest)?,
-            )?;
-            fs::write(model_path()?, b"model")?;
-            fs::write(live_dir()?.join("tokenizer.json"), br#"{"version":"1.0"}"#)?;
-            fs::write(live_dir()?.join(".model.sha256"), &manifest.model.sha256)?;
-
-            let stats = apply_update_locked(manifest_path.to_str().expect("utf-8 path"))?;
-            assert_eq!(
-                stats.bytes_downloaded,
-                manifest_bytes.len() as u64,
-                "missing model_fp16.onnx_data must force manifest fetch instead of update.json fast-path"
-            );
-            assert!(
-                model_data_path()?.exists(),
-                "full update should install the missing external model data file"
-            );
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    fn write_installed_model_marker(data_dir: &Path, marker_value: &str) -> Result<()> {
-        with_data_dir(data_dir, || -> Result<()> {
-            fs::write(model_path()?, b"old-model")?;
-            fs::write(model_data_path()?, b"old-model-data")?;
-            fs::write(tokenizer_path()?, br#"{"version":"1.0"}"#)?;
-            fs::write(model_marker_path()?, marker_value)?;
-            Ok(())
-        })
-    }
-
-    fn old_installed_manifest(marker_value: &str) -> Manifest {
-        Manifest {
-            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
-            index_version: "old-install".to_string(),
-            created_at: "2026-05-01T00:00:00Z".to_string(),
-            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
-            model: ModelInfo {
-                id: EMBEDDING_MODEL_ID.to_string(),
-                sha256: marker_value.to_string(),
-                size: 1,
-                url: "old-model-bundle.tar.zst".to_string(),
-            },
-            documents: Vec::new(),
-            packs: Vec::new(),
-            db: None,
-        }
-    }
-
-    #[test]
-    fn failed_model_fetch_keeps_existing_model_marker() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let data = tempdir()?;
-        let release = tempdir()?;
-        let release_dir = release.path();
-        let old_marker = "old-good-marker";
-        let new_manifest = Manifest {
-            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
-            index_version: "failed-model-fetch".to_string(),
-            created_at: "2026-05-04T00:00:00Z".to_string(),
-            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
-            model: ModelInfo {
-                id: EMBEDDING_MODEL_ID.to_string(),
-                sha256: "new-model-sha".to_string(),
-                size: 123,
-                url: "missing-model-bundle.tar.zst".to_string(),
-            },
-            documents: Vec::new(),
-            packs: Vec::new(),
-            db: None,
-        };
-        let manifest_path = release_dir.join("manifest.json");
-        fs::write(&manifest_path, serde_json::to_vec_pretty(&new_manifest)?)?;
-        write_installed_model_marker(data.path(), old_marker)?;
-
-        with_data_dir(data.path(), || -> Result<()> {
-            fs::write(
-                installed_manifest_path()?,
-                serde_json::to_vec_pretty(&old_installed_manifest(old_marker))?,
-            )?;
-            let err = apply_update_locked(manifest_path.to_str().expect("utf-8 path")).unwrap_err();
-            assert!(
-                err.to_string().contains("missing-model-bundle"),
-                "expected missing model bundle error, got: {err}"
-            );
-            assert_eq!(fs::read_to_string(model_marker_path()?)?, old_marker);
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    #[test]
-    fn failed_db_rebuild_after_model_staging_keeps_existing_model_marker() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let data = tempdir()?;
-        let release = tempdir()?;
-        let release_dir = release.path();
-        let model_bundle = release_dir.join("model-bundle.tar.zst");
-        let model_bundle_bytes = write_test_model_bundle(&model_bundle)?;
-        let old_marker = "old-good-marker";
-        let manifest = Manifest {
-            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
-            index_version: "failed-db-rebuild".to_string(),
-            created_at: "2026-05-04T00:00:00Z".to_string(),
-            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
-            model: ModelInfo {
-                id: EMBEDDING_MODEL_ID.to_string(),
-                sha256: sha256_hex(&model_bundle_bytes),
-                size: model_bundle_bytes.len() as u64,
-                url: "model-bundle.tar.zst".to_string(),
-            },
-            documents: vec![DocRef {
-                doc_id: "DOC_MISSING_PACK".to_string(),
-                content_hash: "missing-pack-doc".to_string(),
-                pack_sha8: "missingpack".to_string(),
-                offset: 0,
-                length: 10,
-            }],
-            packs: vec![PackInfo {
-                sha8: "missingpack".to_string(),
-                sha256: String::new(),
-                size: 10,
-                url: "packs/pack-missingpack.bin.zst".to_string(),
-            }],
-            db: None,
-        };
-        let manifest_path = release_dir.join("manifest.json");
-        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
-        write_installed_model_marker(data.path(), old_marker)?;
-
-        with_data_dir(data.path(), || -> Result<()> {
-            fs::write(
-                installed_manifest_path()?,
-                serde_json::to_vec_pretty(&old_installed_manifest(old_marker))?,
-            )?;
-            let err = apply_update_locked(manifest_path.to_str().expect("utf-8 path")).unwrap_err();
-            assert!(
-                err.to_string().contains("pack-missingpack"),
-                "expected missing pack error, got: {err}"
-            );
-            assert_eq!(fs::read_to_string(model_marker_path()?)?, old_marker);
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    #[test]
-    fn promotion_rolls_back_db_when_assets_promotion_fails() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let data = tempdir()?;
-        with_data_dir(data.path(), || -> Result<()> {
-            let conn = open_write_at(&db_path()?)?;
-            init_db(&conn)?;
-            set_meta(&conn, "index_version", "old-db")?;
-            drop(conn);
-            let live_assets = live_dir()?.join("assets");
-            fs::create_dir_all(&live_assets)?;
-            fs::write(live_assets.join("old.txt"), b"old asset")?;
-            let rollback_backup = backups_dir()?.join("ato.db.prev");
-            fs::write(&rollback_backup, b"previous rollback target")?;
-
-            let staging_root = staging_dir()?.join("promotion-rollback-test");
-            remove_path_if_exists(&staging_root)?;
-            fs::create_dir_all(&staging_root)?;
-            let staged_db = staging_root.join("ato.db");
-            let staged_conn = open_write_at(&staged_db)?;
-            init_db(&staged_conn)?;
-            set_meta(&staged_conn, "index_version", "new-db")?;
-            drop(staged_conn);
-            let staged_asset_root = staging_root.join("live");
-            fs::create_dir_all(&staged_asset_root)?;
-            fs::write(staged_asset_root.join("assets"), b"not a directory")?;
-
-            let manifest = old_installed_manifest("old-marker");
-            let err = promote_staged_update(
-                None,
-                StagedCorpusUpdate {
-                    staging_root,
-                    staged_db,
-                    staged_asset_root,
-                    stats: UpdateStats::default(),
-                },
-                &manifest,
-            )
-            .unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains("staged assets path is not a directory"),
-                "expected assets promotion error, got: {err}"
-            );
-
-            let conn = open_read()?;
-            assert_eq!(get_meta(&conn, "index_version")?.as_deref(), Some("old-db"));
-            assert!(live_assets.join("old.txt").exists());
-            assert!(
-                !installed_manifest_path()?.exists(),
-                "manifest must not be written after failed promotion"
-            );
-            assert_eq!(
-                fs::read(&rollback_backup)?,
-                b"previous rollback target",
-                "failed promotion must not replace the previous doctor rollback backup"
-            );
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    #[test]
-    fn promotion_rolls_back_model_when_persistent_backup_fails() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let data = tempdir()?;
-        with_data_dir(data.path(), || -> Result<()> {
-            let conn = open_write_at(&db_path()?)?;
-            init_db(&conn)?;
-            set_meta(&conn, "index_version", "old-db")?;
-            drop(conn);
-            fs::write(model_path()?, b"old-model")?;
-            fs::write(model_data_path()?, b"old-model-data")?;
-            fs::write(tokenizer_path()?, b"old-tokenizer")?;
-            fs::write(model_marker_path()?, "old-marker")?;
-
-            let staging_root = staging_dir()?.join("promotion-model-rollback-test");
-            remove_path_if_exists(&staging_root)?;
-            fs::create_dir_all(&staging_root)?;
-            let staged_db = staging_root.join("ato.db");
-            let staged_conn = open_write_at(&staged_db)?;
-            init_db(&staged_conn)?;
-            set_meta(&staged_conn, "index_version", "new-db")?;
-            drop(staged_conn);
-            let staged_asset_root = staging_root.join("live");
-            fs::create_dir_all(staged_asset_root.join("assets"))?;
-            let staged_model_dir = staging_root.join("model-stage");
-            fs::create_dir_all(&staged_model_dir)?;
-            fs::write(staged_model_dir.join("model_fp16.onnx"), b"new-model")?;
-            fs::write(
-                staged_model_dir.join("model_fp16.onnx_data"),
-                b"new-model-data",
-            )?;
-            fs::write(staged_model_dir.join("tokenizer.json"), b"new-tokenizer")?;
-            let staged_model = StagedModel {
-                dir: staged_model_dir,
-                marker_value: "new-marker".to_string(),
-            };
-            fs::write(data.path().join("backups"), b"not a directory")?;
-
-            let manifest = old_installed_manifest("new-marker");
-            let err = promote_staged_update(
-                Some(&staged_model),
-                StagedCorpusUpdate {
-                    staging_root,
-                    staged_db,
-                    staged_asset_root,
-                    stats: UpdateStats::default(),
-                },
-                &manifest,
-            )
-            .unwrap_err();
-            assert!(
-                err.to_string().contains("File exists"),
-                "expected persistent backup failure, got: {err}"
-            );
-            assert_eq!(fs::read(model_path()?)?, b"old-model");
-            assert_eq!(fs::read(model_data_path()?)?, b"old-model-data");
-            assert_eq!(fs::read(tokenizer_path()?)?, b"old-tokenizer");
-            assert_eq!(fs::read_to_string(model_marker_path()?)?, "old-marker");
-            let conn = open_read()?;
-            assert_eq!(get_meta(&conn, "index_version")?.as_deref(), Some("old-db"));
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    #[test]
-    fn successful_update_keeps_persistent_doctor_rollback_backup() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let data = tempdir()?;
-        with_data_dir(data.path(), || -> Result<()> {
-            let conn = open_write_at(&db_path()?)?;
-            init_db(&conn)?;
-            set_meta(&conn, "index_version", "old-db")?;
-            drop(conn);
-            fs::write(backups_dir()?.join("ato.db.prev"), b"previous backup")?;
-
-            let staging_root = staging_dir()?.join("promotion-success-test");
-            remove_path_if_exists(&staging_root)?;
-            fs::create_dir_all(&staging_root)?;
-            let staged_db = staging_root.join("ato.db");
-            let staged_conn = open_write_at(&staged_db)?;
-            init_db(&staged_conn)?;
-            set_meta(&staged_conn, "index_version", "new-db")?;
-            drop(staged_conn);
-            let staged_asset_root = staging_root.join("live");
-            fs::create_dir_all(staged_asset_root.join("assets"))?;
-
-            let manifest = old_installed_manifest("old-marker");
-            promote_staged_update(
-                None,
-                StagedCorpusUpdate {
-                    staging_root,
-                    staged_db,
-                    staged_asset_root,
-                    stats: UpdateStats::default(),
-                },
-                &manifest,
-            )?;
-            assert!(
-                backups_dir()?.join("ato.db.prev").exists(),
-                "successful promotion must keep doctor rollback backup"
-            );
-            {
-                let conn = open_read()?;
-                assert_eq!(get_meta(&conn, "index_version")?.as_deref(), Some("new-db"));
-            }
-            doctor(true)?;
-            let conn = open_read()?;
-            assert_eq!(get_meta(&conn, "index_version")?.as_deref(), Some("old-db"));
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    #[test]
     fn ensure_model_rejects_incomplete_bundle_before_marker() -> Result<()> {
         let _lock = TEST_DB_LOCK.lock().unwrap();
         let data = tempdir()?;
@@ -5196,9 +3897,11 @@ mod tests {
                 size: model_bundle_bytes.len() as u64,
                 url: "model-bundle.tar.zst".to_string(),
             },
-            documents: Vec::new(),
-            packs: Vec::new(),
-            db: None,
+            db: ManifestDb {
+                url: "ato.db.zst".to_string(),
+                sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                size: 1,
+            },
         };
         let context = UrlContext {
             manifest_dir: Some(release_dir.to_path_buf()),
@@ -5219,104 +3922,6 @@ mod tests {
                 !model_data_path()?.exists(),
                 "incomplete bundle must not partially install model data"
             );
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    #[test]
-    fn apply_update_locked_rebuilds_unsupported_schema_db() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let data = tempdir()?;
-        let release = tempdir()?;
-        let release_dir = release.path();
-        let packs_dir = release_dir.join("packs");
-        fs::create_dir_all(&packs_dir)?;
-
-        let model_bundle = release_dir.join("model-bundle.tar.zst");
-        let model_bundle_bytes = write_test_model_bundle(&model_bundle)?;
-
-        let embedding_b64 =
-            base64::engine::general_purpose::STANDARD.encode(vec![0u8; EMBEDDING_DIM]);
-        let record = json!({
-            "doc_id": "DOC_REBUILD_SCHEMA",
-            "type": "Public_ruling",
-            "title": "Rebuilt unsupported schema corpus",
-            "date": "2026-05-03",
-            "downloaded_at": "2026-05-03T00:00:00Z",
-            "content_hash": "hash-rebuild-schema",
-            "html": "<div><p>Unsupported schema update path must rebuild before semantic probes.</p></div>",
-            "assets": [],
-            "withdrawn_date": JsonValue::Null,
-            "superseded_by": JsonValue::Null,
-            "replaces": JsonValue::Null,
-            "chunks": [{
-                "ord": 0,
-                "anchor": "ruling",
-                "text": "Unsupported schema update path must rebuild before semantic probes.",
-                "embedding_b64": embedding_b64
-            }]
-        });
-        let pack_bytes = encode_test_pack_record(&record)?;
-        let pack_path = packs_dir.join("pack-feedface.bin.zst");
-        fs::write(&pack_path, &pack_bytes)?;
-
-        let manifest = Manifest {
-            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
-            index_version: "test-rebuild-schema".to_string(),
-            created_at: "2026-05-03T00:00:00Z".to_string(),
-            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
-            model: ModelInfo {
-                id: EMBEDDING_MODEL_ID.to_string(),
-                sha256: sha256_hex(&model_bundle_bytes),
-                size: model_bundle_bytes.len() as u64,
-                url: "model-bundle.tar.zst".to_string(),
-            },
-            documents: vec![DocRef {
-                doc_id: "DOC_REBUILD_SCHEMA".to_string(),
-                content_hash: "hash-rebuild-schema".to_string(),
-                pack_sha8: "feedface".to_string(),
-                offset: 0,
-                length: pack_bytes.len() as u64,
-            }],
-            packs: vec![PackInfo {
-                sha8: "feedface".to_string(),
-                sha256: sha256_hex(&pack_bytes),
-                size: pack_bytes.len() as u64,
-                url: "packs/pack-feedface.bin.zst".to_string(),
-            }],
-            db: None,
-        };
-        let manifest_path = release_dir.join("manifest.json");
-        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
-
-        with_data_dir(data.path(), || -> Result<()> {
-            let conn = open_write_at(&db_path()?)?;
-            init_db(&conn)?;
-            set_meta(&conn, "schema_version", "5")?;
-            drop(conn);
-            fs::write(
-                installed_manifest_path()?,
-                serde_json::to_vec_pretty(&sample_manifest(
-                    SUPPORTED_MANIFEST_VERSION as i64,
-                    env!("CARGO_PKG_VERSION"),
-                ))?,
-            )?;
-
-            let stats = apply_update_locked(manifest_path.to_str().expect("utf-8 path"))?;
-            assert_eq!(stats.added, 1);
-            assert_eq!(stats.changed, 0);
-            assert_eq!(stats.removed, 0);
-
-            let conn = open_read()?;
-            assert_eq!(get_meta(&conn, "schema_version")?.as_deref(), Some("9"));
-            let title: String = conn.query_row(
-                "SELECT title FROM documents WHERE doc_id = ?",
-                ["DOC_REBUILD_SCHEMA"],
-                |row| row.get(0),
-            )?;
-            assert_eq!(title, "Rebuilt unsupported schema corpus");
-            assert_eq!(chunk_embedding_count(&conn)?, 1);
             Ok(())
         })?;
         Ok(())

@@ -9,20 +9,15 @@ use crate::config::{
     model_marker_path, staging_dir,
 };
 use crate::db::{
-    get_meta, init_db, open_read,
-    open_write_at, set_meta, table_exists,
+    get_meta, open_read, open_write_at, set_meta, table_exists,
 };
 use crate::extract::anchors_node_text;
-use crate::pack::{
-    insert_record, read_record_from_pack_bytes,
-};
-use crate::retrieval::derive_citations;
 use crate::search::ensure_vector_search_ready;
 use crate::semantic::EMBEDDING_MODEL_HF_FILES;
 use crate::{
-    diff_manifests, embedding_model_installed_matches, fetch_bytes, fetch_bytes_with,
-    local_path_from_urlish, model_info_matches, resolve_manifest_asset, stage_model,
-    validate_manifest_model_source, verify_sha256_bytes, UrlContext,
+    embedding_model_installed_matches, fetch_bytes, fetch_bytes_with,
+    local_path_from_urlish, model_info_matches, stage_model,
+    validate_manifest_model_source, UrlContext,
     ATO_USER_AGENT, DEFAULT_EXCLUDED_TYPES, EDITED_PRIVATE_ADVICE_LABEL, EMBEDDING_MODEL_ID, LEGISLATION_TYPE, LEGISLATION_TYPE_PREFIXES,
     OLD_CONTENT_CUTOFF, SUPPORTED_MANIFEST_VERSION, SUPPORTED_SCHEMA_VERSION,
 };
@@ -33,7 +28,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
@@ -322,18 +317,7 @@ pub(crate) struct Manifest {
     pub(crate) created_at: String,
     pub(crate) min_client_version: String,
     pub(crate) model: ModelInfo,
-    /// Legacy pack-based fields. Retained for backward compatibility with
-    /// manifest schema versions ≤ 4; manifest schema 5+ ships an empty
-    /// `documents`/`packs` and the corpus DB through `db` instead.
-    #[serde(default)]
-    pub(crate) documents: Vec<DocRef>,
-    #[serde(default)]
-    pub(crate) packs: Vec<PackInfo>,
-    /// Single compressed SQLite artifact replacing the pack-based install
-    /// flow (schema 5+). When present, install decompresses this file,
-    /// rebuilds FTS5 indexes locally, and atomic-swaps the live DB.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) db: Option<ManifestDb>,
+    pub(crate) db: ManifestDb,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -361,42 +345,14 @@ pub(crate) struct UpdateSummary {
     #[serde(default)]
     pub(crate) min_client_version: String,
     pub(crate) model: ModelInfo,
-    #[serde(default)]
-    pub(crate) document_count: usize,
-    #[serde(default)]
-    pub(crate) pack_count: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) db_sha256: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) db_size: Option<u64>,
+    pub(crate) db_sha256: String,
+    pub(crate) db_size: u64,
     #[serde(default)]
     pub(crate) manifest_fingerprint: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct DocRef {
-    pub(crate) doc_id: String,
-    pub(crate) content_hash: String,
-    pub(crate) pack_sha8: String,
-    pub(crate) offset: u64,
-    pub(crate) length: u64,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PackInfo {
-    pub(crate) sha8: String,
-    pub(crate) sha256: String,
-    pub(crate) size: u64,
-    pub(crate) url: String,
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct UpdateStats {
-    pub(crate) added: usize,
-    pub(crate) changed: usize,
-    pub(crate) removed: usize,
     pub(crate) bytes_downloaded: u64,
 }
 
@@ -417,28 +373,15 @@ pub(crate) fn preview_update(manifest_url: &str) -> Result<String> {
     lines.push(format!("manifest url:    {}", manifest_url));
     lines.push(format!("published index: {}", manifest.index_version));
 
-    let pack_set = |packs: &[PackInfo]| -> std::collections::BTreeSet<String> {
-        packs.iter().map(|p| p.sha256.clone()).collect()
-    };
-
     match installed {
         None => {
             lines.push("installed index: <none — corpus not yet installed>".to_string());
             lines.push("=> initial corpus install".to_string());
-            if let Some(db) = &manifest.db {
-                lines.push(format!(
-                    "  - download {} ({:.2} MB)",
-                    db.url,
-                    db.size as f64 / 1_000_000.0,
-                ));
-            } else {
-                let total: u64 = manifest.packs.iter().map(|p| p.size).sum();
-                lines.push(format!(
-                    "  - download {} packs ({:.2} MB total)",
-                    manifest.packs.len(),
-                    total as f64 / 1_000_000.0,
-                ));
-            }
+            lines.push(format!(
+                "  - download {} ({:.2} MB)",
+                manifest.db.url,
+                manifest.db.size as f64 / 1_000_000.0,
+            ));
             lines.push(format!(
                 "  - install model {} ({:.2} MB)",
                 manifest.model.id,
@@ -448,11 +391,7 @@ pub(crate) fn preview_update(manifest_url: &str) -> Result<String> {
         Some(installed) => {
             lines.push(format!("installed index: {}", installed.index_version));
             let model_changed = !crate::model_info_matches(&installed.model, &manifest.model);
-            let db_changed = match (&installed.db, &manifest.db) {
-                (Some(a), Some(b)) => a.sha256 != b.sha256,
-                (None, Some(_)) | (Some(_), None) => true,
-                (None, None) => pack_set(&installed.packs) != pack_set(&manifest.packs),
-            };
+            let db_changed = installed.db.sha256 != manifest.db.sha256;
             if !model_changed && !db_changed {
                 lines.push("=> already current; no download needed".to_string());
             } else {
@@ -465,19 +404,10 @@ pub(crate) fn preview_update(manifest_url: &str) -> Result<String> {
                     ));
                 }
                 if db_changed {
-                    if let Some(db) = &manifest.db {
-                        lines.push(format!(
-                            "  - corpus: {:.2} MB compressed DB download",
-                            db.size as f64 / 1_000_000.0,
-                        ));
-                    } else {
-                        let total: u64 = manifest.packs.iter().map(|p| p.size).sum();
-                        lines.push(format!(
-                            "  - corpus: {} packs ({:.2} MB)",
-                            manifest.packs.len(),
-                            total as f64 / 1_000_000.0,
-                        ));
-                    }
+                    lines.push(format!(
+                        "  - corpus: {:.2} MB compressed DB download",
+                        manifest.db.size as f64 / 1_000_000.0,
+                    ));
                 }
             }
         }
@@ -572,11 +502,6 @@ pub(crate) fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
     let new_manifest: Manifest = serde_json::from_slice(&manifest_bytes)?;
     enforce_manifest_compatibility(&new_manifest)?;
 
-    // Cheap stats-only diff for the human-readable "+a ~c -r" CLI line.
-    // No code path branches on the result — the rebuild always replaces
-    // the live DB wholesale.
-    let old_manifest = load_installed_manifest()?;
-    let (added, changed, removed) = diff_manifests(old_manifest.as_ref(), &new_manifest);
     let update_root = staging.join("update-apply");
     if update_root.exists() {
         fs::remove_dir_all(&update_root)?;
@@ -587,30 +512,12 @@ pub(crate) fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
         &manifest_context,
         &update_root.join("model-stage"),
     )?;
-    let staged_corpus = if new_manifest.db.is_some() {
-        // Manifest schema 5+: corpus ships as a single zstd-compressed SQLite
-        // file. Install decompresses it and rebuilds FTS5 locally.
-        stage_live_db_from_db_artifact(
-            &new_manifest,
-            &manifest_context,
-            manifest_bytes.len() as u64,
-            added.len(),
-            changed.len(),
-            removed.len(),
-            &update_root.join("corpus-rebuild"),
-        )?
-    } else {
-        // Legacy schema 4: per-pack reconstruction.
-        stage_live_db_from_manifest_at(
-            &new_manifest,
-            &manifest_context,
-            manifest_bytes.len() as u64,
-            added.len(),
-            changed.len(),
-            removed.len(),
-            &update_root.join("corpus-rebuild"),
-        )?
-    };
+    let staged_corpus = stage_live_db_from_db_artifact(
+        &new_manifest,
+        &manifest_context,
+        manifest_bytes.len() as u64,
+        &update_root.join("corpus-rebuild"),
+    )?;
     let stats = staged_corpus.stats;
     promote_staged_update(staged_model.as_ref(), staged_corpus, &new_manifest)?;
     let _ = fs::remove_dir_all(&update_root);
@@ -841,65 +748,6 @@ pub(crate) fn live_db_requires_rebuild(path: &Path) -> Result<bool> {
     Ok(parsed != SUPPORTED_SCHEMA_VERSION)
 }
 
-pub(crate) fn stage_live_db_from_manifest_at(
-    manifest: &Manifest,
-    context: &UrlContext,
-    manifest_bytes: u64,
-    added: usize,
-    changed: usize,
-    removed: usize,
-    staging_root: &Path,
-) -> Result<StagedCorpusUpdate> {
-    if staging_root.exists() {
-        fs::remove_dir_all(staging_root)?;
-    }
-    fs::create_dir_all(staging_root)?;
-    let staged_db = staging_root.join("ato.db");
-    let staged_asset_root = staging_root.join("live");
-    let conn = open_write_at(&staged_db)?;
-    init_db(&conn)?;
-
-    let mut bytes_downloaded = manifest_bytes;
-    let tx = conn.unchecked_transaction()?;
-    let apply_result = (|| -> Result<()> {
-        insert_docs_from_packs(
-            &tx,
-            manifest,
-            context,
-            &manifest.documents,
-            &mut bytes_downloaded,
-            &staged_asset_root,
-        )?;
-        set_meta(&tx, "index_version", &manifest.index_version)?;
-        set_meta(&tx, "embedding_model_id", &manifest.model.id)?;
-        set_meta(&tx, "last_update_at", &Utc::now().to_rfc3339())?;
-        // [UM-07] citations is a derived index of `[doc:X]` markers in
-        // chunks.text. Newly-inserted chunks carry no citation rows; derive
-        // them at the tail so the live DB always ships a populated table.
-        derive_citations(&tx)?;
-        verify_semantic_install(&tx, manifest)?;
-        Ok(())
-    })();
-    if let Err(err) = apply_result {
-        tx.rollback()?;
-        return Err(err);
-    }
-    tx.commit()?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
-    drop(conn);
-
-    Ok(StagedCorpusUpdate {
-        staging_root: staging_root.to_path_buf(),
-        staged_db,
-        staged_asset_root,
-        stats: UpdateStats {
-            added,
-            changed,
-            removed,
-            bytes_downloaded,
-        },
-    })
-}
 
 /// Install path for manifest schema 5+: download the single zstd-compressed
 /// SQLite artifact, decompress to staging, rebuild FTS5 indexes locally from
@@ -909,15 +757,9 @@ pub(crate) fn stage_live_db_from_db_artifact(
     manifest: &Manifest,
     context: &UrlContext,
     manifest_bytes: u64,
-    added: usize,
-    changed: usize,
-    removed: usize,
     staging_root: &Path,
 ) -> Result<StagedCorpusUpdate> {
-    let db_info = manifest
-        .db
-        .as_ref()
-        .ok_or_else(|| anyhow!("manifest.db missing — cannot use db-artifact install path"))?;
+    let db_info = &manifest.db;
 
     if staging_root.exists() {
         fs::remove_dir_all(staging_root)?;
@@ -1009,12 +851,7 @@ pub(crate) fn stage_live_db_from_db_artifact(
         staging_root: staging_root.to_path_buf(),
         staged_db,
         staged_asset_root,
-        stats: UpdateStats {
-            added,
-            changed,
-            removed,
-            bytes_downloaded,
-        },
+        stats: UpdateStats { bytes_downloaded },
     })
 }
 
@@ -1105,46 +942,6 @@ pub(crate) fn promote_installed_manifest(manifest: &Manifest, backup: &Path) -> 
     Ok(guard)
 }
 
-pub(crate) fn insert_docs_from_packs(
-    conn: &Connection,
-    manifest: &Manifest,
-    context: &UrlContext,
-    docs: &[DocRef],
-    bytes_downloaded: &mut u64,
-    asset_root: &Path,
-) -> Result<()> {
-    // [UM-03] Pack bytes are fetched from manifest-resolved assets and sha256-verified.
-    let mut pack_to_refs: HashMap<String, Vec<DocRef>> = HashMap::new();
-    for doc in docs {
-        pack_to_refs
-            .entry(doc.pack_sha8.clone())
-            .or_default()
-            .push(doc.clone());
-    }
-    let pack_index: HashMap<String, PackInfo> = manifest
-        .packs
-        .iter()
-        .map(|p| (p.sha8.clone(), p.clone()))
-        .collect();
-    for (sha8, refs) in pack_to_refs {
-        let info = pack_index
-            .get(&sha8)
-            .ok_or_else(|| anyhow!("manifest missing pack info for {sha8}"))?;
-        let pack_url = resolve_manifest_asset(&info.url, context);
-        let pack_bytes = fetch_bytes(&pack_url, context)
-            .with_context(|| format!("fetching pack {}", info.url))?;
-        if !info.sha256.is_empty() {
-            verify_sha256_bytes(&pack_bytes, &info.sha256)
-                .with_context(|| format!("verifying {}", info.url))?;
-        }
-        *bytes_downloaded += pack_bytes.len() as u64;
-        for doc_ref in refs {
-            let record = read_record_from_pack_bytes(&pack_bytes, doc_ref.offset, doc_ref.length)?;
-            insert_record(conn, &record, &doc_ref, asset_root)?;
-        }
-    }
-    Ok(())
-}
 
 pub(crate) fn semantic_backfill_required_for_model(conn: &Connection, model_id: &str) -> Result<bool> {
     if model_id != EMBEDDING_MODEL_ID {
@@ -1222,9 +1019,6 @@ pub(crate) fn try_skip_update_from_summary(
         return Ok(None);
     }
     Ok(Some(UpdateStats {
-        added: 0,
-        changed: 0,
-        removed: 0,
         bytes_downloaded: summary_bytes.len() as u64,
     }))
 }
@@ -1290,15 +1084,18 @@ pub(crate) fn check_for_update_availability(manifest_url: &str) -> Result<Option
     }))
 }
 
-pub(crate) fn enforce_update_summary_compatibility(summary: &UpdateSummary) -> Result<()> {    let manifest = Manifest {
+pub(crate) fn enforce_update_summary_compatibility(summary: &UpdateSummary) -> Result<()> {
+    let manifest = Manifest {
         schema_version: summary.schema_version,
         index_version: summary.index_version.clone(),
         created_at: String::new(),
         min_client_version: summary.min_client_version.clone(),
         model: summary.model.clone(),
-        documents: Vec::new(),
-        packs: Vec::new(),
-        db: None,
+        db: ManifestDb {
+            url: String::new(),
+            sha256: summary.db_sha256.clone(),
+            size: summary.db_size,
+        },
     };
     enforce_manifest_compatibility(&manifest)
 }
@@ -1310,8 +1107,8 @@ pub(crate) fn installed_matches_update_summary(installed: &Manifest, summary: &U
     if installed.schema_version != summary.schema_version
         || installed.index_version != summary.index_version
         || installed.min_client_version != summary.min_client_version
-        || installed.documents.len() != summary.document_count
-        || installed.packs.len() != summary.pack_count
+        || installed.db.sha256 != summary.db_sha256
+        || installed.db.size != summary.db_size
         || manifest_fingerprint(installed)? != summary_fingerprint
         || !model_info_matches(&installed.model, &summary.model)
     {
@@ -1333,24 +1130,23 @@ pub(crate) fn installed_matches_update_summary(installed: &Manifest, summary: &U
 }
 
 pub(crate) fn manifest_fingerprint(manifest: &Manifest) -> Result<String> {
-    let mut documents = manifest.documents.clone();
-    documents.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
-    let mut packs = manifest.packs.clone();
-    packs.sort_by(|a, b| a.sha8.cmp(&b.sha8));
+    // Fingerprint is purely a deduplication hint for the update fast-path —
+    // it must change when any of the install-relevant fields change.
     let payload = json!({
-        "documents": documents.iter().map(|d| json!({
-            "doc_id": d.doc_id,
-            "content_hash": d.content_hash,
-            "pack_sha8": d.pack_sha8,
-            "offset": d.offset,
-            "length": d.length,
-        })).collect::<Vec<_>>(),
-        "packs": packs.iter().map(|p| json!({
-            "sha8": p.sha8,
-            "sha256": p.sha256,
-            "size": p.size,
-            "url": p.url,
-        })).collect::<Vec<_>>(),
+        "schema_version": manifest.schema_version,
+        "index_version": manifest.index_version,
+        "min_client_version": manifest.min_client_version,
+        "model": {
+            "id": manifest.model.id,
+            "sha256": manifest.model.sha256,
+            "size": manifest.model.size,
+            "url": manifest.model.url,
+        },
+        "db": {
+            "url": manifest.db.url,
+            "sha256": manifest.db.sha256,
+            "size": manifest.db.size,
+        },
     });
     let bytes = serde_json::to_vec(&payload)?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
