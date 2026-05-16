@@ -213,7 +213,7 @@ Default search is tuned for current public tax-law work:
   with lexical ranking. `mode=vector` and explicit `mode=keyword` are available;
   hybrid/vector fail rather than silently downgrading when semantic search is
   unavailable.
-- `Edited_private_advice` is excluded unless `types` explicitly includes it.
+- Edited private advice (`EV`) is excluded unless `types` explicitly includes it.
 - Non-legislation documents dated before `2000-01-01` are excluded unless
   `include_old=true`.
 - Legislation is not excluded by the old-content rule because current Acts

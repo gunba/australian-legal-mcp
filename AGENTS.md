@@ -127,7 +127,7 @@ ato-mcp doctor --rollback
 
 Default search is intentionally current-guidance-first:
 
-- `Edited_private_advice` is excluded unless explicitly requested in
+- Edited private advice (`EV`) is excluded unless explicitly requested in
   `types`.
 - Non-legislation documents dated before `2000-01-01` are excluded unless
   `include_old=true`.

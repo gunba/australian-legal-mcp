@@ -53,8 +53,11 @@ const EMBEDDING_TEXT_PREFIX: &str = "";
 const EMBEDDING_MODEL_FINGERPRINT: &str =
     "granite-small-r2-fp16:ee200de55cb2f94e858aabca54be7697a9c0805a14c858ee26ad0922b05f57d7:28d16e29cd623f25cc6fa0968700c5bc31036466091a5fa06d1353c1777f050e:feeb83348dcb033bc6b9d2e1f7906ca9eb2d122845000c9416d894d7c2927149";
 const OLD_CONTENT_CUTOFF: &str = "2000-01-01";
-const DEFAULT_EXCLUDED_TYPES: &[&str] = &["Edited_private_advice"];
+const DEFAULT_EXCLUDED_TYPES: &[&str] = &["EV"];
+const EDITED_PRIVATE_ADVICE_LABEL: &str = "Edited_private_advice";
 const LEGISLATION_TYPE: &str = "Legislation_and_supporting_material";
+const LEGISLATION_TYPE_PREFIXES: &[&str] = &["PAC", "REG", "RPC", "RRG"];
+const STATUTORY_DEFINITION_TYPE_PREFIXES: &[&str] = &["PAC", "REG"];
 const OEWN_2024_URL: &str = "https://en-word.net/static/english-wordnet-2024.zip";
 const OEWN_2024_SOURCE: &str = "Open English WordNet 2024 (CC-BY 4.0)";
 const ORDINARY_DICTIONARY_PATH_ENV: &str = "ATO_MCP_DICTIONARY_PATH";
@@ -1657,11 +1660,14 @@ fn build_doc_filter(
         params_out.push(Value::Text(glob_to_like(doc_scope)));
     }
     if !include_old && date_from.is_none() {
+        let placeholders = vec!["?"; LEGISLATION_TYPE_PREFIXES.len()].join(",");
         clauses.push(format!(
-            "({alias}.date IS NULL OR {alias}.date >= ? OR {alias}.type = ?)"
+            "({alias}.date IS NULL OR {alias}.date >= ? OR {alias}.type IN ({placeholders}))"
         ));
         params_out.push(Value::Text(OLD_CONTENT_CUTOFF.to_string()));
-        params_out.push(Value::Text(LEGISLATION_TYPE.to_string()));
+        for t in LEGISLATION_TYPE_PREFIXES {
+            params_out.push(Value::Text((*t).to_string()));
+        }
     }
     if current_only {
         // W2.4: drop rulings with a known withdrawal/supersession date by
@@ -9493,18 +9499,25 @@ fn get_definition(term: &str, opts: GetDefinitionOptions<'_>) -> Result<String> 
     }
     let norm = normalize_definition_term(term);
     let max_defs = opts.max_defs.clamp(1, 20);
-    let mut stmt = conn.prepare(
+    let source_placeholders = vec!["?"; STATUTORY_DEFINITION_TYPE_PREFIXES.len()].join(",");
+    let sql = format!(
         r#"
         SELECT definition_id, term, doc_id, source_title, source_type, scope,
                anchor, body
         FROM definitions
-        WHERE norm_term = ? AND source_type = ?
+        WHERE norm_term = ? AND source_type IN ({source_placeholders})
         ORDER BY doc_id, ord, term
         LIMIT 100
-        "#,
-    )?;
+        "#
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut query_params = Vec::with_capacity(1 + STATUTORY_DEFINITION_TYPE_PREFIXES.len());
+    query_params.push(Value::Text(norm));
+    for source_type in STATUTORY_DEFINITION_TYPE_PREFIXES {
+        query_params.push(Value::Text((*source_type).to_string()));
+    }
     let mut hits = stmt
-        .query_map(params![norm, LEGISLATION_TYPE], |row| {
+        .query_map(rusqlite::params_from_iter(query_params), |row| {
             let doc_id: String = row.get("doc_id")?;
             Ok(DefinitionHit {
                 definition_id: row.get("definition_id")?,
@@ -9831,8 +9844,10 @@ fn stats() -> Result<String> {
         "prefix_breakdown": prefix_breakdown,
         "default_search_policy": {
             "excluded_types": DEFAULT_EXCLUDED_TYPES,
+            "excluded_type_labels": [EDITED_PRIVATE_ADVICE_LABEL],
             "old_content_cutoff": OLD_CONTENT_CUTOFF,
-            "old_content_exception_types": [LEGISLATION_TYPE],
+            "old_content_exception_types": LEGISLATION_TYPE_PREFIXES,
+            "old_content_exception_type_labels": [LEGISLATION_TYPE],
         }
     });
     // [OF-06] JSON outputs use serde_json pretty rendering before return/write.
@@ -14148,7 +14163,7 @@ fn server_instructions(update_notice: Option<&UpdateAvailability>) -> String {
         .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
     {
         Some(s) => format!(
-            "ATO legal corpus. Documents: {}, chunks: {}. Index: {}. Default search excludes Edited_private_advice, withdrawn rulings, and content dated before {} except legislation; override with current_only=false and include_old=true.\n\n{}",
+            "ATO legal corpus. Documents: {}, chunks: {}. Index: {}. Default search excludes EV edited private advice, withdrawn rulings, and content dated before {} except legislation prefixes PAC/REG/RPC/RRG; override with current_only=false and include_old=true.\n\n{}",
             s["documents"].as_i64().unwrap_or(0),
             s["chunks"].as_i64().unwrap_or(0),
             s["index_version"].as_str().unwrap_or("?"),
@@ -14595,7 +14610,7 @@ mod tests {
         doc_id: &str,
         body: &str,
     ) -> Result<()> {
-        insert_definition_with_source(conn, definition_id, term, doc_id, body, LEGISLATION_TYPE)
+        insert_definition_with_source(conn, definition_id, term, doc_id, body, "PAC")
     }
 
     fn insert_definition_with_source(
@@ -15633,6 +15648,39 @@ mod tests {
     }
 
     #[test]
+    fn build_doc_filter_uses_current_prefix_policy() {
+        let f = build_doc_filter("d", None, None, None, None, false, true);
+        assert!(
+            f.sql.contains("d.type NOT IN (?)"),
+            "default policy must exclude EV by prefix; sql={}",
+            f.sql
+        );
+        assert!(
+            f.sql.contains("d.type IN (?,?,?,?)"),
+            "old-content exception must use legislation prefixes; sql={}",
+            f.sql
+        );
+        let params: Vec<String> = f
+            .params
+            .iter()
+            .filter_map(|v| match v {
+                Value::Text(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            params.contains(&"EV".to_string()),
+            "default exclusion must use EV prefix; params={params:?}"
+        );
+        for expected in LEGISLATION_TYPE_PREFIXES {
+            assert!(
+                params.contains(&expected.to_string()),
+                "missing legislation prefix {expected}; params={params:?}"
+            );
+        }
+    }
+
+    #[test]
     fn search_next_call_preserves_current_only_false() {
         let opts = SearchOptions {
             k: 8,
@@ -15851,8 +15899,11 @@ mod tests {
             None,
         )?;
         conn.execute(
-            "UPDATE documents SET type = 'Legislation_and_supporting_material', title = ? WHERE doc_id = ?",
-            params!["Income Tax Assessment Act 1997 s 203-50", "PAC/19970038/203-50"],
+            "UPDATE documents SET type = 'PAC', title = ? WHERE doc_id = ?",
+            params![
+                "Income Tax Assessment Act 1997 s 203-50",
+                "PAC/19970038/203-50"
+            ],
         )?;
         conn.execute(
             "INSERT INTO title_fts(doc_id, title, headings) VALUES (?, ?, '')",
@@ -15870,7 +15921,7 @@ mod tests {
             None,
         )?;
         conn.execute(
-            "UPDATE documents SET type = 'Legislation_and_supporting_material', title = ? WHERE doc_id = ?",
+            "UPDATE documents SET type = 'PAC', title = ? WHERE doc_id = ?",
             params!["Income Tax Assessment Act 1997 s 8-1", "PAC/19970038/8-1"],
         )?;
         conn.execute(
@@ -15976,7 +16027,7 @@ mod tests {
             "car",
             "EV/123456",
             "A private advice glossary entry.",
-            "Edited_private_advice",
+            "EV",
         )?;
         insert_definition_with_source(
             &conn,
@@ -15984,7 +16035,7 @@ mod tests {
             "car",
             "AID/AID20021000",
             "An interpretative decision glossary entry.",
-            "ATO_interpretative_decisions",
+            "AID",
         )?;
         drop(conn);
 
@@ -16003,7 +16054,7 @@ mod tests {
                 definitions[0]["definition_id"],
                 json!("def-car-legislation")
             );
-            assert_eq!(definitions[0]["source"]["type"], json!(LEGISLATION_TYPE));
+            assert_eq!(definitions[0]["source"]["type"], json!("PAC"));
             Ok(())
         })?;
         Ok(())
