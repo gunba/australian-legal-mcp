@@ -181,19 +181,16 @@ enum Command {
         #[arg(long)]
         view: Option<String>,
     },
-    /// In-binary build orchestrator (port of build.py). Reads
-    /// `pages_dir/index.jsonl` (one record per line, with the fields
-    /// canonical_id and payload_path), runs each doc through the cleaning
-    /// pipeline, the chunker, the rules-engine metadata classifier and the
-    /// embedder in-process, then writes the documents, chunks,
-    /// chunk_embeddings, chunks_fts, title_fts, doc_anchors, definitions
-    /// and citations tables, then writes pack files, per-doc asset blobs,
-    /// manifest.json, and update.json to --out-dir.
-    /// Supports same-output-dir checkpoint resume and previous-release
-    /// seeding through --base-release-dir.
-    /// [CC-05] Source refresh/download and corpus build are separate
-    /// commands: the same ato_pages/ tree can feed repeated builds,
-    /// base-release seeded builds, or release dry runs.
+    /// In-binary build orchestrator. Reads `pages_dir/index.jsonl` (one
+    /// record per line with canonical_id and payload_path), runs each doc
+    /// through the cleaning pipeline, the chunker, the rules-engine
+    /// metadata classifier, and the Granite embedder in-process, then
+    /// writes documents/chunks/chunk_embeddings/chunks_fts/title_fts/
+    /// doc_anchors/definitions/citations tables and emits manifest.json
+    /// and update.json into --out-dir. Supports same-output-dir checkpoint
+    /// resume.
+    /// [CC-05] Source refresh and corpus build are separate commands: the
+    /// same ato_pages/ tree can feed repeated builds or release dry runs.
     Build {
         #[arg(long)]
         pages_dir: PathBuf,
@@ -203,10 +200,7 @@ enum Command {
         /// onnx/model_fp16.onnx, and onnx/model_fp16.onnx_data.
         #[arg(long)]
         model_dir: PathBuf,
-        /// Previous release directory to seed unchanged documents/packs from.
-        #[arg(long)]
-        base_release_dir: Option<PathBuf>,
-        /// Output directory for pack files, asset blobs, manifest.json, and update.json.
+        /// Output directory for manifest.json, update.json, and the built ato.db.
         #[arg(long)]
         out_dir: PathBuf,
         #[arg(long, default_value_t = 3)]
@@ -605,7 +599,6 @@ fn main() -> Result<()> {
             pages_dir,
             db_path,
             model_dir,
-            base_release_dir,
             out_dir,
             zstd_level,
             limit,
@@ -615,7 +608,6 @@ fn main() -> Result<()> {
             pages_dir: &pages_dir,
             db_path: &db_path,
             model_dir: &model_dir,
-            base_release_dir: base_release_dir.as_deref(),
             out_dir: &out_dir,
             zstd_level,
             limit,

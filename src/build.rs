@@ -593,7 +593,6 @@ pub(crate) struct BuildCorpusArgs<'a> {
     pub(crate) pages_dir: &'a Path,
     pub(crate) db_path: &'a Path,
     pub(crate) model_dir: &'a Path,
-    pub(crate) base_release_dir: Option<&'a Path>,
     pub(crate) out_dir: &'a Path,
     pub(crate) zstd_level: i32,
     pub(crate) limit: Option<usize>,
@@ -608,7 +607,6 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         pages_dir,
         db_path,
         model_dir,
-        base_release_dir,
         out_dir,
         zstd_level,
         limit,
@@ -659,12 +657,6 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         None => {
             fs::remove_file(out_dir.join("manifest.json")).ok();
             fs::remove_file(out_dir.join("update.json")).ok();
-            if base_release_dir.is_some() {
-                bail!(
-                    "--base-release-dir is no longer supported (the pack-based seed path was \
-                    removed); run a full build instead."
-                );
-            }
             (Vec::new(), Vec::new())
         }
     };

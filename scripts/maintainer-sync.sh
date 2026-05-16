@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Maintainer steady-state: refresh ato_pages, rebuild index, publish release.
+# Maintainer steady-state: refresh ato_pages, rebuild corpus, publish to the
+# current binary release tag.
 #
-# Now invokes the Rust ato-mcp binary directly — no Python venv, no
-# scraper Python modules. Replaces the previous version that shelled
-# into the Python pipeline.
+# Invokes the Rust ato-mcp binary directly. The released corpus lives on the
+# same GitHub tag as the binary archives — the maintainer queries the latest
+# binary tag with `gh release view`, runs the build/package/publish chain,
+# and uploads manifest.json + update.json + ato.db.zst to that tag with
+# --clobber. Users always hit releases/latest/download/manifest.json.
 #
 # Expects these env vars (set in the systemd unit or your shell):
 #   ATO_MCP_REPO_DIR   absolute path to this repo checkout
@@ -15,21 +18,20 @@
 #   ATO_MCP_MODEL_SHA256 required with a non-Hugging Face ATO_MCP_MODEL_URL
 #   ATO_MCP_MODEL_SIZE   required with a non-Hugging Face ATO_MCP_MODEL_URL
 #   ATO_MCP_FORCE_REBUILD set to 1/true/yes/on to rebuild even when source did not change
-#   ATO_MCP_RELEASE_TAG  tag prefix (default: index)
 #   ATO_MCP_GH_REPO    owner/name (default: gunba/ato-mcp)
 #   ATO_MCP_MODE       incremental | catch_up | full (default: incremental)
 #   ATO_MCP_BIN        path to the Rust ato-mcp binary
 #                      (default: $ATO_MCP_REPO_DIR/target/release/ato-mcp)
+#   ATO_MCP_RELEASE_TAG override the publish tag (default: latest gh release on the repo)
+#   ATO_MCP_ZSTD_LEVEL package-corpus zstd level (default: 19)
 #
 # Flow:
 #   1. Run the requested source refresh mode (catch_up or full) when set.
-#   2. Always run an incremental What's New refresh as the final pre-build
-#      source step, so the release includes the live ATO What's New feed.
-#   3. If ato_pages/index.jsonl actually changed, rebuild against the previous
-#      release manifest when one is available.
-#   4. Publish a new release under tag $ATO_MCP_RELEASE_TAG-YYYY.MM.DD and
-#      mark it latest. GitHub's "download latest" URL then points at it,
-#      so end-users' `ato-mcp update` picks it up on their next run.
+#   2. Always run an incremental What's New refresh as the final pre-build step.
+#   3. If ato_pages/index.jsonl changed, rebuild the corpus from scratch
+#      (or resume a matching interrupted checkpoint).
+#   4. package-corpus → ato.db.zst.
+#   5. publish-release to the current binary release tag with --overwrite.
 
 set -euo pipefail
 
@@ -84,7 +86,7 @@ fi
 GH_REPO="${ATO_MCP_GH_REPO:-gunba/ato-mcp}"
 MODE="${ATO_MCP_MODE:-incremental}"
 FORCE_REBUILD="${ATO_MCP_FORCE_REBUILD:-}"
-TAG_PREFIX="${ATO_MCP_RELEASE_TAG:-index}"
+ZSTD_LEVEL="${ATO_MCP_ZSTD_LEVEL:-19}"
 
 cd "$REPO_DIR"
 if [[ -n "${ATO_MCP_CUDA_LIB_PATH:-}" ]]; then
@@ -205,85 +207,18 @@ if [[ "$FORCE" != true && "$MODE" != "full" && "$AFTER_HASH" == "$BEFORE_HASH" ]
     exit 0
 fi
 
-TAG="$TAG_PREFIX-$(date -u +%Y.%m.%d)"
-RELEASE_DIR="$REPO_DIR/release/$TAG"
-BASE_RELEASE_ARG=()
-LATEST_RELEASE="$REPO_DIR/release/.latest"
+# Target tag: explicit override, or the current latest binary release.
+TAG="${ATO_MCP_RELEASE_TAG:-}"
+if [[ -z "$TAG" ]]; then
+    TAG=$(gh release view --repo "$GH_REPO" --json tagName --jq .tagName 2>/dev/null || true)
+    if [[ -z "$TAG" ]]; then
+        echo "could not determine latest release tag from $GH_REPO; set ATO_MCP_RELEASE_TAG" >&2
+        exit 2
+    fi
+fi
+RELEASE_DIR="$REPO_DIR/release/build-$(date -u +%Y%m%d)"
 
-try_base_release() {
-    local candidate="$1"
-    local label="$2"
-    if [[ ! -d "$candidate" ]]; then
-        return 1
-    fi
-    local candidate_real release_real
-    candidate_real=$(realpath "$candidate")
-    release_real=$(realpath -m "$RELEASE_DIR")
-    if [[ "$candidate_real" == "$release_real" ]]; then
-        return 1
-    fi
-    local check_output
-    if check_output=$("$ATO_MCP" check-base-release "$candidate" 2>&1); then
-        echo "$check_output"
-        BASE_RELEASE_ARG=(--base-release-dir "$candidate")
-        return 0
-    fi
-    echo "base release not usable ($label): $check_output"
-    return 1
-}
-
-try_local_base_releases() {
-    if try_base_release "$LATEST_RELEASE" "release/.latest"; then
-        return 0
-    fi
-    local candidate
-    while IFS= read -r candidate; do
-        if try_base_release "$candidate" "$candidate"; then
-            rm -rf "$LATEST_RELEASE"
-            ln -s "$candidate" "$LATEST_RELEASE"
-            echo "restored release/.latest -> $candidate"
-            return 0
-        fi
-    done < <(find "$REPO_DIR/release" -maxdepth 1 -mindepth 1 -type d -name "$TAG_PREFIX-*" | sort -r)
-    return 1
-}
-
-try_remote_base_releases() {
-    if ! command -v gh >/dev/null 2>&1; then
-        echo "gh CLI not available; cannot materialize a published base release"
-        return 1
-    fi
-    local remote_tag candidate_tmp candidate
-    while IFS= read -r remote_tag; do
-        [[ -z "$remote_tag" || "$remote_tag" == "$TAG" ]] && continue
-        candidate="$REPO_DIR/release/$remote_tag"
-        if try_base_release "$candidate" "$candidate"; then
-            rm -rf "$LATEST_RELEASE"
-            ln -s "$candidate" "$LATEST_RELEASE"
-            echo "restored release/.latest -> $candidate"
-            return 0
-        fi
-        candidate_tmp="$REPO_DIR/release/.materialize-$remote_tag"
-        rm -rf "$candidate_tmp"
-        echo "checking published corpus base $remote_tag"
-        if "$ATO_MCP" materialize-base-release \
-            --manifest-url "https://github.com/$GH_REPO/releases/download/$remote_tag/manifest.json" \
-            --out-dir "$candidate_tmp"; then
-            rm -rf "$candidate"
-            mv "$candidate_tmp" "$candidate"
-            rm -rf "$LATEST_RELEASE"
-            ln -s "$candidate" "$LATEST_RELEASE"
-            BASE_RELEASE_ARG=(--base-release-dir "$LATEST_RELEASE")
-            echo "materialized release/.latest from published corpus $remote_tag"
-            return 0
-        fi
-        rm -rf "$candidate_tmp"
-        echo "published corpus base $remote_tag is not usable with this binary"
-    done < <(gh release list --repo "$GH_REPO" --limit 50 --json tagName,publishedAt \
-        --jq ".[] | select(.tagName | startswith(\"$TAG_PREFIX-\")) | .tagName")
-    return 1
-}
-
+# Resume an interrupted build matching the current source-index hash.
 try_resumable_build_checkpoint() {
     local candidate check_output
     while IFS= read -r candidate; do
@@ -294,20 +229,15 @@ try_resumable_build_checkpoint() {
             --source-index-sha256 "$AFTER_HASH" \
             --zstd-level 3 2>&1); then
             echo "$check_output"
-            TAG=$(basename "$candidate")
             RELEASE_DIR="$candidate"
             echo "resuming interrupted build checkpoint in $RELEASE_DIR"
             return 0
         fi
-    done < <(find "$REPO_DIR/release" -maxdepth 1 -mindepth 1 -type d -name "$TAG_PREFIX-*" | sort -r)
+    done < <(find "$REPO_DIR/release" -maxdepth 1 -mindepth 1 -type d -name "build-*" | sort -r)
     return 1
 }
 
-if ! try_local_base_releases && ! try_remote_base_releases; then
-    if ! try_resumable_build_checkpoint; then
-        echo "no compatible current-model base release or resumable checkpoint found; this build will embed every changed source doc"
-    fi
-fi
+try_resumable_build_checkpoint || true
 
 mkdir -p "$RELEASE_DIR"
 echo "== build corpus =="
@@ -315,12 +245,18 @@ echo "== build corpus =="
     --pages-dir "$PAGES_DIR" \
     --db-path   "$RELEASE_DIR/ato.db" \
     --model-dir "$MODEL_DIR" \
-    "${BASE_RELEASE_ARG[@]}" \
     --out-dir   "$RELEASE_DIR" \
     --gpu \
     --profile
 
-echo "== publish release $TAG =="
+echo "== package corpus (zstd -$ZSTD_LEVEL) =="
+"$ATO_MCP" package-corpus \
+    --db-path  "$RELEASE_DIR/ato.db" \
+    --out      "$RELEASE_DIR/ato.db.zst" \
+    --level    "$ZSTD_LEVEL" \
+    --manifest "$RELEASE_DIR/manifest.json"
+
+echo "== publish corpus to $TAG =="
 "$ATO_MCP" publish-release \
     --out-dir "$RELEASE_DIR" \
     --tag     "$TAG" \
@@ -328,12 +264,4 @@ echo "== publish release $TAG =="
     --overwrite \
     "${MODEL_RELEASE_ARGS[@]}"
 
-# Promote to "latest" so /releases/latest/download resolves to this tag.
-gh release edit "$TAG" --repo "$GH_REPO" --latest --prerelease=false
-
-# Remember this whole release so the next incremental build can reuse prior
-# pack bytes, not just the manifest's offsets.
-rm -rf "$REPO_DIR/release/.latest"
-ln -s "$RELEASE_DIR" "$REPO_DIR/release/.latest"
-
-echo "== done: released $TAG ($(( AFTER_COUNT - BEFORE_COUNT )) new rows) =="
+echo "== done: corpus shipped to $TAG ($(( AFTER_COUNT - BEFORE_COUNT )) new rows) =="
