@@ -34,7 +34,7 @@ use config::{
 use db::enforce_db_schema_version;
 use build::{
     build_corpus, bundle_localize_manifest, check_base_release, check_build_checkpoint,
-    materialize_base_release, package_corpus, BuildCorpusArgs,
+    materialize_base_release, package_corpus, update_manifest_with_db, BuildCorpusArgs,
 };
 use retrieval::{
     fetch_external_doc, get_asset_mcp, get_chunks_mcp,
@@ -45,9 +45,9 @@ use search::{
     search, search_cli, SearchOptions,
 };
 use source::{
-    apply_update, check_for_update_availability, doctor, link_download,
-    manifest_fingerprint, scrape_diff, snapshot_reduce,
-    stats, tree_crawl, DocRef, LinkDownloadArgs, Manifest, ModelInfo, StagedModel, UpdateAvailability, UpdateSummary,
+    apply_update, check_for_update_availability, doctor, link_download, manifest_fingerprint,
+    preview_update, scrape_diff, snapshot_reduce, stats, tree_crawl, DocRef, LinkDownloadArgs,
+    Manifest, ModelInfo, StagedModel, UpdateAvailability, UpdateSummary,
 };
 use semantic::{
     SemanticEncodeStats, SemanticModelPaths, SemanticRuntime,
@@ -91,7 +91,7 @@ pub(crate) const ORDINARY_DICTIONARY_PATH_ENV: &str = "ATO_MCP_DICTIONARY_PATH";
 const SUPPORTED_SCHEMA_VERSION: u32 = 9;
 /// Single release manifest format (`Manifest.schema_version`) this binary
 /// ingests. No legacy manifest layouts are accepted.
-const SUPPORTED_MANIFEST_VERSION: u32 = 4;
+const SUPPORTED_MANIFEST_VERSION: u32 = 5;
 pub(crate) const EMBEDDING_MODEL_ID: &str = "granite-embedding-small-r2-fp16-256d";
 pub(crate) const DEFAULT_MAX_PER_DOC: usize = 2;
 pub(crate) const HARD_MAX_PER_DOC: usize = 3;
@@ -131,6 +131,10 @@ enum Command {
     Update {
         #[arg(long)]
         manifest_url: Option<String>,
+        /// Print what would change vs the installed corpus without
+        /// downloading anything or touching the live DB.
+        #[arg(long)]
+        check: bool,
     },
     /// Verify the local corpus, optionally restoring the previous DB snapshot.
     Doctor {
@@ -320,7 +324,10 @@ enum Command {
     /// Strip FTS5 indexes off a copy of the built ato.db, VACUUM, and zstd-compress
     /// it into a shippable ato.db.zst artifact. Leaves the input DB untouched.
     /// Emits {path, sha256, size} JSON on stdout so the release writer can
-    /// embed those into manifest.json.
+    /// embed those into manifest.json. If --manifest is set, updates that
+    /// manifest in-place to point `db: {url, sha256, size}` at the new artifact
+    /// (URL = bare filename; publish-release rewrites it to a GitHub release URL
+    /// later) and clears the legacy `documents[]`/`packs[]` arrays.
     PackageCorpus {
         /// Path to the canonical built ato.db (e.g. release/<tag>/ato.db).
         #[arg(long)]
@@ -331,6 +338,10 @@ enum Command {
         /// zstd compression level. 19 maximises ratio; 3 is faster but bigger.
         #[arg(long, default_value_t = 19)]
         level: i32,
+        /// Optional: in-place update this manifest's `db` field with the new
+        /// artifact's sha256/size and clear the legacy pack arrays.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
     },
     /// Rewrite a manifest.json so packs/model URLs point at filenames
     /// inside an offline bundle (with fresh SHA256 + size). Used by
@@ -427,16 +438,24 @@ fn main() -> Result<()> {
             daemon(Arc::new(state))
         }
         Command::InstallHttp { port, quiet } => install_http(port, !quiet),
-        Command::Update { manifest_url } => {
+        Command::Update {
+            manifest_url,
+            check,
+        } => {
             let url = manifest_url.unwrap_or_else(default_manifest_url);
-            let stats = apply_update(&url)?;
-            println!(
-                "update complete: +{} ~{} -{} ({:.2} MB downloaded)",
-                stats.added,
-                stats.changed,
-                stats.removed,
-                stats.bytes_downloaded as f64 / 1_000_000.0
-            );
+            if check {
+                let report = preview_update(&url)?;
+                println!("{}", report);
+            } else {
+                let stats = apply_update(&url)?;
+                println!(
+                    "update complete: +{} ~{} -{} ({:.2} MB downloaded)",
+                    stats.added,
+                    stats.changed,
+                    stats.removed,
+                    stats.bytes_downloaded as f64 / 1_000_000.0
+                );
+            }
             Ok(())
         }
         Command::Doctor { rollback } => doctor(rollback),
@@ -575,8 +594,12 @@ fn main() -> Result<()> {
             db_path,
             out,
             level,
+            manifest,
         } => {
             let summary = package_corpus(&db_path, &out, level)?;
+            if let Some(path) = manifest {
+                update_manifest_with_db(&path, &out, &summary)?;
+            }
             println!("{}", serde_json::to_string_pretty(&summary)?);
             Ok(())
         }
@@ -858,22 +881,6 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
     if !manifest_path.exists() {
         bail!("no manifest at {}", manifest_path.display());
     }
-    if !packs_dir.exists() {
-        bail!("no packs/ dir at {}", packs_dir.display());
-    }
-
-    let mut pack_files: Vec<PathBuf> = fs::read_dir(&packs_dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.file_name()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s.starts_with("pack-") && s.ends_with(".bin.zst"))
-        })
-        .collect();
-    pack_files.sort();
-    if pack_files.is_empty() {
-        bail!("no pack files found to upload");
-    }
 
     let repo = args
         .repo
@@ -893,24 +900,65 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
         args.model_size,
     )?;
 
-    // Rewrite packs[].url in-place to GitHub release URLs.
-    for pack in &mut manifest.packs {
-        let filename = std::path::Path::new(&pack.url)
+    // Manifest schema 5+ ships a single ato.db.zst artifact. Schema 4
+    // ships per-doc packs. Detect which shape we have and upload accordingly.
+    let mut artifacts: Vec<PathBuf> = vec![manifest_path.clone()];
+    let mut pack_files: Vec<PathBuf> = Vec::new();
+
+    if let Some(db_info) = manifest.db.as_mut() {
+        let filename = std::path::Path::new(&db_info.url)
             .file_name()
             .and_then(|s| s.to_str())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| pack.url.clone());
-        pack.url = format!(
+            .unwrap_or_else(|| db_info.url.clone());
+        let local = args.out_dir.join(&filename);
+        if !local.exists() {
+            bail!(
+                "manifest.db points at {} but {} does not exist; run `ato-mcp package-corpus --manifest <path>` first",
+                filename,
+                local.display()
+            );
+        }
+        db_info.url = format!(
             "https://github.com/{repo}/releases/download/{tag}/{filename}",
             tag = args.tag,
         );
+        artifacts.push(local);
+    } else {
+        if !packs_dir.exists() {
+            bail!("no packs/ dir at {} and manifest.db is unset", packs_dir.display());
+        }
+        pack_files = fs::read_dir(&packs_dir)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s.starts_with("pack-") && s.ends_with(".bin.zst"))
+            })
+            .collect();
+        pack_files.sort();
+        if pack_files.is_empty() {
+            bail!("no pack files and no manifest.db — nothing to upload");
+        }
+        for pack in &mut manifest.packs {
+            let filename = std::path::Path::new(&pack.url)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| pack.url.clone());
+            pack.url = format!(
+                "https://github.com/{repo}/releases/download/{tag}/{filename}",
+                tag = args.tag,
+            );
+        }
+        artifacts.extend(pack_files.iter().cloned());
     }
 
-    // Save updated manifest (sorted keys, indented).
+    // Save updated manifest.
     let pretty = serde_json::to_vec_pretty(&manifest)?;
     fs::write(&manifest_path, &pretty)?;
 
-    // Generate update.json (UpdateSummary) so end-users can probe quickly.
+    // Generate update.json so end-users can probe quickly.
     let summary = UpdateSummary {
         schema_version: manifest.schema_version,
         index_version: manifest.index_version.clone(),
@@ -918,17 +966,16 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
         model: manifest.model.clone(),
         document_count: manifest.documents.len(),
         pack_count: manifest.packs.len(),
+        db_sha256: manifest.db.as_ref().map(|d| d.sha256.clone()),
+        db_size: manifest.db.as_ref().map(|d| d.size),
         manifest_fingerprint: Some(manifest_fingerprint(&manifest)?),
     };
     let summary_path = args.out_dir.join("update.json");
     fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?)?;
+    artifacts.insert(1, summary_path);
 
     // [SL-07] Optional release signing shells out to the maintainer minisign
     // CLI and uploads the generated manifest.json.minisig artifact.
-    // Sign manifest if --sign-key provided.
-    let mut artifacts: Vec<PathBuf> = vec![manifest_path.clone(), summary_path.clone()];
-    artifacts.extend(pack_files.iter().cloned());
-
     if let Some(sign_key) = args.sign_key.as_deref() {
         let sig_path = args.out_dir.join("manifest.json.minisig");
         let status = std::process::Command::new("minisign")
@@ -2720,6 +2767,7 @@ mod tests {
             },
             documents: Vec::new(),
             packs: Vec::new(),
+            db: None,
         };
         let context = UrlContext {
             manifest_dir: Some(release.path().to_path_buf()),
@@ -2921,6 +2969,7 @@ mod tests {
                 size: pack_bytes.len() as u64,
                 url: "packs/pack-mirror.bin.zst".to_string(),
             }],
+            db: None,
         };
         fs::write(
             base.path().join("manifest.json"),
@@ -2997,6 +3046,7 @@ mod tests {
             },
             documents: Vec::new(),
             packs: Vec::new(),
+            db: None,
         };
 
         with_data_dir(dir.path(), || -> Result<()> {
@@ -3114,6 +3164,7 @@ mod tests {
             },
             documents: Vec::new(),
             packs: Vec::new(),
+            db: None,
         }
     }
 
@@ -3284,6 +3335,7 @@ mod tests {
             },
             documents: Vec::new(),
             packs: Vec::new(),
+            db: None,
         };
         let summary = UpdateSummary {
             schema_version: (SUPPORTED_MANIFEST_VERSION + 1) as i64,
@@ -3292,6 +3344,8 @@ mod tests {
             model: installed.model.clone(),
             document_count: 0,
             pack_count: 0,
+            db_sha256: None,
+            db_size: None,
             manifest_fingerprint: Some("future-fingerprint".to_string()),
         };
         fs::write(
@@ -3339,6 +3393,7 @@ mod tests {
             },
             documents: Vec::new(),
             packs: Vec::new(),
+            db: None,
         };
         let summary = UpdateSummary {
             schema_version: manifest.schema_version,
@@ -3347,6 +3402,8 @@ mod tests {
             model: manifest.model.clone(),
             document_count: 0,
             pack_count: 0,
+            db_sha256: None,
+            db_size: None,
             manifest_fingerprint: Some(manifest_fingerprint(&manifest)?),
         };
         fs::write(
@@ -4425,6 +4482,7 @@ mod tests {
                 size: pack_bytes.len() as u64,
                 url: "packs/pack-deadbeef.bin.zst".to_string(),
             }],
+            db: None,
         };
         let manifest_path = release_dir.join("manifest.json");
         fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
@@ -4526,6 +4584,7 @@ mod tests {
                 size: pack_bytes.len() as u64,
                 url: "packs/pack-citation.bin.zst".to_string(),
             }],
+            db: None,
         };
         let manifest_path = release_dir.join("manifest.json");
         fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
@@ -4607,6 +4666,7 @@ mod tests {
                 size: old_pack_bytes.len() as u64,
                 url: "packs/pack-olddefs.bin.zst".to_string(),
             }],
+            db: None,
         };
         let manifest_path = release_dir.join("manifest.json");
         fs::write(&manifest_path, serde_json::to_vec_pretty(&old_manifest)?)?;
@@ -4652,6 +4712,8 @@ mod tests {
                 model: new_manifest.model.clone(),
                 document_count: new_manifest.documents.len(),
                 pack_count: new_manifest.packs.len(),
+            db_sha256: None,
+            db_size: None,
                 manifest_fingerprint: Some(manifest_fingerprint(&new_manifest)?),
             };
             fs::write(
@@ -4692,6 +4754,7 @@ mod tests {
             },
             documents: Vec::new(),
             packs: Vec::new(),
+            db: None,
         };
         let summary = UpdateSummary {
             schema_version: manifest.schema_version,
@@ -4700,6 +4763,8 @@ mod tests {
             model: manifest.model.clone(),
             document_count: 0,
             pack_count: 0,
+            db_sha256: None,
+            db_size: None,
             manifest_fingerprint: Some(manifest_fingerprint(&manifest)?),
         };
         fs::write(
@@ -4755,6 +4820,7 @@ mod tests {
             },
             documents: Vec::new(),
             packs: Vec::new(),
+            db: None,
         };
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
         fs::write(&manifest_path, &manifest_bytes)?;
@@ -4765,6 +4831,8 @@ mod tests {
             model: manifest.model.clone(),
             document_count: 0,
             pack_count: 0,
+            db_sha256: None,
+            db_size: None,
             manifest_fingerprint: Some(manifest_fingerprint(&manifest)?),
         };
         let summary_bytes = serde_json::to_vec_pretty(&summary)?;
@@ -4821,6 +4889,7 @@ mod tests {
             },
             documents: Vec::new(),
             packs: Vec::new(),
+            db: None,
         }
     }
 
@@ -4844,6 +4913,7 @@ mod tests {
             },
             documents: Vec::new(),
             packs: Vec::new(),
+            db: None,
         };
         let manifest_path = release_dir.join("manifest.json");
         fs::write(&manifest_path, serde_json::to_vec_pretty(&new_manifest)?)?;
@@ -4898,6 +4968,7 @@ mod tests {
                 size: 10,
                 url: "packs/pack-missingpack.bin.zst".to_string(),
             }],
+            db: None,
         };
         let manifest_path = release_dir.join("manifest.json");
         fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
@@ -5123,6 +5194,7 @@ mod tests {
             },
             documents: Vec::new(),
             packs: Vec::new(),
+            db: None,
         };
         let context = UrlContext {
             manifest_dir: Some(release_dir.to_path_buf()),
@@ -5209,6 +5281,7 @@ mod tests {
                 size: pack_bytes.len() as u64,
                 url: "packs/pack-feedface.bin.zst".to_string(),
             }],
+            db: None,
         };
         let manifest_path = release_dir.join("manifest.json");
         fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;

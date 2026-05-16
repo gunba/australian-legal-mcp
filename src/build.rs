@@ -885,6 +885,8 @@ pub(crate) fn materialize_base_release(manifest_url: &str, out_dir: &Path) -> Re
         model: local_manifest.model.clone(),
         document_count: local_manifest.documents.len(),
         pack_count: local_manifest.packs.len(),
+        db_sha256: local_manifest.db.as_ref().map(|d| d.sha256.clone()),
+        db_size: local_manifest.db.as_ref().map(|d| d.size),
         manifest_fingerprint: Some(manifest_fingerprint(&local_manifest)?),
     };
     let summary_path = out_dir.join("update.json");
@@ -1757,6 +1759,7 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         },
         documents,
         packs,
+        db: None,
     };
 
     let final_tx = conn.unchecked_transaction()?;
@@ -1780,6 +1783,8 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         model: manifest.model.clone(),
         document_count: manifest.documents.len(),
         pack_count: manifest.packs.len(),
+        db_sha256: manifest.db.as_ref().map(|d| d.sha256.clone()),
+        db_size: manifest.db.as_ref().map(|d| d.size),
         manifest_fingerprint: Some(manifest_fingerprint(&manifest)?),
     };
     let summary_path = out_dir.join("update.json");
@@ -1868,6 +1873,58 @@ pub(crate) fn package_corpus(db_path: &Path, out: &Path, level: i32) -> Result<J
         "sha256": sha256,
         "size": size,
     }))
+}
+
+/// Update a manifest.json in-place so its `db` field points at the freshly
+/// packaged ato.db.zst. The URL is set to the bare filename; the publish
+/// pipeline rewrites it to a GitHub release URL later. The legacy
+/// `documents[]` and `packs[]` arrays are cleared and the
+/// `manifest.schema_version` is bumped to the current supported version so
+/// the new binary recognises the new shape.
+pub(crate) fn update_manifest_with_db(
+    manifest_path: &Path,
+    artifact_path: &Path,
+    artifact_summary: &JsonValue,
+) -> Result<()> {
+    let raw = fs::read_to_string(manifest_path)
+        .with_context(|| format!("reading {}", manifest_path.display()))?;
+    let mut value: JsonValue = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing {}", manifest_path.display()))?;
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("manifest is not a JSON object"))?;
+    let filename = artifact_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow!("artifact path has no UTF-8 filename"))?
+        .to_string();
+    let sha256 = artifact_summary
+        .get("sha256")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("artifact summary missing sha256"))?
+        .to_string();
+    let size = artifact_summary
+        .get("size")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow!("artifact summary missing size"))?;
+    obj.insert(
+        "db".to_string(),
+        json!({
+            "url": filename,
+            "sha256": sha256,
+            "size": size,
+        }),
+    );
+    obj.insert(
+        "schema_version".to_string(),
+        json!(SUPPORTED_MANIFEST_VERSION),
+    );
+    obj.insert("documents".to_string(), json!([]));
+    obj.insert("packs".to_string(), json!([]));
+    let pretty = serde_json::to_vec_pretty(&value)?;
+    fs::write(manifest_path, pretty)
+        .with_context(|| format!("writing {}", manifest_path.display()))?;
+    Ok(())
 }
 
 pub(crate) fn bundle_localize_manifest(

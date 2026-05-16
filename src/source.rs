@@ -36,7 +36,7 @@ use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -323,8 +323,26 @@ pub(crate) struct Manifest {
     pub(crate) created_at: String,
     pub(crate) min_client_version: String,
     pub(crate) model: ModelInfo,
+    /// Legacy pack-based fields. Retained for backward compatibility with
+    /// manifest schema versions ≤ 4; manifest schema 5+ ships an empty
+    /// `documents`/`packs` and the corpus DB through `db` instead.
+    #[serde(default)]
     pub(crate) documents: Vec<DocRef>,
+    #[serde(default)]
     pub(crate) packs: Vec<PackInfo>,
+    /// Single compressed SQLite artifact replacing the pack-based install
+    /// flow (schema 5+). When present, install decompresses this file,
+    /// rebuilds FTS5 indexes locally, and atomic-swaps the live DB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) db: Option<ManifestDb>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManifestDb {
+    pub(crate) url: String,
+    pub(crate) sha256: String,
+    pub(crate) size: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -344,8 +362,14 @@ pub(crate) struct UpdateSummary {
     #[serde(default)]
     pub(crate) min_client_version: String,
     pub(crate) model: ModelInfo,
+    #[serde(default)]
     pub(crate) document_count: usize,
+    #[serde(default)]
     pub(crate) pack_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) db_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) db_size: Option<u64>,
     #[serde(default)]
     pub(crate) manifest_fingerprint: Option<String>,
 }
@@ -375,6 +399,91 @@ pub(crate) struct UpdateStats {
     pub(crate) changed: usize,
     pub(crate) removed: usize,
     pub(crate) bytes_downloaded: u64,
+}
+
+/// Print what `ato-mcp update` would do without performing any I/O writes.
+/// Fetches the published manifest, compares it against the installed manifest,
+/// and produces a human-readable summary. Used by `ato-mcp update --check`.
+pub(crate) fn preview_update(manifest_url: &str) -> Result<String> {
+    let manifest_context = UrlContext::from_manifest_url(manifest_url);
+    let raw = fetch_bytes(manifest_url, &manifest_context)
+        .with_context(|| format!("fetching {}", manifest_url))?;
+    let manifest: Manifest = serde_json::from_slice(&raw)
+        .with_context(|| format!("parsing {}", manifest_url))?;
+    enforce_manifest_compatibility(&manifest)?;
+
+    let installed = load_installed_manifest()?;
+
+    let mut lines = Vec::new();
+    lines.push(format!("manifest url:    {}", manifest_url));
+    lines.push(format!("published index: {}", manifest.index_version));
+
+    let pack_set = |packs: &[PackInfo]| -> std::collections::BTreeSet<String> {
+        packs.iter().map(|p| p.sha256.clone()).collect()
+    };
+
+    match installed {
+        None => {
+            lines.push("installed index: <none — corpus not yet installed>".to_string());
+            lines.push("=> initial corpus install".to_string());
+            if let Some(db) = &manifest.db {
+                lines.push(format!(
+                    "  - download {} ({:.2} MB)",
+                    db.url,
+                    db.size as f64 / 1_000_000.0,
+                ));
+            } else {
+                let total: u64 = manifest.packs.iter().map(|p| p.size).sum();
+                lines.push(format!(
+                    "  - download {} packs ({:.2} MB total)",
+                    manifest.packs.len(),
+                    total as f64 / 1_000_000.0,
+                ));
+            }
+            lines.push(format!(
+                "  - install model {} ({:.2} MB)",
+                manifest.model.id,
+                manifest.model.size as f64 / 1_000_000.0,
+            ));
+        }
+        Some(installed) => {
+            lines.push(format!("installed index: {}", installed.index_version));
+            let model_changed = !crate::model_info_matches(&installed.model, &manifest.model);
+            let db_changed = match (&installed.db, &manifest.db) {
+                (Some(a), Some(b)) => a.sha256 != b.sha256,
+                (None, Some(_)) | (Some(_), None) => true,
+                (None, None) => pack_set(&installed.packs) != pack_set(&manifest.packs),
+            };
+            if !model_changed && !db_changed {
+                lines.push("=> already current; no download needed".to_string());
+            } else {
+                if model_changed {
+                    lines.push(format!(
+                        "  - model: {} → {} ({:.2} MB)",
+                        installed.model.id,
+                        manifest.model.id,
+                        manifest.model.size as f64 / 1_000_000.0,
+                    ));
+                }
+                if db_changed {
+                    if let Some(db) = &manifest.db {
+                        lines.push(format!(
+                            "  - corpus: {:.2} MB compressed DB download",
+                            db.size as f64 / 1_000_000.0,
+                        ));
+                    } else {
+                        let total: u64 = manifest.packs.iter().map(|p| p.size).sum();
+                        lines.push(format!(
+                            "  - corpus: {} packs ({:.2} MB)",
+                            manifest.packs.len(),
+                            total as f64 / 1_000_000.0,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(lines.join("\n"))
 }
 
 pub(crate) fn apply_update(manifest_url: &str) -> Result<UpdateStats> {
@@ -479,15 +588,30 @@ pub(crate) fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
         &manifest_context,
         &update_root.join("model-stage"),
     )?;
-    let staged_corpus = stage_live_db_from_manifest_at(
-        &new_manifest,
-        &manifest_context,
-        manifest_bytes.len() as u64,
-        added.len(),
-        changed.len(),
-        removed.len(),
-        &update_root.join("corpus-rebuild"),
-    )?;
+    let staged_corpus = if new_manifest.db.is_some() {
+        // Manifest schema 5+: corpus ships as a single zstd-compressed SQLite
+        // file. Install decompresses it and rebuilds FTS5 locally.
+        stage_live_db_from_db_artifact(
+            &new_manifest,
+            &manifest_context,
+            manifest_bytes.len() as u64,
+            added.len(),
+            changed.len(),
+            removed.len(),
+            &update_root.join("corpus-rebuild"),
+        )?
+    } else {
+        // Legacy schema 4: per-pack reconstruction.
+        stage_live_db_from_manifest_at(
+            &new_manifest,
+            &manifest_context,
+            manifest_bytes.len() as u64,
+            added.len(),
+            changed.len(),
+            removed.len(),
+            &update_root.join("corpus-rebuild"),
+        )?
+    };
     let stats = staged_corpus.stats;
     promote_staged_update(staged_model.as_ref(), staged_corpus, &new_manifest)?;
     let _ = fs::remove_dir_all(&update_root);
@@ -778,6 +902,123 @@ pub(crate) fn stage_live_db_from_manifest_at(
     })
 }
 
+/// Install path for manifest schema 5+: download the single zstd-compressed
+/// SQLite artifact, decompress to staging, rebuild FTS5 indexes locally from
+/// the chunks/documents already in the DB, and emit a StagedCorpusUpdate
+/// the caller's promotion guards can swap into live.
+pub(crate) fn stage_live_db_from_db_artifact(
+    manifest: &Manifest,
+    context: &UrlContext,
+    manifest_bytes: u64,
+    added: usize,
+    changed: usize,
+    removed: usize,
+    staging_root: &Path,
+) -> Result<StagedCorpusUpdate> {
+    let db_info = manifest
+        .db
+        .as_ref()
+        .ok_or_else(|| anyhow!("manifest.db missing — cannot use db-artifact install path"))?;
+
+    if staging_root.exists() {
+        fs::remove_dir_all(staging_root)?;
+    }
+    fs::create_dir_all(staging_root)?;
+    let staged_db = staging_root.join("ato.db");
+    let staged_asset_root = staging_root.join("live");
+    fs::create_dir_all(&staged_asset_root)?;
+
+    // Download ato.db.zst and verify size + sha256.
+    let compressed = fetch_bytes(&db_info.url, context)
+        .with_context(|| format!("downloading {}", db_info.url))?;
+    if compressed.len() as u64 != db_info.size {
+        bail!(
+            "size mismatch for {}: expected {}, got {}",
+            db_info.url,
+            db_info.size,
+            compressed.len()
+        );
+    }
+    let actual_sha = format!("{:x}", Sha256::digest(&compressed));
+    if actual_sha != db_info.sha256 {
+        bail!(
+            "sha256 mismatch for {}: expected {}, got {}",
+            db_info.url,
+            db_info.sha256,
+            actual_sha
+        );
+    }
+    let bytes_downloaded = manifest_bytes + compressed.len() as u64;
+
+    // Decompress to staged DB.
+    {
+        let mut input = Cursor::new(compressed);
+        let mut output = File::create(&staged_db)
+            .with_context(|| format!("creating {}", staged_db.display()))?;
+        zstd::stream::copy_decode(&mut input, &mut output)
+            .with_context(|| format!("decompressing into {}", staged_db.display()))?;
+    }
+
+    // Open writable and rebuild FTS5 indexes. We register a `zstd_decompress`
+    // scalar UDF so the chunks_fts repopulation can run as a single SQL
+    // INSERT … SELECT rather than 467 k Rust↔SQLite round-trips.
+    let conn = open_write_at(&staged_db)?;
+    conn.create_scalar_function(
+        "zstd_decompress",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| -> rusqlite::Result<String> {
+            let blob: Vec<u8> = ctx.get(0)?;
+            let bytes = zstd::stream::decode_all(Cursor::new(blob))
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+            String::from_utf8(bytes)
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))
+        },
+    )
+    .context("registering zstd_decompress scalar function")?;
+
+    conn.execute_batch(
+        r#"
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+            text,
+            tokenize = 'porter unicode61 remove_diacritics 2'
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS title_fts USING fts5(
+            doc_id UNINDEXED, title, headings,
+            tokenize = 'porter unicode61 remove_diacritics 2'
+        );
+        DELETE FROM chunks_fts;
+        DELETE FROM title_fts;
+        INSERT INTO chunks_fts(rowid, text)
+            SELECT chunk_id, zstd_decompress(text) FROM chunks;
+        INSERT INTO title_fts(doc_id, title, headings)
+            SELECT doc_id, title, headings FROM documents;
+        "#,
+    )
+    .context("rebuilding FTS5 indexes on staged DB")?;
+
+    set_meta(&conn, "index_version", &manifest.index_version)?;
+    set_meta(&conn, "embedding_model_id", &manifest.model.id)?;
+    set_meta(&conn, "last_update_at", &Utc::now().to_rfc3339())?;
+
+    verify_semantic_install(&conn, manifest)?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    drop(conn);
+
+    Ok(StagedCorpusUpdate {
+        staging_root: staging_root.to_path_buf(),
+        staged_db,
+        staged_asset_root,
+        stats: UpdateStats {
+            added,
+            changed,
+            removed,
+            bytes_downloaded,
+        },
+    })
+}
+
 pub(crate) fn promote_live_db(staged_db: &Path, backup: &Path) -> Result<PathPromotionGuard> {
     let live = live_dir()?;
     let db = db_path()?;
@@ -1050,8 +1291,7 @@ pub(crate) fn check_for_update_availability(manifest_url: &str) -> Result<Option
     }))
 }
 
-pub(crate) fn enforce_update_summary_compatibility(summary: &UpdateSummary) -> Result<()> {
-    let manifest = Manifest {
+pub(crate) fn enforce_update_summary_compatibility(summary: &UpdateSummary) -> Result<()> {    let manifest = Manifest {
         schema_version: summary.schema_version,
         index_version: summary.index_version.clone(),
         created_at: String::new(),
@@ -1059,6 +1299,7 @@ pub(crate) fn enforce_update_summary_compatibility(summary: &UpdateSummary) -> R
         model: summary.model.clone(),
         documents: Vec::new(),
         packs: Vec::new(),
+        db: None,
     };
     enforce_manifest_compatibility(&manifest)
 }
