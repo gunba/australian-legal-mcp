@@ -365,6 +365,13 @@ cargo test --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
 ```
 
+End-to-end smoke test against the installed binary + corpus (CLI surface,
+search modes, retrieval helpers, MCP HTTP transport):
+
+```bash
+scripts/smoke.sh
+```
+
 Offline bundles are materialized through the Rust installer:
 
 ```bash

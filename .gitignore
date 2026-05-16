@@ -5,6 +5,8 @@ target/
 !.claude/rules/
 !.claude/rules/**
 !.claude/settings.json
+!.claude/skills/
+!.claude/skills/**
 .codex/agent-proofs-AGENTS-snippet.md
 .DS_Store
 /tmp/

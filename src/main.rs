@@ -1051,12 +1051,15 @@ fn fts_query(query: &str) -> String {
 }
 
 fn glob_to_like(pattern: &str) -> String {
-    // [MT-13] User glob filters translate '*' to LIKE '%' and escape LIKE metacharacters.
+    // [MT-13] Accept both '*' and '%' as wildcards (the prefix idiom the
+    // MCP tool descriptor advertises is `PAC/%`); escape '_' and '\' so they
+    // match literally. ATO doc_ids never contain '%', so collapsing both
+    // wildcard glyphs onto SQL LIKE '%' is safe.
     let mut out = String::new();
     for ch in pattern.chars() {
         match ch {
-            '*' => out.push('%'),
-            '%' | '_' | '\\' => {
+            '*' | '%' => out.push('%'),
+            '_' | '\\' => {
                 out.push('\\');
                 out.push(ch);
             }
