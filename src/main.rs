@@ -34,7 +34,7 @@ use config::{
 use db::enforce_db_schema_version;
 use build::{
     build_corpus, bundle_localize_manifest, check_base_release, check_build_checkpoint,
-    materialize_base_release, BuildCorpusArgs,
+    materialize_base_release, package_corpus, BuildCorpusArgs,
 };
 use retrieval::{
     fetch_external_doc, get_asset_mcp, get_chunks_mcp,
@@ -88,7 +88,7 @@ pub(crate) const OEWN_2024_SOURCE: &str = "Open English WordNet 2024 (CC-BY 4.0)
 pub(crate) const ORDINARY_DICTIONARY_PATH_ENV: &str = "ATO_MCP_DICTIONARY_PATH";
 /// On-disk schema version this binary supports. Bump when introducing
 /// schema changes; binaries reject any corpus whose schema does not match.
-const SUPPORTED_SCHEMA_VERSION: u32 = 8;
+const SUPPORTED_SCHEMA_VERSION: u32 = 9;
 /// Single release manifest format (`Manifest.schema_version`) this binary
 /// ingests. No legacy manifest layouts are accepted.
 const SUPPORTED_MANIFEST_VERSION: u32 = 4;
@@ -316,6 +316,21 @@ enum Command {
         path_prefix: Option<String>,
         #[arg(long)]
         out: PathBuf,
+    },
+    /// Strip FTS5 indexes off a copy of the built ato.db, VACUUM, and zstd-compress
+    /// it into a shippable ato.db.zst artifact. Leaves the input DB untouched.
+    /// Emits {path, sha256, size} JSON on stdout so the release writer can
+    /// embed those into manifest.json.
+    PackageCorpus {
+        /// Path to the canonical built ato.db (e.g. release/<tag>/ato.db).
+        #[arg(long)]
+        db_path: PathBuf,
+        /// Output path for the compressed artifact (e.g. release/<tag>/ato.db.zst).
+        #[arg(long)]
+        out: PathBuf,
+        /// zstd compression level. 19 maximises ratio; 3 is faster but bigger.
+        #[arg(long, default_value_t = 19)]
+        level: i32,
     },
     /// Rewrite a manifest.json so packs/model URLs point at filenames
     /// inside an offline bundle (with fresh SHA256 + size). Used by
@@ -556,6 +571,15 @@ fn main() -> Result<()> {
             path_prefix.as_deref(),
             &out,
         ),
+        Command::PackageCorpus {
+            db_path,
+            out,
+            level,
+        } => {
+            let summary = package_corpus(&db_path, &out, level)?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            Ok(())
+        }
         Command::BundleLocalizeManifest {
             manifest,
             packs_dir,
@@ -3361,14 +3385,14 @@ mod tests {
     // ----- Schema v8 -----
 
     #[test]
-    fn schema_init_writes_v8_metadata() -> Result<()> {
+    fn schema_init_writes_v9_metadata() -> Result<()> {
         let _lock = TEST_DB_LOCK.lock().unwrap();
         let (_dir, db) = make_test_db()?;
         let conn = open_write_at(&db)?;
         let value =
             get_meta(&conn, "schema_version")?.expect("init_db should have written schema_version");
         assert_eq!(value, SUPPORTED_SCHEMA_VERSION.to_string());
-        assert_eq!(SUPPORTED_SCHEMA_VERSION, 8);
+        assert_eq!(SUPPORTED_SCHEMA_VERSION, 9);
         Ok(())
     }
 
@@ -5208,7 +5232,7 @@ mod tests {
             assert_eq!(stats.removed, 0);
 
             let conn = open_read()?;
-            assert_eq!(get_meta(&conn, "schema_version")?.as_deref(), Some("8"));
+            assert_eq!(get_meta(&conn, "schema_version")?.as_deref(), Some("9"));
             let title: String = conn.query_row(
                 "SELECT title FROM documents WHERE doc_id = ?",
                 ["DOC_REBUILD_SCHEMA"],

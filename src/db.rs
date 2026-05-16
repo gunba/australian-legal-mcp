@@ -97,7 +97,11 @@ pub(crate) fn init_db(conn: &Connection) -> Result<()> {
             replaces         TEXT,
             has_in_doc_links INTEGER NOT NULL DEFAULT 0,
             has_related_docs INTEGER NOT NULL DEFAULT 0,
-            has_history      INTEGER NOT NULL DEFAULT 0
+            has_history      INTEGER NOT NULL DEFAULT 0,
+            -- Newline-joined doc headings, captured at build time and used to
+            -- seed title_fts.headings at install time after the FTS5 indexes
+            -- are rebuilt from the shipped DB.
+            headings         TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_doc_type ON documents(type);
         CREATE INDEX IF NOT EXISTS idx_doc_date ON documents(date);
@@ -192,7 +196,7 @@ pub(crate) fn init_db(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
-    set_meta(conn, "schema_version", "8")?;
+    set_meta(conn, "schema_version", "9")?;
     Ok(())
 }
 

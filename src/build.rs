@@ -1397,13 +1397,24 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         // Pack sha8 placeholder; finalised after all docs processed.
         let pack_placeholder = "PENDING".to_string();
 
+        // Collect headings once: stored on documents.headings for install-time
+        // FTS5 rebuild, and re-used below to populate title_fts.headings.
+        let headings_frag = scraper::Html::parse_fragment(&final_html);
+        let h_sel = scraper::Selector::parse("h1, h2, h3, h4, h5, h6").unwrap();
+        let headings_concat: Vec<String> = headings_frag
+            .select(&h_sel)
+            .map(anchors_node_text)
+            .filter(|s| !s.is_empty())
+            .collect();
+        let headings_text = headings_concat.join(" ");
+
         let started = std::time::Instant::now();
         tx.execute(
             "INSERT INTO documents
                 (doc_id, type, title, date, downloaded_at, content_hash, pack_sha8,
                  html, withdrawn_date, superseded_by, replaces,
-                 has_in_doc_links, has_related_docs, has_history)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 has_in_doc_links, has_related_docs, has_history, headings)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             rusqlite::params![
                 doc_id,
                 doc_type,
@@ -1419,6 +1430,7 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
                 has_in_doc_links as i64,
                 has_related_docs as i64,
                 has_history as i64,
+                headings_text.clone(),
             ],
         )
         .context("INSERT documents")?;
@@ -1464,15 +1476,7 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
             doc_pending_embeddings.push((chunk_id, chunk_idx, chunk.text.clone()));
         }
 
-        // title_fts: concat headings into a searchable per-doc row.
-        let frag = scraper::Html::parse_fragment(&final_html);
-        let h_sel = scraper::Selector::parse("h1, h2, h3, h4, h5, h6").unwrap();
-        let headings_concat: Vec<String> = frag
-            .select(&h_sel)
-            .map(anchors_node_text)
-            .filter(|s| !s.is_empty())
-            .collect();
-        let headings_text = headings_concat.join(" ");
+        // title_fts: re-use the headings collected before the documents INSERT.
         tx.execute(
             "INSERT INTO title_fts (doc_id, title, headings) VALUES (?1, ?2, ?3)",
             rusqlite::params![doc_id, title, headings_text],
@@ -1809,6 +1813,61 @@ pub(crate) fn sha256_file(path: &Path) -> Result<String> {
         hasher.update(&buf[..n]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Strip FTS5 indexes from a copy of the canonical ato.db, VACUUM, and
+/// zstd-compress to produce a shippable artifact. The input file is never
+/// mutated. Returns {path, sha256, size} for embedding into manifest.json.
+pub(crate) fn package_corpus(db_path: &Path, out: &Path, level: i32) -> Result<JsonValue> {
+    use std::io::{copy as io_copy, BufReader, BufWriter};
+
+    if !db_path.is_file() {
+        bail!("input DB not found: {}", db_path.display());
+    }
+    if let Some(parent) = out.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+
+    let staging = tempfile::tempdir().context("creating staging dir")?;
+    let staged_db = staging.path().join("stage.db");
+    fs::copy(db_path, &staged_db).with_context(|| {
+        format!("copying {} → {}", db_path.display(), staged_db.display())
+    })?;
+
+    // Drop FTS5 + VACUUM on the copy. install will rebuild both indexes from
+    // chunks.text and documents.headings.
+    {
+        let conn = Connection::open(&staged_db)
+            .with_context(|| format!("opening staged DB {}", staged_db.display()))?;
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS chunks_fts; DROP TABLE IF EXISTS title_fts; VACUUM;",
+        )
+        .context("stripping FTS5 + VACUUM on staged DB")?;
+    }
+
+    // zstd compress with long-distance matching for the high-redundancy DB.
+    let input = File::open(&staged_db)
+        .with_context(|| format!("opening staged DB {}", staged_db.display()))?;
+    let output = File::create(out).with_context(|| format!("creating {}", out.display()))?;
+    let mut reader = BufReader::new(input);
+    let writer = BufWriter::new(output);
+    let mut encoder = zstd::stream::Encoder::new(writer, level)
+        .context("creating zstd encoder")?;
+    encoder
+        .long_distance_matching(true)
+        .context("enabling zstd long-distance matching")?;
+    io_copy(&mut reader, &mut encoder).context("compressing staged DB")?;
+    encoder.finish().context("finalising zstd stream")?;
+
+    // sha256 + size of the compressed artifact.
+    let sha256 = sha256_file(out).context("hashing compressed artifact")?;
+    let size = fs::metadata(out)?.len();
+
+    Ok(json!({
+        "path": out.display().to_string(),
+        "sha256": sha256,
+        "size": size,
+    }))
 }
 
 pub(crate) fn bundle_localize_manifest(
