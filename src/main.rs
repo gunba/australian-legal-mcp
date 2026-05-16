@@ -316,7 +316,7 @@ enum Command {
     /// embed those into manifest.json. If --manifest is set, updates that
     /// manifest in-place to point `db: {url, sha256, size}` at the new artifact
     /// (URL = bare filename; publish-release rewrites it to a GitHub release URL
-    /// later) and clears the legacy `documents[]`/`packs[]` arrays.
+    /// later).
     PackageCorpus {
         /// Path to the canonical built ato.db (e.g. release/<tag>/ato.db).
         #[arg(long)]

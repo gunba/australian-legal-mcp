@@ -1318,10 +1318,8 @@ pub(crate) fn package_corpus(db_path: &Path, out: &Path, level: i32) -> Result<J
 
 /// Update a manifest.json in-place so its `db` field points at the freshly
 /// packaged ato.db.zst. The URL is set to the bare filename; the publish
-/// pipeline rewrites it to a GitHub release URL later. The legacy
-/// `documents[]` and `packs[]` arrays are cleared and the
-/// `manifest.schema_version` is bumped to the current supported version so
-/// the new binary recognises the new shape.
+/// pipeline rewrites it to a GitHub release URL later. `manifest.schema_version`
+/// is bumped to the current supported version.
 pub(crate) fn update_manifest_with_db(
     manifest_path: &Path,
     artifact_path: &Path,
@@ -1360,8 +1358,6 @@ pub(crate) fn update_manifest_with_db(
         "schema_version".to_string(),
         json!(SUPPORTED_MANIFEST_VERSION),
     );
-    obj.insert("documents".to_string(), json!([]));
-    obj.insert("packs".to_string(), json!([]));
     let pretty = serde_json::to_vec_pretty(&value)?;
     fs::write(manifest_path, pretty)
         .with_context(|| format!("writing {}", manifest_path.display()))?;
