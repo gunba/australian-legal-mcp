@@ -13,7 +13,7 @@ use ort::value::TensorRef;
 use regex::Regex;
 use reqwest::blocking::Client;
 use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, OpenFlags};
+use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
@@ -8312,7 +8312,9 @@ fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
                     let marker = format!("[anchor:{name}]");
                     chunk_ids
                         .iter()
-                        .find(|(_id, text, _anchor)| text.contains(&marker))
+                        .find(|(_id, text, anchor)| {
+                            anchor.as_deref() == Some(name) || text.contains(&marker)
+                        })
                         .map(|(id, _, _)| *id)
                 } else {
                     None
@@ -13867,6 +13869,7 @@ fn get_doc_anchors(doc_id: &str) -> Result<String> {
     let mut in_doc = Vec::<JsonValue>::new();
     let mut related_docs = Vec::<JsonValue>::new();
     let mut historical_versions = Vec::<JsonValue>::new();
+    let mut unresolved_in_doc = false;
     let rows = stmt.query_map([doc_id], |row| {
         let kind: String = row.get("kind")?;
         let label: String = row.get("label")?;
@@ -13884,6 +13887,8 @@ fn get_doc_anchors(doc_id: &str) -> Result<String> {
                         "label": label,
                         "chunk_id": chunk_id,
                     }));
+                } else {
+                    unresolved_in_doc = true;
                 }
             }
             "sister" => {
@@ -13920,6 +13925,28 @@ fn get_doc_anchors(doc_id: &str) -> Result<String> {
             _ => {}
         }
     }
+    if unresolved_in_doc {
+        let mut seen = in_doc
+            .iter()
+            .filter_map(|entry| {
+                Some((
+                    entry.get("label")?.as_str()?.to_string(),
+                    entry.get("chunk_id")?.as_i64()?,
+                ))
+            })
+            .collect::<HashSet<_>>();
+        for entry in resolve_in_doc_anchor_chunks(&conn, doc_id)? {
+            let Some(label) = entry.get("label").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let Some(chunk_id) = entry.get("chunk_id").and_then(|value| value.as_i64()) else {
+                continue;
+            };
+            if seen.insert((label.to_string(), chunk_id)) {
+                in_doc.push(entry);
+            }
+        }
+    }
     let (cited_by, cited_by_total) = load_cited_by(&conn, doc_id)?;
     let mut response = serde_json::Map::new();
     response.insert("doc_id".to_string(), JsonValue::String(doc_id.to_string()));
@@ -13940,6 +13967,62 @@ fn get_doc_anchors(doc_id: &str) -> Result<String> {
         );
     }
     Ok(serde_json::to_string_pretty(&JsonValue::Object(response))?)
+}
+
+fn resolve_in_doc_anchor_chunks(conn: &Connection, doc_id: &str) -> Result<Vec<JsonValue>> {
+    let html_blob: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT html FROM documents WHERE doc_id = ?",
+            [doc_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(html_blob) = html_blob else {
+        return Ok(Vec::new());
+    };
+    let html = decompress_text(html_blob)?;
+    let refs = extract_anchors(&html, doc_id);
+    if refs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut stmt = conn
+        .prepare("SELECT anchor, chunk_id FROM chunks WHERE doc_id = ? AND anchor IS NOT NULL")?;
+    let rows = stmt.query_map([doc_id], |row| {
+        Ok((
+            row.get::<_, String>("anchor")?,
+            row.get::<_, i64>("chunk_id")?,
+        ))
+    })?;
+    let mut chunk_id_by_anchor = HashMap::new();
+    for row in rows {
+        let (anchor, chunk_id) = row?;
+        chunk_id_by_anchor.entry(anchor).or_insert(chunk_id);
+    }
+    if chunk_id_by_anchor.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for r in refs {
+        if r.kind != "in_doc" {
+            continue;
+        }
+        let Some(target_anchor) = r.target_anchor.as_deref() else {
+            continue;
+        };
+        let Some(chunk_id) = chunk_id_by_anchor.get(target_anchor).copied() else {
+            continue;
+        };
+        if seen.insert((r.label.clone(), chunk_id)) {
+            out.push(json!({
+                "label": r.label,
+                "chunk_id": chunk_id,
+            }));
+        }
+    }
+    Ok(out)
 }
 
 /// [MT-17] Per-doc cap on the `cited_by` array surfaced by `get_doc_anchors`. The
@@ -16466,6 +16549,55 @@ mod tests {
                     "https://www.ato.gov.au/law/view/document?docid=DOC_HISTORY&PiT=20200101000000"
                 )
             );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn get_doc_anchors_resolves_in_doc_chunks_from_stored_html() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        insert_doc_full(
+            &conn,
+            "DOC_HTML_ANCHORS",
+            Some("2024-01-01"),
+            None,
+            None,
+            None,
+        )?;
+        conn.execute(
+            "UPDATE documents SET html = ? WHERE doc_id = ?",
+            params![
+                compress_text(
+                    r##"<nav><a href="#target">Target section</a></nav><h2 id="target">Target</h2>"##
+                )?,
+                "DOC_HTML_ANCHORS"
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO chunks(chunk_id, doc_id, ord, anchor, text) VALUES (?, ?, ?, ?, ?)",
+            params![
+                9001i64,
+                "DOC_HTML_ANCHORS",
+                0i64,
+                "target",
+                compress_text("Target body")?,
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO doc_anchors(doc_id, ord, kind, label, target_chunk_id, target_doc_id, target_pit) VALUES (?, 0, 'in_doc', 'Target section', NULL, NULL, NULL)",
+            params!["DOC_HTML_ANCHORS"],
+        )?;
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            let json_str = get_doc_anchors("DOC_HTML_ANCHORS")?;
+            let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+            assert_eq!(parsed["in_doc"].as_array().unwrap().len(), 1);
+            assert_eq!(parsed["in_doc"][0]["label"], json!("Target section"));
+            assert_eq!(parsed["in_doc"][0]["chunk_id"], json!(9001));
             Ok(())
         })?;
         Ok(())
