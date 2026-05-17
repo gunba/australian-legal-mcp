@@ -129,7 +129,15 @@ proxies stdin/stdout to it. The first MCP session on the machine spawns
 the daemon; every subsequent session reuses it. There is nothing to
 start manually and no port to configure.
 
-Claude Code:
+Claude Code (plugin install — recommended; bundles `/ato-update`,
+`/ato-stats`, `/ato-rollback` slash commands alongside the MCP server):
+
+```bash
+git clone https://github.com/gunba/ato-mcp.git
+claude plugin install ./ato-mcp
+```
+
+Claude Code (MCP-only, lighter alternative without slash commands):
 
 ```bash
 claude mcp add --scope user ato -- ato-mcp serve
@@ -202,8 +210,11 @@ In this mode you also need the daemon running independently — either
 `serve` starts immediately from whatever local corpus is present and never
 downloads on the MCP hot path, so it cannot trip stdio client spawn timeouts
 on slow or TLS-inspecting corporate networks. When a newer corpus index has
-been published, the server tells the assistant via `initialize` instructions
-and the assistant asks the user to run `ato-mcp update`. `ATO_MCP_OFFLINE=1`
+been published, the default behaviour is to spawn `ato-mcp update` as a
+detached background process (see [Background auto-update](#background-auto-update));
+the server still notifies the assistant via `initialize` instructions so the
+user knows to restart the MCP client when the download finishes.
+`ATO_MCP_AUTO_UPDATE=0` reverts to the manual-notice flow; `ATO_MCP_OFFLINE=1`
 disables the update-availability probe entirely.
 
 ## Search Defaults
@@ -262,6 +273,21 @@ ato-mcp doctor --rollback
 
 While a server is already running, a newer index does not take effect until
 the MCP client is restarted, since `serve` loads the corpus once at startup.
+
+### Background auto-update
+
+On `ato-mcp serve` startup, the binary checks for an available release. If
+(a) a newer corpus is published *and* (b) the installed corpus is older than
+7 days, it spawns `ato-mcp update` as a fully detached child process and
+flips the MCP `initialize` instructions notice from "tell the user to run
+update" to "downloading in the background, restart the MCP client when
+done". The update runs out-of-band so it cannot trip MCP startup timeouts.
+Progress lands in `<data_dir>/logs/auto-update-*.log`.
+
+This is the default. To opt out and keep the existing manual-notice
+behaviour, set `ATO_MCP_AUTO_UPDATE=0` in the MCP server's environment
+block. `ATO_MCP_OFFLINE=1` continues to disable the availability probe
+entirely (no network reach at all).
 
 ## Data Directory
 

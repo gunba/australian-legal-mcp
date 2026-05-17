@@ -47,9 +47,10 @@ use search::{
     search, search_cli, SearchOptions,
 };
 use source::{
-    apply_update, check_for_update_availability, doctor, link_download, manifest_fingerprint,
-    preview_update, scrape_diff, snapshot_reduce, stats, tree_crawl, LinkDownloadArgs, Manifest,
-    ModelInfo, StagedModel, UpdateAvailability, UpdateSummary,
+    apply_update, auto_update_should_trigger, check_for_update_availability, doctor,
+    link_download, manifest_fingerprint, preview_update, scrape_diff, snapshot_reduce,
+    spawn_update_detached, stats, tree_crawl, LinkDownloadArgs, Manifest, ModelInfo,
+    StagedModel, UpdateAvailability, UpdateSummary,
 };
 use semantic::{
     SemanticEncodeStats, SemanticModelPaths, SemanticRuntime,
@@ -413,9 +414,7 @@ fn main() -> Result<()> {
         Command::Serve {} => serve_stdio_shim(),
         Command::Daemon {} => {
             let state = ServerState {
-                update_notice: check_for_update_availability(&default_manifest_url())
-                    .ok()
-                    .flatten(),
+                update_notice: resolve_startup_update_notice(),
                 ..Default::default()
             };
             daemon(Arc::new(state))
@@ -1807,6 +1806,22 @@ pub(crate) fn optional_string_array(args: &JsonValue, name: &str) -> Result<Opti
 
 const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first. Search hits are chunk pointers, not authority; call `get_chunks` before relying on text. Use `get_doc_anchors` for in-doc navigation, related/history links, and cited-by. Use `fetch_external_doc` only for unindexed `[doc:X]` links; pass fetched chunk text to `search(seed_text=...)` to pivot back into the corpus. For historical or withdrawn material, set `current_only=false` and `include_old=true`."##;
 
+/// Build the `update_notice` carried in `ServerState` for the lifetime of the
+/// daemon. Runs `check_for_update_availability` and, if a newer corpus is
+/// available *and* the local install is stale per `auto_update_should_trigger`,
+/// fires a detached `ato-mcp update` in the background and flips the notice
+/// into the `auto_applying` variant so `server_instructions` tells the user to
+/// wait rather than to run the command themselves.
+fn resolve_startup_update_notice() -> Option<UpdateAvailability> {
+    let mut notice = check_for_update_availability(&default_manifest_url())
+        .ok()
+        .flatten()?;
+    if auto_update_should_trigger().unwrap_or(false) && spawn_update_detached().is_ok() {
+        notice.auto_applying = true;
+    }
+    Some(notice)
+}
+
 fn server_instructions(update_notice: Option<&UpdateAvailability>) -> String {
     // [SW-02] Instructions are generated from live corpus stats.
     // [SW-03] Missing/unreadable stats fall back to static install guidance.
@@ -1828,6 +1843,10 @@ fn server_instructions(update_notice: Option<&UpdateAvailability>) -> String {
         ),
     };
     match update_notice {
+        Some(notice) if notice.auto_applying => format!(
+            "{body}\n\nA newer ATO corpus index ({}) is being downloaded in the background. The current MCP session continues using the installed corpus; the user should restart their MCP client after the download completes (typically 5-10 min; progress in the `logs/auto-update-*.log` file under the ato-mcp data directory).",
+            notice.available_index_version
+        ),
         Some(notice) => format!(
             "{body}\n\nA newer ATO corpus index is available (available: {}). Tell the user to run `ato-mcp update` in their terminal when convenient. The current MCP session will continue using the installed corpus until the update completes and the MCP client is restarted.",
             notice.available_index_version
@@ -2863,6 +2882,7 @@ mod tests {
         with_data_dir(data.path(), || {
             let notice = UpdateAvailability {
                 available_index_version: "2026.05.20".to_string(),
+                auto_applying: false,
             };
             let text = server_instructions(Some(&notice));
             assert!(
@@ -2878,6 +2898,88 @@ mod tests {
                 "missing update command in: {text}"
             );
         });
+        Ok(())
+    }
+
+    #[test]
+    fn auto_applying_notice_text_directs_user_to_wait() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let data = tempdir()?;
+        with_data_dir(data.path(), || {
+            let notice = UpdateAvailability {
+                available_index_version: "2026.05.20".to_string(),
+                auto_applying: true,
+            };
+            let text = server_instructions(Some(&notice));
+            assert!(
+                text.contains("being downloaded in the background"),
+                "auto-applying notice must mention background download: {text}"
+            );
+            assert!(
+                text.contains("2026.05.20"),
+                "missing available index_version: {text}"
+            );
+            assert!(
+                text.contains("restart their MCP client"),
+                "auto-applying notice must tell user to restart client: {text}"
+            );
+            // The available-but-not-applying suffix uses a distinctive
+            // imperative ("when convenient"); make sure the auto-applying
+            // branch did NOT emit it.
+            assert!(
+                !text.contains("when convenient"),
+                "auto-applying notice must not use the manual-update phrasing: {text}"
+            );
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn auto_update_gate_false_when_last_unknown() {
+        assert!(!auto_update_should_trigger_at(None, Utc::now()));
+    }
+
+    #[test]
+    fn auto_update_gate_false_within_seven_days() {
+        let now = Utc::now();
+        assert!(!auto_update_should_trigger_at(
+            Some(now - chrono::Duration::days(1)),
+            now
+        ));
+        assert!(!auto_update_should_trigger_at(
+            Some(now - chrono::Duration::days(7)),
+            now
+        ));
+    }
+
+    #[test]
+    fn auto_update_gate_true_when_stale() {
+        let now = Utc::now();
+        assert!(auto_update_should_trigger_at(
+            Some(now - chrono::Duration::days(8)),
+            now
+        ));
+        assert!(auto_update_should_trigger_at(
+            Some(now - chrono::Duration::days(30)),
+            now
+        ));
+    }
+
+    #[test]
+    fn auto_update_gate_respects_env_disable() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("ATO_MCP_AUTO_UPDATE").ok();
+        std::env::set_var("ATO_MCP_AUTO_UPDATE", "0");
+        let result = auto_update_should_trigger();
+        if let Some(value) = prev {
+            std::env::set_var("ATO_MCP_AUTO_UPDATE", value);
+        } else {
+            std::env::remove_var("ATO_MCP_AUTO_UPDATE");
+        }
+        assert!(
+            !result?,
+            "ATO_MCP_AUTO_UPDATE=0 must short-circuit before any DB read"
+        );
         Ok(())
     }
 

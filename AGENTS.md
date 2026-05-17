@@ -74,7 +74,15 @@ mirror via `ATO_MCP_RELEASES_URL` or install from an offline bundle.
 
 ## Register With The MCP Host
 
-Claude Code:
+Claude Code (plugin install — bundles `/ato-update`, `/ato-stats`,
+`/ato-rollback`):
+
+```bash
+git clone https://github.com/gunba/ato-mcp.git
+claude plugin install ./ato-mcp
+```
+
+Claude Code (MCP-only):
 
 ```bash
 claude mcp add --scope user ato -- ato-mcp serve
@@ -110,7 +118,10 @@ Inside the MCP host, invoke `ato.search` and confirm results include
 
 ## Routine Maintenance
 
-Weekly:
+`ato-mcp serve` auto-updates the corpus in the background once per week when
+a newer release exists; the user only needs to restart the MCP client when
+the download finishes. Manual runs are still useful when the user wants the
+latest corpus immediately or when `ATO_MCP_AUTO_UPDATE=0` has been set:
 
 ```bash
 ato-mcp update

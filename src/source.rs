@@ -22,7 +22,7 @@ use crate::{
     OLD_CONTENT_CUTOFF, SUPPORTED_MANIFEST_VERSION, SUPPORTED_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use reqwest::blocking::Client;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -1027,8 +1027,14 @@ pub(crate) fn try_skip_update_from_summary(
 /// published corpus is newer than the installed one. Constructed only
 /// when an update is genuinely available; the field carries the newly
 /// published `index_version` so the agent can mention it to the user.
+///
+/// When `auto_applying` is true, the daemon startup path has already
+/// spawned a detached `ato-mcp update` and the instructions text tells
+/// the user to wait for the background download rather than to run the
+/// command themselves.
 pub(crate) struct UpdateAvailability {
     pub(crate) available_index_version: String,
+    pub(crate) auto_applying: bool,
 }
 
 pub(crate) fn http_probe_client() -> Result<Client> {
@@ -1081,7 +1087,130 @@ pub(crate) fn check_for_update_availability(manifest_url: &str) -> Result<Option
     }
     Ok(Some(UpdateAvailability {
         available_index_version: summary.index_version,
+        auto_applying: false,
     }))
+}
+
+/// Window the auto-update gate enforces between successive background updates.
+/// Public for tests; runtime callers go through `auto_update_should_trigger`.
+pub(crate) const AUTO_UPDATE_MIN_AGE: chrono::Duration = chrono::Duration::days(7);
+
+/// Pure helper: given the timestamp the live corpus became installed and the
+/// current time, decide whether the >7-day staleness condition is met.
+/// Returns `false` when `last` is `None` because we can't establish age.
+pub(crate) fn auto_update_should_trigger_at(
+    last: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    match last {
+        Some(t) => now - t > AUTO_UPDATE_MIN_AGE,
+        None => false,
+    }
+}
+
+/// Runtime gate for the background auto-update. Returns `true` when:
+/// 1. `ATO_MCP_AUTO_UPDATE` is not explicitly disabled (defaults on), and
+/// 2. The installed corpus is older than `AUTO_UPDATE_MIN_AGE` measured from
+///    `meta.last_update_at`, falling back to `installed_manifest.created_at`
+///    when the meta row is missing (e.g. corpus installed by an older binary).
+///
+/// Every read failure collapses to `Ok(false)` so a flaky DB cannot trigger a
+/// spurious download.
+pub(crate) fn auto_update_should_trigger() -> Result<bool> {
+    if env_falsy("ATO_MCP_AUTO_UPDATE") {
+        return Ok(false);
+    }
+    let last_from_meta = open_read()
+        .ok()
+        .and_then(|conn| get_meta(&conn, "last_update_at").ok().flatten())
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|d| d.with_timezone(&Utc));
+    let last = last_from_meta.or_else(|| {
+        load_installed_manifest()
+            .ok()
+            .flatten()
+            .and_then(|m| DateTime::parse_from_rfc3339(&m.created_at).ok())
+            .map(|d| d.with_timezone(&Utc))
+    });
+    Ok(auto_update_should_trigger_at(last, Utc::now()))
+}
+
+/// Inverse of `env_truthy`: defaults to `false` (i.e. flag *not* set means the
+/// behavior is enabled). Used for opt-out flags like `ATO_MCP_AUTO_UPDATE=0`.
+pub(crate) fn env_falsy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.as_str(),
+                "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Spawn `ato-mcp update` as a fully detached child process and return
+/// immediately. Mirrors `spawn_daemon_detached` in main.rs: stdin → null,
+/// stdout+stderr → a timestamped log file under `<data_dir>/logs/`, child put
+/// in its own process group (Unix) or detached (Windows) so it survives the
+/// MCP session that spawned it.
+///
+/// Acquires `<data_dir>/auto-update.lock` non-blocking and is a silent no-op
+/// when the lock is already held — keeps two simultaneous MCP starts from both
+/// forking an update. The existing `<data_dir>/LOCK` still serialises the
+/// actual corpus swap inside `apply_update`.
+pub(crate) fn spawn_update_detached() -> Result<()> {
+    use fs2::FileExt;
+    use std::process::{Command, Stdio};
+
+    let data = data_dir()?;
+    let lock_path = data.join("auto-update.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+    if lock_file.try_lock_exclusive().is_err() {
+        return Ok(());
+    }
+
+    let log_dir = data.join("logs");
+    fs::create_dir_all(&log_dir)?;
+    let log_path = log_dir.join(format!(
+        "auto-update-{}.log",
+        Utc::now().format("%Y%m%dT%H%M%SZ")
+    ));
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("opening {}", log_path.display()))?;
+    let log_err = log.try_clone()?;
+
+    let exe = std::env::current_exe().context("locating ato-mcp binary")?;
+    let mut cmd = Command::new(&exe);
+    cmd.arg("update")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x00000008);
+    }
+
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("spawning {} update", exe.display()))?;
+    std::mem::forget(child);
+    drop(lock_file);
+    Ok(())
 }
 
 pub(crate) fn enforce_update_summary_compatibility(summary: &UpdateSummary) -> Result<()> {
