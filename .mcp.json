@@ -1,0 +1,6 @@
+{
+  "ato": {
+    "command": "ato-mcp",
+    "args": ["serve"]
+  }
+}
