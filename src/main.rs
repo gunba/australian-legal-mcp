@@ -182,17 +182,6 @@ enum Command {
         #[command(subcommand)]
         action: AustliiAction,
     },
-    /// Live-search AustLII via the SINO CGI. Requires a session cookie
-    /// from `ato-mcp austlii setup`.
-    SearchAustlii {
-        query: String,
-        #[arg(long, value_delimiter = ',')]
-        jurisdictions: Vec<String>,
-        #[arg(short, long, default_value_t = 10)]
-        k: usize,
-        #[arg(long, default_value_t = false)]
-        sort_by_date: bool,
-    },
     /// In-binary build orchestrator. Reads `pages_dir/index.jsonl` (one
     /// record per line with canonical_id and payload_path), runs each doc
     /// through the cleaning pipeline, the chunker, the rules-engine
@@ -392,6 +381,17 @@ enum AustliiAction {
         /// Skip the interactive consent prompt (for scripted use).
         #[arg(long)]
         yes: bool,
+    },
+    /// Live-search AustLII via the SINO CGI. Requires a session cookie
+    /// from `ato-mcp austlii setup`.
+    Search {
+        query: String,
+        #[arg(long, value_delimiter = ',')]
+        jurisdictions: Vec<String>,
+        #[arg(short, long, default_value_t = 10)]
+        k: usize,
+        #[arg(long, default_value_t = false)]
+        sort_by_date: bool,
     },
     /// Delete the persisted session file. (Status info is in `ato-mcp stats`.)
     Clear,
@@ -594,24 +594,6 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Austlii { action } => austlii_command(action),
-        Command::SearchAustlii {
-            query,
-            jurisdictions,
-            k,
-            sort_by_date,
-        } => {
-            let opts = austlii::SearchAustliiOptions {
-                jurisdictions: if jurisdictions.is_empty() {
-                    None
-                } else {
-                    Some(jurisdictions)
-                },
-                limit: Some(k),
-                sort_by_date,
-            };
-            println!("{}", austlii::search_austlii(&query, opts)?);
-            Ok(())
-        }
         Command::Build {
             pages_dir,
             db_path,
@@ -1575,6 +1557,24 @@ pub(crate) fn optional_string_array(args: &JsonValue, name: &str) -> Result<Opti
 fn austlii_command(action: AustliiAction) -> Result<()> {
     match action {
         AustliiAction::Setup { cookie, yes } => austlii_setup(cookie.as_deref(), yes),
+        AustliiAction::Search {
+            query,
+            jurisdictions,
+            k,
+            sort_by_date,
+        } => {
+            let opts = austlii::SearchAustliiOptions {
+                jurisdictions: if jurisdictions.is_empty() {
+                    None
+                } else {
+                    Some(jurisdictions)
+                },
+                limit: Some(k),
+                sort_by_date,
+            };
+            println!("{}", austlii::search_austlii(&query, opts)?);
+            Ok(())
+        }
         AustliiAction::Clear => austlii_clear(),
     }
 }
@@ -1685,7 +1685,7 @@ fn austlii_setup(manual_cookie: Option<&str>, skip_prompt: bool) -> Result<()> {
         println!("Cloudflare challenge until one is present. Click through any AustLII");
         println!("challenge page in your browser, then re-run `ato-mcp austlii setup`.");
     } else {
-        println!("\nReady. `ato-mcp search-austlii \"<query>\"` will now use this session.");
+        println!("\nReady. `ato-mcp austlii search \"<query>\"` will now use this session.");
     }
     Ok(())
 }

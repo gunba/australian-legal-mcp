@@ -17,7 +17,7 @@ Granite ONNX semantic runtime: CPU by default, optional CUDA for maintainer buil
 ## Rust CLI Commands
 Closed clap command surface covering end-user MCP/update/doctor/search commands plus maintainer source, build, and release commands in the Rust binary.
 
-- [CC-01 L108] One Rust binary owns both end-user commands (serve, install-http, update, doctor, stats, search, retrieval helpers) and maintainer-only source, build, and release commands; AGENTS.md documents which maintainer commands require checkout/source/model/GPU.
+- [CC-01 L108] One Rust binary owns both end-user commands (serve, update, stats, search, retrieval helpers, austlii subcommand) and maintainer-only source, build, and release commands; AGENTS.md documents which maintainer commands require checkout/source/model/GPU.
 - [CC-06 L111] The CLI surface is a closed clap enum: every external command is declared in Command, with no dynamic plugin subcommands or generated shell-completion surface.
 - [CC-05 L192] Source acquisition and corpus building are separate commands: source commands populate ato_pages/index.jsonl, while build requires pages-dir/model-dir/db-path/out-dir and can reuse a base release; the same pages tree can feed repeated builds.
 

@@ -112,7 +112,7 @@ fi
 help_text="$("$BIN" --help 2>&1)"
 
 # Subcommands that MUST be present.
-for cmd in serve update stats search fetch austlii search-austlii \
+for cmd in serve update stats search fetch austlii \
            get-definition build tree-crawl snapshot-reduce link-download scrape-diff \
            bundle-localize-manifest publish-release help; do
     if grep -qE "^[[:space:]]+${cmd}[[:space:]]" <<<"$help_text"; then
@@ -123,7 +123,7 @@ for cmd in serve update stats search fetch austlii search-austlii \
 done
 
 # Subcommands that MUST NOT appear (removed during the cleanup).
-for cmd in daemon install-http doctor extract extract-definitions extract-anchors \
+for cmd in daemon install-http doctor search-austlii extract extract-definitions extract-anchors \
            extract-currency chunk-html doc-meta doc-id-from-link pack-write \
            manifest-rewrite-urls bundle-model ato-fetch-nodes embed whats-new \
            normalize-doc-href check-build-checkpoint; do
