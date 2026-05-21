@@ -202,7 +202,7 @@ pub(crate) struct SearchOptions<'a> {
     /// When set, this arbitrary text is runtime-embedded and used as the
     /// query vector — the same mechanism as `similar_to_chunk_id` but for
     /// text that isn't a corpus chunk (e.g. a chunk returned by
-    /// `fetch_external_doc`). Forces vector-only mode and skips title hits,
+    /// `fetch`). Forces vector-only mode and skips title hits,
     /// like `similar_to_chunk_id`. `similar_to_chunk_id` wins if both are set.
     pub(crate) seed_text: Option<&'a str>,
 }
@@ -334,7 +334,7 @@ pub(crate) fn search(
     };
     // `seed_text` runtime-embeds arbitrary text as the query vector — the
     // same seed-driven path as `similar_to_chunk_id`, but for text that
-    // isn't a corpus chunk (e.g. a chunk from `fetch_external_doc`).
+    // isn't a corpus chunk (e.g. a chunk from `fetch`).
     // `similar_to_chunk_id` wins if both are set.
     let seed_text: Option<&str> = if similar_seed.is_some() {
         None

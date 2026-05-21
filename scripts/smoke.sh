@@ -6,7 +6,7 @@
 #   2. Corpus health (stats shape, doctor passes)
 #   3. CLI search (hybrid/vector/keyword modes, type/date/scope filters, recency
 #      sort, seed_text fast path, direct doc_id title hit, include_old)
-#   4. CLI retrieval (get-definition, fetch-external-doc)
+#   4. CLI retrieval (get-definition, fetch)
 #   5. MCP HTTP transport (daemon spawn, initialize, tools/list, all 7 tools)
 #
 # Read-only against the live corpus; HTTP transport tests use a tempdir so they
@@ -15,7 +15,7 @@
 # Usage:
 #   scripts/smoke.sh
 #   ATO_MCP_BIN=/path/to/ato-mcp scripts/smoke.sh
-#   ATO_MCP_SKIP_NETWORK=1 scripts/smoke.sh   # skip fetch-external-doc
+#   ATO_MCP_SKIP_NETWORK=1 scripts/smoke.sh   # skip `fetch` (network)
 set -uo pipefail
 
 BIN="${ATO_MCP_BIN:-$HOME/.local/bin/ato-mcp}"
@@ -112,7 +112,7 @@ fi
 help_text="$("$BIN" --help 2>&1)"
 
 # Subcommands that MUST be present.
-for cmd in serve daemon install-http update doctor stats search fetch-external-doc \
+for cmd in serve daemon install-http update doctor stats search fetch \
            get-definition build tree-crawl snapshot-reduce link-download scrape-diff \
            bundle-localize-manifest publish-release help; do
     if grep -qE "^[[:space:]]+${cmd}[[:space:]]" <<<"$help_text"; then
@@ -247,18 +247,21 @@ else
     bad "get-definition normaliser" "${norm_json:0:120}"
 fi
 
-# fetch-external-doc against a known doc_id (requires network).
+# `fetch` against a known ATO doc_id (requires network).
 if [[ "$SKIP_NETWORK" != "1" ]]; then
-    fetch_json="$("$BIN" fetch-external-doc TXR/TR20007/NAT/ATO/00001 2>&1)"
+    fetch_json="$("$BIN" fetch ato:TXR/TR20007/NAT/ATO/00001 2>&1)"
     if printf '%s' "$fetch_json" | jq -e . >/dev/null 2>&1; then
-        assert_jq_count   "fetch-external-doc: chunks returned" "$fetch_json" '.chunks | length' 1
-        assert_jq         "fetch-external-doc: canonical_url"   "$fetch_json" '.canonical_url' \
+        assert_jq_count   "fetch: chunks returned" "$fetch_json" '.chunks | length' 1
+        assert_jq         "fetch: canonical_url"   "$fetch_json" '.canonical_url' \
             'docid=TXR/TR20007/NAT/ATO/00001'
+        assert_jq         "fetch: uri echoed"      "$fetch_json" '.uri' \
+            'ato:TXR/TR20007/NAT/ATO/00001'
+        assert_jq         "fetch: source flag"     "$fetch_json" '.source' 'live'
     else
-        bad "fetch-external-doc" "non-JSON output: ${fetch_json:0:120}"
+        bad "fetch" "non-JSON output: ${fetch_json:0:120}"
     fi
 else
-    printf "  %sSKIP%s fetch-external-doc (ATO_MCP_SKIP_NETWORK=1)\n" "$c_dim" "$c_reset"
+    printf "  %sSKIP%s fetch (ATO_MCP_SKIP_NETWORK=1)\n" "$c_dim" "$c_reset"
 fi
 
 # ---------------- Section 5: MCP HTTP transport ----------------
@@ -365,7 +368,7 @@ assert_jq_nonempty "initialize: instructions present"   "$init_resp" '.result.in
 
 # 4. tools/list returns exactly the 7 supported tools.
 tools_resp="$(rpc 2 tools/list '')"
-expected_tools=(search get_chunks get_definition get_asset get_doc_anchors fetch_external_doc stats)
+expected_tools=(search get_chunks get_definition get_asset get_doc_anchors fetch stats)
 actual_tools="$(printf '%s' "$tools_resp" | jq -r '.result.tools[].name' 2>/dev/null | sort | tr '\n' ' ')"
 expected_sorted="$(printf '%s\n' "${expected_tools[@]}" | sort | tr '\n' ' ')"
 if [[ "$actual_tools" == "$expected_sorted" ]]; then
@@ -428,17 +431,17 @@ else
     bad "tools/call get_asset" "neither result nor error in response"
 fi
 
-# 11. tools/call: fetch_external_doc (optional, network).
+# 11. tools/call: fetch (optional, network).
 if [[ "$SKIP_NETWORK" != "1" ]]; then
-    fetch_resp="$(rpc 9 tools/call '{"name":"fetch_external_doc","arguments":{"doc_id":"TXR/TR20007/NAT/ATO/00001"}}')"
+    fetch_resp="$(rpc 9 tools/call '{"name":"fetch","arguments":{"uri":"ato:TXR/TR20007/NAT/ATO/00001"}}')"
     fetch_payload="$(printf '%s' "$fetch_resp" | jq -r '.result.content[0].text' 2>/dev/null)"
     if printf '%s' "$fetch_payload" | jq -e . >/dev/null 2>&1; then
-        assert_jq_count "tools/call fetch_external_doc: chunks returned" "$fetch_payload" '.chunks | length' 1
+        assert_jq_count "tools/call fetch: chunks returned" "$fetch_payload" '.chunks | length' 1
     else
-        bad "tools/call fetch_external_doc" "non-JSON payload: ${fetch_payload:0:120}"
+        bad "tools/call fetch" "non-JSON payload: ${fetch_payload:0:120}"
     fi
 else
-    printf "  %sSKIP%s tools/call fetch_external_doc (ATO_MCP_SKIP_NETWORK=1)\n" "$c_dim" "$c_reset"
+    printf "  %sSKIP%s tools/call fetch (ATO_MCP_SKIP_NETWORK=1)\n" "$c_dim" "$c_reset"
 fi
 
 # 12. Unknown tool → JSON-RPC error.

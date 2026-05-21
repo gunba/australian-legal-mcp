@@ -152,7 +152,7 @@ fn initialize_and_tools_list_over_http() -> Result<()> {
         "search",
         "get_chunks",
         "get_doc_anchors",
-        "fetch_external_doc",
+        "fetch",
         "stats",
     ] {
         assert!(
@@ -160,7 +160,7 @@ fn initialize_and_tools_list_over_http() -> Result<()> {
             "expected `{expected}` in tool list, got {names:?}"
         );
     }
-    for removed in ["search_titles", "get_document"] {
+    for removed in ["search_titles", "get_document", "fetch_external_doc"] {
         assert!(
             !names.iter().any(|n| n == removed),
             "`{removed}` should no longer be exposed, got {names:?}"

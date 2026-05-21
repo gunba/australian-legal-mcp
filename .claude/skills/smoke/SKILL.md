@@ -24,7 +24,7 @@ adding new tests.
 
 - `ATO_MCP_BIN` — path to the binary under test. Defaults to
   `$HOME/.local/bin/ato-mcp`.
-- `ATO_MCP_SKIP_NETWORK=1` — skip the two `fetch_external_doc` tests when the
+- `ATO_MCP_SKIP_NETWORK=1` — skip the `fetch` tests when the
   ATO website is unreachable or you're on a metered link.
 
 ## What gets checked
@@ -42,13 +42,13 @@ The script prints `PASS`/`FAIL` per assertion grouped into five sections:
    the `meta.next_call` continuation hint.
 4. **CLI retrieval** — `get-definition` returns statutory hits with `[doc:...]`
    citation markers; the regression check exercises the unified definition
-   term normaliser fixed in v0.10.0; `fetch-external-doc` round-trips against
+   term normaliser fixed in v0.10.0; `fetch` round-trips against
    `ato.gov.au`.
 5. **MCP HTTP transport** — spawns a fresh daemon in a tempdir (symlinking the
    user's live corpus in read-only), then issues JSON-RPC `initialize`,
    `tools/list` (must be exactly the 7 supported tools), and `tools/call`
    for each of `stats`, `search`, `get_chunks`, `get_definition`,
-   `get_doc_anchors`, `get_asset`, and `fetch_external_doc`, plus an
+   `get_doc_anchors`, `get_asset`, and `fetch`, plus an
    `unknown_tool` request to confirm structured JSON-RPC errors.
 
 ## Interpreting failures

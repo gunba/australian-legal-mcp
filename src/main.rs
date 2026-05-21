@@ -28,6 +28,7 @@ mod rules;
 mod search;
 mod semantic;
 mod source;
+mod uri;
 
 use config::{
     daemon_log_path, default_manifest_url, http_config_path, live_dir, model_data_path, model_path,
@@ -39,7 +40,7 @@ use build::{
     update_manifest_with_db, BuildCorpusArgs,
 };
 use retrieval::{
-    fetch_external_doc, get_asset_mcp, get_chunks_mcp,
+    fetch, get_asset_mcp, get_chunks_mcp,
     get_definition, get_doc_anchors_mcp, pit_to_date,
     GetDefinitionOptions,
 };
@@ -169,18 +170,23 @@ enum Command {
         #[arg(long)]
         include_withdrawn: bool,
         /// Runtime-embed this text as the query vector instead of `query`
-        /// (e.g. a chunk from `fetch-external-doc`). Forces vector-only
+        /// (e.g. a chunk from `fetch`). Forces vector-only
         /// mode and returns no title hits.
         #[arg(long)]
         seed_text: Option<String>,
     },
-    /// Fetch a document from ATO's live website and print its chunks.
-    FetchExternalDoc {
-        doc_id: String,
+    /// Live-fetch a document by URI. Schemes:
+    ///   - `ato:<doc_id>[?pit=...&view=...]` (e.g. `ato:JUD/2025ATC20-969/00002`)
+    ///   - `austlii:<path>` (e.g. `austlii:au/cases/cth/HCA/1992/23`)
+    ///
+    /// The cleaned HTML is chunked the same way the build pipeline chunks
+    /// corpus docs, so external docs read like corpus docs. `--allow-ocr`
+    /// authorises Tesseract OCR fallback for scanned-PDF responses (off by
+    /// default since OCR can exceed MCP request timeouts).
+    Fetch {
+        uri: String,
         #[arg(long)]
-        pit: Option<String>,
-        #[arg(long)]
-        view: Option<String>,
+        allow_ocr: bool,
     },
     /// In-binary build orchestrator. Reads `pages_dir/index.jsonl` (one
     /// record per line with canonical_id and payload_path), runs each doc
@@ -587,11 +593,8 @@ fn main() -> Result<()> {
             packs_dir,
             model_bundle,
         } => bundle_localize_manifest(&manifest, &packs_dir, &model_bundle),
-        Command::FetchExternalDoc { doc_id, pit, view } => {
-            println!(
-                "{}",
-                fetch_external_doc(&doc_id, pit.as_deref(), view.as_deref())?
-            );
+        Command::Fetch { uri, allow_ocr } => {
+            println!("{}", fetch(&uri, allow_ocr)?);
             Ok(())
         }
         Command::Build {
@@ -1748,13 +1751,10 @@ fn call_tool(params: JsonValue, state: &ServerState) -> Result<JsonValue> {
             )?
         }
         "stats" => stats()?,
-        "fetch_external_doc" => {
-            let doc_id = required_str(&args, "doc_id")?;
-            fetch_external_doc(
-                doc_id,
-                args.get("pit").and_then(|v| v.as_str()),
-                args.get("view").and_then(|v| v.as_str()),
-            )?
+        "fetch" => {
+            let uri = required_str(&args, "uri")?;
+            let allow_ocr = optional_bool(&args, "allow_ocr").unwrap_or(false);
+            fetch(uri, allow_ocr)?
         }
         _ => bail!("unknown tool: {name}"),
     };
@@ -1804,7 +1804,7 @@ pub(crate) fn optional_string_array(args: &JsonValue, name: &str) -> Result<Opti
 }
 
 
-const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first. Search hits are chunk pointers, not authority; call `get_chunks` before relying on text. Use `get_doc_anchors` for in-doc navigation, related/history links, and cited-by. Use `fetch_external_doc` only for unindexed `[doc:X]` links; markers with the ` ext` suffix (e.g. `[doc:LRP/117CLR514 ext]`) point to docs that aren't in the corpus and need that tool, while unmarked `[doc:X]` references resolve through `get_chunks` / `get_doc_anchors`. Pass fetched chunk text to `search(seed_text=...)` to pivot back into the corpus. For historical or withdrawn material, set `current_only=false` and `include_old=true`."##;
+const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first. Search hits are chunk pointers, not authority; call `get_chunks` before relying on text. Use `get_doc_anchors` for in-doc navigation, related/history links, and cited-by. Markers in chunk text are self-describing: `[doc:X]` points into the local corpus and is resolved via `get_chunks` / `get_doc_anchors`, while `[fetch:URI]` points outside the corpus and must be retrieved via the `fetch` tool (e.g. `[fetch:ato:LRP/117CLR514]` → `fetch("ato:LRP/117CLR514")`; `[fetch:austlii:au/cases/cth/HCA/1992/23]` → `fetch("austlii:au/cases/cth/HCA/1992/23")`). Pass fetched chunk text to `search(seed_text=...)` to pivot back into the corpus. For historical or withdrawn material, set `current_only=false` and `include_old=true`."##;
 
 /// Build the `update_notice` carried in `ServerState` for the lifetime of the
 /// daemon. Runs `check_for_update_availability` and, if a newer corpus is
@@ -1858,7 +1858,7 @@ fn server_instructions(update_notice: Option<&UpdateAvailability>) -> String {
 fn tool_descriptors() -> JsonValue {
     // [SW-01] Seven MCP tools are exposed by tool_descriptors/call_tool:
     // search, get_chunks, get_asset, get_doc_anchors, get_definition, stats,
-    // fetch_external_doc.
+    // fetch.
     //   The surface stays small and explicit; unsupported tools fail through the
     //   normal tools/call error path.
     json!([
@@ -1910,7 +1910,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_chunks",
-            "description": "Fetch chunk bodies by chunk_id, with optional before/after neighbour chunks. Text may contain `[doc:X]` and `[asset:X]` markers; `[doc:X ext]` flags references that are not in the local corpus and need `fetch_external_doc`.",
+            "description": "Fetch chunk bodies by chunk_id, with optional before/after neighbour chunks. Text may contain `[doc:X]` and `[asset:X]` markers; `[fetch:URI]` flags references that are not in the local corpus and must be retrieved via the `fetch` tool.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1948,16 +1948,15 @@ fn tool_descriptors() -> JsonValue {
             }
         },
         {
-            "name": "fetch_external_doc",
-            "description": "Fetch an unindexed live ATO doc_id as `{ord, anchor, text}` chunks. Use when a `[doc:X]` reference carries the ` ext` suffix (e.g. `[doc:LRP/117CLR514 ext]`); some TOC/container ids are not externally fetchable.",
+            "name": "fetch",
+            "description": "Live-fetch a document outside the local corpus and return its `{ord, anchor, text}` chunks. The `uri` carries the source via a scheme prefix: `ato:<doc_id>[?pit=...&view=...]` (e.g. `ato:JUD/2025ATC20-969/00002`) or `austlii:<path>` (e.g. `austlii:au/cases/cth/HCA/1992/23`). Use when chunk text contains a `[fetch:URI]` marker. `allow_ocr` opts into Tesseract OCR fallback for scanned-PDF responses — off by default to keep latency inside the MCP request timeout.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "doc_id": {"type": "string"},
-                    "pit": {"type": "string"},
-                    "view": {"type": "string"}
+                    "uri": {"type": "string"},
+                    "allow_ocr": {"type": "boolean"}
                 },
-                "required": ["doc_id"]
+                "required": ["uri"]
             }
         }
     ])
@@ -4299,7 +4298,7 @@ mod tests {
     static TEST_DB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn test_annotate_doc_refs_marks_external_targets() {
+    fn test_annotate_doc_refs_rewrites_external_markers_to_fetch() {
         let mut corpus = HashSet::new();
         corpus.insert("JUD/HAYES".to_string());
         corpus.insert("PAC/19360027/6".to_string());
@@ -4308,30 +4307,47 @@ mod tests {
             annotate_doc_refs_with("see [doc:JUD/HAYES]", "SRC", &corpus),
             "see [doc:JUD/HAYES]"
         );
-        // External target: ` ext` inserted between doc_id and `]`.
+        // External target: rewritten to a `[fetch:ato:X]` marker so the
+        // agent routes to the `fetch` tool instead of `get_chunks`.
         assert_eq!(
             annotate_doc_refs_with("see [doc:LRP/117CLR514]", "SRC", &corpus),
-            "see [doc:LRP/117CLR514 ext]"
+            "see [fetch:ato:LRP/117CLR514]"
         );
-        // Self-reference: never annotated even if not in corpus.
+        // Self-reference: never rewritten even if not in corpus.
         assert_eq!(
             annotate_doc_refs_with("see [doc:SRC]", "SRC", &corpus),
             "see [doc:SRC]"
         );
-        // Already-annotated marker is left alone (idempotent).
+        // The regex matches `[doc:...]` only, so an already-rewritten
+        // `[fetch:...]` marker passes through untouched (idempotent).
         assert_eq!(
-            annotate_doc_refs_with("see [doc:LRP/X ext]", "SRC", &corpus),
-            "see [doc:LRP/X ext]"
+            annotate_doc_refs_with(
+                "see [fetch:ato:LRP/X]",
+                "SRC",
+                &corpus,
+            ),
+            "see [fetch:ato:LRP/X]"
         );
-        // View qualifier preserved; ` ext` slots in front of the qualifier.
+        // View qualifier becomes a URI query parameter on the rewritten
+        // marker — preserves the navigation context without inventing a
+        // new qualifier grammar.
         assert_eq!(
             annotate_doc_refs_with("see [doc:LRP/X view=HISTFT]", "SRC", &corpus),
-            "see [doc:LRP/X ext view=HISTFT]"
+            "see [fetch:ato:LRP/X?view=HISTFT]"
         );
-        // PiT qualifier (separator is `@`) preserved.
+        // PiT qualifier (separator is `@`) collapses to `?pit=...`.
         assert_eq!(
             annotate_doc_refs_with("see [doc:LRP/X@19960320000001]", "SRC", &corpus),
-            "see [doc:LRP/X ext@19960320000001]"
+            "see [fetch:ato:LRP/X?pit=19960320000001]"
+        );
+        // Combined PiT + view qualifiers stack into one query string.
+        assert_eq!(
+            annotate_doc_refs_with(
+                "see [doc:LRP/X@19960320000001 view=HISTFT]",
+                "SRC",
+                &corpus,
+            ),
+            "see [fetch:ato:LRP/X?pit=19960320000001&view=HISTFT]"
         );
         // Multiple markers in one text, mixed in/out of corpus.
         assert_eq!(
@@ -4340,7 +4356,27 @@ mod tests {
                 "SRC",
                 &corpus,
             ),
-            "[doc:JUD/HAYES] and [doc:LRP/X ext] and [doc:PAC/19360027/6]"
+            "[doc:JUD/HAYES] and [fetch:ato:LRP/X] and [doc:PAC/19360027/6]"
         );
+    }
+
+    #[test]
+    fn test_ato_marker_tail_to_query_suffix_known_shapes() {
+        assert_eq!(ato_marker_tail_to_query_suffix(""), "");
+        assert_eq!(
+            ato_marker_tail_to_query_suffix("@19960320000001"),
+            "?pit=19960320000001"
+        );
+        assert_eq!(
+            ato_marker_tail_to_query_suffix(" view=HISTFT"),
+            "?view=HISTFT"
+        );
+        assert_eq!(
+            ato_marker_tail_to_query_suffix("@19960320000001 view=HISTFT"),
+            "?pit=19960320000001&view=HISTFT"
+        );
+        // Unknown qualifier shape: empty suffix so the rewritten marker
+        // stays a syntactically valid URI form.
+        assert_eq!(ato_marker_tail_to_query_suffix(" something=weird"), "");
     }
 }

@@ -1,12 +1,14 @@
-//! MCP retrieval tools: fetch_external_doc, get_chunks (progressive disclosure),
-//! get_asset, get_doc_anchors, get_definition (+ ordinary-meaning dictionary),
-//! plus the derive_citations build helper and load_cited_by reader.
+//! MCP retrieval tools: `fetch` (URI-scheme dispatcher for live document
+//! fetching), `get_chunks` (progressive disclosure), `get_asset`,
+//! `get_doc_anchors`, `get_definition` (+ ordinary-meaning dictionary), plus
+//! the `derive_citations` build helper and `load_cited_by` reader.
 
 use crate::chunker::{chunk_html, EMBED_MAX_TOKENS};
 use crate::config::{data_dir, live_dir};
 use crate::db::{canonical_url, decompress_text, open_read, table_exists};
 use crate::extract::{extract_anchors, normalize_definition_term};
 use crate::html::clean_ato_html;
+use crate::uri::{parse_doc_uri, DocUri};
 use crate::{
     fetch_bytes, optional_usize, required_str,
     UrlContext, ATO_FETCH_TIMEOUT, ATO_USER_AGENT, OEWN_2024_SOURCE, OEWN_2024_URL,
@@ -57,10 +59,65 @@ pub(crate) fn corpus_doc_id_set() -> Result<&'static HashSet<String>> {
     Ok(CORPUS_DOC_IDS.get_or_init(|| set))
 }
 
-/// Rewrite `[doc:X]` markers whose target is not in the local corpus to
-/// `[doc:X ext]`. Preserves trailing qualifiers (`view=...`, `@PiT=...`,
-/// anchor fragments) — ` ext` slots between the doc_id and any tail.
-/// Self-references and already-annotated markers are left unchanged.
+/// Translate an ATO `[doc:X<tail>]` marker tail (everything captured between
+/// the doc_id and the closing `]`) into the equivalent `?pit=...&view=...`
+/// query-string suffix for an `ato:` URI. Empty input returns an empty
+/// string. Unrecognised tail shapes return an empty suffix — the marker
+/// still carries the external signal via its `fetch:` prefix even if the
+/// qualifier information can't be encoded into the URI.
+///
+/// Recognised tail shapes (from real ATO chunk markers):
+///   - `""`                                    → `""`
+///   - `"@<pit>"`                              → `"?pit=<pit>"`
+///   - `" view=<v>"`                           → `"?view=<v>"`
+///   - `"@<pit> view=<v>"`                     → `"?pit=<pit>&view=<v>"`
+pub(crate) fn ato_marker_tail_to_query_suffix(tail: &str) -> String {
+    let trimmed = tail.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut pit: Option<&str> = None;
+    let mut view: Option<&str> = None;
+    let remainder = if let Some(after_at) = trimmed.strip_prefix('@') {
+        let (pit_val, rest) = after_at.split_once(' ').unwrap_or((after_at, ""));
+        pit = Some(pit_val);
+        rest.trim()
+    } else {
+        trimmed
+    };
+    if !remainder.is_empty() {
+        if let Some(v) = remainder.strip_prefix("view=") {
+            view = Some(v.trim());
+        } else {
+            // Unknown qualifier shape; drop it so the rewritten marker is
+            // still a syntactically valid URI form.
+            return String::new();
+        }
+    }
+    let mut parts = Vec::new();
+    if let Some(p) = pit.filter(|s| !s.is_empty()) {
+        parts.push(format!("pit={p}"));
+    }
+    if let Some(v) = view.filter(|s| !s.is_empty()) {
+        parts.push(format!("view={v}"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", parts.join("&"))
+    }
+}
+
+/// Rewrite `[doc:X<tail>]` markers whose target is not in the local corpus
+/// into `[fetch:ato:X<query>]`. The new marker self-describes the retrieval
+/// path:
+///   - `[doc:X]`        → in corpus; use `get_chunks` / `get_doc_anchors`.
+///   - `[fetch:ato:X]`  → external; use the `fetch` tool.
+///
+/// Self-references (target == current doc_id) and markers whose target IS
+/// in the corpus are left as-is. The regex only matches the `[doc:...]`
+/// shape, so already-rewritten `[fetch:...]` markers are inherently
+/// idempotent — they don't match and pass through untouched.
 pub(crate) fn annotate_doc_refs(text: &str, self_doc_id: &str) -> Result<String> {
     Ok(annotate_doc_refs_with(text, self_doc_id, corpus_doc_id_set()?))
 }
@@ -79,21 +136,49 @@ pub(crate) fn annotate_doc_refs_with(
         if doc_id == self_doc_id || corpus.contains(doc_id) {
             return caps[0].to_string();
         }
-        // Idempotent: if the tail is already ` ext` (alone, or followed by a
-        // separator before the next qualifier), leave it. Plain `starts_with`
-        // would false-positive on accidental tails like ` extra`.
-        if tail == " ext"
-            || tail.starts_with(" ext ")
-            || tail.starts_with(" ext@")
-        {
-            return caps[0].to_string();
-        }
-        format!("[doc:{doc_id} ext{tail}]")
+        let query = ato_marker_tail_to_query_suffix(tail);
+        format!("[fetch:ato:{doc_id}{query}]")
     })
     .into_owned()
 }
 
-pub(crate) fn fetch_external_doc(doc_id: &str, pit: Option<&str>, view: Option<&str>) -> Result<String> {
+/// Public entry point for the `fetch` MCP tool. Parses the URI scheme and
+/// dispatches to the per-source live-fetch implementation. Returns a JSON
+/// string with the shape `{uri, canonical_url, title, source, ocr_used,
+/// chunks}` regardless of source so callers don't branch on the scheme.
+pub(crate) fn fetch(uri_string: &str, allow_ocr: bool) -> Result<String> {
+    let uri = parse_doc_uri(uri_string)?;
+    match uri {
+        DocUri::Ato { doc_id, pit, view } => fetch_ato_doc(
+            &doc_id,
+            pit.as_deref(),
+            view.as_deref(),
+            allow_ocr,
+        ),
+        DocUri::Austlii { path } => {
+            // AustLII fetcher lands in a follow-up commit; the URI scheme
+            // is recognised here so the parser doesn't need a second
+            // expansion later, but the dispatch fails cleanly until the
+            // module is in place. Agents see a definitive negative rather
+            // than a transient timeout.
+            bail!(
+                "AustLII fetch is not enabled in this build. `austlii:{path}` \
+                 cannot be resolved yet — corpus-only search and ATO live \
+                 fetch remain available."
+            )
+        }
+    }
+}
+
+/// Live-fetch an ATO document outside the local corpus. Returns the same
+/// `{uri, canonical_url, title, source, ocr_used, chunks}` shape as other
+/// `fetch` paths so callers don't need to branch on the scheme.
+pub(crate) fn fetch_ato_doc(
+    doc_id: &str,
+    pit: Option<&str>,
+    view: Option<&str>,
+    _allow_ocr: bool,
+) -> Result<String> {
     let mut url = format!("https://www.ato.gov.au/law/view/document?docid={}", doc_id);
     if let Some(p) = pit.filter(|s| !s.is_empty()) {
         url.push_str(&format!("&PiT={}", p));
@@ -161,10 +246,18 @@ pub(crate) fn fetch_external_doc(doc_id: &str, pit: Option<&str>, view: Option<&
             })
         })
         .collect();
+    let canonical_uri = DocUri::Ato {
+        doc_id: doc_id.to_string(),
+        pit: pit.map(str::to_string),
+        view: view.map(str::to_string),
+    }
+    .to_uri_string();
     Ok(serde_json::to_string_pretty(&json!({
-        "doc_id": doc_id,
+        "uri": canonical_uri,
         "canonical_url": url,
         "title": cleaned.title,
+        "source": "live",
+        "ocr_used": false,
         "chunks": chunk_json,
     }))?)
 }

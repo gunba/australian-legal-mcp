@@ -28,7 +28,7 @@ MCP tool registration, shared ServerState, runtime statistics instructions, inst
   - There is no reranker state in the MCP surface; non-semantic tools do not load the semantic runtime.
 - [SW-02 L1811] Server instructions are built dynamically at start time from corpus stats (doc count, chunk count, type breakdown, meta keys), so the agent sees up-to-date corpus shape without restart-time configuration.
 - [SW-03 L1812] server_instructions is built from stats(OutputFormat::Json); if stats cannot be read (corpus not yet installed) it returns a static install message telling the agent to ask the user to run ato-mcp update. When the serve-startup probe has stashed an UpdateAvailability on ServerState, both branches append a newer-index-available notice carrying the published index_version.
-- [SW-01 L1840] Seven MCP tools are exposed by tool_descriptors/call_tool: search, get_chunks, get_definition, get_asset, get_doc_anchors, fetch_external_doc, and stats.
+- [SW-01 L1840] Seven MCP tools are exposed by tool_descriptors/call_tool: search, get_chunks, get_definition, get_asset, get_doc_anchors, fetch, and stats.
   - The surface stays small and explicit; unsupported tools fail through the normal tools/call error path.
 
 ## Rust Source Scraper
