@@ -223,6 +223,10 @@ enum Command {
     /// Crawl the ATO browse-content tree and write nodes.jsonl + meta.json
     /// to a snapshot directory. Mirrors src/ato_mcp/scraper/tree_crawler.py
     /// + src/ato_mcp/scraper/snapshot.py.
+    //
+    // [SS-01] Maintainer source modes: whats-new + scrape-diff for incremental
+    // pulls, tree-crawl + snapshot-reduce for full snapshots, and scrape-diff
+    // over deduped links for catch-up gaps.
     TreeCrawl {
         #[arg(long, default_value = "Mode=type&Action=initialise")]
         root_query: String,
@@ -1042,6 +1046,9 @@ pub(crate) fn local_path_from_urlish(value: &str) -> Option<PathBuf> {
     }
 }
 
+// [UM-03] Fetch helpers resolve local paths, file://, manifest-relative
+// assets, HTTP(S), and hf:// Granite model files; downloaded bytes are
+// sha256-verified against the manifest's pinned hash.
 pub(crate) fn fetch_bytes(url_or_path: &str, context: &UrlContext) -> Result<Vec<u8>> {
     fetch_bytes_with(url_or_path, context, &http_client()?)
 }
@@ -1735,6 +1742,12 @@ fn resolve_startup_update_notice() -> Option<UpdateAvailability> {
         .flatten()
 }
 
+// [SW-02] Server instructions are built dynamically at start time from corpus
+// stats so the agent sees up-to-date corpus shape without restart-time config.
+// [SW-03] If stats cannot be read (corpus not yet installed) we return a
+// static install message telling the agent to ask the user to run ato-mcp
+// update. When the serve-startup probe stashed an UpdateAvailability on
+// ServerState, both branches append a newer-index-available notice.
 fn server_instructions(update_notice: Option<&UpdateAvailability>) -> String {
     let body = match stats()
         .ok()

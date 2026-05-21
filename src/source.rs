@@ -324,6 +324,9 @@ pub(crate) fn apply_update(manifest_url: &str) -> Result<UpdateStats> {
 /// Reject a manifest whose `schema_version` is not the current release
 /// format, or whose `min_client_version` is newer than the currently-running
 /// binary.
+// [CC-03] update and the serve-startup probe both gate on
+// enforce_manifest_compatibility. Update surfaces the upgrade-the-binary error;
+// the probe silently suppresses the incompatible case.
 pub(crate) fn enforce_manifest_compatibility(manifest: &Manifest) -> Result<()> {
     let schema_version = manifest.schema_version;
     if schema_version < 0 {
@@ -774,6 +777,7 @@ pub(crate) struct UpdateAvailability {
     pub(crate) available_index_version: String,
 }
 
+// [SW-06] Serve startup probe: 5s budget, non-mutating, errors collapse to None.
 pub(crate) fn http_probe_client() -> Result<Client> {
     // Tight budget: this client runs synchronously inside `serve` startup.
     // A slow network must not stall the startup banner — `serve` falls
@@ -904,6 +908,8 @@ pub(crate) fn canonical_id_from(data_url: Option<&str>, href: Option<&str>) -> O
     Some(data_url.to_string())
 }
 
+// [SS-02] fetch_nodes_blocking hits the ATO browse-content JSON API through a
+// reqwest blocking client; the response payload is expected to be a JSON list.
 pub(crate) fn fetch_nodes_blocking(
     client: &reqwest::blocking::Client,
     base_url: &str,

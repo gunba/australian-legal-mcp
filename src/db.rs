@@ -134,6 +134,9 @@ pub(crate) fn init_db(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_definitions_norm_term ON definitions(norm_term);
         CREATE INDEX IF NOT EXISTS idx_definitions_doc ON definitions(doc_id);
 
+        -- [SL-12] document_assets stores image bytes inline so the release
+        -- ships everything inside ato.db.zst; there is no on-disk live/assets/
+        -- tree. get_asset SELECTs the data BLOB and returns MCP ImageContent.
         CREATE TABLE IF NOT EXISTS document_assets (
             asset_ref  TEXT PRIMARY KEY,
             doc_id     TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,

@@ -70,6 +70,8 @@ pub(crate) fn lock_file() -> Result<File> {
         .read(true)
         .write(true)
         .open(path)?;
+    // [UM-02] Single-writer guard around update/install: cross-platform
+    // advisory lock via fs2::FileExt on the app LOCK file.
     file.lock_exclusive()?;
     Ok(file)
 }

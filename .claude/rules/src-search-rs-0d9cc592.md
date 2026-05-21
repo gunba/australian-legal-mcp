@@ -24,5 +24,5 @@ Hybrid BM25+vector search, title_hits, slim hits, RRF fusion, recency boost, sim
 - [MT-05 L716] Hybrid mode fuses BM25 and vector results via Reciprocal Rank Fusion with K=60: each result contributes 1/(K+rank+1) per ranker, scores summed across rankers.
 - [MT-01 L743] ServerState owns one lazy SemanticRuntime cache; HTTP transport shares one ServerState across worker threads, and semantic runtime loading is reused across subsequent semantic tool calls.
   - Search-time inference holds the semantic_runtime mutex only while encoding query embeddings; read-only non-semantic tools run without that runtime lock.
-- [MT-14 L1097] search populates title_hits from direct doc_id / ATO-link lookups and BM25 over title_fts (title + collected headings), independently of chunk ranking and SeenTracker.
+- [MT-14 L1098] search populates title_hits from direct doc_id / ATO-link lookups and BM25 over title_fts (title + collected headings), independently of chunk ranking and SeenTracker.
   - Title hits reuse the same document filter as chunk search, so EPA/current/old/type/doc_scope exclusions stay consistent.
