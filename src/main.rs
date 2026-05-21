@@ -2803,9 +2803,6 @@ mod tests {
         Ok(())
     }
 
-        Ok(())
-    }
-
     #[test]
     fn mcp_startup_guidance_stays_compact() -> Result<()> {
         let _lock = TEST_DB_LOCK.lock().unwrap();
