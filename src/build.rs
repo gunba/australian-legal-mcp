@@ -1,8 +1,7 @@
 //! Corpus build orchestrator: walks ato_pages/index.jsonl, runs cleaning +
 //! chunker + rules-engine + embedder pipeline in-process, writes documents/
-//! chunks/embeddings/anchors/definitions/citations, manifest, ato.db.zst, and
-//! update.json. Plus checkpoint resume and `bundle_localize_manifest` for
-//! offline bundles.
+//! chunks/embeddings/anchors/definitions/citations and emits manifest.json.
+//! Plus checkpoint resume and `bundle_localize_manifest` for offline bundles.
 
 use crate::chunker::{chunk_html, Chunk, CHUNKER_FORMAT_VERSION, EMBED_MAX_TOKENS};
 use crate::db::{
@@ -79,9 +78,8 @@ pub(crate) const BUILD_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 // Walks pages_dir/index.jsonl, runs each doc through the cleaning + chunker
 // + rules-engine metadata classifier + embedder pipeline in-process, writes
 // documents + chunks + chunk_embeddings + chunks_fts + title_fts +
-// doc_anchors + definitions + citations rows, then writes pack files,
-// asset blobs, manifest.json, and update.json to --out-dir. Missing vs
-// build.py: release seeding, checkpoint resume, parallelism.
+// doc_anchors + definitions + citations rows, then writes the manifest.json
+// to --out-dir.
 
 pub(crate) struct PendingBuildEmbedding {
     pub(crate) chunk_id: i64,

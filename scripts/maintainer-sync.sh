@@ -5,7 +5,7 @@
 # Invokes the Rust ato-mcp binary directly. The released corpus lives on the
 # same GitHub tag as the binary archives — the maintainer queries the latest
 # binary tag with `gh release view`, runs the build/package/publish chain,
-# and uploads manifest.json + update.json + ato.db.zst to that tag with
+# and uploads manifest.json + ato.db.zst to that tag with
 # --clobber. Users always hit releases/latest/download/manifest.json.
 #
 # Expects these env vars (set in the systemd unit or your shell):

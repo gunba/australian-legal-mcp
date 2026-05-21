@@ -7,7 +7,7 @@
 #      $RELEASE_DIR/ato.db.zst, and rewrites $RELEASE_DIR/manifest.json so
 #      `db: {url, sha256, size}` points at the new artifact
 #   3. `ato-mcp publish-release` rewrites manifest URLs to GitHub release URLs
-#      and uploads manifest.json + update.json + ato.db.zst to the named tag
+#      and uploads manifest.json + ato.db.zst to the named tag
 #
 # Prereqs:
 #   - ato-mcp build has finished; release/ contains ato.db and manifest.json

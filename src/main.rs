@@ -188,7 +188,7 @@ enum Command {
     /// metadata classifier, and the Granite embedder in-process, then
     /// writes documents/chunks/chunk_embeddings/chunks_fts/title_fts/
     /// doc_anchors/definitions/citations tables and emits manifest.json
-    /// and update.json into --out-dir. Supports same-output-dir checkpoint
+    /// into --out-dir. Supports same-output-dir checkpoint resume.
     /// resume.
     /// [CC-05] Source refresh and corpus build are separate commands: the
     /// same ato_pages/ tree can feed repeated builds or release dry runs.
@@ -329,7 +329,7 @@ enum Command {
     /// release asset URLs, fixes embedding-model fields if they're
     /// placeholder/GitHub-hosted, optionally signs the manifest with
     /// minisign, then `gh release create` + `gh release upload`s
-    /// manifest.json + manifest.json.minisig + update.json + every pack.
+    /// manifest.json + manifest.json.minisig + every pack.
     PublishRelease {
         #[arg(long)]
         out_dir: PathBuf,
