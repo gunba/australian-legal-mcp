@@ -1,8 +1,7 @@
-//! Source acquisition (scraper) + stats/doctor + manifest/update/release.
+//! Source acquisition (scraper) + stats + manifest/update/release.
 //!
 //! TODO: this file accumulated several distinct concerns during the v0.11
-//! refactor — split into scraper.rs, stats.rs, doctor.rs, and manifest.rs in
-//! a follow-up.
+//! refactor — split into scraper.rs, stats.rs, and manifest.rs in a follow-up.
 
 use crate::config::{
     data_dir, db_path, installed_manifest_path, live_dir, lock_file,
