@@ -15,7 +15,6 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -148,7 +147,7 @@ fn detect_native() -> Result<DetectedBrowser> {
         ("/Applications/Safari.app", BrowserFamily::Safari, "Safari"),
     ];
     for (app_path, family, name) in candidates {
-        if !Path::new(app_path).exists() {
+        if !std::path::Path::new(app_path).exists() {
             continue;
         }
         let version = read_macos_app_version(app_path)?;
@@ -224,7 +223,7 @@ fn detect_for_family(family: BrowserFamily, override_value: &str) -> Result<Dete
         if *fam != family {
             continue;
         }
-        if !Path::new(path).exists() {
+        if !std::path::Path::new(path).exists() {
             continue;
         }
         let version = run_version_probe(path)?;
@@ -263,7 +262,7 @@ fn detect_for_family(family: BrowserFamily, override_value: &str) -> Result<Dete
         if *fam != family {
             continue;
         }
-        if !Path::new(app_path).exists() {
+        if !std::path::Path::new(app_path).exists() {
             continue;
         }
         let version = read_macos_app_version(app_path)?;
@@ -312,6 +311,7 @@ fn detect_for_family(family: BrowserFamily, override_value: &str) -> Result<Dete
 }
 
 #[derive(Copy, Clone)]
+#[allow(dead_code)] // Variants are constructed under #[cfg(target_os = ...)] arms.
 enum OsLabel {
     Windows,
     Macos,
@@ -328,7 +328,7 @@ impl OsLabel {
     }
 }
 
-pub(crate) fn build_user_agent(family: BrowserFamily, version: &str, os: OsLabel) -> String {
+fn build_user_agent(family: BrowserFamily, version: &str, os: OsLabel) -> String {
     let os_token = os.token();
     match family {
         BrowserFamily::Chromium => format!(
