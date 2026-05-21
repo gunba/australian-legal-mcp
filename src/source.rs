@@ -499,7 +499,6 @@ pub(crate) fn remove_path_if_exists(path: &Path) -> Result<()> {
 pub(crate) struct StagedCorpusUpdate {
     pub(crate) staging_root: PathBuf,
     pub(crate) staged_db: PathBuf,
-    pub(crate) staged_asset_root: PathBuf,
     pub(crate) stats: UpdateStats,
 }
 
@@ -519,10 +518,6 @@ pub(crate) fn promote_staged_update(
         &staged_corpus.staged_db,
         &staged_corpus.staging_root.join("ato.db.backup"),
     )?;
-    let assets_guard = promote_live_assets(
-        &staged_corpus.staged_asset_root,
-        &staged_corpus.staging_root.join("assets.backup"),
-    )?;
     let manifest_guard = promote_installed_manifest(
         manifest,
         &staged_corpus
@@ -536,7 +531,6 @@ pub(crate) fn promote_staged_update(
         guard.commit();
     }
     manifest_guard.commit();
-    assets_guard.commit();
     db_guard.commit();
     let _ = fs::remove_dir_all(&staged_corpus.staging_root);
     Ok(())
@@ -625,8 +619,6 @@ pub(crate) fn stage_live_db_from_db_artifact(
     }
     fs::create_dir_all(staging_root)?;
     let staged_db = staging_root.join("ato.db");
-    let staged_asset_root = staging_root.join("live");
-    fs::create_dir_all(&staged_asset_root)?;
 
     // Download ato.db.zst and verify size + sha256.
     let compressed = fetch_bytes(&db_info.url, context)
@@ -709,7 +701,6 @@ pub(crate) fn stage_live_db_from_db_artifact(
     Ok(StagedCorpusUpdate {
         staging_root: staging_root.to_path_buf(),
         staged_db,
-        staged_asset_root,
         stats: UpdateStats { bytes_downloaded },
     })
 }
@@ -726,31 +717,6 @@ pub(crate) fn promote_live_db(staged_db: &Path, backup: &Path) -> Result<PathPro
     let guard = PathPromotionGuard::backup(db.clone(), backup.to_path_buf())?;
     fs::rename(staged_db, &db)
         .with_context(|| format!("promoting staged DB to {}", db.display()))?;
-    Ok(guard)
-}
-
-pub(crate) fn promote_live_assets(staged_asset_root: &Path, backup: &Path) -> Result<PathPromotionGuard> {
-    let live_assets = live_dir()?.join("assets");
-    let guard = PathPromotionGuard::backup(live_assets.clone(), backup.to_path_buf())?;
-    let staged_assets = staged_asset_root.join("assets");
-    if staged_assets.exists() {
-        if !staged_assets.is_dir() {
-            bail!(
-                "staged assets path is not a directory: {}",
-                staged_assets.display()
-            );
-        }
-        fs::rename(staged_assets, &live_assets)
-            .with_context(|| format!("promoting assets to {}", live_assets.display()))?;
-    } else {
-        fs::create_dir_all(&live_assets)?;
-    }
-    if !live_assets.is_dir() {
-        bail!(
-            "promoted assets path is not a directory: {}",
-            live_assets.display()
-        );
-    }
     Ok(guard)
 }
 

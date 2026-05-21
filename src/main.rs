@@ -95,7 +95,7 @@ pub(crate) const ORDINARY_DICTIONARY_PATH_ENV: &str = "ATO_MCP_DICTIONARY_PATH";
 /// published manifest.json — the two were previously distinct numbers that
 /// always moved together; now they share one identifier. Bump on any
 /// breaking change to the on-disk layout or the manifest contract.
-pub(crate) const SUPPORTED_SCHEMA_VERSION: u32 = 9;
+pub(crate) const SUPPORTED_SCHEMA_VERSION: u32 = 10;
 pub(crate) const EMBEDDING_MODEL_ID: &str = "granite-embedding-small-r2-fp16-256d";
 
 /// Compile-time switch: corpus build and runtime semantic search use the
@@ -1451,6 +1451,10 @@ fn call_tool(params: JsonValue, state: &ServerState) -> Result<JsonValue> {
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    if name == "get_asset" {
+        let content = get_asset_mcp(&args)?;
+        return Ok(json!({ "content": content, "isError": false }));
+    }
     let text = match name {
         "search" => {
             let query = required_str(&args, "query")?;
@@ -1493,7 +1497,6 @@ fn call_tool(params: JsonValue, state: &ServerState) -> Result<JsonValue> {
                 Some(state),
             )?
         }
-        "get_asset" => get_asset_mcp(&args)?,
         "get_doc_anchors" => get_doc_anchors_mcp(&args)?,
         "get_chunks" => get_chunks_mcp(&args)?,
         "get_definition" => {
@@ -1792,7 +1795,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_asset",
-            "description": "Resolve an `[asset:X]` reference to a local file path and metadata.",
+            "description": "Resolve an `[asset:X]` reference to its bytes as an MCP image content item plus a caption.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2178,31 +2181,49 @@ mod tests {
                 compress_text(html)?,
             ],
         )?;
-        let asset_rel = "assets/aa/test.gif";
-        let asset_path = dir.path().join("live").join(asset_rel);
-        fs::create_dir_all(asset_path.parent().expect("asset parent"))?;
-        fs::write(&asset_path, b"gif")?;
+        let asset_bytes: &[u8] = b"GIF89a-fake-payload";
         conn.execute(
-            "INSERT INTO document_assets(asset_ref, doc_id, source_path, relative_path, media_type, alt, title, sha256, bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO document_assets(asset_ref, doc_id, media_type, alt, title, sha256, bytes, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 "ato-image://DOC_HTML/0",
                 "DOC_HTML",
-                "assets/test.gif",
-                asset_rel,
                 "image/gif",
                 Option::<String>::None,
                 "Diagram",
-                format!("{:x}", Sha256::digest(b"gif")),
-                3i64,
+                format!("{:x}", Sha256::digest(asset_bytes)),
+                asset_bytes.len() as i64,
+                asset_bytes,
             ],
         )?;
         drop(conn);
 
         with_data_dir(dir.path(), || -> Result<()> {
-            let asset = get_asset("ato-image://DOC_HTML/0")?;
-            let parsed: JsonValue = serde_json::from_str(&asset)?;
-            assert_eq!(parsed["title"], "Diagram");
-            assert_eq!(parsed["path"], asset_path.display().to_string());
+            let content = get_asset("ato-image://DOC_HTML/0")?;
+            let items = content.as_array().expect("content array");
+            assert_eq!(items.len(), 2, "expected caption + image item, got {content:?}");
+            assert_eq!(items[0]["type"], "text");
+            assert!(
+                items[0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("ato-image://DOC_HTML/0"),
+                "caption should reference asset_ref: {}",
+                items[0]["text"]
+            );
+            assert_eq!(items[1]["type"], "image");
+            assert_eq!(items[1]["mimeType"], "image/gif");
+            let b64 = items[1]["data"].as_str().expect("base64 data");
+            let decoded = {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.decode(b64)?
+            };
+            assert_eq!(decoded, asset_bytes);
+
+            let missing = get_asset("ato-image://DOC_HTML/missing")?;
+            let items = missing.as_array().expect("content array");
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0]["type"], "text");
+            assert!(items[0]["text"].as_str().unwrap().contains("not found"));
             Ok(())
         })?;
         Ok(())
@@ -2961,14 +2982,14 @@ mod tests {
     // ----- Schema v8 -----
 
     #[test]
-    fn schema_init_writes_v9_metadata() -> Result<()> {
+    fn schema_init_writes_v10_metadata() -> Result<()> {
         let _lock = TEST_DB_LOCK.lock().unwrap();
         let (_dir, db) = make_test_db()?;
         let conn = open_write_at(&db)?;
         let value =
             get_meta(&conn, "schema_version")?.expect("init_db should have written schema_version");
         assert_eq!(value, SUPPORTED_SCHEMA_VERSION.to_string());
-        assert_eq!(SUPPORTED_SCHEMA_VERSION, 9);
+        assert_eq!(SUPPORTED_SCHEMA_VERSION, 10);
         Ok(())
     }
 

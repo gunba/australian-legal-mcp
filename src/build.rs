@@ -58,7 +58,6 @@ use crate::{
     EMBEDDING_MODEL_HF_URL, EMBEDDING_MODEL_ID, SUPPORTED_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context, Result};
-use base64::Engine as _;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
@@ -524,13 +523,11 @@ pub(crate) fn build_source_fingerprint_value(input: BuildSourceFingerprint<'_>) 
         })).collect::<Vec<_>>(),
         "assets": input.assets.iter().map(|asset| json!({
             "asset_ref": &asset.asset_ref,
-            "source_path": &asset.source_path,
-            "relative_path": &asset.relative_path,
             "media_type": &asset.media_type,
             "alt": &asset.alt,
             "title": &asset.title,
             "sha256": &asset.sha256,
-            "size": asset.size,
+            "size": asset.data.len(),
         })).collect::<Vec<_>>(),
     })
 }
@@ -576,7 +573,6 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
     fs::create_dir_all(out_dir)
         .with_context(|| format!("creating out_dir {}", out_dir.display()))?;
     fs::create_dir_all(out_dir.join("packs"))?;
-    fs::create_dir_all(out_dir.join("assets"))?;
 
     let checkpoint = load_build_checkpoint(out_dir, &source_index_sha256, zstd_level)?;
     let checkpoint_loaded = checkpoint.is_some();
@@ -1020,19 +1016,25 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         }
         profile.sqlite += started.elapsed();
 
-        // Asset persistence: write each image to <out_dir>/assets/<sha[:2]>/<sha>.bin.
+        // Asset persistence: store each image inline in document_assets.data.
         let started = std::time::Instant::now();
         for asset in &assets {
-            let target = out_dir.join(&asset.relative_path);
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            if !target.exists() || fs::metadata(&target)?.len() != asset.size {
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(asset.data_b64.as_bytes())
-                    .context("decoding asset b64")?;
-                fs::write(&target, &bytes)?;
-            }
+            tx.execute(
+                "INSERT OR REPLACE INTO document_assets
+                    (asset_ref, doc_id, media_type, alt, title, sha256, bytes, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    asset.asset_ref,
+                    doc_id,
+                    asset.media_type,
+                    asset.alt,
+                    asset.title,
+                    asset.sha256,
+                    asset.data.len() as i64,
+                    asset.data,
+                ],
+            )
+            .context("INSERT document_assets")?;
         }
         profile.assets += started.elapsed();
 

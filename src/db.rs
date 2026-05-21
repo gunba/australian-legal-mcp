@@ -135,15 +135,14 @@ pub(crate) fn init_db(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_definitions_doc ON definitions(doc_id);
 
         CREATE TABLE IF NOT EXISTS document_assets (
-            asset_ref     TEXT PRIMARY KEY,
-            doc_id        TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
-            source_path   TEXT NOT NULL,
-            relative_path TEXT NOT NULL,
-            media_type    TEXT,
-            alt           TEXT,
-            title         TEXT,
-            sha256        TEXT NOT NULL,
-            bytes         INTEGER NOT NULL
+            asset_ref  TEXT PRIMARY KEY,
+            doc_id     TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+            media_type TEXT,
+            alt        TEXT,
+            title      TEXT,
+            sha256     TEXT NOT NULL,
+            bytes      INTEGER NOT NULL,
+            data       BLOB NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_assets_doc ON document_assets(doc_id);
 

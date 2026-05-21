@@ -4,7 +4,7 @@
 //! the `derive_citations` build helper and `load_cited_by` reader.
 
 use crate::chunker::{chunk_html, EMBED_MAX_TOKENS};
-use crate::config::{data_dir, live_dir};
+use crate::config::{data_dir};
 use crate::db::{canonical_url, decompress_text, open_read, table_exists};
 use crate::extract::{extract_anchors, normalize_definition_term};
 use crate::html::clean_ato_html;
@@ -15,6 +15,7 @@ use crate::{
     ORDINARY_DICTIONARY_PATH_ENV, STATUTORY_DEFINITION_TYPE_PREFIXES,
 };
 use anyhow::{anyhow, bail, Context, Result};
+use base64::Engine as _;
 use regex::Regex;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
@@ -819,60 +820,47 @@ pub(crate) fn load_chunks_by_ord_range(
     Ok(out)
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct DocumentAssetOut {
-    pub(crate) asset_ref: String,
-    pub(crate) doc_id: String,
-    pub(crate) source_path: String,
-    pub(crate) relative_path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) media_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) alt: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) title: Option<String>,
-    pub(crate) sha256: String,
-    pub(crate) bytes: i64,
-    pub(crate) path: String,
-}
-
-pub(crate) fn get_asset_mcp(args: &JsonValue) -> Result<String> {
+pub(crate) fn get_asset_mcp(args: &JsonValue) -> Result<JsonValue> {
     let asset_ref = required_str(args, "asset_ref")?;
     get_asset(asset_ref)
 }
 
-pub(crate) fn get_asset(asset_ref: &str) -> Result<String> {
+pub(crate) fn get_asset(asset_ref: &str) -> Result<JsonValue> {
     let conn = open_read()?;
     let mut stmt = conn.prepare(
         r#"
-        SELECT asset_ref, doc_id, source_path, relative_path, media_type,
-               alt, title, sha256, bytes
+        SELECT doc_id, media_type, alt, title, bytes, data
         FROM document_assets
         WHERE asset_ref = ?
         "#,
     )?;
     let mut rows = stmt.query([asset_ref])?;
     let Some(row) = rows.next()? else {
-        return Ok(format!("_Asset not found: `{}`_", asset_ref));
+        return Ok(json!([
+            { "type": "text", "text": format!("_Asset not found: `{}`_", asset_ref) }
+        ]));
     };
-    let relative_path: String = row.get("relative_path")?;
-    let path = live_dir()?.join(&relative_path);
-    if !path.exists() {
-        bail!("asset file missing for {asset_ref}: {}", path.display());
-    }
-    let out = DocumentAssetOut {
-        asset_ref: row.get("asset_ref")?,
-        doc_id: row.get("doc_id")?,
-        source_path: row.get("source_path")?,
-        relative_path,
-        media_type: row.get("media_type")?,
-        alt: row.get("alt")?,
-        title: row.get("title")?,
-        sha256: row.get("sha256")?,
-        bytes: row.get("bytes")?,
-        path: path.display().to_string(),
+    let doc_id: String = row.get("doc_id")?;
+    let media_type: Option<String> = row.get("media_type")?;
+    let alt: Option<String> = row.get("alt")?;
+    let title: Option<String> = row.get("title")?;
+    let bytes: i64 = row.get("bytes")?;
+    let data: Vec<u8> = row.get("data")?;
+
+    let mime = media_type
+        .clone()
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let caption = match alt.as_deref().or(title.as_deref()) {
+        Some(label) if !label.is_empty() => {
+            format!("Asset `{asset_ref}` ({mime}, {bytes} bytes) from `{doc_id}`: {label}")
+        }
+        _ => format!("Asset `{asset_ref}` ({mime}, {bytes} bytes) from `{doc_id}`"),
     };
-    Ok(serde_json::to_string_pretty(&out)?)
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+    Ok(json!([
+        { "type": "text", "text": caption },
+        { "type": "image", "data": b64, "mimeType": mime },
+    ]))
 }
 
 pub(crate) fn get_doc_anchors_mcp(args: &JsonValue) -> Result<String> {

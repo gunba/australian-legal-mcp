@@ -6,7 +6,6 @@ use crate::html::{
     assets_html_escape, doc_id_from_ato_link, extract_attr,
 };
 use crate::pit_to_date;
-use base64::Engine as _;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -906,22 +905,18 @@ pub(crate) fn extract_currency(html: &str) -> CurrencyInfo {
 // ----- Image asset extraction (port of extract.py:_rewrite_images_html) -----
 //
 // Walks <img> tags in cleaned HTML, reads referenced files (src resolved
-// against source_path's parent), SHA256-hashes + base64-encodes them, emits
+// against source_path's parent), SHA256-hashes the bytes, emits
 // ExtractedAsset records and rewrites the HTML so each <img> becomes a
 // <span data-asset-ref="..." data-media-type="...">[image: alt]</span>.
-// Mirrors src/ato_mcp/indexer/extract.py:_rewrite_images_html.
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct ExtractedAsset {
     pub(crate) asset_ref: String,
-    pub(crate) source_path: String,
-    pub(crate) relative_path: String,
     pub(crate) media_type: Option<String>,
     pub(crate) alt: Option<String>,
     pub(crate) title: Option<String>,
     pub(crate) sha256: String,
-    pub(crate) size: u64,
-    pub(crate) data_b64: String,
+    pub(crate) data: Vec<u8>,
 }
 
 pub(crate) fn assets_url_encode_doc_id(doc_id: &str) -> String {
@@ -961,39 +956,6 @@ pub(crate) fn assets_guess_media_type(src: &str) -> Option<String> {
         "ico" => Some("image/vnd.microsoft.icon".to_string()),
         _ => None,
     }
-}
-
-pub(crate) fn assets_extension_from_media_type(mt: &Option<String>) -> &'static str {
-    match mt.as_deref() {
-        Some("image/png") => ".png",
-        Some("image/jpeg") => ".jpg",
-        Some("image/gif") => ".gif",
-        Some("image/svg+xml") => ".svg",
-        Some("image/webp") => ".webp",
-        Some("image/bmp") => ".bmp",
-        Some("image/vnd.microsoft.icon") => ".ico",
-        _ => ".bin",
-    }
-}
-
-pub(crate) fn assets_relative_path(data: &[u8], src: &str, media_type: &Option<String>) -> (String, String) {
-    let mut h = Sha256::new();
-    h.update(data);
-    let sha_full = h.finalize();
-    let sha = sha_full
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    let path = src.split('?').next().unwrap_or(src);
-    let mut suffix = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| format!(".{}", s.to_lowercase()))
-        .unwrap_or_default();
-    if suffix.is_empty() || suffix.len() > 10 {
-        suffix = assets_extension_from_media_type(media_type).to_string();
-    }
-    (format!("assets/{}/{}{}", &sha[..2], sha, suffix), sha)
 }
 
 pub(crate) fn assets_resolve_path(source_path: Option<&Path>, src: &str) -> Option<PathBuf> {
@@ -1049,19 +1011,16 @@ pub(crate) fn rewrite_images_html(
             }
             let media_type = assets_guess_media_type(&src);
             let mut asset_ref: Option<String> = None;
-            if let (Some(d), Some(did)) = (data.as_ref(), doc_id) {
+            if let (Some(d), Some(did)) = (data, doc_id) {
                 let r = assets_asset_ref(did, image_ord);
-                let (relpath, sha) = assets_relative_path(d, &src, &media_type);
+                let sha = format!("{:x}", Sha256::digest(&d));
                 assets.push(ExtractedAsset {
                     asset_ref: r.clone(),
-                    source_path: src.clone(),
-                    relative_path: relpath,
                     media_type: media_type.clone(),
                     alt: alt.clone(),
                     title: title.clone(),
                     sha256: sha,
-                    size: d.len() as u64,
-                    data_b64: base64::engine::general_purpose::STANDARD.encode(d),
+                    data: d,
                 });
                 asset_ref = Some(r);
                 image_ord += 1;
