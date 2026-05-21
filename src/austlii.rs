@@ -1,100 +1,49 @@
-//! AustLII fetch and search via wreq's Chrome TLS impersonation.
+//! AustLII fetch and search.
 //!
-//! AustLII is fronted by Cloudflare. Document URLs on `classic.austlii.edu.au`
-//! return clean 200s with a browser-grade TLS fingerprint and User-Agent;
-//! the SINO search CGI (`sinosrch.cgi`) is gated everywhere and needs a
-//! `cf_clearance` cookie acquired by clearing the JS challenge in a real
-//! browser. We use the `wreq` crate (BoringSSL-backed TLS fingerprint
-//! impersonation) plus the user's actual UA and the cookies persisted by
-//! `ato-mcp austlii setup` to look like the user's own browser.
+//! AustLII is fronted by Cloudflare. Document URLs on
+//! `classic.austlii.edu.au` return clean 200s with a browser-grade
+//! User-Agent over standard TLS; the SINO search CGI (`sinosrch.cgi`)
+//! is gated everywhere and needs a `cf_clearance` cookie acquired by
+//! clearing the JS challenge in a real browser. We use system TLS
+//! (`reqwest` + `native-tls`, the same TLS stack `curl` uses on Linux
+//! / macOS, and SChannel on Windows) plus the user's actual UA and
+//! the cookies persisted by `ato-mcp austlii setup`, so requests
+//! look indistinguishable from the user's own browser pulling the
+//! same URL.
 //!
 //! See README.md "AustLII access" for the setup flow.
 
-use crate::browser::{self, BrowserFamily, DetectedBrowser};
+use crate::browser::{self, DetectedBrowser};
 use crate::chunker::{chunk_html, EMBED_MAX_TOKENS};
 use crate::cookies::{self, AustliiSession};
 use crate::ocr;
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
+use reqwest::blocking::Client;
 use scraper::{ElementRef, Html, Selector};
 use serde_json::{json, Value as JsonValue};
 use std::sync::OnceLock;
 use std::time::Duration;
-use tokio::runtime::Runtime;
-use wreq::Client;
-use wreq_util::Emulation;
 
 const FETCH_TIMEOUT_SECS: u64 = 30;
 const SEARCH_TIMEOUT_SECS: u64 = 30;
 const AUSTLII_REFERER: &str = "https://classic.austlii.edu.au/";
 const AUSTLII_SEARCH_FORM_REFERER: &str = "https://www.austlii.edu.au/forms/search1.html";
+const ACCEPT_HTML: &str =
+    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+const ACCEPT_LANGUAGE: &str = "en-AU,en;q=0.9";
 const SETUP_REQUIRED_HINT: &str =
     "Run `ato-mcp austlii setup` to acquire or refresh the AustLII session cookie.";
 const PDF_TEXT_MIN_CHARS: usize = 100;
 const OCR_WARNING: &str =
     "Text extracted via Tesseract OCR — may contain errors. Verify against the canonical source.";
 
-static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-
-fn runtime() -> Result<&'static Runtime> {
-    if let Some(rt) = RUNTIME.get() {
-        return Ok(rt);
-    }
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .thread_name("austlii")
-        .build()
-        .context("building tokio runtime for AustLII")?;
-    Ok(RUNTIME.get_or_init(|| rt))
-}
-
-fn detected_to_emulation(browser: &DetectedBrowser) -> Emulation {
-    let major: u32 = browser
-        .version
-        .split('.')
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    match browser.family {
-        BrowserFamily::Chromium => match major {
-            137 => Emulation::Chrome137,
-            136 => Emulation::Chrome136,
-            135 => Emulation::Chrome135,
-            134 => Emulation::Chrome134,
-            133 => Emulation::Chrome133,
-            132 => Emulation::Chrome132,
-            131 => Emulation::Chrome131,
-            130 => Emulation::Chrome130,
-            129 => Emulation::Chrome129,
-            128 => Emulation::Chrome128,
-            127 => Emulation::Chrome127,
-            126 => Emulation::Chrome126,
-            _ => Emulation::Chrome137,
-        },
-        BrowserFamily::Firefox => match major {
-            139 => Emulation::Firefox139,
-            136 => Emulation::Firefox136,
-            135 => Emulation::Firefox135,
-            133 => Emulation::Firefox133,
-            128 => Emulation::Firefox128,
-            _ => Emulation::Firefox139,
-        },
-        BrowserFamily::Safari => match major {
-            18 => Emulation::Safari18_5,
-            17 => Emulation::Safari17_5,
-            16 => Emulation::Safari16_5,
-            _ => Emulation::Safari18_5,
-        },
-    }
-}
-
-fn build_client(emulation: Emulation, timeout_secs: u64) -> Result<Client> {
+fn build_client(user_agent: &str, timeout_secs: u64) -> Result<Client> {
     Client::builder()
-        .emulation(emulation)
+        .user_agent(user_agent)
         .timeout(Duration::from_secs(timeout_secs))
         .build()
-        .context("building wreq client for AustLII")
+        .context("building HTTP client for AustLII")
 }
 
 fn format_cookie_header(session: &AustliiSession) -> Option<String> {
@@ -109,37 +58,28 @@ fn format_cookie_header(session: &AustliiSession) -> Option<String> {
     Some(pairs.join("; "))
 }
 
-/// Fetch an AustLII case or legislation document and return chunks in the
-/// shared `fetch` response shape. `path` is the AustLII canonical path
-/// stripped of the host (e.g. `au/cases/cth/HCA/1992/23`); we append `.html`
-/// and prefix the classic host.
+/// Fetch an AustLII case or legislation document and return chunks in
+/// the shared `fetch` response shape. `path` is the AustLII canonical
+/// path stripped of the host (e.g. `au/cases/cth/HCA/1992/23`); we
+/// append `.html` and prefix the classic host.
 ///
 /// When the response is a scanned PDF and `allow_ocr` is true, the PDF
 /// goes through Tesseract OCR via `crate::ocr`. With `allow_ocr=false`
 /// (the default) we surface a clear error so callers can opt in
-/// explicitly — OCR can take 10-30s and risks tripping the MCP request
-/// timeout if the client isn't configured for it.
+/// explicitly — OCR can take 10-30s and risks tripping the MCP
+/// request timeout if the client isn't configured for it.
 pub(crate) fn fetch_austlii_doc(path: &str, allow_ocr: bool) -> Result<String> {
-    runtime()?.block_on(fetch_austlii_doc_async(path, allow_ocr))
-}
-
-async fn fetch_austlii_doc_async(path: &str, allow_ocr: bool) -> Result<String> {
     let browser = browser::detect().context(
         "detecting default browser for AustLII fetch; set ATO_MCP_BROWSER to override",
     )?;
     let session = cookies::load_session()?;
-    let emulation = detected_to_emulation(browser);
-    let client = build_client(emulation, FETCH_TIMEOUT_SECS)?;
+    let client = build_client(&browser.user_agent, FETCH_TIMEOUT_SECS)?;
 
     let url = format!("https://classic.austlii.edu.au/{path}.html");
     let mut req = client
         .get(&url)
-        .header("User-Agent", browser.user_agent.as_str())
-        .header(
-            "Accept",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        )
-        .header("Accept-Language", "en-AU,en;q=0.9")
+        .header("Accept", ACCEPT_HTML)
+        .header("Accept-Language", ACCEPT_LANGUAGE)
         .header("Referer", AUSTLII_REFERER);
     if let Some(s) = session.as_ref() {
         if let Some(cookie_header) = format_cookie_header(s) {
@@ -148,7 +88,6 @@ async fn fetch_austlii_doc_async(path: &str, allow_ocr: bool) -> Result<String> 
     }
     let resp = req
         .send()
-        .await
         .with_context(|| format!("fetching {url}"))?;
     let status = resp.status();
     if status.as_u16() == 403 {
@@ -162,7 +101,6 @@ async fn fetch_austlii_doc_async(path: &str, allow_ocr: bool) -> Result<String> 
     }
     let bytes = resp
         .bytes()
-        .await
         .with_context(|| format!("reading response body from {url}"))?;
 
     if is_pdf_bytes(&bytes) {
@@ -275,10 +213,11 @@ pub(crate) struct CleanedAustliiDoc {
     pub(crate) title: Option<String>,
 }
 
-/// AustLII pages are simple XHTML-ish HTML. Pull the `<title>`, take the
-/// `<body>` inner HTML, then regex out the noise elements so the chunker
-/// doesn't churn on them. AustLII doesn't use a dedicated content container
-/// the way ATO's `#LawContent` does — the whole body is the content.
+/// AustLII pages are simple XHTML-ish HTML. Pull the `<title>`, take
+/// the `<body>` inner HTML, then regex out the noise elements so the
+/// chunker doesn't churn on them. AustLII doesn't use a dedicated
+/// content container the way ATO's `#LawContent` does — the whole
+/// body is the content.
 pub(crate) fn clean_austlii_html(html: &str) -> CleanedAustliiDoc {
     let doc = Html::parse_document(html);
     let title_selector = Selector::parse("title").expect("valid selector");
@@ -310,11 +249,11 @@ fn strip_austlii_noise(html: &str) -> String {
     let script = SCRIPT_RE.get_or_init(|| {
         Regex::new(r"(?is)<script\b[^>]*>.*?</script>").expect("valid regex")
     });
-    let style =
-        STYLE_RE.get_or_init(|| Regex::new(r"(?is)<style\b[^>]*>.*?</style>").expect("valid regex"));
+    let style = STYLE_RE
+        .get_or_init(|| Regex::new(r"(?is)<style\b[^>]*>.*?</style>").expect("valid regex"));
     let nav = NAV_RE.get_or_init(|| Regex::new(r"(?is)<nav\b[^>]*>.*?</nav>").expect("valid regex"));
-    let comment =
-        COMMENT_RE.get_or_init(|| Regex::new(r"(?is)<!--.*?-->").expect("valid regex"));
+    let comment = COMMENT_RE
+        .get_or_init(|| Regex::new(r"(?is)<!--.*?-->").expect("valid regex"));
     let s = script.replace_all(html, "").to_string();
     let s = style.replace_all(&s, "").to_string();
     let s = nav.replace_all(&s, "").to_string();
@@ -333,19 +272,15 @@ pub(crate) struct SearchAustliiOptions {
 }
 
 /// SINO search over AustLII. Returns hits as `{title, fetch_uri,
-/// neutral_citation, reported_citation, summary, url}` plus a small
-/// `meta` envelope. Citations are extracted from result titles using
-/// the AGLC4-stable neutral citation grammar; no hand-maintained
-/// court-to-URL mappings are involved.
+/// neutral_citation, reported_citation, summary, url, jurisdiction}`
+/// plus a small `meta` envelope. Citations are extracted from result
+/// titles using the AGLC4-stable neutral citation grammar; no
+/// hand-maintained court-to-URL mappings are involved.
 pub(crate) fn search_austlii(query: &str, opts: SearchAustliiOptions) -> Result<String> {
-    runtime()?.block_on(search_austlii_async(query, opts))
-}
-
-async fn search_austlii_async(query: &str, opts: SearchAustliiOptions) -> Result<String> {
     if query.trim().is_empty() {
         bail!("search_austlii: query string is empty");
     }
-    let browser = browser::detect()?;
+    let browser: &DetectedBrowser = browser::detect()?;
     let session = cookies::load_session()?.ok_or_else(|| {
         anyhow!("search_austlii: no AustLII session on disk. {SETUP_REQUIRED_HINT}")
     })?;
@@ -373,20 +308,14 @@ async fn search_austlii_async(query: &str, opts: SearchAustliiOptions) -> Result
         }
     }
 
-    let emulation = detected_to_emulation(browser);
-    let client = build_client(emulation, SEARCH_TIMEOUT_SECS)?;
+    let client = build_client(&browser.user_agent, SEARCH_TIMEOUT_SECS)?;
     let resp = client
         .get(url.as_str())
-        .header("User-Agent", browser.user_agent.as_str())
-        .header(
-            "Accept",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        )
-        .header("Accept-Language", "en-AU,en;q=0.9")
+        .header("Accept", ACCEPT_HTML)
+        .header("Accept-Language", ACCEPT_LANGUAGE)
         .header("Referer", AUSTLII_SEARCH_FORM_REFERER)
         .header("Cookie", cookie_header)
         .send()
-        .await
         .with_context(|| format!("issuing AustLII search request {}", url.as_str()))?;
     let status = resp.status();
     if status.as_u16() == 403 {
@@ -404,7 +333,6 @@ async fn search_austlii_async(query: &str, opts: SearchAustliiOptions) -> Result
     }
     let body = resp
         .text()
-        .await
         .context("reading AustLII search response body")?;
     let hits = parse_search_results(&body);
     Ok(serde_json::to_string_pretty(&json!({
@@ -439,7 +367,7 @@ fn parse_search_results(html: &str) -> Vec<SearchHit> {
     let item_selector =
         Selector::parse("li[data-count].multi").expect("valid SINO result selector");
     doc.select(&item_selector)
-        .filter_map(|node| parse_search_hit(node))
+        .filter_map(parse_search_hit)
         .collect()
 }
 
@@ -536,7 +464,8 @@ fn extract_neutral_citation(title: &str) -> Option<String> {
         Regex::new(r"\[(\d{4})\]\s+([A-Za-z][A-Za-z0-9]+)\s+(\d+)")
             .expect("valid neutral citation regex")
     });
-    re.captures(title).map(|c| format!("[{}] {} {}", &c[1], &c[2], &c[3]))
+    re.captures(title)
+        .map(|c| format!("[{}] {} {}", &c[1], &c[2], &c[3]))
 }
 
 fn extract_reported_citation(title: &str) -> Option<String> {
@@ -552,7 +481,6 @@ fn extract_reported_citation(title: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::browser::BrowserFamily;
 
     #[test]
     fn is_pdf_bytes_recognises_magic() {
@@ -608,28 +536,6 @@ mod tests {
             format_cookie_header(&session).as_deref(),
             Some("cf_clearance=abc; session=xyz"),
         );
-    }
-
-    #[test]
-    fn detected_to_emulation_picks_chrome_version() {
-        let detected = DetectedBrowser {
-            name: "Google Chrome".to_string(),
-            version: "136.0.7103.93".to_string(),
-            family: BrowserFamily::Chromium,
-            user_agent: "...".to_string(),
-        };
-        assert_eq!(detected_to_emulation(&detected), Emulation::Chrome136);
-    }
-
-    #[test]
-    fn detected_to_emulation_falls_back_to_newest_for_old_chrome() {
-        let detected = DetectedBrowser {
-            name: "Google Chrome".to_string(),
-            version: "90.0.0.0".to_string(),
-            family: BrowserFamily::Chromium,
-            user_agent: "...".to_string(),
-        };
-        assert_eq!(detected_to_emulation(&detected), Emulation::Chrome137);
     }
 
     #[test]
@@ -757,4 +663,3 @@ mod tests {
         assert_eq!(hits[1].neutral_citation.as_deref(), Some("[1966] HCA 48"));
     }
 }
-
