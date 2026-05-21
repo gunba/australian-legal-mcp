@@ -141,7 +141,6 @@ pub(crate) fn init_db(conn: &Connection) -> Result<()> {
             alt        TEXT,
             title      TEXT,
             sha256     TEXT NOT NULL,
-            bytes      INTEGER NOT NULL,
             data       BLOB NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_assets_doc ON document_assets(doc_id);

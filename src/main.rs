@@ -2183,7 +2183,7 @@ mod tests {
         )?;
         let asset_bytes: &[u8] = b"GIF89a-fake-payload";
         conn.execute(
-            "INSERT INTO document_assets(asset_ref, doc_id, media_type, alt, title, sha256, bytes, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO document_assets(asset_ref, doc_id, media_type, alt, title, sha256, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
             params![
                 "ato-image://DOC_HTML/0",
                 "DOC_HTML",
@@ -2191,7 +2191,6 @@ mod tests {
                 Option::<String>::None,
                 "Diagram",
                 format!("{:x}", Sha256::digest(asset_bytes)),
-                asset_bytes.len() as i64,
                 asset_bytes,
             ],
         )?;
@@ -2979,7 +2978,7 @@ mod tests {
 
     // ===== Wave 2 ===========================================================
 
-    // ----- Schema v8 -----
+    // ----- Schema v10 -----
 
     #[test]
     fn schema_init_writes_v10_metadata() -> Result<()> {

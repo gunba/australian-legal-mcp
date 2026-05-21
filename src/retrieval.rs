@@ -4,7 +4,7 @@
 //! the `derive_citations` build helper and `load_cited_by` reader.
 
 use crate::chunker::{chunk_html, EMBED_MAX_TOKENS};
-use crate::config::{data_dir};
+use crate::config::data_dir;
 use crate::db::{canonical_url, decompress_text, open_read, table_exists};
 use crate::extract::{extract_anchors, normalize_definition_term};
 use crate::html::clean_ato_html;
@@ -829,7 +829,7 @@ pub(crate) fn get_asset(asset_ref: &str) -> Result<JsonValue> {
     let conn = open_read()?;
     let mut stmt = conn.prepare(
         r#"
-        SELECT doc_id, media_type, alt, title, bytes, data
+        SELECT doc_id, media_type, alt, title, data
         FROM document_assets
         WHERE asset_ref = ?
         "#,
@@ -844,12 +844,10 @@ pub(crate) fn get_asset(asset_ref: &str) -> Result<JsonValue> {
     let media_type: Option<String> = row.get("media_type")?;
     let alt: Option<String> = row.get("alt")?;
     let title: Option<String> = row.get("title")?;
-    let bytes: i64 = row.get("bytes")?;
     let data: Vec<u8> = row.get("data")?;
+    let bytes = data.len();
 
-    let mime = media_type
-        .clone()
-        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let mime = media_type.unwrap_or_else(|| "application/octet-stream".to_string());
     let caption = match alt.as_deref().or(title.as_deref()) {
         Some(label) if !label.is_empty() => {
             format!("Asset `{asset_ref}` ({mime}, {bytes} bytes) from `{doc_id}`: {label}")

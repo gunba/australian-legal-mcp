@@ -1021,8 +1021,8 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         for asset in &assets {
             tx.execute(
                 "INSERT OR REPLACE INTO document_assets
-                    (asset_ref, doc_id, media_type, alt, title, sha256, bytes, data)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    (asset_ref, doc_id, media_type, alt, title, sha256, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
                     asset.asset_ref,
                     doc_id,
@@ -1030,7 +1030,6 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
                     asset.alt,
                     asset.title,
                     asset.sha256,
-                    asset.data.len() as i64,
                     asset.data,
                 ],
             )
