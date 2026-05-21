@@ -17,7 +17,6 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
-const OCR_TIMEOUT_SECS: u64 = 180;
 const OCR_LANGUAGE: &str = "eng";
 const OCR_OEM: &str = "1";
 const OCR_PSM: &str = "3";
@@ -82,11 +81,10 @@ pub(crate) fn ocr_pdf(pdf_bytes: &[u8]) -> Result<String> {
 
 fn run_tesseract(input_path: &str) -> Result<std::process::Output> {
     // tesseract <input> stdout -l eng --oem 1 --psm 3
-    // We can't set a per-process timeout via std::process; tesseract
-    // itself has no --timeout flag. The MCP client's request timeout
+    // tesseract has no `--timeout` flag and `std::process` has no
+    // per-process timeout. The MCP client's request timeout
     // (recommended 120s for OCR-allowed calls; see README) is what
     // bounds us in practice.
-    let _ = OCR_TIMEOUT_SECS;
     Command::new("tesseract")
         .args([input_path, "stdout", "-l", OCR_LANGUAGE, "--oem", OCR_OEM, "--psm", OCR_PSM])
         .output()
