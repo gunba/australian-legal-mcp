@@ -116,6 +116,28 @@ ato-mcp search "research and development tax incentive eligibility" --k 5
 Inside the MCP host, invoke `ato.search` and confirm results include
 `canonical_url` links.
 
+## AustLII Access
+
+The `austlii:` URI scheme for `fetch` and the planned `search_austlii`
+MCP tool reach `*.austlii.edu.au` through Cloudflare's bot management.
+Document fetches against `classic.austlii.edu.au` work with a
+browser-grade User-Agent alone; SINO search requires a `cf_clearance`
+cookie that's tied to a real browser session that's cleared the JS
+challenge.
+
+The user runs `ato-mcp austlii setup` once to grant consent, open
+AustLII in their default browser, and acquire the cookie. The cookie
+and the browser's User-Agent string are persisted to
+`<data_dir>/austlii_session.json` and reused on subsequent MCP calls.
+`ato-mcp austlii status` shows the cached browser, cookie age, and
+cf_clearance presence; `ato-mcp austlii clear` deletes the file.
+
+Override the detected browser with `ATO_MCP_BROWSER=chrome|edge|firefox`
+when the registry / xdg-mime lookup returns the wrong default. Safari
+isn't supported by `rookie`; macOS Safari users either override to
+Chrome/Firefox or paste the cookie manually with
+`ato-mcp austlii setup --cookie '<value>'`.
+
 ## Routine Maintenance
 
 `ato-mcp serve` auto-updates the corpus in the background once per week when

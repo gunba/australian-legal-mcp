@@ -40,6 +40,12 @@ zstd = "0.13"
 # outbound fetch path (`fetch` live-fetcher, tree-crawl, link-download,
 # whats-new, update); the MCP transport itself is plain localhost HTTP.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls"] }
+# AustLII integration: rookie reads cf_clearance from the user's actual
+# browser cookie store (Chrome/Edge/Firefox/Safari) so requests look
+# legitimate; open launches the user's default browser during the
+# `austlii setup` consent flow to acquire the cookie.
+rookie = "0.5"
+open = "5"
 
 [features]
 default = []
@@ -47,6 +53,11 @@ cuda = ["ort/cuda"]
 
 [target.'cfg(windows)'.dependencies]
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["load-dynamic", "api-24", "ndarray"] }
+# Windows default-browser detection reads
+# HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice
+# to find the registered ProgID, then resolves the exe path via the
+# corresponding `<ProgID>\shell\open\command` key.
+winreg = "0.55"
 
 [target.'cfg(not(windows))'.dependencies]
 ort = "2.0.0-rc.12"

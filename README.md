@@ -30,6 +30,41 @@ Markdown escaping or rendered-host assumptions. Search chunks are plain
 semantic text derived from the cleaned HTML; heading paths are metadata, and
 internal links/images contribute only useful visible text to search.
 
+## AustLII access (optional)
+
+The `austlii:` URI scheme on the `fetch` tool and the planned
+`search_austlii` MCP tool both reach `*.austlii.edu.au`, which is gated by
+Cloudflare's bot management. Document fetches against
+`classic.austlii.edu.au` succeed with a browser-grade User-Agent alone;
+SINO search additionally requires a `cf_clearance` cookie that's tied to
+a real browser session that has cleared the JS challenge.
+
+Acquire that cookie via a one-time consent flow:
+
+```bash
+ato-mcp austlii setup       # opens your default browser, reads cf_clearance
+ato-mcp austlii status      # show cached browser, cookie age, cf_clearance presence
+ato-mcp austlii clear       # delete the persisted session
+```
+
+The setup command detects your default browser, prints what will happen,
+asks for `y/N` consent, opens `classic.austlii.edu.au` in your browser,
+waits for you to press Enter, then reads AustLII cookies via the
+[`rookie`](https://crates.io/crates/rookie) crate and saves them to
+`$XDG_DATA_HOME/ato-mcp/austlii_session.json` (Linux), `~/Library/Application
+Support/ato-mcp/austlii_session.json` (macOS), or `%APPDATA%\ato-mcp\
+austlii_session.json` (Windows).
+
+If your endpoint blocks cookie extraction (Safari on macOS, or an EDR
+policy on a managed workstation), paste the value manually:
+
+```bash
+ato-mcp austlii setup --cookie "<cf_clearance value from DevTools>"
+```
+
+Override the auto-detected browser with `ATO_MCP_BROWSER=chrome|edge|firefox`
+when the registry / xdg-mime lookup returns something unexpected.
+
 ## Install
 
 `ato-mcp` is shipped as a Rust binary — there is no `pip install ato-mcp`

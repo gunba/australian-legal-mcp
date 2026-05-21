@@ -18,8 +18,10 @@ use std::time::Duration;
 use url::Url;
 
 mod build;
+mod browser;
 mod chunker;
 mod config;
+mod cookies;
 mod db;
 mod extract;
 mod html;
@@ -187,6 +189,12 @@ enum Command {
         uri: String,
         #[arg(long)]
         allow_ocr: bool,
+    },
+    /// Manage the persisted AustLII session cookie used for SINO search
+    /// access through Cloudflare. See AGENTS.md for the consent flow.
+    Austlii {
+        #[command(subcommand)]
+        action: AustliiAction,
     },
     /// In-binary build orchestrator. Reads `pages_dir/index.jsonl` (one
     /// record per line with canonical_id and payload_path), runs each doc
@@ -386,6 +394,28 @@ enum Command {
 enum SortBy {
     Relevance,
     Recency,
+}
+
+#[derive(Subcommand)]
+enum AustliiAction {
+    /// Acquire a Cloudflare clearance cookie from your browser and save
+    /// it to the data directory. Prints a consent prompt before opening
+    /// your browser unless `--yes` is passed.
+    Setup {
+        /// Skip browser launch + automatic extraction and accept a
+        /// manually-pasted cf_clearance value. Useful for Safari or
+        /// EDR-locked endpoints where rookie can't read the cookie store.
+        #[arg(long, value_name = "VALUE")]
+        cookie: Option<String>,
+        /// Skip the interactive consent prompt (for scripted use).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Print the persisted session's browser, cookie age, and
+    /// cf_clearance presence.
+    Status,
+    /// Delete the persisted session file.
+    Clear,
 }
 
 impl SortBy {
@@ -597,6 +627,7 @@ fn main() -> Result<()> {
             println!("{}", fetch(&uri, allow_ocr)?);
             Ok(())
         }
+        Command::Austlii { action } => austlii_command(action),
         Command::Build {
             pages_dir,
             db_path,
@@ -1801,6 +1832,166 @@ pub(crate) fn optional_string_array(args: &JsonValue, name: &str) -> Result<Opti
         );
     }
     Ok(Some(out))
+}
+
+fn austlii_command(action: AustliiAction) -> Result<()> {
+    match action {
+        AustliiAction::Setup { cookie, yes } => austlii_setup(cookie.as_deref(), yes),
+        AustliiAction::Status => austlii_status(),
+        AustliiAction::Clear => austlii_clear(),
+    }
+}
+
+fn austlii_setup(manual_cookie: Option<&str>, skip_prompt: bool) -> Result<()> {
+    use std::io::Write;
+
+    let browser = browser::detect()
+        .context("detecting default browser; set ATO_MCP_BROWSER=chrome|edge|firefox to override")?;
+    println!("Detected browser: {} {}", browser.name, browser.version);
+    println!("User agent: {}", browser.user_agent);
+    println!();
+
+    let session_path = cookies::session_file_path()?;
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+    if let Some(cookie_value) = manual_cookie {
+        let session = cookies::AustliiSession {
+            acquired_at: now,
+            browser_name: format!("{} (manual cookie)", browser.name),
+            user_agent: browser.user_agent.clone(),
+            cookies: vec![cookies::NamedCookie {
+                domain: "www.austlii.edu.au".to_string(),
+                name: "cf_clearance".to_string(),
+                value: cookie_value.to_string(),
+                expires: None,
+            }],
+        };
+        cookies::save_session(&session)?;
+        println!("Saved manually-pasted cf_clearance to {}", session_path.display());
+        return Ok(());
+    }
+
+    println!("ato-mcp needs a Cloudflare clearance cookie from your browser to access");
+    println!("AustLII's SINO search endpoint. This will:");
+    println!("  1. Open https://classic.austlii.edu.au/ in your default browser");
+    println!("  2. Wait for you to confirm the page loaded (and any JS challenge cleared)");
+    println!(
+        "  3. Read AustLII cookies from {}",
+        browser.family.cookie_source_label()
+    );
+    println!("  4. Save them to {}", session_path.display());
+
+    if !skip_prompt {
+        print!("\nContinue? [y/N] ");
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        let answer = line.trim().to_lowercase();
+        if answer != "y" && answer != "yes" {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    println!("\nLaunching browser…");
+    open::that("https://classic.austlii.edu.au/")
+        .context("launching default browser via the `open` crate")?;
+
+    println!("\nWhen the AustLII page has fully loaded (including any Cloudflare challenge),");
+    println!("press Enter here to read the cookies.");
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+
+    println!(
+        "\nReading cookies from {} ({})…",
+        browser.name,
+        browser.family.cookie_source_label()
+    );
+    let cookies = cookies::read_browser_cookies().context(
+        "reading AustLII cookies from browser; if your endpoint blocks cookie access \
+         re-run with `--cookie '<value pasted from DevTools>'`",
+    )?;
+    let cookies = match cookies {
+        Some(c) => c,
+        None => {
+            bail!(
+                "no AustLII cookies found in {}. The browser may not have visited the \
+                 page successfully, or your cookies live in a profile we can't see. \
+                 Try `ato-mcp austlii setup --cookie '<value pasted from DevTools>'` \
+                 as a manual fallback.",
+                browser.name
+            );
+        }
+    };
+
+    let has_cf_clearance = cookies
+        .iter()
+        .any(|c| c.name.eq_ignore_ascii_case("cf_clearance"));
+    let cookie_count = cookies.len();
+
+    let session = cookies::AustliiSession {
+        acquired_at: now,
+        browser_name: browser.name.clone(),
+        user_agent: browser.user_agent.clone(),
+        cookies,
+    };
+    cookies::save_session(&session)?;
+    println!(
+        "Saved {} cookies to {}",
+        cookie_count,
+        session_path.display()
+    );
+
+    if !has_cf_clearance {
+        println!();
+        println!("WARNING: no cf_clearance cookie was found. AustLII search will hit the");
+        println!("Cloudflare challenge until one is present. Click through any AustLII");
+        println!("challenge page in your browser, then re-run `ato-mcp austlii setup`.");
+    } else {
+        println!("\nReady. `ato-mcp search-austlii \"<query>\"` will now use this session.");
+    }
+    Ok(())
+}
+
+fn austlii_status() -> Result<()> {
+    let session = cookies::load_session()?;
+    match session {
+        None => {
+            println!("No persisted AustLII session.");
+            println!("Run `ato-mcp austlii setup` to acquire one.");
+        }
+        Some(s) => {
+            println!("Session file: {}", cookies::session_file_path()?.display());
+            println!("Acquired at:  {}", s.acquired_at);
+            println!("Browser:      {}", s.browser_name);
+            println!("User agent:   {}", s.user_agent);
+            println!("Cookies:      {}", s.cookies.len());
+            match cookies::cf_clearance(&s) {
+                Some(value) => {
+                    let mask = if value.len() > 12 {
+                        format!("{}…{}", &value[..6], &value[value.len() - 6..])
+                    } else {
+                        "(redacted)".to_string()
+                    };
+                    println!("cf_clearance: present ({mask})");
+                }
+                None => println!("cf_clearance: MISSING"),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn austlii_clear() -> Result<()> {
+    let path = cookies::session_file_path()?;
+    let existed = path.exists();
+    cookies::clear_session()?;
+    if existed {
+        println!("Cleared session at {}", path.display());
+    } else {
+        println!("No session to clear (file {} did not exist).", path.display());
+    }
+    Ok(())
 }
 
 
