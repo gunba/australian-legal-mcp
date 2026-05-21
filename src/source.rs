@@ -281,7 +281,7 @@ pub(crate) fn description_from_title(title: &str) -> String {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Manifest {
     pub(crate) schema_version: i64,
