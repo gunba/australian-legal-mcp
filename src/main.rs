@@ -121,16 +121,24 @@ struct Cli {
 // here, with no dynamic plugin subcommands or shell-completion surface.
 #[derive(Subcommand)]
 enum Command {
-    /// Run the HTTP MCP server in the foreground. Plugin clients connect to
-    /// `http://127.0.0.1:<port>/mcp`. Default port is 51234; override with
-    /// `--port` if it clashes. The user starts this from their terminal; the
-    /// plugin skill guides the agent to ask the user to start it when not
-    /// already running.
+    /// Run the HTTP MCP server in the foreground. The plugin's `.mcp.json`
+    /// uses `${env:ATO_MCP_PORT}` to discover the port; run `ato-mcp install`
+    /// once after `claude plugin install` to set it up. Port precedence on
+    /// `serve`: `--port` flag > `ATO_MCP_PORT` env var > persisted
+    /// `<data_dir>/http.json` > freshly-picked free port (persisted).
     Serve {
-        #[arg(long, default_value_t = config::DEFAULT_HTTP_PORT)]
-        port: u16,
+        #[arg(long)]
+        port: Option<u16>,
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
+    },
+    /// One-shot setup: pick a free port (or accept `--port`), persist it to
+    /// `<data_dir>/http.json`, and print the `export ATO_MCP_PORT=<port>`
+    /// line the user adds to their shell rc. The plugin's `.mcp.json`
+    /// resolves to the chosen URL via env-var expansion.
+    Install {
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// Download or refresh the local corpus. Always performs a full
     /// replacement; there is no partial-update path.
@@ -427,12 +435,14 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve { port, bind } => {
+            let port = config::resolve_serve_port(port)?;
             let state = ServerState {
                 update_notice: resolve_startup_update_notice(),
                 ..Default::default()
             };
             serve(port, &bind, Arc::new(state))
         }
+        Command::Install { port } => install_http(port),
         Command::Update {} => {
             let stats = apply_update(&default_manifest_url())?;
             println!(
@@ -1299,6 +1309,33 @@ fn stage_hf_embedding_model(repo: &str, revision: &str, staging: &Path) -> Resul
         fs::rename(source, dest)?;
     }
     let _ = fs::remove_dir_all(download_dir);
+    Ok(())
+}
+
+fn install_http(port_override: Option<u16>) -> Result<()> {
+    let port = match port_override {
+        Some(p) => p,
+        None => match config::HttpConfig::load()? {
+            Some(cfg) => cfg.port,
+            None => config::pick_free_port()?,
+        },
+    };
+    let cfg = config::HttpConfig {
+        bind: "127.0.0.1".to_string(),
+        port,
+    };
+    cfg.save()?;
+    let path = config::http_config_path()?;
+    println!("ato-mcp install: persisted port {port} to {}", path.display());
+    println!();
+    println!("Add this to your shell rc (~/.bashrc, ~/.zshrc, or equivalent):");
+    println!();
+    println!("    export ATO_MCP_PORT={port}");
+    println!();
+    println!("Then reopen your terminal (and Claude Code) so the plugin's `${{env:ATO_MCP_PORT}}`");
+    println!("resolves to {port}. After that, `ato-mcp serve` will bind the same port.");
+    println!();
+    println!("Plugin URL: {}", cfg.url());
     Ok(())
 }
 

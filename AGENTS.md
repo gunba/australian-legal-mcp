@@ -41,13 +41,26 @@ git clone https://github.com/gunba/ato-mcp.git
 claude plugin install ./ato-mcp
 ```
 
-The plugin's `.mcp.json` points at `http://127.0.0.1:51234/mcp`. The user
-starts the HTTP server from a terminal:
+The plugin's `.mcp.json` connects to `http://127.0.0.1:${env:ATO_MCP_PORT}/mcp`.
+Run the one-shot setup once so the env var resolves:
 
 ```bash
-ato-mcp serve              # default port 51234
-ato-mcp serve --port 51235 # alternate port
+ato-mcp install
 ```
+
+`install` picks a free port, persists it, and prints the
+`export ATO_MCP_PORT=<port>` line for the user to add to their shell rc.
+After that, the user starts the HTTP server from a terminal:
+
+```bash
+ato-mcp serve              # binds the persisted port
+ato-mcp serve --port 51235 # explicit override
+```
+
+The plugin includes a skill (`skills/ato-mcp-server/SKILL.md`) that the agent
+loads on ATO-related queries. If the server isn't reachable, the skill
+instructs the agent to ask the user for permission to start it via a
+background `ato-mcp serve` invocation.
 
 On the first MCP `initialize`, the server tells the agent whether the corpus
 is installed. If not, the agent surfaces "run `ato-mcp update`" to the user;
@@ -136,7 +149,7 @@ checkout plus model assets. Don't run them on a user install.
 | Symptom | Fix |
 |---|---|
 | `ato-mcp: command not found` | Put the release binary on `PATH`. |
-| `ato-mcp serve: bind ... already in use` | Pass `--port <other>` and update the plugin's `.mcp.json`. |
+| `ato-mcp serve: bind ... already in use` | Re-run `ato-mcp install --port <other>` and update `ATO_MCP_PORT` in the shell rc to match. |
 | `stats` reports zero documents | `update` didn't complete; rerun after deleting the incomplete `live/` dir. |
 | `search` returns no hits | Confirm `stats` shows `chunks > 0`; use `include_old=true` for older authorities. |
 | `austlii search` returns 403 | The cf_clearance cookie expired. Run `ato-mcp austlii setup` again. |

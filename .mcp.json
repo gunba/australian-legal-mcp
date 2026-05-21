@@ -1,6 +1,6 @@
 {
   "ato": {
     "type": "http",
-    "url": "http://127.0.0.1:51234/mcp"
+    "url": "http://127.0.0.1:${env:ATO_MCP_PORT}/mcp"
   }
 }
