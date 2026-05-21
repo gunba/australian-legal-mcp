@@ -9,7 +9,7 @@ use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtensio
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 #[allow(unused_imports)]
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -969,13 +969,6 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
         args.tag,
     );
     Ok(())
-}
-
-pub(crate) fn model_info_matches(left: &ModelInfo, right: &ModelInfo) -> bool {
-    left.id == right.id
-        && left.sha256 == right.sha256
-        && left.size == right.size
-        && left.url == right.url
 }
 
 fn embedding_model_marker_value(info: &ModelInfo) -> String {
@@ -2335,33 +2328,6 @@ mod tests {
         assert!(
             serde_json::from_value::<Manifest>(with_tokenizer_sha).is_err(),
             "legacy tokenizer_sha256 field must not be silently ignored"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn check_build_checkpoint_requires_matching_source_hash() -> Result<()> {
-        let dir = tempdir()?;
-        let conn = open_write_at(&dir.path().join("ato.db"))?;
-        init_db(&conn)?;
-        drop(conn);
-        let verified = HashSet::new();
-        let base_hashes = HashMap::new();
-        save_build_checkpoint(SaveBuildCheckpointArgs {
-            out_dir: dir.path(),
-            source_index_sha256: "source-a",
-            zstd_level: 3,
-            documents: &[],
-            packs: &[],
-            base_documents: &[],
-            base_source_hash_by_doc_id: &base_hashes,
-            verified_source_doc_ids: &verified,
-        })?;
-        check_build_checkpoint(dir.path(), "source-a", 3)?;
-        let err = check_build_checkpoint(dir.path(), "source-b", 3).unwrap_err();
-        assert!(
-            err.to_string().contains("source index hash differs"),
-            "expected source-hash mismatch, got: {err}"
         );
         Ok(())
     }

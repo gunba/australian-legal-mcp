@@ -14,16 +14,15 @@ use crate::extract::anchors_node_text;
 use crate::search::ensure_vector_search_ready;
 use crate::semantic::EMBEDDING_MODEL_HF_FILES;
 use crate::{
-    embedding_model_installed_matches, fetch_bytes, fetch_bytes_with,
-    local_path_from_urlish, model_info_matches, stage_model,
+    fetch_bytes, fetch_bytes_with, stage_model,
     validate_manifest_model_source, UrlContext,
     ATO_USER_AGENT, DEFAULT_EXCLUDED_TYPES, EDITED_PRIVATE_ADVICE_LABEL, EMBEDDING_MODEL_ID, LEGISLATION_TYPE, LEGISLATION_TYPE_PREFIXES,
     OLD_CONTENT_CUTOFF, SUPPORTED_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use reqwest::blocking::Client;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
@@ -471,10 +470,6 @@ impl PathPromotionGuard {
         self.active = false;
         let _ = remove_path_if_exists(&self.backup_path);
     }
-
-    fn backup_path(&self) -> &Path {
-        &self.backup_path
-    }
 }
 
 impl Drop for PathPromotionGuard {
@@ -612,21 +607,6 @@ pub(crate) fn promote_staged_model_files(
     })
 }
 
-pub(crate) fn live_db_requires_rebuild(path: &Path) -> Result<bool> {
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .context("opening local corpus database for schema check")?;
-    if !table_exists(&conn, "meta")? {
-        return Ok(true);
-    }
-    let Some(value) = get_meta(&conn, "schema_version")? else {
-        return Ok(true);
-    };
-    let Ok(parsed) = value.parse::<u32>() else {
-        return Ok(true);
-    };
-    Ok(parsed != SUPPORTED_SCHEMA_VERSION)
-}
-
 
 /// Install path for manifest schema 5+: download the single zstd-compressed
 /// SQLite artifact, decompress to staging, rebuild FTS5 indexes locally from
@@ -749,22 +729,6 @@ pub(crate) fn promote_live_db(staged_db: &Path, backup: &Path) -> Result<PathPro
     Ok(guard)
 }
 
-pub(crate) fn replace_file_cross_platform(src: &Path, dest: &Path, old: &Path) -> Result<()> {
-    if dest.exists() {
-        fs::rename(dest, old)
-            .with_context(|| format!("moving {} to {}", dest.display(), old.display()))?;
-    }
-    if let Err(err) = fs::rename(src, dest) {
-        if old.exists() {
-            let _ = fs::rename(old, dest);
-        }
-        return Err(err)
-            .with_context(|| format!("renaming {} to {}", src.display(), dest.display()));
-    }
-    let _ = remove_path_if_exists(old);
-    Ok(())
-}
-
 pub(crate) fn promote_live_assets(staged_asset_root: &Path, backup: &Path) -> Result<PathPromotionGuard> {
     let live_assets = live_dir()?.join("assets");
     let guard = PathPromotionGuard::backup(live_assets.clone(), backup.to_path_buf())?;
@@ -802,18 +766,6 @@ pub(crate) fn promote_installed_manifest(manifest: &Manifest, backup: &Path) -> 
     Ok(guard)
 }
 
-
-pub(crate) fn semantic_backfill_required_for_model(conn: &Connection, model_id: &str) -> Result<bool> {
-    if model_id != EMBEDDING_MODEL_ID {
-        return Ok(false);
-    }
-    let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?;
-    if chunks == 0 {
-        return Ok(false);
-    }
-    let embeddings = chunk_embedding_count(conn)?;
-    Ok(embeddings < chunks)
-}
 
 pub(crate) fn verify_semantic_install(conn: &Connection, manifest: &Manifest) -> Result<()> {
     if manifest.model.id != EMBEDDING_MODEL_ID {

@@ -400,51 +400,6 @@ pub(crate) fn load_build_checkpoint(
     Ok(Some(checkpoint))
 }
 
-pub(crate) fn check_build_checkpoint(
-    out_dir: &Path,
-    source_index_sha256: &str,
-    zstd_level: i32,
-) -> Result<()> {
-    // Maintainer scripts can resume interrupted build outputs only when the
-    // checkpoint, source index, model, and DB agree exactly.
-    let checkpoint =
-        load_build_checkpoint(out_dir, source_index_sha256, zstd_level)?.ok_or_else(|| {
-            anyhow!(
-                "build checkpoint missing {}",
-                build_checkpoint_path(out_dir).display()
-            )
-        })?;
-    let db_path = out_dir.join("ato.db");
-    if !db_path.exists() {
-        bail!("build checkpoint missing {}", db_path.display());
-    }
-    let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("opening {}", db_path.display()))?;
-    enforce_db_schema_version(&conn)
-        .with_context(|| format!("validating DB schema in {}", db_path.display()))?;
-    let pending_docs = pending_build_doc_count(&conn)?;
-    if pending_docs > 0 {
-        bail!(
-            "build checkpoint has {pending_docs} uncheckpointed PENDING documents at {}",
-            db_path.display()
-        );
-    }
-    let committed_docs = committed_build_doc_count(&conn)?;
-    if committed_docs != checkpoint.documents.len() {
-        bail!(
-            "build checkpoint has {} documents but DB has {committed_docs}",
-            checkpoint.documents.len()
-        );
-    }
-    println!(
-        "build checkpoint resumable: {} ({} docs, {} packs)",
-        out_dir.display(),
-        checkpoint.documents.len(),
-        checkpoint.packs.len()
-    );
-    Ok(())
-}
-
 pub(crate) struct SaveBuildCheckpointArgs<'a> {
     pub(crate) out_dir: &'a Path,
     pub(crate) source_index_sha256: &'a str,
