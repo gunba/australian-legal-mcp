@@ -2144,7 +2144,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_chunks",
-            "description": "Fetch chunk bodies by chunk_id, with optional before/after neighbour chunks. Text may contain `[doc:X]` and `[asset:X]` markers; `[fetch:URI]` flags references that are not in the local corpus and must be retrieved via the `fetch` tool.",
+            "description": "Fetch chunk bodies by chunk_id, with optional before/after neighbours. Text may contain `[doc:X]` (in-corpus) and `[fetch:URI]` (external) markers; `[asset:X]` for images.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2183,7 +2183,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "fetch",
-            "description": "Live-fetch a doc outside the local corpus. `uri` carries the source: `ato:<doc_id>` (with optional `?pit=...&view=...`) or `austlii:<path>`. Use when chunk text contains a `[fetch:URI]` marker. `allow_ocr=true` enables Tesseract OCR for scanned PDFs (slower; set MCP `timeout: 120000`).",
+            "description": "Live-fetch a doc outside the corpus. `uri`: `ato:<doc_id>[?pit=...&view=...]` or `austlii:<path>`. Use when chunk text has `[fetch:URI]`. `allow_ocr=true` enables Tesseract for scanned PDFs (slow; set MCP `timeout: 120000`).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2195,7 +2195,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "search_austlii",
-            "description": "Live-search AustLII via SINO. Returns `{title, fetch_uri, neutral_citation, summary, url, jurisdiction}` hits; pass `fetch_uri` to `fetch`. Requires session from `ato-mcp austlii setup`. Optional `jurisdictions` (e.g. `au/cases/cth/HCA`), `limit` (1-50), `sort_by_date`.",
+            "description": "Live-search AustLII via SINO. Hits include `fetch_uri` to pass to `fetch`. Requires `ato-mcp austlii setup` first. Optional `jurisdictions` (e.g. `au/cases/cth/HCA`), `limit` (1-50), `sort_by_date`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
