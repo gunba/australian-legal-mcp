@@ -113,6 +113,7 @@ help_text="$("$BIN" --help 2>&1)"
 
 # Subcommands that MUST be present.
 for cmd in serve daemon install-http update doctor stats search fetch \
+           austlii search-austlii \
            get-definition build tree-crawl snapshot-reduce link-download scrape-diff \
            bundle-localize-manifest publish-release help; do
     if grep -qE "^[[:space:]]+${cmd}[[:space:]]" <<<"$help_text"; then
@@ -368,7 +369,7 @@ assert_jq_nonempty "initialize: instructions present"   "$init_resp" '.result.in
 
 # 4. tools/list returns exactly the 7 supported tools.
 tools_resp="$(rpc 2 tools/list '')"
-expected_tools=(search get_chunks get_definition get_asset get_doc_anchors fetch stats)
+expected_tools=(search get_chunks get_definition get_asset get_doc_anchors fetch search_austlii stats)
 actual_tools="$(printf '%s' "$tools_resp" | jq -r '.result.tools[].name' 2>/dev/null | sort | tr '\n' ' ')"
 expected_sorted="$(printf '%s\n' "${expected_tools[@]}" | sort | tr '\n' ' ')"
 if [[ "$actual_tools" == "$expected_sorted" ]]; then

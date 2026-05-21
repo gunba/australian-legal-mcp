@@ -54,6 +54,9 @@ open = "5"
 wreq = { version = "5", features = ["cookies"] }
 wreq-util = "2"
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "time"] }
+# Pure-Rust PDF text extraction. AustLII serves some judgments as PDFs;
+# scanned ones (no text layer) fall through to the OCR path in src/ocr.rs.
+pdf-extract = "0.7"
 
 [features]
 default = []

@@ -16,12 +16,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install BoringSSL build deps
+      - name: Install BoringSSL + tesseract build deps
         # wreq is built on boring2 (BoringSSL fork) for TLS fingerprint
         # impersonation against AustLII's Cloudflare-fronted endpoints.
         # BoringSSL's build pulls cmake + perl; pkg-config + libssl-dev cover
-        # the rest of the native-tls + rookie deps.
-        run: sudo apt-get update && sudo apt-get install -y cmake perl pkg-config libssl-dev
+        # the rest of the native-tls + rookie deps. tesseract-ocr is needed
+        # for the scanned-PDF fallback path that the AustLII fetcher uses
+        # when allow_ocr is set.
+        run: sudo apt-get update && sudo apt-get install -y cmake perl pkg-config libssl-dev tesseract-ocr
       - name: Build
         run: cargo build --release --locked
       - name: Clippy

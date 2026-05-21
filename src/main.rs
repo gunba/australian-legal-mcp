@@ -26,6 +26,7 @@ mod austlii;
 mod db;
 mod extract;
 mod html;
+mod ocr;
 mod retrieval;
 mod rules;
 mod search;
@@ -196,6 +197,17 @@ enum Command {
     Austlii {
         #[command(subcommand)]
         action: AustliiAction,
+    },
+    /// Live-search AustLII via the SINO CGI. Requires a session cookie
+    /// from `ato-mcp austlii setup`.
+    SearchAustlii {
+        query: String,
+        #[arg(long, value_delimiter = ',')]
+        jurisdictions: Vec<String>,
+        #[arg(short, long, default_value_t = 10)]
+        k: usize,
+        #[arg(long, default_value_t = false)]
+        sort_by_date: bool,
     },
     /// In-binary build orchestrator. Reads `pages_dir/index.jsonl` (one
     /// record per line with canonical_id and payload_path), runs each doc
@@ -629,6 +641,24 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Austlii { action } => austlii_command(action),
+        Command::SearchAustlii {
+            query,
+            jurisdictions,
+            k,
+            sort_by_date,
+        } => {
+            let opts = austlii::SearchAustliiOptions {
+                jurisdictions: if jurisdictions.is_empty() {
+                    None
+                } else {
+                    Some(jurisdictions)
+                },
+                limit: Some(k),
+                sort_by_date,
+            };
+            println!("{}", austlii::search_austlii(&query, opts)?);
+            Ok(())
+        }
         Command::Build {
             pages_dir,
             db_path,
@@ -1788,6 +1818,18 @@ fn call_tool(params: JsonValue, state: &ServerState) -> Result<JsonValue> {
             let allow_ocr = optional_bool(&args, "allow_ocr").unwrap_or(false);
             fetch(uri, allow_ocr)?
         }
+        "search_austlii" => {
+            let query = required_str(&args, "query")?;
+            let jurisdictions = optional_string_array(&args, "jurisdictions")?;
+            let limit = optional_usize(&args, "limit");
+            let sort_by_date = optional_bool(&args, "sort_by_date").unwrap_or(false);
+            let opts = austlii::SearchAustliiOptions {
+                jurisdictions,
+                limit,
+                sort_by_date,
+            };
+            austlii::search_austlii(query, opts)?
+        }
         _ => bail!("unknown tool: {name}"),
     };
     Ok(json!({
@@ -1996,7 +2038,7 @@ fn austlii_clear() -> Result<()> {
 }
 
 
-const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first. Search hits are chunk pointers, not authority; call `get_chunks` before relying on text. Use `get_doc_anchors` for in-doc navigation, related/history links, and cited-by. Markers in chunk text are self-describing: `[doc:X]` points into the local corpus and is resolved via `get_chunks` / `get_doc_anchors`, while `[fetch:URI]` points outside the corpus and must be retrieved via the `fetch` tool (e.g. `[fetch:ato:LRP/117CLR514]` → `fetch("ato:LRP/117CLR514")`; `[fetch:austlii:au/cases/cth/HCA/1992/23]` → `fetch("austlii:au/cases/cth/HCA/1992/23")`). Pass fetched chunk text to `search(seed_text=...)` to pivot back into the corpus. For historical or withdrawn material, set `current_only=false` and `include_old=true`."##;
+const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first. Search hits are chunk pointers, not authority; call `get_chunks` before relying on text. Use `get_doc_anchors` for in-doc navigation, related/history links, and cited-by. Markers in chunk text are self-describing: `[doc:X]` points into the local corpus and is resolved via `get_chunks` / `get_doc_anchors`, while `[fetch:URI]` points outside the corpus and must be retrieved via the `fetch` tool (e.g. `[fetch:ato:LRP/117CLR514]` → `fetch("ato:LRP/117CLR514")`; `[fetch:austlii:au/cases/cth/HCA/1992/23]` → `fetch("austlii:au/cases/cth/HCA/1992/23")`). For AustLII case/legislation lookup, use `search_austlii` to discover canonical paths from a citation or party name, then pass `fetch_uri` to `fetch`. `fetch(uri, allow_ocr=true)` opts into Tesseract OCR for scanned-PDF responses; the MCP client must allow ~120s for that path. Pass fetched chunk text to `search(seed_text=...)` to pivot back into the corpus. For historical or withdrawn material, set `current_only=false` and `include_old=true`."##;
 
 /// Build the `update_notice` carried in `ServerState` for the lifetime of the
 /// daemon. Runs `check_for_update_availability` and, if a newer corpus is
@@ -2048,9 +2090,9 @@ fn server_instructions(update_notice: Option<&UpdateAvailability>) -> String {
 }
 
 fn tool_descriptors() -> JsonValue {
-    // [SW-01] Seven MCP tools are exposed by tool_descriptors/call_tool:
+    // [SW-01] Eight MCP tools are exposed by tool_descriptors/call_tool:
     // search, get_chunks, get_asset, get_doc_anchors, get_definition, stats,
-    // fetch.
+    // fetch, search_austlii.
     //   The surface stays small and explicit; unsupported tools fail through the
     //   normal tools/call error path.
     json!([
@@ -2149,6 +2191,23 @@ fn tool_descriptors() -> JsonValue {
                     "allow_ocr": {"type": "boolean"}
                 },
                 "required": ["uri"]
+            }
+        },
+        {
+            "name": "search_austlii",
+            "description": "Live-search AustLII via the SINO CGI. Returns hits as `{title, fetch_uri, neutral_citation, reported_citation, summary, url, jurisdiction}` triples; pass `fetch_uri` to the `fetch` tool to retrieve the body. Requires a session cookie acquired via `ato-mcp austlii setup`. Optional `jurisdictions` is a list of AustLII path prefixes (e.g. `au/cases/cth/HCA`); `limit` is clamped to 1..=50; `sort_by_date` switches relevance ranking to most-recent first.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "jurisdictions": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                    "sort_by_date": {"type": "boolean"}
+                },
+                "required": ["query"]
             }
         }
     ])

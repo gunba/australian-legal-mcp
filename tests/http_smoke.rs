@@ -153,6 +153,7 @@ fn initialize_and_tools_list_over_http() -> Result<()> {
         "get_chunks",
         "get_doc_anchors",
         "fetch",
+        "search_austlii",
         "stats",
     ] {
         assert!(

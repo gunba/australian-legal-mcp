@@ -21,7 +21,8 @@ the external URL recorded in the release manifest.
 | `get_chunks` | Fetch exact chunks returned by `search`, with optional neighbor context. `[doc:X]` markers in chunk text point into the local corpus and resolve via `get_chunks` / `get_doc_anchors`; `[fetch:URI]` markers point outside the corpus and must be retrieved via the `fetch` tool. |
 | `get_definition` | Fetch compact statutory definitions for a term, with labelled ordinary-meaning fallback when no statutory definition is found. |
 | `get_asset` | Resolve a retained image `data-asset-ref` to a local file path and source metadata. |
-| `fetch` | Live-fetch a document outside the local corpus. URI scheme carries the source: `ato:<doc_id>[?pit=...&view=...]` for ATO live-fetch, `austlii:<path>` for AustLII (planned). Returned chunks share the `{ord, anchor, text}` shape and `[doc:X]` / `[fetch:URI]` marker convention so navigation stays consistent across the corpus/external boundary. `allow_ocr` opts into Tesseract fallback for scanned-PDF responses. |
+| `fetch` | Live-fetch a document outside the local corpus. URI scheme carries the source: `ato:<doc_id>[?pit=...&view=...]` for ATO live-fetch, `austlii:<path>` for AustLII (via classic.austlii.edu.au + wreq Chrome TLS emulation). Returns the same `{ord, anchor, text}` chunk shape and `[doc:X]` / `[fetch:URI]` marker convention as corpus chunks. `allow_ocr=true` opts into Tesseract OCR for scanned-PDF responses (MCP client should allow ~120s for that path). |
+| `search_austlii` | Live-search AustLII via SINO. Returns hits with `fetch_uri` ready to pass to `fetch`. Requires a cf_clearance session from `ato-mcp austlii setup`. Optional `jurisdictions`, `limit`, `sort_by_date`. |
 | `stats` | Index version, counts, and default search policy. |
 
 JSON results include the ATO `canonical_url`. Document bodies are exposed as
@@ -64,6 +65,36 @@ ato-mcp austlii setup --cookie "<cf_clearance value from DevTools>"
 
 Override the auto-detected browser with `ATO_MCP_BROWSER=chrome|edge|firefox`
 when the registry / xdg-mime lookup returns something unexpected.
+
+### OCR for scanned PDFs
+
+A handful of pre-digital AustLII judgments are served as scanned PDFs with
+no embedded text. Pass `allow_ocr=true` on the `fetch` call (or `--allow-ocr`
+on the CLI) to opt into a Tesseract fallback:
+
+```bash
+ato-mcp fetch "austlii:au/cases/cth/HCA/1953/<scanned>" --allow-ocr
+```
+
+OCR requires `tesseract` on `$PATH` and can take 10-30s per judgment, so the
+MCP client timeout needs to be raised:
+
+```json
+{
+  "mcpServers": {
+    "ato": {
+      "command": "ato-mcp",
+      "args": ["serve"],
+      "timeout": 120000
+    }
+  }
+}
+```
+
+Results are cached at `<data_dir>/ocr_cache/<sha256>.txt`, so repeat fetches
+of the same scanned PDF return instantly. The `fetch` response carries
+`ocr_used: true` and `ocr_warning` when OCR was used — surface that to the
+user so they verify against the canonical source.
 
 ## Install
 

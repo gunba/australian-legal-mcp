@@ -13,9 +13,10 @@
 use crate::browser::{self, BrowserFamily, DetectedBrowser};
 use crate::chunker::{chunk_html, EMBED_MAX_TOKENS};
 use crate::cookies::{self, AustliiSession};
+use crate::ocr;
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
-use scraper::{Html, Selector};
+use scraper::{ElementRef, Html, Selector};
 use serde_json::{json, Value as JsonValue};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -24,14 +25,18 @@ use wreq::Client;
 use wreq_util::Emulation;
 
 const FETCH_TIMEOUT_SECS: u64 = 30;
+const SEARCH_TIMEOUT_SECS: u64 = 30;
 const AUSTLII_REFERER: &str = "https://classic.austlii.edu.au/";
-const SETUP_REQUIRED_HINT: &str = "Run `ato-mcp austlii setup` to refresh the session cookie.";
+const AUSTLII_SEARCH_FORM_REFERER: &str = "https://www.austlii.edu.au/forms/search1.html";
+const SETUP_REQUIRED_HINT: &str =
+    "Run `ato-mcp austlii setup` to acquire or refresh the AustLII session cookie.";
+const PDF_TEXT_MIN_CHARS: usize = 100;
+const OCR_WARNING: &str =
+    "Text extracted via Tesseract OCR — may contain errors. Verify against the canonical source.";
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 fn runtime() -> Result<&'static Runtime> {
-    // Lazy global tokio runtime. wreq is async-only; bridging through
-    // block_on at the FFI boundary keeps the rest of ato-mcp synchronous.
     if let Some(rt) = RUNTIME.get() {
         return Ok(rt);
     }
@@ -44,11 +49,6 @@ fn runtime() -> Result<&'static Runtime> {
     Ok(RUNTIME.get_or_init(|| rt))
 }
 
-/// Pick the wreq `Emulation` profile closest to the user's detected
-/// browser. Falls back to the most recent profile when the detected
-/// major version is older than what wreq-util ships — the goal is to
-/// look like a current real browser, not to perfectly mirror an
-/// outdated one.
 fn detected_to_emulation(browser: &DetectedBrowser) -> Emulation {
     let major: u32 = browser
         .version
@@ -89,10 +89,10 @@ fn detected_to_emulation(browser: &DetectedBrowser) -> Emulation {
     }
 }
 
-fn build_client(emulation: Emulation) -> Result<Client> {
+fn build_client(emulation: Emulation, timeout_secs: u64) -> Result<Client> {
     Client::builder()
         .emulation(emulation)
-        .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(timeout_secs))
         .build()
         .context("building wreq client for AustLII")
 }
@@ -114,20 +114,22 @@ fn format_cookie_header(session: &AustliiSession) -> Option<String> {
 /// stripped of the host (e.g. `au/cases/cth/HCA/1992/23`); we append `.html`
 /// and prefix the classic host.
 ///
-/// `_allow_ocr` is accepted for shape compatibility with the dispatcher
-/// signature — PDF/OCR support lands in the next commit alongside
-/// `search_austlii`.
-pub(crate) fn fetch_austlii_doc(path: &str, _allow_ocr: bool) -> Result<String> {
-    runtime()?.block_on(fetch_austlii_doc_async(path))
+/// When the response is a scanned PDF and `allow_ocr` is true, the PDF
+/// goes through Tesseract OCR via `crate::ocr`. With `allow_ocr=false`
+/// (the default) we surface a clear error so callers can opt in
+/// explicitly — OCR can take 10-30s and risks tripping the MCP request
+/// timeout if the client isn't configured for it.
+pub(crate) fn fetch_austlii_doc(path: &str, allow_ocr: bool) -> Result<String> {
+    runtime()?.block_on(fetch_austlii_doc_async(path, allow_ocr))
 }
 
-async fn fetch_austlii_doc_async(path: &str) -> Result<String> {
+async fn fetch_austlii_doc_async(path: &str, allow_ocr: bool) -> Result<String> {
     let browser = browser::detect().context(
         "detecting default browser for AustLII fetch; set ATO_MCP_BROWSER to override",
     )?;
     let session = cookies::load_session()?;
     let emulation = detected_to_emulation(browser);
-    let client = build_client(emulation)?;
+    let client = build_client(emulation, FETCH_TIMEOUT_SECS)?;
 
     let url = format!("https://classic.austlii.edu.au/{path}.html");
     let mut req = client
@@ -164,10 +166,7 @@ async fn fetch_austlii_doc_async(path: &str) -> Result<String> {
         .with_context(|| format!("reading response body from {url}"))?;
 
     if is_pdf_bytes(&bytes) {
-        bail!(
-            "{url} responded with a PDF. PDF + OCR support lands in a follow-up \
-             commit — for now, open the URL in a browser."
-        );
+        return handle_pdf_response(path, &url, &bytes, allow_ocr);
     }
 
     let html = String::from_utf8_lossy(&bytes).to_string();
@@ -199,6 +198,69 @@ async fn fetch_austlii_doc_async(path: &str) -> Result<String> {
         "ocr_used": false,
         "chunks": chunk_json,
     }))?)
+}
+
+fn handle_pdf_response(
+    path: &str,
+    url: &str,
+    bytes: &[u8],
+    allow_ocr: bool,
+) -> Result<String> {
+    let embedded = extract_pdf_text(bytes).unwrap_or_default();
+    let (text, ocr_used) = if embedded.trim().len() >= PDF_TEXT_MIN_CHARS {
+        (embedded, false)
+    } else if allow_ocr {
+        let ocr_text = ocr::ocr_pdf(bytes)
+            .with_context(|| format!("running OCR over PDF response from {url}"))?;
+        (ocr_text, true)
+    } else {
+        bail!(
+            "{url} is a scanned PDF with no embedded text. Retry with \
+             allow_ocr=true to run Tesseract OCR. OCR can take 10-30s and \
+             will exceed the MCP default 30s request timeout — set \
+             `timeout: 120000` in your MCP client config first."
+        );
+    };
+    let title = derive_pdf_title(path);
+    let chunks = vec![json!({
+        "ord": 0,
+        "anchor": null,
+        "text": text,
+    })];
+    let canonical_uri = format!("austlii:{path}");
+    let mut response = serde_json::Map::new();
+    response.insert("uri".to_string(), JsonValue::String(canonical_uri));
+    response.insert("canonical_url".to_string(), JsonValue::String(url.to_string()));
+    response.insert("title".to_string(), JsonValue::String(title));
+    response.insert("source".to_string(), JsonValue::String("live".to_string()));
+    response.insert("ocr_used".to_string(), JsonValue::Bool(ocr_used));
+    response.insert("chunks".to_string(), JsonValue::Array(chunks));
+    if ocr_used {
+        response.insert(
+            "ocr_warning".to_string(),
+            JsonValue::String(OCR_WARNING.to_string()),
+        );
+    }
+    Ok(serde_json::to_string_pretty(&JsonValue::Object(response))?)
+}
+
+fn extract_pdf_text(bytes: &[u8]) -> Result<String> {
+    pdf_extract::extract_text_from_mem(bytes)
+        .map_err(|e| anyhow!("pdf_extract failed: {e}"))
+}
+
+/// Derive a human-readable title from the AustLII path when the PDF
+/// response carries no usable metadata. `au/cases/cth/HCA/1966/48` →
+/// `"HCA 1966/48"`.
+fn derive_pdf_title(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() >= 5 && parts[1] == "cases" {
+        return format!("{} {}/{}", parts[3], parts[4], parts.last().unwrap_or(&"?"));
+    }
+    if parts.len() >= 2 && parts[1] == "legis" {
+        return path.to_string();
+    }
+    path.to_string()
 }
 
 fn is_pdf_bytes(bytes: &[u8]) -> bool {
@@ -257,6 +319,234 @@ fn strip_austlii_noise(html: &str) -> String {
     let s = style.replace_all(&s, "").to_string();
     let s = nav.replace_all(&s, "").to_string();
     comment.replace_all(&s, "").to_string()
+}
+
+/// Options for `search_austlii`. `jurisdictions` is a list of AustLII path
+/// prefixes (e.g. `au/cases/cth/HCA`) and translates to repeated `mask_path`
+/// query parameters. `limit` is clamped to 1..=50 server-side. `sort_by_date`
+/// toggles `view=date-latest` instead of the default relevance ordering.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct SearchAustliiOptions {
+    pub(crate) jurisdictions: Option<Vec<String>>,
+    pub(crate) limit: Option<usize>,
+    pub(crate) sort_by_date: bool,
+}
+
+/// SINO search over AustLII. Returns hits as `{title, fetch_uri,
+/// neutral_citation, reported_citation, summary, url}` plus a small
+/// `meta` envelope. Citations are extracted from result titles using
+/// the AGLC4-stable neutral citation grammar; no hand-maintained
+/// court-to-URL mappings are involved.
+pub(crate) fn search_austlii(query: &str, opts: SearchAustliiOptions) -> Result<String> {
+    runtime()?.block_on(search_austlii_async(query, opts))
+}
+
+async fn search_austlii_async(query: &str, opts: SearchAustliiOptions) -> Result<String> {
+    if query.trim().is_empty() {
+        bail!("search_austlii: query string is empty");
+    }
+    let browser = browser::detect()?;
+    let session = cookies::load_session()?.ok_or_else(|| {
+        anyhow!("search_austlii: no AustLII session on disk. {SETUP_REQUIRED_HINT}")
+    })?;
+    let cookie_header = format_cookie_header(&session)
+        .ok_or_else(|| anyhow!("session has no cookies. {SETUP_REQUIRED_HINT}"))?;
+    let limit = opts.limit.unwrap_or(10).clamp(1, 50);
+
+    let mut url = url::Url::parse("https://www.austlii.edu.au/cgi-bin/sinosrch.cgi")
+        .expect("static URL parses");
+    {
+        let mut qp = url.query_pairs_mut();
+        qp.append_pair("query", query);
+        qp.append_pair("meta", "/au");
+        qp.append_pair("method", "auto");
+        qp.append_pair("results", &limit.to_string());
+        if opts.sort_by_date {
+            qp.append_pair("view", "date-latest");
+        } else {
+            qp.append_pair("view", "relevance");
+        }
+        if let Some(jurs) = &opts.jurisdictions {
+            for j in jurs {
+                qp.append_pair("mask_path", j);
+            }
+        }
+    }
+
+    let emulation = detected_to_emulation(browser);
+    let client = build_client(emulation, SEARCH_TIMEOUT_SECS)?;
+    let resp = client
+        .get(url.as_str())
+        .header("User-Agent", browser.user_agent.as_str())
+        .header(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .header("Accept-Language", "en-AU,en;q=0.9")
+        .header("Referer", AUSTLII_SEARCH_FORM_REFERER)
+        .header("Cookie", cookie_header)
+        .send()
+        .await
+        .with_context(|| format!("issuing AustLII search request {}", url.as_str()))?;
+    let status = resp.status();
+    if status.as_u16() == 403 {
+        bail!(
+            "AustLII SINO search returned HTTP 403 (Cloudflare challenge). \
+             {SETUP_REQUIRED_HINT}"
+        );
+    }
+    if !status.is_success() {
+        bail!(
+            "AustLII SINO search returned HTTP {} for {}",
+            status.as_u16(),
+            url.as_str()
+        );
+    }
+    let body = resp
+        .text()
+        .await
+        .context("reading AustLII search response body")?;
+    let hits = parse_search_results(&body);
+    Ok(serde_json::to_string_pretty(&json!({
+        "query": query,
+        "hits": hits,
+        "meta": {
+            "source": "austlii.sinosrch",
+            "result_count": hits.len(),
+            "limit": limit,
+            "sort_by": if opts.sort_by_date { "date" } else { "relevance" },
+        },
+    }))?)
+}
+
+#[derive(Debug, serde::Serialize, PartialEq, Eq)]
+pub(crate) struct SearchHit {
+    pub(crate) title: String,
+    pub(crate) fetch_uri: String,
+    pub(crate) url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) neutral_citation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reported_citation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) jurisdiction: Option<String>,
+}
+
+fn parse_search_results(html: &str) -> Vec<SearchHit> {
+    let doc = Html::parse_document(html);
+    let item_selector =
+        Selector::parse("li[data-count].multi").expect("valid SINO result selector");
+    doc.select(&item_selector)
+        .filter_map(|node| parse_search_hit(node))
+        .collect()
+}
+
+fn parse_search_hit(node: ElementRef<'_>) -> Option<SearchHit> {
+    let a_selector = Selector::parse("a").expect("valid selector");
+    let meta_selector = Selector::parse("p.meta").expect("valid selector");
+    let link = node.select(&a_selector).next()?;
+    let href_raw = link.value().attr("href")?;
+    let title: String = link.text().collect::<String>().trim().to_string();
+    if title.is_empty() {
+        return None;
+    }
+    let absolute = absolutise_austlii_url(href_raw);
+    let fetch_uri = austlii_url_to_uri(&absolute)?;
+
+    let summary = node
+        .select(&meta_selector)
+        .next()
+        .map(|n| n.text().collect::<String>().trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let jurisdiction = jurisdiction_from_uri(&fetch_uri);
+    let neutral_citation = extract_neutral_citation(&title);
+    let reported_citation = extract_reported_citation(&title);
+
+    Some(SearchHit {
+        title,
+        fetch_uri,
+        url: absolute,
+        neutral_citation,
+        reported_citation,
+        summary,
+        jurisdiction,
+    })
+}
+
+fn absolutise_austlii_url(href: &str) -> String {
+    if href.starts_with("http://") || href.starts_with("https://") {
+        return href.to_string();
+    }
+    if let Some(rest) = href.strip_prefix("//") {
+        return format!("https://{rest}");
+    }
+    if href.starts_with('/') {
+        return format!("https://www.austlii.edu.au{href}");
+    }
+    format!("https://www.austlii.edu.au/{href}")
+}
+
+/// Translate an AustLII document URL into the corresponding `austlii:`
+/// URI. Strips the host + `cgi-bin/viewdoc/` + `cgi-bin/sinodisp/` shims,
+/// drops the trailing `.html`, and returns just the `au/...` or `nz/...`
+/// canonical path.
+fn austlii_url_to_uri(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    if !parsed
+        .host_str()
+        .map(|h| h.contains("austlii.edu.au"))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let mut path = parsed.path().trim_start_matches('/').to_string();
+    for prefix in ["cgi-bin/viewdoc/", "cgi-bin/sinodisp/"] {
+        if let Some(rest) = path.strip_prefix(prefix) {
+            path = rest.to_string();
+        }
+    }
+    if let Some(rest) = path.strip_suffix(".html") {
+        path = rest.to_string();
+    }
+    if !path.starts_with("au/") && !path.starts_with("nz/") {
+        return None;
+    }
+    Some(format!("austlii:{path}"))
+}
+
+fn jurisdiction_from_uri(uri: &str) -> Option<String> {
+    // austlii:au/cases/cth/HCA/... → "cth/HCA"
+    let path = uri.strip_prefix("austlii:")?;
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() >= 4 {
+        Some(format!("{}/{}", parts[2], parts[3]))
+    } else if parts.len() >= 3 {
+        Some(parts[2].to_string())
+    } else {
+        None
+    }
+}
+
+fn extract_neutral_citation(title: &str) -> Option<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"\[(\d{4})\]\s+([A-Za-z][A-Za-z0-9]+)\s+(\d+)")
+            .expect("valid neutral citation regex")
+    });
+    re.captures(title).map(|c| format!("[{}] {} {}", &c[1], &c[2], &c[3]))
+}
+
+fn extract_reported_citation(title: &str) -> Option<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"\((\d{4})\)\s+(\d+)\s+([A-Za-z]+)\s+(\d+)")
+            .expect("valid reported citation regex")
+    });
+    re.captures(title)
+        .map(|c| format!("({}) {} {} {}", &c[1], &c[2], &c[3], &c[4]))
 }
 
 #[cfg(test)]
@@ -341,4 +631,130 @@ mod tests {
         };
         assert_eq!(detected_to_emulation(&detected), Emulation::Chrome137);
     }
+
+    #[test]
+    fn extract_neutral_citation_from_aglc4_title() {
+        assert_eq!(
+            extract_neutral_citation("Scott v FCT [1966] HCA 48"),
+            Some("[1966] HCA 48".to_string())
+        );
+        assert_eq!(
+            extract_neutral_citation("Re X [2024] FCAFC 36 (someone)"),
+            Some("[2024] FCAFC 36".to_string())
+        );
+        assert_eq!(extract_neutral_citation("just a title"), None);
+    }
+
+    #[test]
+    fn extract_reported_citation_from_title() {
+        assert_eq!(
+            extract_reported_citation("Scott v FCT (1966) 117 CLR 514"),
+            Some("(1966) 117 CLR 514".to_string())
+        );
+        assert_eq!(
+            extract_reported_citation("Mabo (1992) 175 CLR 1"),
+            Some("(1992) 175 CLR 1".to_string())
+        );
+        assert_eq!(extract_reported_citation("[2024] HCA 1"), None);
+    }
+
+    #[test]
+    fn austlii_url_to_uri_handles_canonical_forms() {
+        assert_eq!(
+            austlii_url_to_uri(
+                "https://www.austlii.edu.au/cgi-bin/viewdoc/au/cases/cth/HCA/1992/23.html"
+            ),
+            Some("austlii:au/cases/cth/HCA/1992/23".to_string())
+        );
+        assert_eq!(
+            austlii_url_to_uri(
+                "https://classic.austlii.edu.au/au/cases/cth/HCA/1992/23.html"
+            ),
+            Some("austlii:au/cases/cth/HCA/1992/23".to_string())
+        );
+        assert_eq!(
+            austlii_url_to_uri(
+                "https://www.austlii.edu.au/cgi-bin/sinodisp/au/cases/cth/HCA/1992/23.html"
+            ),
+            Some("austlii:au/cases/cth/HCA/1992/23".to_string())
+        );
+        assert_eq!(
+            austlii_url_to_uri("https://www.austlii.edu.au/au/legis/cth/consol_act/itaa1997240"),
+            Some("austlii:au/legis/cth/consol_act/itaa1997240".to_string())
+        );
+        assert_eq!(
+            austlii_url_to_uri("https://example.com/au/cases/cth/HCA/1992/23"),
+            None
+        );
+    }
+
+    #[test]
+    fn absolutise_austlii_url_handles_relative() {
+        assert_eq!(
+            absolutise_austlii_url("/cgi-bin/viewdoc/au/cases/cth/HCA/1992/23.html"),
+            "https://www.austlii.edu.au/cgi-bin/viewdoc/au/cases/cth/HCA/1992/23.html"
+        );
+        assert_eq!(
+            absolutise_austlii_url("https://www.austlii.edu.au/foo.html"),
+            "https://www.austlii.edu.au/foo.html"
+        );
+        assert_eq!(
+            absolutise_austlii_url("//www.austlii.edu.au/foo.html"),
+            "https://www.austlii.edu.au/foo.html"
+        );
+    }
+
+    #[test]
+    fn jurisdiction_from_uri_extracts_court_path() {
+        assert_eq!(
+            jurisdiction_from_uri("austlii:au/cases/cth/HCA/1992/23"),
+            Some("cth/HCA".to_string())
+        );
+        assert_eq!(
+            jurisdiction_from_uri("austlii:au/legis/cth/consol_act/itaa1997240"),
+            Some("cth/consol_act".to_string())
+        );
+        assert_eq!(jurisdiction_from_uri("austlii:au"), None);
+        assert_eq!(jurisdiction_from_uri("notausti"), None);
+    }
+
+    #[test]
+    fn derive_pdf_title_handles_case_path() {
+        assert_eq!(derive_pdf_title("au/cases/cth/HCA/1966/48"), "HCA 1966/48");
+    }
+
+    #[test]
+    fn parse_search_results_reads_sino_result_html() {
+        let html = r#"<html><body>
+            <ul>
+              <li data-count="1" class="multi">
+                <a href="/cgi-bin/viewdoc/au/cases/cth/HCA/1992/23.html">Mabo v Queensland (No 2) [1992] HCA 23; (1992) 175 CLR 1</a>
+                <p class="meta">High Court of Australia - 3 June 1992</p>
+              </li>
+              <li data-count="2" class="multi">
+                <a href="https://www.austlii.edu.au/cgi-bin/viewdoc/au/cases/cth/HCA/1966/48.html">Scott v FCT [1966] HCA 48</a>
+                <p class="meta">High Court of Australia - 24 August 1966</p>
+              </li>
+            </ul>
+        </body></html>"#;
+        let hits = parse_search_results(html);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0],
+            SearchHit {
+                title: "Mabo v Queensland (No 2) [1992] HCA 23; (1992) 175 CLR 1".to_string(),
+                fetch_uri: "austlii:au/cases/cth/HCA/1992/23".to_string(),
+                url:
+                    "https://www.austlii.edu.au/cgi-bin/viewdoc/au/cases/cth/HCA/1992/23.html"
+                        .to_string(),
+                neutral_citation: Some("[1992] HCA 23".to_string()),
+                reported_citation: Some("(1992) 175 CLR 1".to_string()),
+                summary: Some("High Court of Australia - 3 June 1992".to_string()),
+                jurisdiction: Some("cth/HCA".to_string()),
+            }
+        );
+        assert_eq!(hits[1].fetch_uri, "austlii:au/cases/cth/HCA/1966/48");
+        assert_eq!(hits[1].neutral_citation.as_deref(), Some("[1966] HCA 48"));
+    }
 }
+
