@@ -359,7 +359,7 @@ fn parse_browser_version_output(s: &str) -> Result<(String, BrowserFamily, Strin
     let version = line
         .split_whitespace()
         .filter(|t| t.chars().any(|c| c.is_ascii_digit()))
-        .last()
+        .next_back()
         .ok_or_else(|| anyhow!("could not extract version token from `{line}`"))?
         .to_string();
     let lower = line.to_lowercase();
