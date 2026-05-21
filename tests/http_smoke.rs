@@ -2,10 +2,11 @@
 //!
 //! Spawns the release binary against a tempdir data dir, hits the MCP
 //! endpoint with `initialize` and `tools/list`, and asserts the JSON
-//! shape. Wait for daemon readiness is deterministic — we read the
-//! `ato-mcp listening on ...` line from stderr before issuing requests.
+//! shape. Readiness is deterministic — we read the `ato-mcp listening
+//! on ...` line from stderr before issuing requests.
 
 use std::io::{BufRead, BufReader};
+use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -17,53 +18,37 @@ fn bin_path() -> &'static str {
     env!("CARGO_BIN_EXE_ato-mcp")
 }
 
-struct Daemon {
+fn pick_free_port() -> Result<u16> {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").context("binding 127.0.0.1:0 to discover a free port")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
+}
+
+struct Server {
     child: Child,
     url: String,
 }
 
-impl Drop for Daemon {
+impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
-fn start_daemon(data_dir: &std::path::Path) -> Result<Daemon> {
-    // Pick a port and write http.json into the tempdir.
-    let install = Command::new(bin_path())
-        .args(["install-http", "--quiet"])
-        .env("ATO_MCP_DATA_DIR", data_dir)
-        .output()
-        .context("running install-http")?;
-    if !install.status.success() {
-        return Err(anyhow!(
-            "install-http exited {}: {}",
-            install.status,
-            String::from_utf8_lossy(&install.stderr)
-        ));
-    }
-
-    // Read the chosen port back so we know the URL.
-    let cfg_raw = std::fs::read_to_string(data_dir.join("http.json"))
-        .context("reading http.json after install-http")?;
-    let cfg: Value = serde_json::from_str(&cfg_raw)?;
-    let port = cfg["port"]
-        .as_u64()
-        .ok_or_else(|| anyhow!("http.json missing port"))?;
+fn start_server(data_dir: &std::path::Path) -> Result<Server> {
+    let port = pick_free_port()?;
     let url = format!("http://127.0.0.1:{port}/mcp");
 
-    // Spawn `daemon`, capture stderr, and wait for the readiness line.
     let mut child = Command::new(bin_path())
-        .arg("daemon")
+        .args(["serve", "--port", &port.to_string()])
         .env("ATO_MCP_DATA_DIR", data_dir)
-        // Don't let the daemon try to phone home for an update banner — it
-        // would add latency and external dep on github.com.
-        .env("ATO_MCP_OFFLINE", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .context("spawning daemon")?;
+        .context("spawning serve")?;
 
     let stderr = child
         .stderr
@@ -76,16 +61,15 @@ fn start_daemon(data_dir: &std::path::Path) -> Result<Daemon> {
         line.clear();
         let n = reader.read_line(&mut line)?;
         if n == 0 {
-            // EOF before readiness — daemon crashed.
             let _ = child.wait();
-            return Err(anyhow!("daemon exited before emitting readiness line"));
+            return Err(anyhow!("serve exited before emitting readiness line"));
         }
         if line.contains(&needle) {
             break;
         }
     }
 
-    Ok(Daemon { child, url })
+    Ok(Server { child, url })
 }
 
 fn post(url: &str, payload: Value) -> Result<Value> {
@@ -109,11 +93,10 @@ fn post(url: &str, payload: Value) -> Result<Value> {
 #[test]
 fn initialize_and_tools_list_over_http() -> Result<()> {
     let dir = tempdir()?;
-    let daemon = start_daemon(dir.path())?;
+    let server = start_server(dir.path())?;
 
-    // initialize
     let init = post(
-        &daemon.url,
+        &server.url,
         json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -133,9 +116,8 @@ fn initialize_and_tools_list_over_http() -> Result<()> {
         "initialize must surface server instructions: {init:?}"
     );
 
-    // tools/list
     let tools = post(
-        &daemon.url,
+        &server.url,
         json!({
             "jsonrpc": "2.0",
             "id": 2,
@@ -161,34 +143,40 @@ fn initialize_and_tools_list_over_http() -> Result<()> {
             "expected `{expected}` in tool list, got {names:?}"
         );
     }
-    for removed in ["search_titles", "get_document", "fetch_external_doc"] {
+    for removed in [
+        "search_titles",
+        "get_document",
+        "fetch_external_doc",
+        "doctor",
+        "install_http",
+    ] {
         assert!(
             !names.iter().any(|n| n == removed),
             "`{removed}` should no longer be exposed, got {names:?}"
         );
     }
 
-    drop(daemon);
+    drop(server);
     Ok(())
 }
 
 #[test]
 fn rejects_non_mcp_paths_and_methods() -> Result<()> {
     let dir = tempdir()?;
-    let daemon = start_daemon(dir.path())?;
+    let server = start_server(dir.path())?;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()?;
 
     let bad_path = client
-        .post(format!("{}/wrong", daemon.url.trim_end_matches("/mcp")))
+        .post(format!("{}/wrong", server.url.trim_end_matches("/mcp")))
         .body("{}")
         .send()?;
     assert_eq!(bad_path.status().as_u16(), 404);
 
-    let bad_method = client.get(&daemon.url).send()?;
+    let bad_method = client.get(&server.url).send()?;
     assert_eq!(bad_method.status().as_u16(), 405);
 
-    drop(daemon);
+    drop(server);
     Ok(())
 }

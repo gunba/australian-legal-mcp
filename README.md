@@ -1,371 +1,126 @@
 # ato-mcp
 
-Standalone MCP server for local search and retrieval over the Australian
-Taxation Office legal corpus.
+Local search and retrieval over the Australian Taxation Office legal corpus.
+Ships as a Claude Code plugin that bundles an MCP server, a Rust binary, and
+a one-shot corpus download.
 
-`ato-mcp` is retrieval infrastructure, not tax advice. Always verify cited
-ATO material and apply professional judgment before relying on an answer.
+> Retrieval infrastructure, not tax advice. Verify cited ATO material and
+> apply professional judgment before relying on an answer.
 
-The installed server is a Rust binary. End users do not need Python, pip,
-pipx, uv, a compiler, `gh`, or an API key. Each release tag carries the
-platform binary archives plus a single pre-built corpus artifact
-(`ato.db.zst`); the Granite embedding query encoder is downloaded from
-the external URL recorded in the release manifest.
+## What you get
+
+- A pre-built local corpus of ~158k ATO documents and ~467k chunks, queryable
+  with hybrid BM25 + Granite vector search.
+- Live retrieval for ATO documents the corpus doesn't carry, plus AustLII
+  case law and legislation via the `fetch` and `search_austlii` tools.
+- Statutory-definition lookup with an ordinary-meaning fallback.
+- All of the above as MCP tools the agent can call directly.
 
 ## Tools
 
 | Tool | Purpose |
 |---|---|
-| `search` | Hybrid semantic-plus-lexical search over the GPU-built corpus. Defaults exclude Edited Private Advice and very old non-legislation content. |
-| `get_doc_anchors` | Return in-document anchors, related documents, historical-version URLs, and reverse citations for a corpus document. |
-| `get_chunks` | Fetch exact chunks returned by `search`, with optional neighbor context. `[doc:X]` markers in chunk text point into the local corpus and resolve via `get_chunks` / `get_doc_anchors`; `[fetch:URI]` markers point outside the corpus and must be retrieved via the `fetch` tool. |
-| `get_definition` | Fetch compact statutory definitions for a term, with labelled ordinary-meaning fallback when no statutory definition is found. |
-| `get_asset` | Resolve a retained image `data-asset-ref` to a local file path and source metadata. |
-| `fetch` | Live-fetch a document outside the local corpus. URI scheme carries the source: `ato:<doc_id>[?pit=...&view=...]` for ATO live-fetch, `austlii:<path>` for AustLII (via classic.austlii.edu.au + wreq Chrome TLS emulation). Returns the same `{ord, anchor, text}` chunk shape and `[doc:X]` / `[fetch:URI]` marker convention as corpus chunks. `allow_ocr=true` opts into Tesseract OCR for scanned-PDF responses (MCP client should allow ~120s for that path). |
-| `search_austlii` | Live-search AustLII via SINO. Returns hits with `fetch_uri` ready to pass to `fetch`. Requires a cf_clearance session from `ato-mcp austlii setup`. Optional `jurisdictions`, `limit`, `sort_by_date`. |
-| `stats` | Index version, counts, and default search policy. |
+| `search` | Hybrid semantic-plus-lexical search over the corpus. Defaults exclude edited private advice and pre-2000 non-legislation content. |
+| `get_chunks` | Fetch chunk bodies by `chunk_id`, with optional neighbour context. `[doc:X]` markers point into the corpus and resolve via `get_chunks` / `get_doc_anchors`; `[fetch:URI]` markers point outside the corpus and resolve via `fetch`. |
+| `get_doc_anchors` | In-document anchors, related documents, historical-version URLs, and reverse citations for a corpus document. |
+| `get_definition` | Statutory definitions with a labelled ordinary-meaning fallback. |
+| `get_asset` | Resolve a retained image `data-asset-ref` to a local file path. |
+| `fetch` | Live-fetch a document by URI. `ato:<doc_id>[?pit=...&view=...]` for ATO live retrieval; `austlii:<path>` for AustLII via `classic.austlii.edu.au`. Returns chunks of the same shape as `get_chunks`. Pass `allow_ocr=true` for scanned PDFs (Tesseract on `$PATH`, allow ~120s). |
+| `search_austlii` | Live search of AustLII via SINO. Returns hits with `fetch_uri` ready to pass to `fetch`. Uses the `cf_clearance` session acquired by `ato-mcp austlii setup`. |
+| `stats` | Index version, counts, default search policy, AustLII session state. |
 
-JSON results include the ATO `canonical_url`. Document bodies are exposed as
-cleaned HTML fragments so agents can navigate source structure directly without
-Markdown escaping or rendered-host assumptions. Search chunks are plain
-semantic text derived from the cleaned HTML; heading paths are metadata, and
-internal links/images contribute only useful visible text to search.
-
-## AustLII access (optional)
-
-The `austlii:` URI scheme on the `fetch` tool and the planned
-`search_austlii` MCP tool both reach `*.austlii.edu.au`, which is gated by
-Cloudflare's bot management. Document fetches against
-`classic.austlii.edu.au` succeed with a browser-grade User-Agent alone;
-SINO search additionally requires a `cf_clearance` cookie that's tied to
-a real browser session that has cleared the JS challenge.
-
-Acquire that cookie via a one-time consent flow:
-
-```bash
-ato-mcp austlii setup       # opens your default browser, reads cf_clearance
-ato-mcp austlii status      # show cached browser, cookie age, cf_clearance presence
-ato-mcp austlii clear       # delete the persisted session
-```
-
-The setup command detects your default browser, prints what will happen,
-asks for `y/N` consent, opens `classic.austlii.edu.au` in your browser,
-waits for you to press Enter, then reads AustLII cookies via the
-[`rookie`](https://crates.io/crates/rookie) crate and saves them to
-`$XDG_DATA_HOME/ato-mcp/austlii_session.json` (Linux), `~/Library/Application
-Support/ato-mcp/austlii_session.json` (macOS), or `%APPDATA%\ato-mcp\
-austlii_session.json` (Windows).
-
-If your endpoint blocks cookie extraction (Safari on macOS, or an EDR
-policy on a managed workstation), paste the value manually:
-
-```bash
-ato-mcp austlii setup --cookie "<cf_clearance value from DevTools>"
-```
-
-Override the auto-detected browser with `ATO_MCP_BROWSER=chrome|edge|firefox`
-when the registry / xdg-mime lookup returns something unexpected.
-
-### OCR for scanned PDFs
-
-A handful of pre-digital AustLII judgments are served as scanned PDFs with
-no embedded text. Pass `allow_ocr=true` on the `fetch` call (or `--allow-ocr`
-on the CLI) to opt into a Tesseract fallback:
-
-```bash
-ato-mcp fetch "austlii:au/cases/cth/HCA/1953/<scanned>" --allow-ocr
-```
-
-OCR requires `tesseract` on `$PATH` and can take 10-30s per judgment, so the
-MCP client timeout needs to be raised:
-
-```json
-{
-  "mcpServers": {
-    "ato": {
-      "command": "ato-mcp",
-      "args": ["serve"],
-      "timeout": 120000
-    }
-  }
-}
-```
-
-Results are cached at `<data_dir>/ocr_cache/<sha256>.txt`, so repeat fetches
-of the same scanned PDF return instantly. The `fetch` response carries
-`ocr_used: true` and `ocr_warning` when OCR was used — surface that to the
-user so they verify against the canonical source.
+Document bodies are exposed as cleaned HTML fragments so agents navigate the
+source structure directly. Search chunks are plain text derived from that
+HTML; heading paths live in metadata, links and images contribute only their
+visible text.
 
 ## Install
 
-`ato-mcp` is shipped as a Rust binary — there is no `pip install ato-mcp`
-and no Python is needed for end users. The flow is:
-
-1. **Download the release binary** for your platform from the GitHub
-   releases page at `https://github.com/gunba/ato-mcp/releases/latest`.
-
-   - Linux x64: `ato-mcp-x86_64-unknown-linux-gnu.tar.gz`
-   - macOS Apple Silicon: `ato-mcp-aarch64-apple-darwin.tar.gz`
-   - Windows x64: `ato-mcp-x86_64-pc-windows-msvc.zip`
-
-2. **Extract and put on `PATH`.**
-
-   Linux/macOS:
-
-   ```bash
-   mkdir -p ~/.local/bin
-   tar -xzf ato-mcp-*.tar.gz -C ~/.local/bin ato-mcp
-   ```
-
-   Windows: unzip `ato-mcp.exe` (and the bundled `onnxruntime.dll`) into a
-   directory on `%PATH%`.
-
-3. **Wire `ato-mcp serve` into your MCP client** (Claude Code / Claude
-   Desktop / Cursor / Codex / Continue / any stdio MCP host — see next
-   section). `ato-mcp serve` is a thin stdio shim: on first launch it
-   auto-spawns the persistent HTTP daemon in the background, then proxies
-   stdin/stdout to it. Every subsequent MCP session reuses the same
-   daemon, so the embedding model and corpus index only load once across
-   the whole machine. There is no daemon to start manually and no port
-   to remember. On first use, the MCP server tells the assistant that
-   the corpus has not been installed yet and asks the user to run
-   `ato-mcp update` in their terminal. The download is ~4 GB and takes
-   1–10 minutes on a typical home connection (longer behind a corporate
-   proxy — see
-   [Enterprise / corporate environments](#enterprise--corporate-environments)).
-   After it completes, restart the MCP client so it picks up the new
-   corpus.
-
-You can also run `ato-mcp update` manually before wiring the server in;
-`ato-mcp doctor` and `ato-mcp stats` will verify the install.
-
-### Enterprise / corporate environments
-
-The published binaries are unsigned today (no Authenticode / no notarised
-macOS bundle). On a managed endpoint expect one or more of the following
-to delay or block first run:
-
-- **EDR / endpoint protection** (Defender, CrowdStrike, SentinelOne,
-  Carbon Black, Sophos, …) may hold the binary in a cloud-sandbox queue
-  for minutes-to-hours before allowing execution, or quarantine it
-  outright. If `ato-mcp` disappears after extraction or fails to launch
-  with no error, check your endpoint console. IT typically resolves this
-  by either waiting out the analysis, adding a per-hash allow rule, or
-  flagging the binary as known-good.
-
-- **Windows SmartScreen / macOS Gatekeeper** will show an "unidentified
-  developer" or "unrecognized program" warning on the first launch.
-  Users without override privilege need IT to whitelist the executable
-  hash, or build from source on-prem.
-
-- **TLS-inspecting proxies** terminate and re-sign HTTPS. The Windows
-  binary uses `native-tls`/SChannel so it trusts the corporate root CA
-  in the OS certificate store automatically. The Linux/macOS binaries
-  use `rustls` with the built-in Mozilla bundle; if your proxy re-signs
-  with a private CA, set `SSL_CERT_FILE` to a bundle that includes that
-  CA before running `ato-mcp update`.
-
-- **Egress allow-list.** `ato-mcp update` fetches from two hosts:
-  `github.com` (release manifest + `ato.db.zst`) and `huggingface.co`
-  (Granite embedding model). Both need to be reachable. The release URL
-  base can be overridden with `ATO_MCP_RELEASES_URL` to point at an
-  internal mirror; the model URL is recorded in `manifest.model.url` and
-  can be redirected at release time with `--model-url`.
-
-- **No GitHub token needed.** `ato-mcp` deliberately does not read
-  `GITHUB_TOKEN` or shell out to `gh`. Public releases are fetched
-  anonymously. For private mirrors, expose them through a plain HTTPS
-  URL that doesn't require auth, or pre-stage the install via the
-  offline-bundle path documented under [Development](#development).
-
-If your team can't run unsigned binaries at all, build from source on a
-maintainer machine (`cargo build --release` from this repo) and
-distribute the resulting binary internally. Building from source is
-straightforward; signing the resulting artifact is the
-organisation-specific bit. Maintainer corpus rebuilds are a separate
-maintainer flow and not required for fresh installs — end users always
-consume pre-built corpus releases from GitHub.
-
-## Wire Into MCP Clients
-
-`ato-mcp serve` is a stdio MCP entry point — the same shape Claude
-Code, Cursor, Codex, and Continue expect. Internally it's a thin shim
-that auto-launches a persistent HTTP daemon in the background and
-proxies stdin/stdout to it. The first MCP session on the machine spawns
-the daemon; every subsequent session reuses it. There is nothing to
-start manually and no port to configure.
-
-Claude Code (plugin install — recommended; bundles `/ato-update`,
-`/ato-stats`, `/ato-rollback` slash commands alongside the MCP server):
+The plugin is installed through Claude Code:
 
 ```bash
 git clone https://github.com/gunba/ato-mcp.git
 claude plugin install ./ato-mcp
 ```
 
-Claude Code (MCP-only, lighter alternative without slash commands):
+The plugin's `.mcp.json` points at `http://127.0.0.1:51234/mcp`, so the agent
+needs the local HTTP server running. Start it from a terminal:
 
 ```bash
-claude mcp add --scope user ato -- ato-mcp serve
-claude mcp list
+ato-mcp serve              # default port 51234
+ato-mcp serve --port 51235 # if 51234 is in use
 ```
 
-Claude Desktop:
-
-```json
-{
-  "mcpServers": {
-    "ato": {
-      "command": "ato-mcp",
-      "args": ["serve"]
-    }
-  }
-}
-```
-
-Codex (`~/.codex/config.toml`):
-
-```toml
-[mcp_servers.ato]
-command = "ato-mcp"
-args = ["serve"]
-```
-
-Cursor, Continue, and other stdio MCP clients use the same command.
-
-The shim handles daemon lifecycle automatically:
-
-- First `ato-mcp serve` call picks a free port in the ephemeral range,
-  persists it to `~/.local/share/ato-mcp/http.json` (macOS:
-  `~/Library/Application Support/ato-mcp/http.json`; Windows:
-  `%APPDATA%\ato-mcp\http.json`), and spawns the HTTP daemon detached
-  from the shim process.
-- Subsequent shims detect the live daemon and proxy to it directly.
-- If the daemon dies, the next request transparently re-spawns it.
-- Concurrent shim launches are serialised through
-  `<data_dir>/spawn.lock` so two parallel sessions don't race the bind.
-
-For the always-on systemd / launchd shape, see `systemd/README.md` —
-that lets the daemon come up at login so the first MCP request never
-pays spawn cost. It's optional; the shim works the same without it.
-
-### Advanced: connect directly over HTTP
-
-Power users who want to bypass the shim (for example, an MCP client
-that natively speaks Streamable HTTP, or a remote tunnel) can talk to
-the daemon directly. Pick or read the port and point the client at it:
-
-```bash
-ato-mcp install-http                    # prints the URL and config block
-```
-
-```json
-{
-  "mcpServers": {
-    "ato": {
-      "type": "http",
-      "url": "http://127.0.0.1:51234/mcp"
-    }
-  }
-}
-```
-
-In this mode you also need the daemon running independently — either
-`ato-mcp daemon` in a terminal or the systemd unit.
-
-`serve` starts immediately from whatever local corpus is present and never
-downloads on the MCP hot path, so it cannot trip stdio client spawn timeouts
-on slow or TLS-inspecting corporate networks. When a newer corpus index has
-been published, the default behaviour is to spawn `ato-mcp update` as a
-detached background process (see [Background auto-update](#background-auto-update));
-the server still notifies the assistant via `initialize` instructions so the
-user knows to restart the MCP client when the download finishes.
-`ATO_MCP_AUTO_UPDATE=0` reverts to the manual-notice flow; `ATO_MCP_OFFLINE=1`
-disables the update-availability probe entirely.
-
-## Search Defaults
-
-Default search is tuned for current public tax-law work:
-
-- `search` defaults to `mode=hybrid`, combining Granite vector retrieval
-  with lexical ranking. `mode=vector` and explicit `mode=keyword` are available;
-  hybrid/vector fail rather than silently downgrading when semantic search is
-  unavailable.
-- Edited private advice (`EV`) is excluded unless `types` explicitly includes it.
-- Non-legislation documents dated before `2000-01-01` are excluded unless
-  `include_old=true`.
-- Legislation is not excluded by the old-content rule because current Acts
-  often have old commencement dates.
-- `get_definition` returns statutory definitions from the corpus definition
-  index. If no statutory definition is found, it falls back to a labelled
-  non-statutory ordinary meaning. By default the Rust client downloads and
-  indexes Open English WordNet 2024 (CC-BY 4.0) into the local data directory
-  on first use. Set `ATO_MCP_DICTIONARY_PATH` to a licensed JSON/JSONL/TSV
-  dictionary export to use that source instead.
-
-Examples:
-
-```bash
-ato-mcp search "R&D tax incentive eligibility" --k 5
-ato-mcp search "TR 2024 3" --k 5
-ato-mcp search "PAC/19970038/203-50" --k 5
-ato-mcp fetch ato:PAC/19970038/203-50
-ato-mcp get-definition "corporate tax gross-up rate" --context-doc-id PAC/19970038/203-50
-ato-mcp search "section 8-1 repairs" --mode keyword
-ato-mcp search "royalties withholding old cases" --include-old --types Cases
-```
+On first start the server tells the agent the corpus isn't installed yet; the
+agent will offer to run `ato-mcp update`, which downloads `ato.db.zst` (~4 GB,
+5–10 min) from the latest GitHub release and atomic-swaps it into place. Once
+the download finishes, restart the MCP client (or just reconnect) so it picks
+up the new corpus.
 
 ## Updates
 
-`ato-mcp update` is the one command that both installs the corpus on a fresh
-machine and refreshes it later:
-
 ```bash
 ato-mcp update
-ato-mcp doctor
 ```
 
-Update first fetches the small `update.json` release summary. If the installed
-corpus, schema, and model still match, it exits without downloading the
-manifest. When the corpus has changed, it fetches `manifest.json`, downloads
-the single `ato.db.zst` artifact, verifies its sha256, decompresses it into a
-staging file, rebuilds the FTS5 indexes in-place, and atomically renames it
-over the live DB — leaving the previous database in `backups/ato.db.prev`
-for rollback:
+Full corpus replacement: the binary fetches the published `manifest.json`,
+downloads the new `ato.db.zst`, verifies its sha256, and atomic-renames it
+into the live data dir. The MCP server reads its corpus once at startup, so
+restart the MCP client (or the `ato-mcp serve` process) for a new corpus to
+take effect.
+
+When a newer corpus is published, the server's `initialize` instructions tell
+the agent — the agent surfaces the suggestion to the user and runs the update
+when the user agrees.
+
+## AustLII
+
+ATO commentary cites AustLII material that lives outside the local corpus.
+The `fetch` tool reaches `classic.austlii.edu.au` directly for case and
+legislation URLs. `search_austlii` reaches SINO, which Cloudflare gates with
+a JS challenge — that needs a clearance cookie from your real browser:
 
 ```bash
-ato-mcp doctor --rollback
+ato-mcp austlii setup                       # opens AustLII in your browser, reads cf_clearance
+ato-mcp austlii setup --cookie "<value>"    # manual paste fallback (Safari, EDR-locked endpoints)
+ato-mcp austlii clear                       # delete the persisted session
 ```
 
-While a server is already running, a newer index does not take effect until
-the MCP client is restarted, since `serve` loads the corpus once at startup.
+`stats` reports the persisted session (browser, cookie age, cf_clearance
+presence). Override the auto-detected default browser with
+`ATO_MCP_BROWSER=chrome|edge|firefox` if the registry / xdg-mime lookup
+returns the wrong one.
 
-### Background auto-update
+Scanned pre-digital judgments return `error: scanned_pdf` from `fetch` by
+default. Pass `allow_ocr=true` to opt into Tesseract OCR (results are cached
+at `<data_dir>/ocr_cache/<sha256>.txt`). The response carries `ocr_used:
+true` and an `ocr_warning` so the agent can tell the user to verify against
+the canonical source.
 
-On `ato-mcp serve` startup, the binary checks for an available release. If
-(a) a newer corpus is published *and* (b) the installed corpus is older than
-7 days, it spawns `ato-mcp update` as a fully detached child process and
-flips the MCP `initialize` instructions notice from "tell the user to run
-update" to "downloading in the background, restart the MCP client when
-done". The update runs out-of-band so it cannot trip MCP startup timeouts.
-Progress lands in `<data_dir>/logs/auto-update-*.log`.
+## Search defaults
 
-This is the default. To opt out and keep the existing manual-notice
-behaviour, set `ATO_MCP_AUTO_UPDATE=0` in the MCP server's environment
-block. `ATO_MCP_OFFLINE=1` continues to disable the availability probe
-entirely (no network reach at all).
+- `mode=hybrid` (default) combines Granite vector retrieval with BM25 ranking.
+  `mode=vector` and `mode=keyword` are also available; both fail rather than
+  silently downgrade when the semantic runtime can't load.
+- Edited private advice (`EV`) is excluded unless `types` includes it.
+- Non-legislation documents dated before 2000-01-01 are excluded unless
+  `include_old=true`. Legislation is exempt from the cutoff because current
+  Acts often have old commencement dates.
+- `get_definition` returns statutory definitions from the corpus index, with
+  a labelled non-statutory ordinary-meaning fallback. The fallback uses Open
+  English WordNet 2024 (CC-BY 4.0), downloaded on first use. Point
+  `ATO_MCP_DICTIONARY_PATH` at a JSON/JSONL/TSV file to use a different
+  source.
 
-## Data Directory
-
-Override the install location with `ATO_MCP_DATA_DIR`.
+## Data directory
 
 ```text
 Linux:   ~/.local/share/ato-mcp
 macOS:   ~/Library/Application Support/ato-mcp
-Windows: %APPDATA%\ato-mcp or the platform data directory
+Windows: %APPDATA%\ato-mcp
 ```
 
-Layout:
+Override with `ATO_MCP_DATA_DIR`. Layout:
 
 ```text
 ato-mcp/
@@ -376,133 +131,44 @@ ato-mcp/
 │   ├── model_fp16.onnx_data
 │   └── tokenizer.json
 ├── installed_manifest.json
-├── backups/ato.db.prev
-├── staging/
-└── LOCK
+├── austlii_session.json   # only when `austlii setup` has run
+└── staging/               # transient during update
 ```
 
-## Maintainer Workflow
+## Maintainer workflow
 
-The Rust binary is the end-user product **and** the maintainer tool. The
-Python pipeline that used to do scraping, metadata extraction, vector
-generation, corpus building, and release publication has been retired —
-all of it now ships as `ato-mcp` subcommands.
-
-Local GPU release build:
+The Rust binary ships both the end-user product and the maintainer pipeline.
+A maintainer build runs on a GPU box with the `cuda` Cargo feature:
 
 ```bash
 cargo build --release --features cuda
 
-./target/release/ato-mcp scrape-diff \
-  --index         /path/to/ato_pages/index.jsonl \
-  --whats-new-url https://www.ato.gov.au/law/view/whatsnew.htm?fid=whatsnew \
-  --out           /tmp/whats_new_pending.jsonl
-
-./target/release/ato-mcp link-download \
-  --deduped-links /tmp/whats_new_pending.jsonl \
-  --out-dir       /path/to/ato_pages
-
-./target/release/ato-mcp build \
-  --pages-dir /path/to/ato_pages \
-  --db-path   ./release/ato.db \
-  --model-dir /path/to/granite-embedding-small-r2 \
-  --out-dir   ./release \
-  --gpu \
-  --profile
-
-./target/release/ato-mcp package-corpus \
-  --db-path  ./release/ato.db \
-  --out      ./release/ato.db.zst \
-  --manifest ./release/manifest.json
-
-./target/release/ato-mcp publish-release \
-  --out-dir ./release \
-  --tag     v0.13.0 \
-  --repo    gunba/ato-mcp \
-  --overwrite
+./target/release/ato-mcp tree-crawl   --out-dir snapshots/$(date -u +%Y%m%dT%H%M%SZ)
+./target/release/ato-mcp snapshot-reduce --nodes-path snapshots/.../nodes.jsonl
+./target/release/ato-mcp link-download   --deduped-links snapshots/.../deduped_links.jsonl --out-dir /path/to/ato_pages
+./target/release/ato-mcp build           --pages-dir /path/to/ato_pages --db-path ./release/ato.db --model-dir /path/to/granite-embedding-small-r2 --out-dir ./release --profile
+./target/release/ato-mcp package-corpus  --db-path ./release/ato.db --out ./release/ato.db.zst --manifest ./release/manifest.json
+./target/release/ato-mcp publish-release --out-dir ./release --tag v0.13.0 --repo gunba/ato-mcp --overwrite
 ```
 
 `scripts/publish-release.sh <tag>` wraps the `package-corpus` +
-`publish-release` steps and is what the maintainer host actually runs.
-The whole release lives on a single rolling tag: binary archives are
-published by `.github/workflows/release-binaries.yml` on tag push, and
-the maintainer GPU host adds `manifest.json`, `update.json`, and
-`ato.db.zst` to the same tag. End users always hit
-`releases/latest/download/manifest.json` regardless of the tag name.
-
-For full crawls (rare, hours):
-
-```bash
-./target/release/ato-mcp tree-crawl --out-dir snapshots/$(date -u +%Y%m%dT%H%M%SZ)
-./target/release/ato-mcp snapshot-reduce --nodes-path snapshots/.../nodes.jsonl
-./target/release/ato-mcp link-download --deduped-links snapshots/.../deduped_links.jsonl --out-dir /path/to/ato_pages
-```
-
-Release builds use Granite embedding vectors and should run on the
-maintainer GPU. The Rust end-user runtime does not require a GPU; query
-embedding must continue to work on ordinary CPU-only laptops. The model
-is not uploaded to GitHub Releases; by default the manifest points at
-pinned Hugging Face Granite embedding files, and the Rust client
-downloads and verifies them during `ato-mcp update`. The model URL can
-be redirected at release time via `--model-url` / `--model-sha256` /
-`--model-size`; non-Hugging Face mirrors must supply both hash and size.
-
-Corpus releases must come from `ato-mcp build` + `ato-mcp
-package-corpus`. The optional `corpus release (gpu)` workflow targets a
-self-hosted runner labelled `gpu` and fails if `nvidia-smi` is
-unavailable. It is not scheduled by default, so it does not spend hosted
-GPU minutes.
+`publish-release` steps. Releases live on a single rolling tag: binary
+archives publish on tag push, and the maintainer GPU host attaches
+`manifest.json` and `ato.db.zst` to the same tag. End users hit
+`releases/latest/download/manifest.json`.
 
 ## Development
 
 ```bash
 cargo test --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
-```
-
-End-to-end smoke test against the installed binary + corpus (CLI surface,
-search modes, retrieval helpers, MCP HTTP transport):
-
-```bash
 scripts/smoke.sh
 ```
 
-Offline bundles are materialized through the Rust installer:
-
-```bash
-ATO_MCP_RELEASE_DIR=./release/index-2026.05.02 \
-ATO_MCP_MODEL_BUNDLE=/path/to/semantic-model-bundle.tar.zst \
-scripts/make-offline-bundle.sh ./release/ato-mcp-offline-bundle.tar.zst
-```
-
-CI runs the Rust binary checks. Release binary assets are produced by
+CI runs build, clippy, and tests on Linux. Release binaries are built by
 `.github/workflows/release-binaries.yml`.
-
-## Corporate Windows Builds from Source
-
-For from-source Windows builds (the binary release already bundles
-everything needed), a few extras matter on managed networks.
-
-Microsoft's `onnxruntime.dll` is not vendored into the Cargo build. Put
-the DLL next to your built `ato-mcp.exe`, or set `ORT_DYLIB_PATH` to its
-path before running. The published Windows release zip already includes
-this DLL.
-
-If building from source behind a TLS-inspecting proxy, Cargo may fail
-revocation checks before it can fetch dependencies. Put this in
-`%USERPROFILE%\.cargo\config.toml` when your corporate proxy blocks CRL
-access:
-
-```toml
-[http]
-check-revoke = false
-```
-
-End-user concerns (Authenticode signing, SmartScreen, EDR holds, proxy
-allow-listing) are covered in the [Enterprise / corporate
-environments](#enterprise--corporate-environments) subsection above.
 
 ## License
 
-MIT. ATO content remains subject to the ATO's publication terms.
-Granite Embedding Small English R2 is distributed under Apache-2.0.
+MIT. ATO content remains subject to the ATO's publication terms. Granite
+Embedding Small English R2 is distributed under Apache-2.0.

@@ -5,7 +5,7 @@
 //! a follow-up.
 
 use crate::config::{
-    backups_dir, data_dir, db_path, installed_manifest_path, live_dir, lock_file,
+    data_dir, db_path, installed_manifest_path, live_dir, lock_file,
     model_marker_path, staging_dir,
 };
 use crate::db::{
@@ -19,7 +19,7 @@ use crate::{
     local_path_from_urlish, model_info_matches, stage_model,
     validate_manifest_model_source, UrlContext,
     ATO_USER_AGENT, DEFAULT_EXCLUDED_TYPES, EDITED_PRIVATE_ADVICE_LABEL, EMBEDDING_MODEL_ID, LEGISLATION_TYPE, LEGISLATION_TYPE_PREFIXES,
-    OLD_CONTENT_CUTOFF, SUPPORTED_MANIFEST_VERSION, SUPPORTED_SCHEMA_VERSION,
+    OLD_CONTENT_CUTOFF, SUPPORTED_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -172,11 +172,13 @@ pub(crate) fn stats() -> Result<String> {
     // prefix-to-doc-type map; agents read this to discover the canonical
     // ``doc_scope="<PREFIX>/*"`` filter idiom for every prefix in the corpus.
     let prefix_breakdown = collect_prefix_breakdown(&conn)?;
+    let semantic_search_ready = ensure_vector_search_ready(&conn).is_ok();
     let payload = json!({
         "data_dir": data_dir()?.display().to_string(),
         "index_version": get_meta(&conn, "index_version")?,
         "last_update_at": get_meta(&conn, "last_update_at")?,
         "embedding_model_id": get_meta(&conn, "embedding_model_id")?,
+        "semantic_search_ready": semantic_search_ready,
         "search_modes": ["hybrid", "vector", "keyword"],
         "default_search_mode": "hybrid",
         "documents": docs,
@@ -191,7 +193,8 @@ pub(crate) fn stats() -> Result<String> {
             "old_content_cutoff": OLD_CONTENT_CUTOFF,
             "old_content_exception_types": LEGISLATION_TYPE_PREFIXES,
             "old_content_exception_type_labels": [LEGISLATION_TYPE],
-        }
+        },
+        "austlii": crate::cookies::session_summary_json(),
     });
     // [OF-06] JSON outputs use serde_json pretty rendering before return/write.
     Ok(serde_json::to_string_pretty(&payload)?)
@@ -279,36 +282,6 @@ pub(crate) fn description_from_title(title: &str) -> String {
     }
 }
 
-pub(crate) fn doctor(rollback: bool) -> Result<()> {
-    if rollback {
-        // [UM-06] Rollback restores the previous DB snapshot from backups/ato.db.prev.
-        let backup = backups_dir()?.join("ato.db.prev");
-        if !backup.exists() {
-            bail!("no backup found at {}", backup.display());
-        }
-        fs::copy(&backup, db_path()?)?;
-        println!("rollback complete.");
-        return Ok(());
-    }
-    let conn = open_read()?;
-    let docs: i64 = conn.query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))?;
-    let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
-    if docs == 0 || chunks == 0 {
-        bail!("corpus is empty: documents={docs}, chunks={chunks}");
-    }
-    println!("documents: {docs}");
-    println!("chunks: {chunks}");
-    let model_id = get_meta(&conn, "embedding_model_id")?.unwrap_or_default();
-    if model_id == EMBEDDING_MODEL_ID {
-        ensure_vector_search_ready(&conn)?;
-        let embeddings: i64 =
-            conn.query_row("SELECT COUNT(*) FROM chunk_embeddings", [], |r| r.get(0))?;
-        println!("chunk_embeddings: {embeddings}");
-        println!("semantic_search: ready");
-    }
-    Ok(())
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Manifest {
@@ -337,82 +310,9 @@ pub(crate) struct ModelInfo {
     pub(crate) url: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct UpdateSummary {
-    pub(crate) schema_version: i64,
-    pub(crate) index_version: String,
-    #[serde(default)]
-    pub(crate) min_client_version: String,
-    pub(crate) model: ModelInfo,
-    pub(crate) db_sha256: String,
-    pub(crate) db_size: u64,
-    #[serde(default)]
-    pub(crate) manifest_fingerprint: Option<String>,
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct UpdateStats {
     pub(crate) bytes_downloaded: u64,
-}
-
-/// Print what `ato-mcp update` would do without performing any I/O writes.
-/// Fetches the published manifest, compares it against the installed manifest,
-/// and produces a human-readable summary. Used by `ato-mcp update --check`.
-pub(crate) fn preview_update(manifest_url: &str) -> Result<String> {
-    let manifest_context = UrlContext::from_manifest_url(manifest_url);
-    let raw = fetch_bytes(manifest_url, &manifest_context)
-        .with_context(|| format!("fetching {}", manifest_url))?;
-    let manifest: Manifest = serde_json::from_slice(&raw)
-        .with_context(|| format!("parsing {}", manifest_url))?;
-    enforce_manifest_compatibility(&manifest)?;
-
-    let installed = load_installed_manifest()?;
-
-    let mut lines = Vec::new();
-    lines.push(format!("manifest url:    {}", manifest_url));
-    lines.push(format!("published index: {}", manifest.index_version));
-
-    match installed {
-        None => {
-            lines.push("installed index: <none — corpus not yet installed>".to_string());
-            lines.push("=> initial corpus install".to_string());
-            lines.push(format!(
-                "  - download {} ({:.2} MB)",
-                manifest.db.url,
-                manifest.db.size as f64 / 1_000_000.0,
-            ));
-            lines.push(format!(
-                "  - install model {} ({:.2} MB)",
-                manifest.model.id,
-                manifest.model.size as f64 / 1_000_000.0,
-            ));
-        }
-        Some(installed) => {
-            lines.push(format!("installed index: {}", installed.index_version));
-            let model_changed = !crate::model_info_matches(&installed.model, &manifest.model);
-            let db_changed = installed.db.sha256 != manifest.db.sha256;
-            if !model_changed && !db_changed {
-                lines.push("=> already current; no download needed".to_string());
-            } else {
-                if model_changed {
-                    lines.push(format!(
-                        "  - model: {} → {} ({:.2} MB)",
-                        installed.model.id,
-                        manifest.model.id,
-                        manifest.model.size as f64 / 1_000_000.0,
-                    ));
-                }
-                if db_changed {
-                    lines.push(format!(
-                        "  - corpus: {:.2} MB compressed DB download",
-                        manifest.db.size as f64 / 1_000_000.0,
-                    ));
-                }
-            }
-        }
-    }
-    Ok(lines.join("\n"))
 }
 
 pub(crate) fn apply_update(manifest_url: &str) -> Result<UpdateStats> {
@@ -423,32 +323,18 @@ pub(crate) fn apply_update(manifest_url: &str) -> Result<UpdateStats> {
     result
 }
 
-pub(crate) fn env_truthy(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| {
-            matches!(
-                value.as_str(),
-                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-            )
-        })
-        .unwrap_or(false)
-}
-
 /// Reject a manifest whose `schema_version` is not the current release
 /// format, or whose `min_client_version` is newer than the currently-running
 /// binary.
 pub(crate) fn enforce_manifest_compatibility(manifest: &Manifest) -> Result<()> {
-    // [CC-03] `ato-mcp update` and the `serve` startup availability probe
-    // both gate on this. There is one current manifest schema; old or new
-    // schemas are incompatible.
     let schema_version = manifest.schema_version;
     if schema_version < 0 {
         bail!("manifest schema_version is negative ({schema_version}); manifest is malformed");
     }
     let schema_version = schema_version as u32;
-    if schema_version != SUPPORTED_MANIFEST_VERSION {
+    if schema_version != SUPPORTED_SCHEMA_VERSION {
         bail!(
-            "manifest schema_version {schema_version} is not supported by this binary (expects {SUPPORTED_MANIFEST_VERSION}); install a matching ato-mcp release"
+            "manifest schema_version {schema_version} is not supported by this binary (expects {SUPPORTED_SCHEMA_VERSION}); install a matching ato-mcp release"
         );
     }
     let min = manifest.min_client_version.trim();
@@ -486,16 +372,11 @@ pub(crate) fn cmp_dotted_version(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 pub(crate) fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
-    // [UM-05] Update flow: short-circuit via update.json summary when the
-    // installed manifest still matches; otherwise rebuild the live DB
-    // wholesale through a staging file and atomic rename. There is no
-    // in-place delete+insert path — full rebuild on a fresh SQLite file
-    // is faster than mutating the live multi-GB DB and avoids FK cascades
-    // wiping the citations table mid-update.
+    // Full corpus replacement every time: rebuilding the live DB wholesale
+    // through a staging file and atomic rename is faster than mutating the
+    // multi-GB live DB and avoids FK cascades wiping the citations table
+    // mid-update.
     let manifest_context = UrlContext::from_manifest_url(manifest_url);
-    if let Some(stats) = try_skip_update_from_summary(manifest_url, &manifest_context)? {
-        return Ok(stats);
-    }
     let staging = staging_dir()?;
     let manifest_bytes = fetch_bytes(manifest_url, &manifest_context)
         .with_context(|| format!("fetching manifest from {manifest_url}"))?;
@@ -657,7 +538,6 @@ pub(crate) fn promote_staged_update(
     if let Some(guard) = model_guard.as_ref() {
         guard.write_marker()?;
     }
-    persist_doctor_db_backup(db_guard.backup_path())?;
     if let Some(guard) = model_guard {
         guard.commit();
     }
@@ -870,25 +750,6 @@ pub(crate) fn promote_live_db(staged_db: &Path, backup: &Path) -> Result<PathPro
     Ok(guard)
 }
 
-pub(crate) fn persist_doctor_db_backup(transient_backup: &Path) -> Result<()> {
-    if !transient_backup.exists() {
-        return Ok(());
-    }
-    let persistent_backup = backups_dir()?.join("ato.db.prev");
-    let tmp = persistent_backup.with_extension("prev.tmp");
-    let old = persistent_backup.with_extension("prev.old");
-    remove_path_if_exists(&tmp)?;
-    remove_path_if_exists(&old)?;
-    fs::copy(transient_backup, &tmp).with_context(|| {
-        format!(
-            "writing persistent rollback backup {}",
-            persistent_backup.display()
-        )
-    })?;
-    replace_file_cross_platform(&tmp, &persistent_backup, &old)?;
-    Ok(())
-}
-
 pub(crate) fn replace_file_cross_platform(src: &Path, dest: &Path, old: &Path) -> Result<()> {
     if dest.exists() {
         fs::rename(dest, old)
@@ -988,58 +849,17 @@ pub(crate) fn load_installed_manifest() -> Result<Option<Manifest>> {
     Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
 }
 
-pub(crate) fn update_summary_url_for_manifest(manifest_url: &str) -> String {
-    if let Some(path) = local_path_from_urlish(manifest_url) {
-        return path.with_file_name("update.json").display().to_string();
-    }
-    manifest_url
-        .rsplit_once('/')
-        .map(|(base, _)| format!("{base}/update.json"))
-        .unwrap_or_else(|| "update.json".to_string())
-}
-
-pub(crate) fn try_skip_update_from_summary(
-    manifest_url: &str,
-    context: &UrlContext,
-) -> Result<Option<UpdateStats>> {
-    let Some(installed) = load_installed_manifest()? else {
-        return Ok(None);
-    };
-    let summary_url = update_summary_url_for_manifest(manifest_url);
-    let summary_bytes = match fetch_bytes(&summary_url, context) {
-        Ok(bytes) => bytes,
-        Err(_) => return Ok(None),
-    };
-    let summary: UpdateSummary = match serde_json::from_slice(&summary_bytes) {
-        Ok(summary) => summary,
-        Err(_) => return Ok(None),
-    };
-    enforce_update_summary_compatibility(&summary)?;
-    if !installed_matches_update_summary(&installed, &summary)? {
-        return Ok(None);
-    }
-    Ok(Some(UpdateStats {
-        bytes_downloaded: summary_bytes.len() as u64,
-    }))
-}
-
 /// Notice surfaced to the agent via `server_instructions` when the
-/// published corpus is newer than the installed one. Constructed only
-/// when an update is genuinely available; the field carries the newly
-/// published `index_version` so the agent can mention it to the user.
-///
-/// When `auto_applying` is true, the daemon startup path has already
-/// spawned a detached `ato-mcp update` and the instructions text tells
-/// the user to wait for the background download rather than to run the
-/// command themselves.
+/// published corpus is newer than the installed one. Carries the published
+/// `index_version` so the agent can mention it to the user when suggesting
+/// `ato-mcp update`.
 pub(crate) struct UpdateAvailability {
     pub(crate) available_index_version: String,
-    pub(crate) auto_applying: bool,
 }
 
 pub(crate) fn http_probe_client() -> Result<Client> {
     // Tight budget: this client runs synchronously inside `serve` startup.
-    // A slow network must not stall the MCP stdio loop — `serve` falls
+    // A slow network must not stall the startup banner — `serve` falls
     // through to no-notice if the probe doesn't complete in time.
     Ok(Client::builder()
         .connect_timeout(Duration::from_secs(5))
@@ -1052,233 +872,36 @@ pub(crate) fn fetch_bytes_probe(url_or_path: &str, context: &UrlContext) -> Resu
 }
 
 /// Non-mutating availability probe. Returns `Some(UpdateAvailability)` only
-/// when (a) an installed manifest is present, (b) the published `update.json`
+/// when (a) an installed manifest is present, (b) the published `manifest.json`
 /// is reachable inside the probe timeout, (c) it parses, (d) this binary can
-/// still ingest it, and (e) its fingerprint does not match the installed
+/// still ingest it, and (e) its `index_version` differs from the installed
 /// corpus. Every other case collapses to `Ok(None)` — no error path that
 /// could stall serve startup. A published index that requires a newer binary
 /// also returns `None` rather than emitting an "update available" notice the
 /// user could not act on; the next manual `ato-mcp update` will surface the
 /// real upgrade-the-binary error.
 pub(crate) fn check_for_update_availability(manifest_url: &str) -> Result<Option<UpdateAvailability>> {
-    // [SW-06] Synchronous startup probe with a tight 5s budget; every failure
-    // path collapses to Ok(None) so a slow network cannot stall serve.
-    if env_truthy("ATO_MCP_OFFLINE") {
-        return Ok(None);
-    }
     let Some(installed) = load_installed_manifest()? else {
         return Ok(None);
     };
     let context = UrlContext::from_manifest_url(manifest_url);
-    let summary_url = update_summary_url_for_manifest(manifest_url);
-    let summary_bytes = match fetch_bytes_probe(&summary_url, &context) {
+    let manifest_bytes = match fetch_bytes_probe(manifest_url, &context) {
         Ok(bytes) => bytes,
         Err(_) => return Ok(None),
     };
-    let summary: UpdateSummary = match serde_json::from_slice(&summary_bytes) {
-        Ok(summary) => summary,
+    let manifest: Manifest = match serde_json::from_slice(&manifest_bytes) {
+        Ok(m) => m,
         Err(_) => return Ok(None),
     };
-    if enforce_update_summary_compatibility(&summary).is_err() {
+    if enforce_manifest_compatibility(&manifest).is_err() {
         return Ok(None);
     }
-    if installed_matches_update_summary(&installed, &summary).unwrap_or(false) {
+    if installed.index_version == manifest.index_version {
         return Ok(None);
     }
     Ok(Some(UpdateAvailability {
-        available_index_version: summary.index_version,
-        auto_applying: false,
+        available_index_version: manifest.index_version,
     }))
-}
-
-/// Window the auto-update gate enforces between successive background updates.
-/// Public for tests; runtime callers go through `auto_update_should_trigger`.
-pub(crate) const AUTO_UPDATE_MIN_AGE: chrono::Duration = chrono::Duration::days(7);
-
-/// Pure helper: given the timestamp the live corpus became installed and the
-/// current time, decide whether the >7-day staleness condition is met.
-/// Returns `false` when `last` is `None` because we can't establish age.
-pub(crate) fn auto_update_should_trigger_at(
-    last: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-) -> bool {
-    match last {
-        Some(t) => now - t > AUTO_UPDATE_MIN_AGE,
-        None => false,
-    }
-}
-
-/// Runtime gate for the background auto-update. Returns `true` when:
-/// 1. `ATO_MCP_AUTO_UPDATE` is not explicitly disabled (defaults on), and
-/// 2. The installed corpus is older than `AUTO_UPDATE_MIN_AGE` measured from
-///    `meta.last_update_at`, falling back to `installed_manifest.created_at`
-///    when the meta row is missing (e.g. corpus installed by an older binary).
-///
-/// Every read failure collapses to `Ok(false)` so a flaky DB cannot trigger a
-/// spurious download.
-pub(crate) fn auto_update_should_trigger() -> Result<bool> {
-    if env_falsy("ATO_MCP_AUTO_UPDATE") {
-        return Ok(false);
-    }
-    let last_from_meta = open_read()
-        .ok()
-        .and_then(|conn| get_meta(&conn, "last_update_at").ok().flatten())
-        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-        .map(|d| d.with_timezone(&Utc));
-    let last = last_from_meta.or_else(|| {
-        load_installed_manifest()
-            .ok()
-            .flatten()
-            .and_then(|m| DateTime::parse_from_rfc3339(&m.created_at).ok())
-            .map(|d| d.with_timezone(&Utc))
-    });
-    Ok(auto_update_should_trigger_at(last, Utc::now()))
-}
-
-/// Inverse of `env_truthy`: defaults to `false` (i.e. flag *not* set means the
-/// behavior is enabled). Used for opt-out flags like `ATO_MCP_AUTO_UPDATE=0`.
-pub(crate) fn env_falsy(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| {
-            matches!(
-                value.as_str(),
-                "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
-            )
-        })
-        .unwrap_or(false)
-}
-
-/// Spawn `ato-mcp update` as a fully detached child process and return
-/// immediately. Mirrors `spawn_daemon_detached` in main.rs: stdin → null,
-/// stdout+stderr → a timestamped log file under `<data_dir>/logs/`, child put
-/// in its own process group (Unix) or detached (Windows) so it survives the
-/// MCP session that spawned it.
-///
-/// Acquires `<data_dir>/auto-update.lock` non-blocking and is a silent no-op
-/// when the lock is already held — keeps two simultaneous MCP starts from both
-/// forking an update. The existing `<data_dir>/LOCK` still serialises the
-/// actual corpus swap inside `apply_update`.
-pub(crate) fn spawn_update_detached() -> Result<()> {
-    use fs2::FileExt;
-    use std::process::{Command, Stdio};
-
-    let data = data_dir()?;
-    let lock_path = data.join("auto-update.lock");
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .with_context(|| format!("opening {}", lock_path.display()))?;
-    if lock_file.try_lock_exclusive().is_err() {
-        return Ok(());
-    }
-
-    let log_dir = data.join("logs");
-    fs::create_dir_all(&log_dir)?;
-    let log_path = log_dir.join(format!(
-        "auto-update-{}.log",
-        Utc::now().format("%Y%m%dT%H%M%SZ")
-    ));
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("opening {}", log_path.display()))?;
-    let log_err = log.try_clone()?;
-
-    let exe = std::env::current_exe().context("locating ato-mcp binary")?;
-    let mut cmd = Command::new(&exe);
-    cmd.arg("update")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err));
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x00000008);
-    }
-
-    let child = cmd
-        .spawn()
-        .with_context(|| format!("spawning {} update", exe.display()))?;
-    std::mem::forget(child);
-    drop(lock_file);
-    Ok(())
-}
-
-pub(crate) fn enforce_update_summary_compatibility(summary: &UpdateSummary) -> Result<()> {
-    let manifest = Manifest {
-        schema_version: summary.schema_version,
-        index_version: summary.index_version.clone(),
-        created_at: String::new(),
-        min_client_version: summary.min_client_version.clone(),
-        model: summary.model.clone(),
-        db: ManifestDb {
-            url: String::new(),
-            sha256: summary.db_sha256.clone(),
-            size: summary.db_size,
-        },
-    };
-    enforce_manifest_compatibility(&manifest)
-}
-
-pub(crate) fn installed_matches_update_summary(installed: &Manifest, summary: &UpdateSummary) -> Result<bool> {
-    let Some(summary_fingerprint) = summary.manifest_fingerprint.as_deref() else {
-        return Ok(false);
-    };
-    if installed.schema_version != summary.schema_version
-        || installed.index_version != summary.index_version
-        || installed.min_client_version != summary.min_client_version
-        || installed.db.sha256 != summary.db_sha256
-        || installed.db.size != summary.db_size
-        || manifest_fingerprint(installed)? != summary_fingerprint
-        || !model_info_matches(&installed.model, &summary.model)
-    {
-        return Ok(false);
-    }
-
-    let db = db_path()?;
-    if !db.exists() || live_db_requires_rebuild(&db)? {
-        return Ok(false);
-    }
-    if !embedding_model_installed_matches(&summary.model)? {
-        return Ok(false);
-    }
-    let conn = open_read()?;
-    Ok(!semantic_backfill_required_for_model(
-        &conn,
-        &summary.model.id,
-    )?)
-}
-
-pub(crate) fn manifest_fingerprint(manifest: &Manifest) -> Result<String> {
-    // Fingerprint is purely a deduplication hint for the update fast-path —
-    // it must change when any of the install-relevant fields change.
-    let payload = json!({
-        "schema_version": manifest.schema_version,
-        "index_version": manifest.index_version,
-        "min_client_version": manifest.min_client_version,
-        "model": {
-            "id": manifest.model.id,
-            "sha256": manifest.model.sha256,
-            "size": manifest.model.size,
-            "url": manifest.model.url,
-        },
-        "db": {
-            "url": manifest.db.url,
-            "sha256": manifest.db.sha256,
-            "size": manifest.db.size,
-        },
-    });
-    let bytes = serde_json::to_vec(&payload)?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 // ----- tree-crawl (port of src/ato_mcp/scraper/tree_crawler.py + snapshot.py) -----

@@ -3,14 +3,14 @@
 #
 # Verifies:
 #   1. Binary identity (version, expected subcommand surface, no dead commands)
-#   2. Corpus health (stats shape, doctor passes)
+#   2. Corpus health via `stats`
 #   3. CLI search (hybrid/vector/keyword modes, type/date/scope filters, recency
 #      sort, seed_text fast path, direct doc_id title hit, include_old)
 #   4. CLI retrieval (get-definition, fetch)
-#   5. MCP HTTP transport (daemon spawn, initialize, tools/list, all 7 tools)
+#   5. MCP HTTP transport (serve, initialize, tools/list, all tools)
 #
-# Read-only against the live corpus; HTTP transport tests use a tempdir so they
-# do not collide with the user's running daemon.
+# Read-only against the live corpus; the HTTP transport tests use a tempdir
+# so they do not collide with the user's running server.
 #
 # Usage:
 #   scripts/smoke.sh
@@ -45,8 +45,6 @@ ok()   { pass=$((pass+1)); printf "  %sPASS%s %s\n" "$c_green" "$c_reset" "$1"; 
 bad()  { fail=$((fail+1)); fail_names+=("$1"); printf "  %sFAIL%s %s%s%s\n" "$c_red" "$c_reset" "$1" "${2:+: $c_dim$2$c_reset}" ""; }
 section() { printf "\n%s\n" "==> $1"; }
 
-# assert_jq <name> <json> <jq filter> <expected-substring>
-#   Pass when `jq -r <filter>` against <json> contains <expected-substring>.
 assert_jq() {
     local name="$1" json="$2" filter="$3" expected="$4"
     local actual
@@ -61,8 +59,6 @@ assert_jq() {
     fi
 }
 
-# assert_jq_nonempty <name> <json> <jq filter>
-#   Pass when the filter result is non-empty (i.e. not "" and not "null").
 assert_jq_nonempty() {
     local name="$1" json="$2" filter="$3"
     local actual
@@ -77,8 +73,6 @@ assert_jq_nonempty() {
     fi
 }
 
-# assert_jq_count <name> <json> <jq filter> <min>
-#   Pass when the filter result is a number >= min.
 assert_jq_count() {
     local name="$1" json="$2" filter="$3" min="$4"
     local actual
@@ -98,6 +92,12 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 2
 fi
 
+# Pick a free port for the HTTP transport test.
+free_port() {
+    python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()' 2>/dev/null || \
+    python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'
+}
+
 # ---------------- Section 1: binary identity ----------------
 
 section "Section 1: binary identity"
@@ -112,8 +112,7 @@ fi
 help_text="$("$BIN" --help 2>&1)"
 
 # Subcommands that MUST be present.
-for cmd in serve daemon install-http update doctor stats search fetch \
-           austlii search-austlii \
+for cmd in serve update stats search fetch austlii search-austlii \
            get-definition build tree-crawl snapshot-reduce link-download scrape-diff \
            bundle-localize-manifest publish-release help; do
     if grep -qE "^[[:space:]]+${cmd}[[:space:]]" <<<"$help_text"; then
@@ -123,10 +122,11 @@ for cmd in serve daemon install-http update doctor stats search fetch \
     fi
 done
 
-# Subcommands that MUST NOT appear (deleted in v0.10.0).
-for cmd in extract extract-definitions extract-anchors extract-currency chunk-html \
-           doc-meta doc-id-from-link pack-write manifest-rewrite-urls bundle-model \
-           ato-fetch-nodes embed whats-new normalize-doc-href; do
+# Subcommands that MUST NOT appear (removed during the cleanup).
+for cmd in daemon install-http doctor extract extract-definitions extract-anchors \
+           extract-currency chunk-html doc-meta doc-id-from-link pack-write \
+           manifest-rewrite-urls bundle-model ato-fetch-nodes embed whats-new \
+           normalize-doc-href check-build-checkpoint; do
     if grep -qE "^[[:space:]]+${cmd}[[:space:]]" <<<"$help_text"; then
         bad "dead subcommand still listed: $cmd"
     else
@@ -151,14 +151,8 @@ assert_jq_count "stats.definitions > 0"      "$stats_json" '.definitions'      1
 assert_jq_count "stats.prefix_breakdown items" "$stats_json" '.prefix_breakdown | length' 5
 assert_jq_nonempty "stats.embedding_model_id" "$stats_json" '.embedding_model_id'
 assert_jq_nonempty "stats.index_version"      "$stats_json" '.index_version'
-
-doctor_out="$("$BIN" doctor 2>&1)"
-doctor_rc=$?
-if [[ $doctor_rc -eq 0 ]] && grep -q "semantic_search: ready" <<<"$doctor_out"; then
-    ok "doctor reports semantic_search ready"
-else
-    bad "doctor" "rc=$doctor_rc, output=${doctor_out:0:200}"
-fi
+assert_jq "stats.semantic_search_ready"      "$stats_json" '.semantic_search_ready' 'true'
+assert_jq_nonempty "stats.austlii block present" "$stats_json" '.austlii'
 
 # ---------------- Section 3: CLI search ----------------
 
@@ -184,14 +178,13 @@ typed_json="$("$BIN" search "GST going concern" --k 5 --types TXR 2>&1)"
 assert_jq_count "type filter: hits returned" "$typed_json" '.hits | length' 1
 assert_jq      "type filter: every hit is TXR" "$typed_json" '[.hits[].type] | unique | join(",")' 'TXR'
 
-# doc_scope filter (glob) — also covers the PAC/% idiom advertised in the
-# MCP tool descriptor.
+# doc_scope filter (glob).
 scoped_json="$("$BIN" search "income" --k 5 --doc-scope 'PAC/%' 2>&1)"
 assert_jq_count "doc-scope filter: hits returned" "$scoped_json" '.hits | length' 1
 assert_jq      "doc-scope filter: every hit under PAC/" "$scoped_json" \
     '(.hits | length > 0) and (.hits | all(.doc_id | startswith("PAC/")))' 'true'
 
-# Recency sort — first hit should have the most recent date among returned.
+# Recency sort.
 recency_json="$("$BIN" search "small business" --k 5 --sort-by recency 2>&1)"
 assert_jq_count "recency sort: hits returned" "$recency_json" '.hits | length' 1
 assert_jq      "recency sort: dates monotonic descending" "$recency_json" \
@@ -203,7 +196,7 @@ seed_json="$("$BIN" search "ignored when seed-text set" --k 3 --seed-text "$seed
 assert_jq_count "seed-text: hits returned" "$seed_json" '.hits | length' 1
 assert_jq      "seed-text: title_hits suppressed" "$seed_json" '.title_hits | length' '0'
 
-# include_old: query an old-era doc kind. Default policy excludes < 2000 except legislation.
+# include_old.
 old_default="$("$BIN" search "fringe benefits" --k 3 --types FBR 2>&1)"
 old_relaxed="$("$BIN" search "fringe benefits" --k 3 --types FBR --include-old 2>&1)"
 default_count=$(printf '%s' "$old_default" | jq -r '.hits | length' 2>/dev/null || echo 0)
@@ -227,20 +220,13 @@ assert_jq_nonempty "search.meta.next_call present" "$truncated_json" '.meta.next
 
 section "Section 4: CLI retrieval"
 
-# get-definition: a common statutory term should return ≥ 1 hit and the body
-# should contain the doc-id marker that get_doc_anchors / search use for
-# citation extraction.
+# get-definition.
 defn_json="$("$BIN" get-definition "trading stock" --max-defs 3 2>&1)"
 assert_jq_count "get-definition: definitions returned" "$defn_json" '.definitions | length' 1
 assert_jq      "get-definition: statutory_definition_found"  "$defn_json" '.statutory_definition_found' 'true'
 assert_jq_nonempty "get-definition: body carries [doc:...] markers" "$defn_json" \
     '[.definitions[].body | select(contains("[doc:"))] | length'
 
-# Regression: the v0.10.0 fix unified the build-side and runtime normalisers.
-# A term containing an escaped ampersand must round-trip through the same
-# normaliser used at build time. Use a real corpus term that exercises the
-# whitespace + lowercase normalisation path (single word, common): we expect
-# at least one definition (or a clean ordinary_meaning miss) — never a panic.
 norm_json="$("$BIN" get-definition "Australian resident" --max-defs 2 2>&1)"
 if printf '%s' "$norm_json" | jq -e . >/dev/null 2>&1; then
     ok "get-definition normaliser: returns valid JSON on multi-word lowercase term"
@@ -270,40 +256,13 @@ fi
 section "Section 5: MCP HTTP transport"
 
 workdir="$(mktemp -d)"
-trap 'rm -rf "$workdir"' EXIT
-
 export ATO_MCP_DATA_DIR="$workdir/data"
-# Don't trigger a network probe inside the daemon — we're testing the local
-# server, not GitHub reachability.
-export ATO_MCP_OFFLINE=1
 
-# 1. install-http persists http.json.
-install_out="$("$BIN" install-http --quiet 2>&1)"
-install_rc=$?
-if [[ $install_rc -ne 0 ]]; then
-    bad "install-http" "rc=$install_rc, output=${install_out:0:200}"
-fi
-if [[ -f "$ATO_MCP_DATA_DIR/http.json" ]]; then
-    ok "install-http writes http.json"
-else
-    bad "install-http: http.json missing"
-fi
-
-port="$(jq -r '.port' "$ATO_MCP_DATA_DIR/http.json" 2>/dev/null)"
-if [[ "$port" =~ ^[0-9]+$ ]]; then
-    ok "install-http picked port $port"
-else
-    bad "install-http port" "got '$port'"
-fi
-
-# Make the daemon share the live corpus by symlinking the user's live dir into
-# the temp data dir. install-http already created the tempdir layout, but the
-# real DB lives elsewhere.
+# Share the live corpus by symlinking the user's live dir into the tempdir.
 live_src="$HOME/.local/share/ato-mcp/live"
+mkdir -p "$ATO_MCP_DATA_DIR"
 if [[ -d "$live_src" ]]; then
-    rm -rf "$ATO_MCP_DATA_DIR/live"
     ln -s "$live_src" "$ATO_MCP_DATA_DIR/live"
-    # Also symlink the installed manifest so update_notice / version checks work.
     if [[ -f "$HOME/.local/share/ato-mcp/installed_manifest.json" ]]; then
         ln -sf "$HOME/.local/share/ato-mcp/installed_manifest.json" \
             "$ATO_MCP_DATA_DIR/installed_manifest.json"
@@ -311,20 +270,20 @@ if [[ -d "$live_src" ]]; then
     ok "linked live corpus into tempdir"
 else
     bad "live corpus not found at $live_src — install one with: ato-mcp update"
+    rm -rf "$workdir"
     echo ""
     echo "Summary: $pass passed, $fail failed"
     exit 1
 fi
 
-# 2. Spawn the daemon, wait for readiness.
+port="$(free_port)"
 url="http://127.0.0.1:$port/mcp"
-log="$workdir/daemon.log"
-"$BIN" daemon >/dev/null 2>"$log" &
-daemon_pid=$!
-# Pass the daemon PID through to the EXIT trap.
-trap 'kill '"$daemon_pid"' 2>/dev/null; rm -rf "$workdir"' EXIT
+log="$workdir/serve.log"
+"$BIN" serve --port "$port" >/dev/null 2>"$log" &
+serve_pid=$!
+trap 'kill '"$serve_pid"' 2>/dev/null; rm -rf "$workdir"' EXIT
 
-# Wait for the readiness line — bounded to ~5 s by reading stderr line-by-line.
+# Wait for the readiness line — bounded to ~10 s.
 deadline=$(( $(date +%s) + 10 ))
 ready=0
 while [[ $(date +%s) -lt $deadline ]]; do
@@ -332,21 +291,20 @@ while [[ $(date +%s) -lt $deadline ]]; do
         ready=1
         break
     fi
-    if ! kill -0 "$daemon_pid" 2>/dev/null; then
+    if ! kill -0 "$serve_pid" 2>/dev/null; then
         break
     fi
     sleep 0.1
 done
 if [[ $ready -eq 1 ]]; then
-    ok "daemon ready on $url"
+    ok "server ready on $url"
 else
-    bad "daemon failed to start" "log: $(tail -c 500 "$log")"
+    bad "server failed to start" "log: $(tail -c 500 "$log")"
     echo ""
     echo "Summary: $pass passed, $fail failed"
     exit 1
 fi
 
-# Helper: post a JSON-RPC envelope to the daemon and echo the response.
 rpc() {
     local id="$1" method="$2" params="$3"
     local body
@@ -362,29 +320,25 @@ rpc() {
         --data-raw "$body"
 }
 
-# 3. initialize.
 init_resp="$(rpc 1 initialize '{"protocolVersion":"2025-03-26","clientInfo":{"name":"smoke","version":"0"},"capabilities":{}}')"
 assert_jq "initialize: server name is ato-mcp" "$init_resp" '.result.serverInfo.name' 'ato-mcp'
 assert_jq_nonempty "initialize: instructions present"   "$init_resp" '.result.instructions'
 
-# 4. tools/list returns exactly the 7 supported tools.
 tools_resp="$(rpc 2 tools/list '')"
 expected_tools=(search get_chunks get_definition get_asset get_doc_anchors fetch search_austlii stats)
 actual_tools="$(printf '%s' "$tools_resp" | jq -r '.result.tools[].name' 2>/dev/null | sort | tr '\n' ' ')"
 expected_sorted="$(printf '%s\n' "${expected_tools[@]}" | sort | tr '\n' ' ')"
 if [[ "$actual_tools" == "$expected_sorted" ]]; then
-    ok "tools/list: exactly the 7 expected tools"
+    ok "tools/list: exactly the expected tools"
 else
     bad "tools/list mismatch" "expected: $expected_sorted | got: $actual_tools"
 fi
 
-# 5. tools/call: stats.
 stats_resp="$(rpc 3 tools/call '{"name":"stats","arguments":{}}')"
 assert_jq_nonempty "tools/call stats: response.content" "$stats_resp" '.result.content[0].text'
 stats_payload="$(printf '%s' "$stats_resp" | jq -r '.result.content[0].text')"
 assert_jq_count "tools/call stats: chunks > 0" "$stats_payload" '.chunks' 1
 
-# 6. tools/call: search → grab a chunk_id for the next step.
 search_resp="$(rpc 4 tools/call '{"name":"search","arguments":{"query":"capital gains main residence","k":3}}')"
 search_payload="$(printf '%s' "$search_resp" | jq -r '.result.content[0].text')"
 assert_jq_count "tools/call search: hits returned" "$search_payload" '.hits | length' 1
@@ -396,7 +350,6 @@ else
     bad "tools/call search: no chunk_id in first hit"
 fi
 
-# 7. tools/call: get_chunks (progressive disclosure of the search hit).
 if [[ -n "$first_chunk_id" ]]; then
     chunks_args=$(jq -nc --argjson cid "$first_chunk_id" '{name:"get_chunks", arguments:{chunk_ids:[$cid], before:1, after:1}}')
     chunks_resp="$(rpc 5 tools/call "$chunks_args")"
@@ -406,13 +359,11 @@ if [[ -n "$first_chunk_id" ]]; then
         '[.chunks[].text] | map(select(. != null and . != "")) | length'
 fi
 
-# 8. tools/call: get_definition.
 defn_resp="$(rpc 6 tools/call '{"name":"get_definition","arguments":{"term":"trading stock","max_defs":2}}')"
 defn_payload="$(printf '%s' "$defn_resp" | jq -r '.result.content[0].text')"
 assert_jq_count "tools/call get_definition: definitions returned" "$defn_payload" '.definitions | length' 1
 assert_jq      "tools/call get_definition: statutory hit"          "$defn_payload" '.statutory_definition_found' 'true'
 
-# 9. tools/call: get_doc_anchors on the doc_id we found via search.
 if [[ -n "$first_doc_id" ]]; then
     anchors_args=$(jq -nc --arg did "$first_doc_id" '{name:"get_doc_anchors", arguments:{doc_id:$did}}')
     anchors_resp="$(rpc 7 tools/call "$anchors_args")"
@@ -423,8 +374,6 @@ if [[ -n "$first_doc_id" ]]; then
     fi
 fi
 
-# 10. tools/call: get_asset for an obviously invalid ref — should return a
-# structured error rather than crashing the daemon.
 asset_resp="$(rpc 8 tools/call '{"name":"get_asset","arguments":{"asset_ref":"asset:bogus-not-real-doc/9999"}}')"
 if printf '%s' "$asset_resp" | jq -e '.result // .error' >/dev/null 2>&1; then
     ok "tools/call get_asset: structured response for unknown ref"
@@ -432,7 +381,6 @@ else
     bad "tools/call get_asset" "neither result nor error in response"
 fi
 
-# 11. tools/call: fetch (optional, network).
 if [[ "$SKIP_NETWORK" != "1" ]]; then
     fetch_resp="$(rpc 9 tools/call '{"name":"fetch","arguments":{"uri":"ato:TXR/TR20007/NAT/ATO/00001"}}')"
     fetch_payload="$(printf '%s' "$fetch_resp" | jq -r '.result.content[0].text' 2>/dev/null)"
@@ -445,7 +393,6 @@ else
     printf "  %sSKIP%s tools/call fetch (ATO_MCP_SKIP_NETWORK=1)\n" "$c_dim" "$c_reset"
 fi
 
-# 12. Unknown tool → JSON-RPC error.
 err_resp="$(rpc 10 tools/call '{"name":"definitely_not_a_tool","arguments":{}}')"
 if printf '%s' "$err_resp" | jq -e '.error.code' >/dev/null 2>&1; then
     ok "unknown tool: returns JSON-RPC error"

@@ -21,7 +21,7 @@ use crate::semantic::{
     SemanticEncodeStats, SemanticModelPaths,
 };
 use crate::source::{
-    manifest_fingerprint, verify_semantic_install, Manifest, ManifestDb, ModelInfo, UpdateSummary,
+    verify_semantic_install, Manifest, ManifestDb, ModelInfo,
 };
 
 // BuildCheckpoint carries minimal per-doc records purely for resume tracking.
@@ -56,7 +56,7 @@ pub(crate) struct PackInfo {
 use crate::{
     enforce_db_schema_version, ServerState, EMBEDDING_DIM,
     EMBEDDING_INPUT_MAX_TOKENS, EMBEDDING_MODEL_FINGERPRINT, EMBEDDING_MODEL_HF_SIZE,
-    EMBEDDING_MODEL_HF_URL, EMBEDDING_MODEL_ID, SUPPORTED_MANIFEST_VERSION,
+    EMBEDDING_MODEL_HF_URL, EMBEDDING_MODEL_ID, SUPPORTED_SCHEMA_VERSION,
 };
 use rusqlite::OpenFlags;
 use anyhow::{anyhow, bail, Context, Result};
@@ -596,7 +596,6 @@ pub(crate) struct BuildCorpusArgs<'a> {
     pub(crate) out_dir: &'a Path,
     pub(crate) zstd_level: i32,
     pub(crate) limit: Option<usize>,
-    pub(crate) use_gpu: bool,
     pub(crate) profile_enabled: bool,
 }
 
@@ -610,7 +609,6 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         out_dir,
         zstd_level,
         limit,
-        use_gpu,
         profile_enabled,
     } = args;
 
@@ -691,7 +689,7 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
     let mut profile = BuildProfile::new(profile_enabled);
     // [IB-16] Corpus build runs as a single Rust process with adaptive
     // embedding batches and no separate worker-pool build path.
-    let state = ServerState::with_model_paths(use_gpu, semantic_model_paths);
+    let state = ServerState::with_model_paths(semantic_model_paths);
     let mut processed: usize = if checkpoint_loaded && base_seeded {
         source_doc_ids.len()
     } else {
@@ -1178,7 +1176,7 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
     let started = std::time::Instant::now();
     let created_at = chrono::Utc::now().to_rfc3339();
     let manifest = Manifest {
-        schema_version: SUPPORTED_MANIFEST_VERSION as i64,
+        schema_version: SUPPORTED_SCHEMA_VERSION as i64,
         index_version: chrono::Utc::now().format("%Y.%m.%d").to_string(),
         created_at,
         min_client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1211,22 +1209,7 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
 
     let manifest_path = out_dir.join("manifest.json");
     fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
-    let summary = UpdateSummary {
-        schema_version: manifest.schema_version,
-        index_version: manifest.index_version.clone(),
-        min_client_version: manifest.min_client_version.clone(),
-        model: manifest.model.clone(),
-        db_sha256: manifest.db.sha256.clone(),
-        db_size: manifest.db.size,
-        manifest_fingerprint: Some(manifest_fingerprint(&manifest)?),
-    };
-    let summary_path = out_dir.join("update.json");
-    fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?)?;
-    eprintln!(
-        "ato-mcp build: wrote {} + {}",
-        manifest_path.display(),
-        summary_path.display()
-    );
+    eprintln!("ato-mcp build: wrote {}", manifest_path.display());
     profile.finalise += started.elapsed();
     profile.print();
 
@@ -1348,7 +1331,7 @@ pub(crate) fn update_manifest_with_db(
     );
     obj.insert(
         "schema_version".to_string(),
-        json!(SUPPORTED_MANIFEST_VERSION),
+        json!(SUPPORTED_SCHEMA_VERSION),
     );
     let pretty = serde_json::to_vec_pretty(&value)?;
     fs::write(manifest_path, pretty)
@@ -1398,38 +1381,13 @@ pub(crate) fn bundle_localize_manifest(
             JsonValue::Number(serde_json::Number::from(fs::metadata(model_bundle)?.len()));
     }
 
-    let manifest_typed: Manifest = serde_json::from_value(manifest.clone())
+    let _: Manifest = serde_json::from_value(manifest.clone())
         .with_context(|| format!("validating {}", manifest_path.display()))?;
-    let manifest_fingerprint = manifest_fingerprint(&manifest_typed)?;
     fs::write(manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
 
-    let summary = json!({
-        "schema_version": manifest.get("schema_version").cloned().unwrap_or(JsonValue::Null),
-        "index_version": manifest.get("index_version").cloned().unwrap_or(JsonValue::Null),
-        "min_client_version": manifest.get("min_client_version").cloned().unwrap_or(JsonValue::String(String::new())),
-        "model": manifest.get("model").cloned().unwrap_or(JsonValue::Null),
-        "document_count": manifest
-            .get("documents")
-            .and_then(|v| v.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0),
-        "pack_count": manifest
-            .get("packs")
-            .and_then(|v| v.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0),
-        "manifest_fingerprint": manifest_fingerprint,
-    });
-    let summary_path = manifest_path
-        .parent()
-        .map(|p| p.join("update.json"))
-        .ok_or_else(|| anyhow!("manifest has no parent dir"))?;
-    fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?)?;
-
     eprintln!(
-        "bundle-localize-manifest: rewrote {} + {}",
+        "bundle-localize-manifest: rewrote {}",
         manifest_path.display(),
-        summary_path.display(),
     );
     Ok(())
 }

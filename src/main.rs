@@ -11,7 +11,7 @@ use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 #[allow(unused_imports)]
-use std::io::{BufRead, Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -35,12 +35,11 @@ mod source;
 mod uri;
 
 use config::{
-    daemon_log_path, default_manifest_url, http_config_path, live_dir, model_data_path, model_path,
-    pick_free_port, spawn_lock_path, tokenizer_path, HttpConfig,
+    default_manifest_url, live_dir, model_data_path, model_path, tokenizer_path,
 };
 use db::enforce_db_schema_version;
 use build::{
-    build_corpus, bundle_localize_manifest, check_build_checkpoint, package_corpus,
+    build_corpus, bundle_localize_manifest, package_corpus,
     update_manifest_with_db, BuildCorpusArgs,
 };
 use retrieval::{
@@ -52,10 +51,8 @@ use search::{
     search, search_cli, SearchOptions,
 };
 use source::{
-    apply_update, auto_update_should_trigger, check_for_update_availability, doctor,
-    link_download, manifest_fingerprint, preview_update, scrape_diff, snapshot_reduce,
-    spawn_update_detached, stats, tree_crawl, LinkDownloadArgs, Manifest, ModelInfo,
-    StagedModel, UpdateAvailability, UpdateSummary,
+    apply_update, check_for_update_availability, link_download, scrape_diff, snapshot_reduce,
+    stats, tree_crawl, LinkDownloadArgs, Manifest, ModelInfo, StagedModel, UpdateAvailability,
 };
 use semantic::{
     SemanticEncodeStats, SemanticModelPaths, SemanticRuntime,
@@ -94,13 +91,19 @@ pub(crate) const STATUTORY_DEFINITION_TYPE_PREFIXES: &[&str] = &["PAC", "REG"];
 pub(crate) const OEWN_2024_URL: &str = "https://en-word.net/static/english-wordnet-2024.zip";
 pub(crate) const OEWN_2024_SOURCE: &str = "Open English WordNet 2024 (CC-BY 4.0)";
 pub(crate) const ORDINARY_DICTIONARY_PATH_ENV: &str = "ATO_MCP_DICTIONARY_PATH";
-/// On-disk schema version this binary supports. Bump when introducing
-/// schema changes; binaries reject any corpus whose schema does not match.
-const SUPPORTED_SCHEMA_VERSION: u32 = 9;
-/// Single release manifest format (`Manifest.schema_version`) this binary
-/// ingests. No legacy manifest layouts are accepted.
-const SUPPORTED_MANIFEST_VERSION: u32 = 5;
+/// Single corpus version this binary supports. Stamped into both
+/// `meta.schema_version` in the SQLite DB and `schema_version` in the
+/// published manifest.json — the two were previously distinct numbers that
+/// always moved together; now they share one identifier. Bump on any
+/// breaking change to the on-disk layout or the manifest contract.
+pub(crate) const SUPPORTED_SCHEMA_VERSION: u32 = 9;
 pub(crate) const EMBEDDING_MODEL_ID: &str = "granite-embedding-small-r2-fp16-256d";
+
+/// Compile-time switch: corpus build and runtime semantic search use the
+/// CUDA execution provider when this binary was built with `--features cuda`,
+/// otherwise CPU. There is no runtime override — the build flavour IS the
+/// switch.
+pub(crate) const USE_GPU: bool = cfg!(feature = "cuda");
 pub(crate) const DEFAULT_MAX_PER_DOC: usize = 2;
 pub(crate) const HARD_MAX_PER_DOC: usize = 3;
 
@@ -118,38 +121,21 @@ struct Cli {
 // here, with no dynamic plugin subcommands or shell-completion surface.
 #[derive(Subcommand)]
 enum Command {
-    /// stdio MCP shim. Auto-spawns the HTTP daemon on first use and proxies
-    /// stdin/stdout to it. This is what MCP clients (Claude Code, Cursor, …)
-    /// launch — no manual daemon management required.
-    Serve {},
-    /// Run the long-lived HTTP MCP daemon directly. Bypasses the stdio
-    /// shim — use this for systemd / launchd / Scheduled Task setups, or
-    /// when an MCP client connects over HTTP transport.
-    Daemon {},
-    /// Pick a port and persist HTTP config; prints the MCP client config to paste.
-    InstallHttp {
-        /// Override the auto-picked port (rare).
-        #[arg(long)]
-        port: Option<u16>,
-        /// Suppress the MCP config block (only write http.json).
-        #[arg(long)]
-        quiet: bool,
+    /// Run the HTTP MCP server in the foreground. Plugin clients connect to
+    /// `http://127.0.0.1:<port>/mcp`. Default port is 51234; override with
+    /// `--port` if it clashes. The user starts this from their terminal; the
+    /// plugin skill guides the agent to ask the user to start it when not
+    /// already running.
+    Serve {
+        #[arg(long, default_value_t = config::DEFAULT_HTTP_PORT)]
+        port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
     },
-    /// Download or refresh the local corpus.
-    Update {
-        #[arg(long)]
-        manifest_url: Option<String>,
-        /// Print what would change vs the installed corpus without
-        /// downloading anything or touching the live DB.
-        #[arg(long)]
-        check: bool,
-    },
-    /// Verify the local corpus, optionally restoring the previous DB snapshot.
-    Doctor {
-        #[arg(long)]
-        rollback: bool,
-    },
-    /// Print index version and counts.
+    /// Download or refresh the local corpus. Always performs a full
+    /// replacement; there is no partial-update path.
+    Update {},
+    /// Print index version, counts, and AustLII session status (JSON).
     Stats {},
     /// Run a search from the CLI.
     Search {
@@ -168,14 +154,12 @@ enum Command {
         mode: SearchMode,
         #[arg(long, default_value = "relevance")]
         sort_by: SortBy,
+        /// Include content dated before 2000-01-01 (matches MCP `include_old`).
         #[arg(long)]
         include_old: bool,
-        /// Include withdrawn / superseded rulings (default excludes them).
-        #[arg(long)]
-        include_withdrawn: bool,
         /// Runtime-embed this text as the query vector instead of `query`
-        /// (e.g. a chunk from `fetch`). Forces vector-only
-        /// mode and returns no title hits.
+        /// (e.g. a chunk from `fetch`). Forces vector-only mode and returns
+        /// no title hits. Matches MCP `seed_text`.
         #[arg(long)]
         seed_text: Option<String>,
     },
@@ -228,30 +212,16 @@ enum Command {
         /// onnx/model_fp16.onnx, and onnx/model_fp16.onnx_data.
         #[arg(long)]
         model_dir: PathBuf,
-        /// Output directory for manifest.json, update.json, and the built ato.db.
+        /// Output directory for manifest.json and the built ato.db.
         #[arg(long)]
         out_dir: PathBuf,
         #[arg(long, default_value_t = 3)]
         zstd_level: i32,
         #[arg(long)]
         limit: Option<usize>,
-        /// Use the CUDA execution provider and fail if CUDA is unavailable.
-        #[arg(long)]
-        gpu: bool,
         /// Print cumulative build-stage timings to stderr.
         #[arg(long)]
         profile: bool,
-    },
-    /// Maintainer-only: validate that a build output dir has a checkpoint
-    /// compatible with the current source index/model settings.
-    #[command(hide = true)]
-    CheckBuildCheckpoint {
-        #[arg(long)]
-        release_dir: PathBuf,
-        #[arg(long)]
-        source_index_sha256: String,
-        #[arg(long, default_value_t = 3)]
-        zstd_level: i32,
     },
     /// Fetch compact statutory definitions for a term.
     GetDefinition {
@@ -356,8 +326,7 @@ enum Command {
     },
     /// Rewrite a manifest.json so packs/model URLs point at filenames
     /// inside an offline bundle (with fresh SHA256 + size). Used by
-    /// scripts/make-offline-bundle.sh as the post-bundling step. Also
-    /// emits update.json (UpdateSummary).
+    /// scripts/make-offline-bundle.sh as the post-bundling step.
     BundleLocalizeManifest {
         #[arg(long)]
         manifest: PathBuf,
@@ -424,10 +393,7 @@ enum AustliiAction {
         #[arg(long)]
         yes: bool,
     },
-    /// Print the persisted session's browser, cookie age, and
-    /// cf_clearance presence.
-    Status,
-    /// Delete the persisted session file.
+    /// Delete the persisted session file. (Status info is in `ato-mcp stats`.)
     Clear,
 }
 
@@ -460,33 +426,21 @@ impl SearchMode {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve {} => serve_stdio_shim(),
-        Command::Daemon {} => {
+        Command::Serve { port, bind } => {
             let state = ServerState {
                 update_notice: resolve_startup_update_notice(),
                 ..Default::default()
             };
-            daemon(Arc::new(state))
+            serve(port, &bind, Arc::new(state))
         }
-        Command::InstallHttp { port, quiet } => install_http(port, !quiet),
-        Command::Update {
-            manifest_url,
-            check,
-        } => {
-            let url = manifest_url.unwrap_or_else(default_manifest_url);
-            if check {
-                let report = preview_update(&url)?;
-                println!("{}", report);
-            } else {
-                let stats = apply_update(&url)?;
-                println!(
-                    "update complete ({:.2} MB downloaded)",
-                    stats.bytes_downloaded as f64 / 1_000_000.0,
-                );
-            }
+        Command::Update {} => {
+            let stats = apply_update(&default_manifest_url())?;
+            println!(
+                "update complete ({:.2} MB downloaded)",
+                stats.bytes_downloaded as f64 / 1_000_000.0,
+            );
             Ok(())
         }
-        Command::Doctor { rollback } => doctor(rollback),
         Command::Stats {} => {
             println!("{}", stats()?);
             Ok(())
@@ -501,7 +455,6 @@ fn main() -> Result<()> {
             mode,
             sort_by,
             include_old,
-            include_withdrawn,
             seed_text,
         } => {
             let types = empty_vec_as_none(types);
@@ -519,7 +472,7 @@ fn main() -> Result<()> {
                     mode,
                     sort_by,
                     include_old,
-                    current_only: !include_withdrawn,
+                    current_only: true,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
                     similar_to_chunk_id: None,
@@ -666,7 +619,6 @@ fn main() -> Result<()> {
             out_dir,
             zstd_level,
             limit,
-            gpu,
             profile,
         } => build_corpus(BuildCorpusArgs {
             pages_dir: &pages_dir,
@@ -675,14 +627,8 @@ fn main() -> Result<()> {
             out_dir: &out_dir,
             zstd_level,
             limit,
-            use_gpu: gpu,
             profile_enabled: profile,
         }),
-        Command::CheckBuildCheckpoint {
-            release_dir,
-            source_index_sha256,
-            zstd_level,
-        } => check_build_checkpoint(&release_dir, &source_index_sha256, zstd_level),
     }
 }
 
@@ -698,25 +644,22 @@ struct ServerState {
     semantic_runtime: Mutex<Option<SemanticRuntime>>,
     semantic_model_paths: Option<SemanticModelPaths>,
     update_notice: Option<UpdateAvailability>,
-    use_gpu: bool,
 }
 
 impl ServerState {
-    fn new(use_gpu: bool) -> Self {
+    fn new() -> Self {
         Self {
             semantic_runtime: Mutex::new(None),
             semantic_model_paths: None,
             update_notice: None,
-            use_gpu,
         }
     }
 
-    fn with_model_paths(use_gpu: bool, semantic_model_paths: SemanticModelPaths) -> Self {
+    fn with_model_paths(semantic_model_paths: SemanticModelPaths) -> Self {
         Self {
             semantic_runtime: Mutex::new(None),
             semantic_model_paths: Some(semantic_model_paths),
             update_notice: None,
-            use_gpu,
         }
     }
 
@@ -747,7 +690,7 @@ impl ServerState {
                 Some(paths) => paths.clone(),
                 None => SemanticModelPaths::live()?,
             };
-            *guard = Some(SemanticRuntime::load(self.use_gpu, &model_paths)?);
+            *guard = Some(SemanticRuntime::load(USE_GPU, &model_paths)?);
         }
         guard
             .as_mut()
@@ -758,7 +701,7 @@ impl ServerState {
 
 impl Default for ServerState {
     fn default() -> Self {
-        Self::new(false)
+        Self::new()
     }
 }
 
@@ -962,20 +905,6 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
     // Save updated manifest.
     let pretty = serde_json::to_vec_pretty(&manifest)?;
     fs::write(&manifest_path, &pretty)?;
-
-    // Generate update.json so end-users can probe quickly.
-    let summary = UpdateSummary {
-        schema_version: manifest.schema_version,
-        index_version: manifest.index_version.clone(),
-        min_client_version: manifest.min_client_version.clone(),
-        model: manifest.model.clone(),
-        db_sha256: manifest.db.sha256.clone(),
-        db_size: manifest.db.size,
-        manifest_fingerprint: Some(manifest_fingerprint(&manifest)?),
-    };
-    let summary_path = args.out_dir.join("update.json");
-    fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?)?;
-    artifacts.insert(1, summary_path);
 
     // [SL-07] Optional release signing shells out to the maintainer minisign
     // CLI and uploads the generated manifest.json.minisig artifact.
@@ -1391,212 +1320,14 @@ fn stage_hf_embedding_model(repo: &str, revision: &str, staging: &Path) -> Resul
     Ok(())
 }
 
-/// Cheap liveness check — returns true iff a request to the configured URL
-/// gets a JSON-RPC parse error back (i.e. the daemon is up and willing to
-/// reject malformed bodies). Any HTTP success on /mcp signals a live daemon
-/// because the endpoint always responds to POSTs.
-fn ping_daemon(url: &str) -> bool {
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_millis(500))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    client
-        .post(url)
-        .header("content-type", "application/json")
-        .body("{}")
-        .send()
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
-}
-
-/// Spawn `ato-mcp daemon` as a detached background process and block until
-/// it prints its readiness line on stderr. The child:
-///   * runs in its own process group / detached so SIGINT to the shim doesn't kill it
-///   * inherits no stdin/stdout (null), so it survives shim teardown
-///   * pipes stderr to us only for the readiness handshake; afterwards we
-///     drain the rest into the daemon log file on a background thread so the
-///     pipe never fills and the daemon keeps running.
-fn spawn_daemon_detached(cfg: &HttpConfig) -> Result<()> {
-    use std::process::{Command, Stdio};
-
-    let exe = std::env::current_exe().context("locating ato-mcp binary")?;
-    let mut cmd = Command::new(&exe);
-    cmd.arg("daemon")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-
-    // Detach so the child survives the shim's exit and isn't in our process
-    // group (so Ctrl-C / SIGTERM to the shim doesn't propagate).
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS = 0x00000008
-        cmd.creation_flags(0x00000008);
-    }
-
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("spawning {}", exe.display()))?;
-
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("daemon stderr not captured"))?;
-    let needle = format!("listening on {}", cfg.url());
-    let mut reader = std::io::BufReader::new(stderr);
-    let mut line = String::new();
-    let mut early_lines = String::new();
-    loop {
-        line.clear();
-        let n = reader
-            .read_line(&mut line)
-            .context("reading daemon readiness")?;
-        if n == 0 {
-            // Daemon exited before readiness. Try to surface what it said.
-            let _ = child.wait();
-            if early_lines.is_empty() {
-                bail!("daemon exited before becoming ready");
-            }
-            bail!(
-                "daemon exited before becoming ready: {}",
-                early_lines.trim()
-            );
-        }
-        if line.contains(&needle) {
-            break;
-        }
-        early_lines.push_str(&line);
-    }
-
-    // Daemon is up. Drain the rest of its stderr into the log file on a
-    // background thread so the pipe buffer never fills.
-    if let Ok(log_path) = daemon_log_path() {
-        std::thread::spawn(move || {
-            if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(&log_path) {
-                let mut buf = [0u8; 4096];
-                while let Ok(n) = reader.get_mut().read(&mut buf) {
-                    if n == 0 {
-                        break;
-                    }
-                    let _ = log.write_all(&buf[..n]);
-                }
-            }
-        });
-    }
-
-    // We intentionally drop `child` here so the OS reparents it; the
-    // detached process keeps running.
-    std::mem::forget(child);
-    Ok(())
-}
-
-/// Ensure a daemon is running at the configured URL, spawning one if not.
-/// Serialised across concurrent shim invocations via an exclusive file lock
-/// so two parallel sessions don't race on the bind.
-fn ensure_daemon_running(cfg: &HttpConfig) -> Result<()> {
-    if ping_daemon(&cfg.url()) {
-        return Ok(());
-    }
-    let lock_path = spawn_lock_path()?;
-    let lock_file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .with_context(|| format!("opening {}", lock_path.display()))?;
-    lock_file
-        .lock_exclusive()
-        .with_context(|| format!("locking {}", lock_path.display()))?;
-    // Recheck after acquiring the lock — another shim may have spawned the
-    // daemon while we were waiting for the lock.
-    if !ping_daemon(&cfg.url()) {
-        spawn_daemon_detached(cfg)?;
-    }
-    // Lock releases on drop.
-    drop(lock_file);
-    Ok(())
-}
-
-/// MCP stdio shim: zero-config front-end that auto-starts the HTTP daemon
-/// and proxies stdin/stdout to it. This is what MCP clients launch — they
-/// never see HTTP, the daemon, or its port; the user never starts anything
-/// manually.
-fn serve_stdio_shim() -> Result<()> {
-    let cfg = HttpConfig::load_or_init()?;
-    ensure_daemon_running(&cfg)?;
-
-    let url = cfg.url();
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .context("building HTTP client")?;
-
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let response = match post_to_daemon(&client, &url, &line) {
-            Ok(r) => r,
-            Err(_) => {
-                // Daemon may have died mid-session. Try once to bring it
-                // back and retry the request.
-                ensure_daemon_running(&cfg)?;
-                post_to_daemon(&client, &url, &line)?
-            }
-        };
-        if let Some(body) = response {
-            stdout.write_all(body.as_bytes())?;
-            stdout.write_all(b"\n")?;
-            stdout.flush()?;
-        }
-    }
-    Ok(())
-}
-
-fn post_to_daemon(
-    client: &reqwest::blocking::Client,
-    url: &str,
-    body: &str,
-) -> Result<Option<String>> {
-    let resp = client
-        .post(url)
-        .header("content-type", "application/json")
-        .body(body.to_string())
-        .send()?;
-    let status = resp.status();
-    if status.as_u16() == 204 {
-        // Notification — no body to forward.
-        return Ok(None);
-    }
-    let text = resp.text()?;
-    if !status.is_success() {
-        bail!("daemon returned HTTP {status}: {text}");
-    }
-    Ok(Some(text))
-}
-
-fn daemon(state: Arc<ServerState>) -> Result<()> {
-    let cfg = HttpConfig::load_or_init()?;
-    let addr = format!("{}:{}", cfg.bind, cfg.port);
+fn serve(port: u16, bind: &str, state: Arc<ServerState>) -> Result<()> {
+    let addr = format!("{bind}:{port}");
     let server = tiny_http::Server::http(&addr).map_err(|e| {
         anyhow!(
-            "bind {addr}: {e}. If the port is already in use, re-run `ato-mcp install-http --port <free-port>`."
+            "bind {addr}: {e}. If the port is already in use, start with `ato-mcp serve --port <free-port>`."
         )
     })?;
-    eprintln!("ato-mcp listening on {}", cfg.url());
+    eprintln!("ato-mcp listening on http://{addr}/mcp");
 
     for request in server.incoming_requests() {
         let state = Arc::clone(&state);
@@ -1655,42 +1386,6 @@ fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<(
     Ok(())
 }
 
-fn install_http(port_override: Option<u16>, print_config: bool) -> Result<()> {
-    let cfg = match (HttpConfig::load()?, port_override) {
-        (Some(existing), None) => existing,
-        _ => {
-            let port = match port_override {
-                Some(p) => p,
-                None => pick_free_port()?,
-            };
-            let cfg = HttpConfig {
-                bind: "127.0.0.1".to_string(),
-                port,
-            };
-            cfg.save()?;
-            cfg
-        }
-    };
-    if print_config {
-        let url = cfg.url();
-        println!("ato-mcp will listen on {url}");
-        println!("Config written to {}", http_config_path()?.display());
-        println!();
-        println!("Claude Code:");
-        println!("  claude mcp add --scope user --transport http ato {url}");
-        println!();
-        println!("Claude Desktop (claude_desktop_config.json):");
-        let block = json!({
-            "mcpServers": {
-                "ato": { "type": "http", "url": url }
-            }
-        });
-        println!("{}", serde_json::to_string_pretty(&block)?);
-        println!();
-        println!("Start the daemon with: ato-mcp serve");
-    }
-    Ok(())
-}
 
 fn handle_rpc(message: JsonValue, state: &ServerState) -> Option<JsonValue> {
     if message.is_array() {
@@ -1880,7 +1575,6 @@ pub(crate) fn optional_string_array(args: &JsonValue, name: &str) -> Result<Opti
 fn austlii_command(action: AustliiAction) -> Result<()> {
     match action {
         AustliiAction::Setup { cookie, yes } => austlii_setup(cookie.as_deref(), yes),
-        AustliiAction::Status => austlii_status(),
         AustliiAction::Clear => austlii_clear(),
     }
 }
@@ -1996,35 +1690,6 @@ fn austlii_setup(manual_cookie: Option<&str>, skip_prompt: bool) -> Result<()> {
     Ok(())
 }
 
-fn austlii_status() -> Result<()> {
-    let session = cookies::load_session()?;
-    match session {
-        None => {
-            println!("No persisted AustLII session.");
-            println!("Run `ato-mcp austlii setup` to acquire one.");
-        }
-        Some(s) => {
-            println!("Session file: {}", cookies::session_file_path()?.display());
-            println!("Acquired at:  {}", s.acquired_at);
-            println!("Browser:      {}", s.browser_name);
-            println!("User agent:   {}", s.user_agent);
-            println!("Cookies:      {}", s.cookies.len());
-            match cookies::cf_clearance(&s) {
-                Some(value) => {
-                    let mask = if value.len() > 12 {
-                        format!("{}…{}", &value[..6], &value[value.len() - 6..])
-                    } else {
-                        "(redacted)".to_string()
-                    };
-                    println!("cf_clearance: present ({mask})");
-                }
-                None => println!("cf_clearance: MISSING"),
-            }
-        }
-    }
-    Ok(())
-}
-
 fn austlii_clear() -> Result<()> {
     let path = cookies::session_file_path()?;
     let existed = path.exists();
@@ -2041,24 +1706,16 @@ fn austlii_clear() -> Result<()> {
 const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first; hits are chunk pointers — call `get_chunks` for text. Use `get_doc_anchors` for nav, related, history, and cited-by. Chunk markers self-describe: `[doc:X]` is in-corpus (resolve via `get_chunks` / `get_doc_anchors`), `[fetch:URI]` is external (use `fetch`, e.g. `fetch("austlii:au/cases/cth/HCA/1992/23")`). For AustLII lookups, run `search_austlii` first to get a `fetch_uri`. `fetch(uri, allow_ocr=true)` opts into Tesseract OCR for scanned PDFs — set MCP `timeout: 120000` for that. For historical/withdrawn material set `current_only=false` and `include_old=true`."##;
 
 /// Build the `update_notice` carried in `ServerState` for the lifetime of the
-/// daemon. Runs `check_for_update_availability` and, if a newer corpus is
-/// available *and* the local install is stale per `auto_update_should_trigger`,
-/// fires a detached `ato-mcp update` in the background and flips the notice
-/// into the `auto_applying` variant so `server_instructions` tells the user to
-/// wait rather than to run the command themselves.
+/// server. Runs `check_for_update_availability` once at startup; the result
+/// (newer index version, if any) is folded into the MCP `initialize`
+/// instructions so the agent can suggest the user run `ato-mcp update`.
 fn resolve_startup_update_notice() -> Option<UpdateAvailability> {
-    let mut notice = check_for_update_availability(&default_manifest_url())
+    check_for_update_availability(&default_manifest_url())
         .ok()
-        .flatten()?;
-    if auto_update_should_trigger().unwrap_or(false) && spawn_update_detached().is_ok() {
-        notice.auto_applying = true;
-    }
-    Some(notice)
+        .flatten()
 }
 
 fn server_instructions(update_notice: Option<&UpdateAvailability>) -> String {
-    // [SW-02] Instructions are generated from live corpus stats.
-    // [SW-03] Missing/unreadable stats fall back to static install guidance.
     let body = match stats()
         .ok()
         .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
@@ -2072,17 +1729,13 @@ fn server_instructions(update_notice: Option<&UpdateAvailability>) -> String {
             ATO_MCP_USE_INSTRUCTIONS,
         ),
         None => format!(
-            "ATO corpus is not yet installed on this machine. Tell the user to run `ato-mcp update` in their terminal to download the corpus (~4 GB, takes 5-10 min). After install completes, the MCP client should be restarted so this server picks up the new corpus.\n\n{}",
+            "The ATO corpus is not yet installed on this machine. Run `ato-mcp update` in a terminal to download it (~4 GB, takes 5-10 min). Restart the MCP client after the download completes.\n\n{}",
             ATO_MCP_USE_INSTRUCTIONS
         ),
     };
     match update_notice {
-        Some(notice) if notice.auto_applying => format!(
-            "{body}\n\nA newer ATO corpus index ({}) is being downloaded in the background. The current MCP session continues using the installed corpus; the user should restart their MCP client after the download completes (typically 5-10 min; progress in the `logs/auto-update-*.log` file under the ato-mcp data directory).",
-            notice.available_index_version
-        ),
         Some(notice) => format!(
-            "{body}\n\nA newer ATO corpus index is available (available: {}). Tell the user to run `ato-mcp update` in their terminal when convenient. The current MCP session will continue using the installed corpus until the update completes and the MCP client is restarted.",
+            "{body}\n\nA newer ATO corpus index is available ({}). Run `ato-mcp update` in a terminal when convenient and restart the MCP client to pick it up.",
             notice.available_index_version
         ),
         None => body,
@@ -2591,13 +2244,13 @@ mod tests {
 
     #[test]
     fn manifest_compat_accepts_current_schema() {
-        let m = sample_manifest(SUPPORTED_MANIFEST_VERSION as i64, "");
+        let m = sample_manifest(SUPPORTED_SCHEMA_VERSION as i64, "");
         assert!(enforce_manifest_compatibility(&m).is_ok());
     }
 
     #[test]
     fn manifest_compat_rejects_newer_schema() {
-        let m = sample_manifest((SUPPORTED_MANIFEST_VERSION + 1) as i64, "");
+        let m = sample_manifest((SUPPORTED_SCHEMA_VERSION + 1) as i64, "");
         let err = enforce_manifest_compatibility(&m).unwrap_err();
         assert!(
             err.to_string().contains("not supported"),
@@ -2607,7 +2260,7 @@ mod tests {
 
     #[test]
     fn manifest_compat_rejects_older_schema() {
-        let m = sample_manifest((SUPPORTED_MANIFEST_VERSION - 1) as i64, "");
+        let m = sample_manifest((SUPPORTED_SCHEMA_VERSION - 1) as i64, "");
         let err = enforce_manifest_compatibility(&m).unwrap_err();
         assert!(
             err.to_string().contains("not supported"),
@@ -2618,7 +2271,7 @@ mod tests {
     #[test]
     fn manifest_json_rejects_legacy_or_unknown_fields() -> Result<()> {
         let mut with_reranker = serde_json::to_value(sample_manifest(
-            SUPPORTED_MANIFEST_VERSION as i64,
+            SUPPORTED_SCHEMA_VERSION as i64,
             env!("CARGO_PKG_VERSION"),
         ))?;
         with_reranker["reranker"] = JsonValue::Null;
@@ -2628,7 +2281,7 @@ mod tests {
         );
 
         let mut with_legacy_docs = serde_json::to_value(sample_manifest(
-            SUPPORTED_MANIFEST_VERSION as i64,
+            SUPPORTED_SCHEMA_VERSION as i64,
             env!("CARGO_PKG_VERSION"),
         ))?;
         with_legacy_docs["docs"] = json!([]);
@@ -2638,7 +2291,7 @@ mod tests {
         );
 
         let mut with_tokenizer_sha = serde_json::to_value(sample_manifest(
-            SUPPORTED_MANIFEST_VERSION as i64,
+            SUPPORTED_SCHEMA_VERSION as i64,
             env!("CARGO_PKG_VERSION"),
         ))?;
         with_tokenizer_sha["model"]["tokenizer_sha256"] = json!("legacy");
@@ -2804,7 +2457,7 @@ mod tests {
 
     #[test]
     fn manifest_compat_rejects_higher_min_client_version() {
-        let m = sample_manifest(SUPPORTED_MANIFEST_VERSION as i64, "999.0.0");
+        let m = sample_manifest(SUPPORTED_SCHEMA_VERSION as i64, "999.0.0");
         let err = enforce_manifest_compatibility(&m).unwrap_err();
         assert!(
             err.to_string().contains("999"),
@@ -2816,15 +2469,15 @@ mod tests {
     fn manifest_compat_accepts_min_client_version_at_or_below_current() {
         // Any version that's <= the current binary's version should pass.
         let current = env!("CARGO_PKG_VERSION");
-        let m = sample_manifest(SUPPORTED_MANIFEST_VERSION as i64, current);
+        let m = sample_manifest(SUPPORTED_SCHEMA_VERSION as i64, current);
         assert!(enforce_manifest_compatibility(&m).is_ok());
-        let m = sample_manifest(SUPPORTED_MANIFEST_VERSION as i64, "0.0.1");
+        let m = sample_manifest(SUPPORTED_SCHEMA_VERSION as i64, "0.0.1");
         assert!(enforce_manifest_compatibility(&m).is_ok());
     }
 
     #[test]
     fn manifest_compat_rejects_non_hf_model_without_metadata() {
-        let mut m = sample_manifest(SUPPORTED_MANIFEST_VERSION as i64, "");
+        let mut m = sample_manifest(SUPPORTED_SCHEMA_VERSION as i64, "");
         m.model = ModelInfo {
             id: EMBEDDING_MODEL_ID.to_string(),
             sha256: String::new(),
@@ -2840,7 +2493,7 @@ mod tests {
 
     #[test]
     fn manifest_compat_rejects_hf_model_metadata_mismatch() {
-        let mut m = sample_manifest(SUPPORTED_MANIFEST_VERSION as i64, "");
+        let mut m = sample_manifest(SUPPORTED_SCHEMA_VERSION as i64, "");
         m.model = ModelInfo {
             id: EMBEDDING_MODEL_ID.to_string(),
             sha256: "wrong-sha".to_string(),
@@ -2869,7 +2522,7 @@ mod tests {
         let model_bundle = release.path().join("model-bundle.tar.zst");
         let bundle_bytes = write_test_model_bundle(&model_bundle)?;
         let manifest = Manifest {
-            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
+            schema_version: SUPPORTED_SCHEMA_VERSION as i64,
             index_version: "wrong-model-size".to_string(),
             created_at: "2026-05-04T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2975,7 +2628,7 @@ mod tests {
         drop(conn);
         let model_sha = "expected-model-marker";
         let manifest = Manifest {
-            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
+            schema_version: SUPPORTED_SCHEMA_VERSION as i64,
             index_version: "test-marker-readiness".to_string(),
             created_at: "2026-05-04T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -3132,7 +2785,6 @@ mod tests {
         with_data_dir(data.path(), || {
             let notice = UpdateAvailability {
                 available_index_version: "2026.05.20".to_string(),
-                auto_applying: false,
             };
             let text = server_instructions(Some(&notice));
             assert!(
@@ -3151,85 +2803,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn auto_applying_notice_text_directs_user_to_wait() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let data = tempdir()?;
-        with_data_dir(data.path(), || {
-            let notice = UpdateAvailability {
-                available_index_version: "2026.05.20".to_string(),
-                auto_applying: true,
-            };
-            let text = server_instructions(Some(&notice));
-            assert!(
-                text.contains("being downloaded in the background"),
-                "auto-applying notice must mention background download: {text}"
-            );
-            assert!(
-                text.contains("2026.05.20"),
-                "missing available index_version: {text}"
-            );
-            assert!(
-                text.contains("restart their MCP client"),
-                "auto-applying notice must tell user to restart client: {text}"
-            );
-            // The available-but-not-applying suffix uses a distinctive
-            // imperative ("when convenient"); make sure the auto-applying
-            // branch did NOT emit it.
-            assert!(
-                !text.contains("when convenient"),
-                "auto-applying notice must not use the manual-update phrasing: {text}"
-            );
-        });
-        Ok(())
-    }
-
-    #[test]
-    fn auto_update_gate_false_when_last_unknown() {
-        assert!(!auto_update_should_trigger_at(None, Utc::now()));
-    }
-
-    #[test]
-    fn auto_update_gate_false_within_seven_days() {
-        let now = Utc::now();
-        assert!(!auto_update_should_trigger_at(
-            Some(now - chrono::Duration::days(1)),
-            now
-        ));
-        assert!(!auto_update_should_trigger_at(
-            Some(now - chrono::Duration::days(7)),
-            now
-        ));
-    }
-
-    #[test]
-    fn auto_update_gate_true_when_stale() {
-        let now = Utc::now();
-        assert!(auto_update_should_trigger_at(
-            Some(now - chrono::Duration::days(8)),
-            now
-        ));
-        assert!(auto_update_should_trigger_at(
-            Some(now - chrono::Duration::days(30)),
-            now
-        ));
-    }
-
-    #[test]
-    fn auto_update_gate_respects_env_disable() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var("ATO_MCP_AUTO_UPDATE").ok();
-        std::env::set_var("ATO_MCP_AUTO_UPDATE", "0");
-        let result = auto_update_should_trigger();
-        if let Some(value) = prev {
-            std::env::set_var("ATO_MCP_AUTO_UPDATE", value);
-        } else {
-            std::env::remove_var("ATO_MCP_AUTO_UPDATE");
-        }
-        assert!(
-            !result?,
-            "ATO_MCP_AUTO_UPDATE=0 must short-circuit before any DB read"
-        );
         Ok(())
     }
 
@@ -3297,35 +2870,12 @@ mod tests {
     }
 
     #[test]
-    fn check_for_update_availability_returns_none_when_offline() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
-        let prev = std::env::var("ATO_MCP_OFFLINE").ok();
-        std::env::set_var("ATO_MCP_OFFLINE", "1");
-        let result = check_for_update_availability("https://example.invalid/manifest.json");
-        if let Some(value) = prev {
-            std::env::set_var("ATO_MCP_OFFLINE", value);
-        } else {
-            std::env::remove_var("ATO_MCP_OFFLINE");
-        }
-        assert!(
-            result?.is_none(),
-            "offline probe must short-circuit before any network attempt"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn check_for_update_availability_returns_none_when_no_installed_manifest() -> Result<()> {
         let _lock = TEST_DB_LOCK.lock().unwrap();
         let data = tempdir()?;
-        let prev = std::env::var("ATO_MCP_OFFLINE").ok();
-        std::env::remove_var("ATO_MCP_OFFLINE");
         let result = with_data_dir(data.path(), || {
             check_for_update_availability("https://example.invalid/manifest.json")
         });
-        if let Some(value) = prev {
-            std::env::set_var("ATO_MCP_OFFLINE", value);
-        }
         assert!(
             result?.is_none(),
             "probe must return None when no installed manifest is present"
@@ -3342,7 +2892,7 @@ mod tests {
         let manifest_path = release_dir.join("manifest.json");
 
         let installed = Manifest {
-            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
+            schema_version: SUPPORTED_SCHEMA_VERSION as i64,
             index_version: "test-installed".to_string(),
             created_at: "2026-05-04T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -3358,22 +2908,14 @@ mod tests {
                 size: 1,
             },
         };
-        let summary = UpdateSummary {
-            schema_version: (SUPPORTED_MANIFEST_VERSION + 1) as i64,
+        // Published manifest declares a schema this binary can't ingest.
+        let published = Manifest {
+            schema_version: (SUPPORTED_SCHEMA_VERSION + 1) as i64,
             index_version: "test-future".to_string(),
-            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
-            model: installed.model.clone(),
-            db_sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-            db_size: 1,
-            manifest_fingerprint: Some("future-fingerprint".to_string()),
+            ..installed.clone()
         };
-        fs::write(
-            release_dir.join("update.json"),
-            serde_json::to_vec_pretty(&summary)?,
-        )?;
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&published)?)?;
 
-        let prev = std::env::var("ATO_MCP_OFFLINE").ok();
-        std::env::remove_var("ATO_MCP_OFFLINE");
         let result = with_data_dir(data.path(), || -> Result<Option<UpdateAvailability>> {
             fs::write(
                 installed_manifest_path()?,
@@ -3381,9 +2923,6 @@ mod tests {
             )?;
             check_for_update_availability(manifest_path.to_str().expect("utf-8 path"))
         });
-        if let Some(value) = prev {
-            std::env::set_var("ATO_MCP_OFFLINE", value);
-        }
         assert!(
             result?.is_none(),
             "probe must suppress the notice when the published index requires a newer binary"
@@ -3398,15 +2937,14 @@ mod tests {
         let release = tempdir()?;
         let release_dir = release.path();
         let manifest_path = release_dir.join("manifest.json");
-        let model_sha = "current-probe-sha";
         let manifest = Manifest {
-            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
+            schema_version: SUPPORTED_SCHEMA_VERSION as i64,
             index_version: "test-probe-current".to_string(),
             created_at: "2026-05-04T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
             model: ModelInfo {
                 id: EMBEDDING_MODEL_ID.to_string(),
-                sha256: model_sha.to_string(),
+                sha256: "current-probe-sha".to_string(),
                 size: 5,
                 url: "model-bundle.tar.zst".to_string(),
             },
@@ -3416,42 +2954,18 @@ mod tests {
                 size: 1,
             },
         };
-        let summary = UpdateSummary {
-            schema_version: manifest.schema_version,
-            index_version: manifest.index_version.clone(),
-            min_client_version: manifest.min_client_version.clone(),
-            model: manifest.model.clone(),
-            db_sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-            db_size: 1,
-            manifest_fingerprint: Some(manifest_fingerprint(&manifest)?),
-        };
-        fs::write(
-            release_dir.join("update.json"),
-            serde_json::to_vec_pretty(&summary)?,
-        )?;
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
 
-        let prev = std::env::var("ATO_MCP_OFFLINE").ok();
-        std::env::remove_var("ATO_MCP_OFFLINE");
         let result = with_data_dir(data.path(), || -> Result<Option<UpdateAvailability>> {
-            let conn = open_write_at(&db_path()?)?;
-            init_db(&conn)?;
-            drop(conn);
             fs::write(
                 installed_manifest_path()?,
                 serde_json::to_vec_pretty(&manifest)?,
             )?;
-            fs::write(model_path()?, b"model")?;
-            fs::write(model_data_path()?, b"model-data")?;
-            fs::write(live_dir()?.join("tokenizer.json"), br#"{"version":"1.0"}"#)?;
-            fs::write(live_dir()?.join(".model.sha256"), model_sha)?;
             check_for_update_availability(manifest_path.to_str().expect("utf-8 path"))
         });
-        if let Some(value) = prev {
-            std::env::set_var("ATO_MCP_OFFLINE", value);
-        }
         assert!(
             result?.is_none(),
-            "probe must return None when installed corpus already matches the published summary"
+            "probe must return None when installed corpus already matches the published manifest"
         );
         Ok(())
     }
@@ -4231,7 +3745,7 @@ mod tests {
         )?;
         let model_bundle_bytes = fs::read(&model_bundle)?;
         let manifest = Manifest {
-            schema_version: SUPPORTED_MANIFEST_VERSION as i64,
+            schema_version: SUPPORTED_SCHEMA_VERSION as i64,
             index_version: "test-incomplete-model-bundle".to_string(),
             created_at: "2026-05-04T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -4364,7 +3878,7 @@ mod tests {
 
     #[test]
     fn manifest_compat_rejects_newer_manifest_format() {
-        let m = sample_manifest((SUPPORTED_MANIFEST_VERSION + 1) as i64, "");
+        let m = sample_manifest((SUPPORTED_SCHEMA_VERSION + 1) as i64, "");
         let err =
             enforce_manifest_compatibility(&m).expect_err("newer manifest should be rejected");
         assert!(

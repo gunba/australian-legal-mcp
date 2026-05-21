@@ -196,7 +196,7 @@ pub(crate) fn init_db(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
-    set_meta(conn, "schema_version", "9")?;
+    set_meta(conn, "schema_version", &SUPPORTED_SCHEMA_VERSION.to_string())?;
     Ok(())
 }
 

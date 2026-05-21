@@ -171,6 +171,26 @@ pub(crate) fn cf_clearance(session: &AustliiSession) -> Option<&str> {
         .map(|c| c.value.as_str())
 }
 
+/// JSON summary of the persisted AustLII session for `stats` output.
+/// Returns `null` when no session is persisted. The `cf_clearance_present`
+/// boolean lets callers see whether search is functional without exposing
+/// the cookie value itself.
+pub(crate) fn session_summary_json() -> serde_json::Value {
+    match load_session() {
+        Ok(Some(session)) => serde_json::json!({
+            "session_present": true,
+            "acquired_at": session.acquired_at,
+            "browser_name": session.browser_name,
+            "user_agent": session.user_agent,
+            "cookie_count": session.cookies.len(),
+            "cf_clearance_present": cf_clearance(&session).is_some(),
+        }),
+        _ => serde_json::json!({
+            "session_present": false,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
