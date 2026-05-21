@@ -18,10 +18,10 @@ the external URL recorded in the release manifest.
 |---|---|
 | `search` | Hybrid semantic-plus-lexical search over the GPU-built corpus. Defaults exclude Edited Private Advice and very old non-legislation content. |
 | `get_doc_anchors` | Return in-document anchors, related documents, historical-version URLs, and reverse citations for a corpus document. |
-| `get_chunks` | Fetch exact chunks returned by `search`, with optional neighbor context. |
+| `get_chunks` | Fetch exact chunks returned by `search`, with optional neighbor context. `[doc:X]` markers in chunk text carry an ` ext` suffix when the target is not in the local corpus, so the agent can route to `fetch_external_doc` without probing. |
 | `get_definition` | Fetch compact statutory definitions for a term, with labelled ordinary-meaning fallback when no statutory definition is found. |
 | `get_asset` | Resolve a retained image `data-asset-ref` to a local file path and source metadata. |
-| `fetch_external_doc` | Fetch a live ATO document by `doc_id` and optional point-in-time parameters when a referenced document is outside the local corpus. |
+| `fetch_external_doc` | Fetch a live ATO document by `doc_id` and optional point-in-time parameters when a referenced document is outside the local corpus. Returned chunk text uses the same `[doc:X]` / `[doc:X ext]` annotation as corpus chunks, so navigation stays consistent across the boundary. |
 | `stats` | Index version, counts, and default search policy. |
 
 JSON results include the ATO `canonical_url`. Document bodies are exposed as

@@ -768,7 +768,8 @@ pub(crate) fn load_hit(
         return Ok(None);
     };
     let doc_id: String = row.get("doc_id")?;
-    let text = decompress_text(row.get("text")?)?;
+    let raw_text = decompress_text(row.get("text")?)?;
+    let text = crate::retrieval::annotate_doc_refs(&raw_text, &doc_id)?;
     let chunk_id: i64 = row.get("chunk_id")?;
     Ok(Some(Hit {
         doc_id: doc_id.clone(),

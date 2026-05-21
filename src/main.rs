@@ -1804,7 +1804,7 @@ pub(crate) fn optional_string_array(args: &JsonValue, name: &str) -> Result<Opti
 }
 
 
-const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first. Search hits are chunk pointers, not authority; call `get_chunks` before relying on text. Use `get_doc_anchors` for in-doc navigation, related/history links, and cited-by. Use `fetch_external_doc` only for unindexed `[doc:X]` links; pass fetched chunk text to `search(seed_text=...)` to pivot back into the corpus. For historical or withdrawn material, set `current_only=false` and `include_old=true`."##;
+const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first. Search hits are chunk pointers, not authority; call `get_chunks` before relying on text. Use `get_doc_anchors` for in-doc navigation, related/history links, and cited-by. Use `fetch_external_doc` only for unindexed `[doc:X]` links; markers with the ` ext` suffix (e.g. `[doc:LRP/117CLR514 ext]`) point to docs that aren't in the corpus and need that tool, while unmarked `[doc:X]` references resolve through `get_chunks` / `get_doc_anchors`. Pass fetched chunk text to `search(seed_text=...)` to pivot back into the corpus. For historical or withdrawn material, set `current_only=false` and `include_old=true`."##;
 
 /// Build the `update_notice` carried in `ServerState` for the lifetime of the
 /// daemon. Runs `check_for_update_availability` and, if a newer corpus is
@@ -1910,7 +1910,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_chunks",
-            "description": "Fetch chunk bodies by chunk_id, with optional before/after neighbour chunks. Text may contain `[doc:X]` and `[asset:X]` markers.",
+            "description": "Fetch chunk bodies by chunk_id, with optional before/after neighbour chunks. Text may contain `[doc:X]` and `[asset:X]` markers; `[doc:X ext]` flags references that are not in the local corpus and need `fetch_external_doc`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1949,7 +1949,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "fetch_external_doc",
-            "description": "Fetch an unindexed live ATO doc_id as `{ord, anchor, text}` chunks. Use for specific `[doc:X]` links; some TOC/container ids are not externally fetchable.",
+            "description": "Fetch an unindexed live ATO doc_id as `{ord, anchor, text}` chunks. Use when a `[doc:X]` reference carries the ` ext` suffix (e.g. `[doc:LRP/117CLR514 ext]`); some TOC/container ids are not externally fetchable.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4297,4 +4297,50 @@ mod tests {
     // Tests that touch the global data dir env var cannot run in
     // parallel — serialise them through a single mutex.
     static TEST_DB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_annotate_doc_refs_marks_external_targets() {
+        let mut corpus = HashSet::new();
+        corpus.insert("JUD/HAYES".to_string());
+        corpus.insert("PAC/19360027/6".to_string());
+        // Bare in-corpus marker: unchanged.
+        assert_eq!(
+            annotate_doc_refs_with("see [doc:JUD/HAYES]", "SRC", &corpus),
+            "see [doc:JUD/HAYES]"
+        );
+        // External target: ` ext` inserted between doc_id and `]`.
+        assert_eq!(
+            annotate_doc_refs_with("see [doc:LRP/117CLR514]", "SRC", &corpus),
+            "see [doc:LRP/117CLR514 ext]"
+        );
+        // Self-reference: never annotated even if not in corpus.
+        assert_eq!(
+            annotate_doc_refs_with("see [doc:SRC]", "SRC", &corpus),
+            "see [doc:SRC]"
+        );
+        // Already-annotated marker is left alone (idempotent).
+        assert_eq!(
+            annotate_doc_refs_with("see [doc:LRP/X ext]", "SRC", &corpus),
+            "see [doc:LRP/X ext]"
+        );
+        // View qualifier preserved; ` ext` slots in front of the qualifier.
+        assert_eq!(
+            annotate_doc_refs_with("see [doc:LRP/X view=HISTFT]", "SRC", &corpus),
+            "see [doc:LRP/X ext view=HISTFT]"
+        );
+        // PiT qualifier (separator is `@`) preserved.
+        assert_eq!(
+            annotate_doc_refs_with("see [doc:LRP/X@19960320000001]", "SRC", &corpus),
+            "see [doc:LRP/X ext@19960320000001]"
+        );
+        // Multiple markers in one text, mixed in/out of corpus.
+        assert_eq!(
+            annotate_doc_refs_with(
+                "[doc:JUD/HAYES] and [doc:LRP/X] and [doc:PAC/19360027/6]",
+                "SRC",
+                &corpus,
+            ),
+            "[doc:JUD/HAYES] and [doc:LRP/X ext] and [doc:PAC/19360027/6]"
+        );
+    }
 }

@@ -22,10 +22,76 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use zip::ZipArchive;
 
 pub(crate) const CITED_BY_LIMIT: usize = 100;
 
+/// Cached set of every doc_id in the local corpus. Loaded once per process
+/// from `documents.doc_id` so the `[doc:X]` annotation pass on chunk hydration
+/// stays O(text length) instead of paying a SQL round-trip per marker.
+static CORPUS_DOC_IDS: OnceLock<HashSet<String>> = OnceLock::new();
+
+/// `[doc:X]` marker regex. Captures the doc_id (up to whitespace, `]`, or
+/// `@` for the PiT/view qualifier separator) and the trailing qualifier
+/// segment up to the closing `]`. Shared by `derive_citations` (build-time
+/// citation extraction) and `annotate_doc_refs` (read-time annotation).
+fn doc_marker_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\[doc:([^\s\]@]+)([^\]]*)\]").expect("valid regex"))
+}
+
+/// Lazily load every doc_id in `documents` into a set. ~150k strings of
+/// ~25 chars ≈ a few MB; amortised across the process lifetime.
+pub(crate) fn corpus_doc_id_set() -> Result<&'static HashSet<String>> {
+    if let Some(set) = CORPUS_DOC_IDS.get() {
+        return Ok(set);
+    }
+    let conn = open_read()?;
+    let mut stmt = conn.prepare("SELECT doc_id FROM documents")?;
+    let mut set = HashSet::new();
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        set.insert(row?);
+    }
+    Ok(CORPUS_DOC_IDS.get_or_init(|| set))
+}
+
+/// Rewrite `[doc:X]` markers whose target is not in the local corpus to
+/// `[doc:X ext]`. Preserves trailing qualifiers (`view=...`, `@PiT=...`,
+/// anchor fragments) — ` ext` slots between the doc_id and any tail.
+/// Self-references and already-annotated markers are left unchanged.
+pub(crate) fn annotate_doc_refs(text: &str, self_doc_id: &str) -> Result<String> {
+    Ok(annotate_doc_refs_with(text, self_doc_id, corpus_doc_id_set()?))
+}
+
+/// Pure helper: same as `annotate_doc_refs` but takes the doc-id set
+/// explicitly so unit tests don't need a live DB.
+pub(crate) fn annotate_doc_refs_with(
+    text: &str,
+    self_doc_id: &str,
+    corpus: &HashSet<String>,
+) -> String {
+    let re = doc_marker_regex();
+    re.replace_all(text, |caps: &regex::Captures<'_>| {
+        let doc_id = &caps[1];
+        let tail = &caps[2];
+        if doc_id == self_doc_id || corpus.contains(doc_id) {
+            return caps[0].to_string();
+        }
+        // Idempotent: if the tail is already ` ext` (alone, or followed by a
+        // separator before the next qualifier), leave it. Plain `starts_with`
+        // would false-positive on accidental tails like ` extra`.
+        if tail == " ext"
+            || tail.starts_with(" ext ")
+            || tail.starts_with(" ext@")
+        {
+            return caps[0].to_string();
+        }
+        format!("[doc:{doc_id} ext{tail}]")
+    })
+    .into_owned()
+}
 
 pub(crate) fn fetch_external_doc(doc_id: &str, pit: Option<&str>, view: Option<&str>) -> Result<String> {
     let mut url = format!("https://www.ato.gov.au/law/view/document?docid={}", doc_id);
@@ -84,13 +150,14 @@ pub(crate) fn fetch_external_doc(doc_id: &str, pit: Option<&str>, view: Option<&
     // chunks aren't persisted and carry no chunk_id; all of them come
     // back inline in this one response.
     let chunks = chunk_html(&cleaned.html, cleaned.title.as_deref(), EMBED_MAX_TOKENS);
+    let corpus = corpus_doc_id_set()?;
     let chunk_json: Vec<JsonValue> = chunks
         .iter()
         .map(|c| {
             json!({
                 "ord": c.ord,
                 "anchor": c.anchor,
-                "text": c.text,
+                "text": annotate_doc_refs_with(&c.text, doc_id, corpus),
             })
         })
         .collect();
@@ -650,8 +717,11 @@ pub(crate) fn load_chunks_by_ord_range(
         ))
     })?;
     let mut out = Vec::new();
+    let corpus = corpus_doc_id_set()?;
     for row in rows {
         let (chunk_id, doc_id, doc_type, title, date, anchor, text_blob) = row?;
+        let raw_text = decompress_text(text_blob)?;
+        let text = annotate_doc_refs_with(&raw_text, &doc_id, corpus);
         out.push(HydratedChunk {
             chunk_id,
             requested: false,
@@ -661,7 +731,7 @@ pub(crate) fn load_chunks_by_ord_range(
             date,
             anchor,
             canonical_url: canonical_url(&doc_id),
-            text: decompress_text(text_blob)?,
+            text,
         });
     }
     Ok(out)
