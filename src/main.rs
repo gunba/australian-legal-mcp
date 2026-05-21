@@ -2038,7 +2038,7 @@ fn austlii_clear() -> Result<()> {
 }
 
 
-const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first. Search hits are chunk pointers, not authority; call `get_chunks` before relying on text. Use `get_doc_anchors` for in-doc navigation, related/history links, and cited-by. Markers in chunk text are self-describing: `[doc:X]` points into the local corpus and is resolved via `get_chunks` / `get_doc_anchors`, while `[fetch:URI]` points outside the corpus and must be retrieved via the `fetch` tool (e.g. `[fetch:ato:LRP/117CLR514]` → `fetch("ato:LRP/117CLR514")`; `[fetch:austlii:au/cases/cth/HCA/1992/23]` → `fetch("austlii:au/cases/cth/HCA/1992/23")`). For AustLII case/legislation lookup, use `search_austlii` to discover canonical paths from a citation or party name, then pass `fetch_uri` to `fetch`. `fetch(uri, allow_ocr=true)` opts into Tesseract OCR for scanned-PDF responses; the MCP client must allow ~120s for that path. Pass fetched chunk text to `search(seed_text=...)` to pivot back into the corpus. For historical or withdrawn material, set `current_only=false` and `include_old=true`."##;
+const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first; hits are chunk pointers — call `get_chunks` for text. Use `get_doc_anchors` for nav, related, history, and cited-by. Chunk markers self-describe: `[doc:X]` is in-corpus (resolve via `get_chunks` / `get_doc_anchors`), `[fetch:URI]` is external (use `fetch`, e.g. `fetch("austlii:au/cases/cth/HCA/1992/23")`). For AustLII lookups, run `search_austlii` first to get a `fetch_uri`. `fetch(uri, allow_ocr=true)` opts into Tesseract OCR for scanned PDFs — set MCP `timeout: 120000` for that. For historical/withdrawn material set `current_only=false` and `include_old=true`."##;
 
 /// Build the `update_notice` carried in `ServerState` for the lifetime of the
 /// daemon. Runs `check_for_update_availability` and, if a newer corpus is
@@ -2183,7 +2183,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "fetch",
-            "description": "Live-fetch a document outside the local corpus and return its `{ord, anchor, text}` chunks. The `uri` carries the source via a scheme prefix: `ato:<doc_id>[?pit=...&view=...]` (e.g. `ato:JUD/2025ATC20-969/00002`) or `austlii:<path>` (e.g. `austlii:au/cases/cth/HCA/1992/23`). Use when chunk text contains a `[fetch:URI]` marker. `allow_ocr` opts into Tesseract OCR fallback for scanned-PDF responses — off by default to keep latency inside the MCP request timeout.",
+            "description": "Live-fetch a doc outside the local corpus. `uri` carries the source: `ato:<doc_id>` (with optional `?pit=...&view=...`) or `austlii:<path>`. Use when chunk text contains a `[fetch:URI]` marker. `allow_ocr=true` enables Tesseract OCR for scanned PDFs (slower; set MCP `timeout: 120000`).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2195,7 +2195,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "search_austlii",
-            "description": "Live-search AustLII via the SINO CGI. Returns hits as `{title, fetch_uri, neutral_citation, reported_citation, summary, url, jurisdiction}` triples; pass `fetch_uri` to the `fetch` tool to retrieve the body. Requires a session cookie acquired via `ato-mcp austlii setup`. Optional `jurisdictions` is a list of AustLII path prefixes (e.g. `au/cases/cth/HCA`); `limit` is clamped to 1..=50; `sort_by_date` switches relevance ranking to most-recent first.",
+            "description": "Live-search AustLII via SINO. Returns `{title, fetch_uri, neutral_citation, summary, url, jurisdiction}` hits; pass `fetch_uri` to `fetch`. Requires session from `ato-mcp austlii setup`. Optional `jurisdictions` (e.g. `au/cases/cth/HCA`), `limit` (1-50), `sort_by_date`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
