@@ -43,33 +43,29 @@ git clone https://github.com/gunba/ato-mcp.git
 claude plugin install ./ato-mcp
 ```
 
-The plugin's `.mcp.json` connects to a local HTTP server at
-`http://127.0.0.1:${env:ATO_MCP_PORT}/mcp`. Run the one-shot setup once so
-the env var resolves:
+The plugin's `.mcp.json` ships with `http://127.0.0.1:0/mcp` as a sentinel
+— `:0` means "the server will pick a port on first run." Start the server
+from a terminal:
 
 ```bash
-ato-mcp install
+ato-mcp serve
 ```
 
-`install` picks a free port, persists it to `<data_dir>/http.json`, and
-prints the `export ATO_MCP_PORT=<port>` line. Add that line to your shell rc
-(`~/.bashrc`, `~/.zshrc`, or equivalent on Windows), then reopen your
-terminal and Claude Code so both pick up the variable. After that, start the
-server when you need it:
+On first run, `serve` picks a free port, binds it, and writes the actual
+URL back into the plugin's `.mcp.json` so Claude Code can find it. **Exit
+and resume the Claude Code session** so it re-reads the updated config.
+Subsequent runs reuse the same port from `.mcp.json`; pass `--port <N>`
+to force a different binding.
 
-```bash
-ato-mcp serve              # binds the persisted port
-ato-mcp serve --port 51235 # explicit override
-```
-
-The plugin's skill detects when the server isn't reachable and offers to
-start it in the background on your behalf.
+If you ever see "ATO MCP tools unavailable" the agent will offer to start
+the server for you via the plugin's skill. Same flow — start the server,
+exit and resume the session.
 
 On first start the server tells the agent the corpus isn't installed yet;
 the agent will offer to run `ato-mcp update`, which downloads `ato.db.zst`
 (~4 GB, 5–10 min) from the latest GitHub release and atomic-swaps it into
-place. Once the download finishes, restart `ato-mcp serve` (or just
-reconnect) so it picks up the new corpus.
+place. After the download completes, restart `ato-mcp serve` so it picks
+up the new corpus.
 
 ## Updates
 

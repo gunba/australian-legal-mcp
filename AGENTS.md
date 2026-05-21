@@ -41,26 +41,21 @@ git clone https://github.com/gunba/ato-mcp.git
 claude plugin install ./ato-mcp
 ```
 
-The plugin's `.mcp.json` connects to `http://127.0.0.1:${env:ATO_MCP_PORT}/mcp`.
-Run the one-shot setup once so the env var resolves:
+The plugin's `.mcp.json` ships with `http://127.0.0.1:0/mcp` as a sentinel.
+On first start, `ato-mcp serve` picks a free port, binds it, and rewrites
+the URL in the plugin's installed `.mcp.json` to match. The user exits and
+resumes the Claude Code session so the new URL takes effect.
 
 ```bash
-ato-mcp install
-```
-
-`install` picks a free port, persists it, and prints the
-`export ATO_MCP_PORT=<port>` line for the user to add to their shell rc.
-After that, the user starts the HTTP server from a terminal:
-
-```bash
-ato-mcp serve              # binds the persisted port
+ato-mcp serve              # picks a free port on first run; reuses it after
 ato-mcp serve --port 51235 # explicit override
 ```
 
-The plugin includes a skill (`skills/ato-mcp-server/SKILL.md`) that the agent
-loads on ATO-related queries. If the server isn't reachable, the skill
-instructs the agent to ask the user for permission to start it via a
-background `ato-mcp serve` invocation.
+The plugin includes a skill (`skills/ato-mcp-server/SKILL.md`) that the
+agent loads on ATO-related queries. If the `ato` tools aren't in the agent's
+tool list, the skill instructs the agent to ask the user for permission to
+start the server via a background `ato-mcp serve` invocation and to exit +
+resume the session.
 
 On the first MCP `initialize`, the server tells the agent whether the corpus
 is installed. If not, the agent surfaces "run `ato-mcp update`" to the user;
@@ -149,7 +144,7 @@ checkout plus model assets. Don't run them on a user install.
 | Symptom | Fix |
 |---|---|
 | `ato-mcp: command not found` | Put the release binary on `PATH`. |
-| `ato-mcp serve: bind ... already in use` | Re-run `ato-mcp install --port <other>` and update `ATO_MCP_PORT` in the shell rc to match. |
+| `ato-mcp serve: bind ... already in use` | Stop whatever holds the port, or run `ato-mcp serve --port <other>`; the new URL is written back into `.mcp.json` and the user exits + resumes the session. |
 | `stats` reports zero documents | `update` didn't complete; rerun after deleting the incomplete `live/` dir. |
 | `search` returns no hits | Confirm `stats` shows `chunks > 0`; use `include_old=true` for older authorities. |
 | `austlii search` returns 403 | The cf_clearance cookie expired. Run `ato-mcp austlii setup` again. |

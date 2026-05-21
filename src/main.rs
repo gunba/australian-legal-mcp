@@ -121,24 +121,17 @@ struct Cli {
 // here, with no dynamic plugin subcommands or shell-completion surface.
 #[derive(Subcommand)]
 enum Command {
-    /// Run the HTTP MCP server in the foreground. The plugin's `.mcp.json`
-    /// uses `${env:ATO_MCP_PORT}` to discover the port; run `ato-mcp install`
-    /// once after `claude plugin install` to set it up. Port precedence on
-    /// `serve`: `--port` flag > `ATO_MCP_PORT` env var > persisted
-    /// `<data_dir>/http.json` > freshly-picked free port (persisted).
+    /// Run the HTTP MCP server in the foreground. On first run the server
+    /// picks a free port and writes the URL into the plugin's installed
+    /// `.mcp.json`; subsequent runs reuse the same port. After the URL is
+    /// updated the user must restart their MCP client (exit + resume the
+    /// Claude Code session) so it re-reads `.mcp.json`. Override the port
+    /// with `--port` for testing or to force a specific binding.
     Serve {
         #[arg(long)]
         port: Option<u16>,
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
-    },
-    /// One-shot setup: pick a free port (or accept `--port`), persist it to
-    /// `<data_dir>/http.json`, and print the `export ATO_MCP_PORT=<port>`
-    /// line the user adds to their shell rc. The plugin's `.mcp.json`
-    /// resolves to the chosen URL via env-var expansion.
-    Install {
-        #[arg(long)]
-        port: Option<u16>,
     },
     /// Download or refresh the local corpus. Always performs a full
     /// replacement; there is no partial-update path.
@@ -435,14 +428,13 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve { port, bind } => {
-            let port = config::resolve_serve_port(port)?;
+            let choice = config::resolve_serve_port(port)?;
             let state = ServerState {
                 update_notice: resolve_startup_update_notice(),
                 ..Default::default()
             };
-            serve(port, &bind, Arc::new(state))
+            serve(choice, &bind, Arc::new(state))
         }
-        Command::Install { port } => install_http(port),
         Command::Update {} => {
             let stats = apply_update(&default_manifest_url())?;
             println!(
@@ -1305,41 +1297,37 @@ fn stage_hf_embedding_model(repo: &str, revision: &str, staging: &Path) -> Resul
     Ok(())
 }
 
-fn install_http(port_override: Option<u16>) -> Result<()> {
-    let port = match port_override {
-        Some(p) => p,
-        None => match config::HttpConfig::load()? {
-            Some(cfg) => cfg.port,
-            None => config::pick_free_port()?,
-        },
+fn serve(choice: config::PortChoice, bind: &str, state: Arc<ServerState>) -> Result<()> {
+    let port = match &choice {
+        config::PortChoice::Cli(p) => *p,
+        config::PortChoice::PluginUnchanged(p) => *p,
+        config::PortChoice::PluginNeedsRewrite { port, .. } => *port,
     };
-    let cfg = config::HttpConfig {
-        bind: "127.0.0.1".to_string(),
-        port,
-    };
-    cfg.save()?;
-    let path = config::http_config_path()?;
-    println!("ato-mcp install: persisted port {port} to {}", path.display());
-    println!();
-    println!("Add this to your shell rc (~/.bashrc, ~/.zshrc, or equivalent):");
-    println!();
-    println!("    export ATO_MCP_PORT={port}");
-    println!();
-    println!("Then reopen your terminal (and Claude Code) so the plugin's `${{env:ATO_MCP_PORT}}`");
-    println!("resolves to {port}. After that, `ato-mcp serve` will bind the same port.");
-    println!();
-    println!("Plugin URL: {}", cfg.url());
-    Ok(())
-}
-
-fn serve(port: u16, bind: &str, state: Arc<ServerState>) -> Result<()> {
     let addr = format!("{bind}:{port}");
     let server = tiny_http::Server::http(&addr).map_err(|e| {
         anyhow!(
-            "bind {addr}: {e}. If the port is already in use, start with `ato-mcp serve --port <free-port>`."
+            "bind {addr}: {e}. If the port is in use, start with `ato-mcp serve --port <free-port>`."
         )
     })?;
-    eprintln!("ato-mcp listening on http://{addr}/mcp");
+    let url = config::server_url(port);
+    eprintln!("ato-mcp listening on {url}");
+    if let config::PortChoice::PluginNeedsRewrite { mcp_json, .. } = &choice {
+        match config::update_plugin_mcp_json_url(mcp_json, &url) {
+            Ok(true) => {
+                eprintln!(
+                    "ato-mcp wrote the new URL to {}; exit and resume your Claude Code session for it to take effect.",
+                    mcp_json.display()
+                );
+            }
+            Ok(false) => {}
+            Err(err) => {
+                eprintln!(
+                    "ato-mcp: warning: could not update {}: {err}. Update its `url` to {url} manually and restart your MCP client.",
+                    mcp_json.display()
+                );
+            }
+        }
+    }
 
     for request in server.incoming_requests() {
         let state = Arc::clone(&state);

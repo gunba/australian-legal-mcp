@@ -4,94 +4,65 @@ description: "Ensure the local ato-mcp HTTP server is reachable before using ato
 
 # Starting the ato-mcp server
 
-The `ato` MCP plugin connects to a local HTTP server (`ato-mcp serve`) that the
-user starts manually from a terminal. If that server isn't running, every `ato`
-tool call will fail with a connection error.
+The `ato` plugin connects to a local HTTP server started by the user
+(`ato-mcp serve`). If that server isn't running, the `ato` tools won't be
+available in this MCP session.
 
-When you need an `ato` tool and aren't sure the server is up:
+## When the `ato` tools aren't in your tool list
 
-## 1. Check reachability
+That means the MCP host couldn't connect to the URL in the plugin's
+`.mcp.json`. The first run hasn't happened, so the URL still has the `:0`
+sentinel. The user needs to start the server, which auto-picks a free port
+and writes the real URL back into `.mcp.json`. After that they exit and
+resume the session and the tools show up.
 
-The plugin's URL resolves from the user's `ATO_MCP_PORT` env var. Probe:
+Walk the user through it in one turn:
 
-```bash
-curl -sf -o /dev/null -X POST -H 'content-type: application/json' \
-    -d '{}' "http://127.0.0.1:${ATO_MCP_PORT:-51234}/mcp"
-```
+1. Ask:
+   > The ATO plugin's local server isn't running. Should I start it for you
+   > in the background? It'll pick a free port and update the plugin
+   > config; you'll need to exit and resume this Claude Code session
+   > afterwards so the new URL takes effect.
 
-The server replies with a JSON-RPC parse error (HTTP 200) when it's up.
-`curl` exits 7 (could not connect) when it's down. Treat any other status as
-a transient and ask the user to investigate.
+2. On approval, run via the **Bash tool with `run_in_background: true`**:
+   ```bash
+   ato-mcp serve
+   ```
+   `serve` prints the chosen URL on stderr and rewrites the plugin's
+   `.mcp.json`. The background process keeps running.
 
-## 2. If unreachable, ask the user
+3. Tell the user:
+   > Server is up. Exit and resume this Claude Code session, then ask me
+   > your question again — the ATO tools will be loaded.
 
-Tell the user the server isn't running and ask whether to start it in the
-background:
+Don't wait for them; that's the end of this turn.
 
-> The local ATO MCP server isn't reachable. Should I start it for you?
-> It'll run in the background on port `${ATO_MCP_PORT:-51234}`; you can stop
-> it from the terminal it spawns in or by killing the process.
+## When the `ato` tools ARE in the list but a call returns a connection error
 
-On approval:
+The server was running and stopped (machine restart, terminal closed,
+process killed). Same flow as above — `ato-mcp serve` will reuse the port
+that's already in `.mcp.json`, so no restart is needed unless the port has
+been taken by something else. Run it in the background and retry the user's
+last query.
 
-```bash
-ato-mcp serve
-```
+## When the corpus isn't installed yet
 
-Run via the **Bash tool with `run_in_background: true`** so the agent's
-foreground continues. Wait ~2 seconds, then re-probe with the curl command
-above to confirm readiness. If still down, surface the background process's
-stderr to the user.
-
-## 3. If `ATO_MCP_PORT` isn't set
-
-The plugin's `.mcp.json` uses `${env:ATO_MCP_PORT}`. If the variable isn't
-in the user's environment, the plugin URL can't be resolved. Detect this by:
-
-```bash
-test -n "${ATO_MCP_PORT:-}" && echo "set" || echo "unset"
-```
-
-If unset, ask the user to run the one-shot setup:
-
-> The plugin needs an `ATO_MCP_PORT` env var to know which local port the
-> server listens on. Should I run `ato-mcp install` to pick a free port and
-> tell you the `export` line to add to your shell rc? After you set it,
-> restart your shell (and Claude Code) so the plugin can read it.
-
-On approval:
-
-```bash
-ato-mcp install
-```
-
-The command prints the `export ATO_MCP_PORT=<n>` line and the resolved URL.
-Tell the user to add that line to `~/.bashrc` / `~/.zshrc` / their shell's
-rc, then restart their terminal and Claude Code so the plugin picks up the
-new URL.
-
-## 4. If the corpus isn't installed yet
-
-`ato-mcp stats` returns "corpus is not yet installed" guidance on a fresh
-machine. The first MCP `initialize` response carries the same message.
-Offer to run `ato-mcp update` for the user (~4 GB download, 5-10 minutes):
+`stats` (or the MCP `initialize` instructions) reports "corpus is not yet
+installed" on a fresh machine. Offer to run the download for the user
+(~4 GB, 5-10 min):
 
 ```bash
 ato-mcp update
 ```
 
-After the download completes, restart `ato-mcp serve` so it picks up the new
-corpus, then retry the user's original question.
+After the download completes, restart `ato-mcp serve` so it picks up the
+new corpus, then retry the user's original question.
 
-## What NOT to do
+## What not to do
 
-- Don't poll the server with `sleep` loops. If it's down, ask the user once
-  and stop.
 - Don't run `ato-mcp serve` in the foreground (it blocks the Bash tool).
   Always use `run_in_background: true`.
-- Don't try to write the user's shell rc for them; print the `export` line
-  and let them paste it. Modifying shell rcs without explicit per-line
-  consent is rude.
-- Don't fall back to web-search for ATO content when the local server is
-  down without telling the user — the corpus is the authority; degrading
-  silently hides the actual problem.
+- Don't poll the server with `sleep` loops; if it's down, run `serve` once
+  and tell the user to resume the session.
+- Don't fall back to web-search for ATO content silently. The corpus is the
+  authority; if it's unreachable, tell the user.
