@@ -37,7 +37,6 @@ mod uri;
 use config::{
     default_manifest_url, live_dir, model_data_path, model_path, tokenizer_path,
 };
-use db::enforce_db_schema_version;
 use build::{
     build_corpus, bundle_localize_manifest, package_corpus,
     update_manifest_with_db, BuildCorpusArgs,

@@ -2,7 +2,7 @@
 //! data dir.
 
 use crate::APP_NAME;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use fs2::FileExt;
 use serde_json::Value as JsonValue;
 use std::fs::{self, File, OpenOptions};
@@ -204,11 +204,12 @@ pub(crate) fn update_plugin_mcp_json_url(path: &std::path::Path, new_url: &str) 
     Ok(true)
 }
 
-/// Pick the port `ato-mcp serve` should bind, in order of precedence:
+/// Pick the port `ato-mcp serve` should bind. Precedence:
 ///   1. `--port` flag, if the caller supplied one.
 ///   2. The port in the plugin's installed `.mcp.json` (if it's bindable —
 ///      i.e. not the `:0` sentinel and not already in use).
 ///   3. A freshly-picked free port.
+///
 /// Returns the chosen port and the source of truth so the caller can decide
 /// whether to rewrite the plugin's `.mcp.json`.
 pub(crate) enum PortChoice {
