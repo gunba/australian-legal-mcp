@@ -53,11 +53,10 @@ pub(crate) struct PackInfo {
     pub(crate) url: String,
 }
 use crate::{
-    enforce_db_schema_version, ServerState, EMBEDDING_DIM,
+    ServerState, EMBEDDING_DIM,
     EMBEDDING_INPUT_MAX_TOKENS, EMBEDDING_MODEL_FINGERPRINT, EMBEDDING_MODEL_HF_SIZE,
     EMBEDDING_MODEL_HF_URL, EMBEDDING_MODEL_ID, SUPPORTED_SCHEMA_VERSION,
 };
-use rusqlite::OpenFlags;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use rusqlite::Connection;

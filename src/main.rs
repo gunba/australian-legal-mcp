@@ -1887,7 +1887,6 @@ fn tool_descriptors() -> JsonValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build::*;
     use crate::config::*;
     use crate::db::*;
     use crate::extract::*;
