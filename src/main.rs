@@ -22,6 +22,7 @@ mod browser;
 mod chunker;
 mod config;
 mod cookies;
+mod austlii;
 mod db;
 mod extract;
 mod html;

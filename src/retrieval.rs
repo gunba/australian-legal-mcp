@@ -155,18 +155,7 @@ pub(crate) fn fetch(uri_string: &str, allow_ocr: bool) -> Result<String> {
             view.as_deref(),
             allow_ocr,
         ),
-        DocUri::Austlii { path } => {
-            // AustLII fetcher lands in a follow-up commit; the URI scheme
-            // is recognised here so the parser doesn't need a second
-            // expansion later, but the dispatch fails cleanly until the
-            // module is in place. Agents see a definitive negative rather
-            // than a transient timeout.
-            bail!(
-                "AustLII fetch is not enabled in this build. `austlii:{path}` \
-                 cannot be resolved yet — corpus-only search and ATO live \
-                 fetch remain available."
-            )
-        }
+        DocUri::Austlii { path } => crate::austlii::fetch_austlii_doc(&path, allow_ocr),
     }
 }
 

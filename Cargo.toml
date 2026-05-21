@@ -46,6 +46,14 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # `austlii setup` consent flow to acquire the cookie.
 rookie = "0.5"
 open = "5"
+# AustLII (and most modern Cloudflare-fronted sites) gate requests on TLS
+# fingerprint. wreq + wreq-util provide BoringSSL-backed clients that match
+# real Chrome/Firefox/Safari TLS handshakes. Used by the AustLII branch of
+# `fetch` and by `search_austlii`; everything else still goes through the
+# existing reqwest+native-tls path.
+wreq = { version = "5", features = ["cookies"] }
+wreq-util = "2"
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "time"] }
 
 [features]
 default = []
