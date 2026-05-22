@@ -60,16 +60,20 @@ new corpus, then retry the user's original question.
 
 ## AustLII search
 
-`search_austlii` uses AustLII title indexes because AustLII's published SINO
-CGI endpoint is no longer available. Results are AustLII URLs normalised to
-`austlii:<path>` fetch URIs and should be fetched and verified before use.
-The implementation handles AustLII's short-lived bot-management cookie with a
-temporary curl cookie jar during the search call; it does not require a browser
-session or a persisted user cookie.
+`search_austlii` uses native AustLII SINO full-text search when a validated
+AustLII session exists. Results are AustLII URLs normalised to
+`austlii:<path>` fetch URIs and should be fetched and verified before use. If
+native SINO is not configured or fails, the tool falls back to AustLII title
+indexes.
 
-Do not ask the user to open a SINO browser URL, paste a Cookie header, or run
-browser cookie-store extraction. `ato-mcp austlii setup` is a no-op because no
-cookie setup is required.
+If `stats` reports `austlii.native_search_available=false`, run
+`ato-mcp austlii setup`. Setup first tries local browser cookies. If no valid
+Cloudflare session is available, it opens the AustLII SINO validation URL in
+the user's browser, waits for the user to complete Cloudflare verification,
+then re-reads the browser cookie store and validates the session before saving
+metadata. Manual fallback for locked-down environments:
+`ato-mcp austlii setup --cookie '<cf_clearance>' --user-agent '<matching UA>'`
+or `ato-mcp austlii setup --cookie-header '<Cookie header>' --user-agent '<matching UA>'`.
 
 ## What not to do
 

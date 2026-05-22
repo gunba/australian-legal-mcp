@@ -2,9 +2,10 @@
 //!
 //! AustLII is fronted by Cloudflare. Document URLs on
 //! `classic.austlii.edu.au` return clean 200s with a browser-grade
-//! User-Agent through curl's TLS stack. AustLII's formerly published
-//! SINO search CGI is no longer a supported retrieval path, so
-//! `search_austlii` searches AustLII's static title indexes through curl
+//! User-Agent through curl's TLS stack. Native SINO full-text search is
+//! Cloudflare-gated, so it is used only after `ato-mcp austlii setup` has
+//! collected and validated the user's browser session. Without that session,
+//! `search_austlii` falls back to AustLII's static title indexes through curl
 //! with a temporary per-search cookie jar and returns exact `austlii:<path>`
 //! fetch URIs.
 //!
@@ -15,6 +16,7 @@ use crate::chunker::{chunk_html, EMBED_MAX_TOKENS};
 use crate::cookies;
 use crate::ocr;
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::Utc;
 use regex::Regex;
 use reqwest::blocking::Client;
 use scraper::ElementRef;
@@ -29,17 +31,22 @@ use std::time::Duration;
 const FETCH_TIMEOUT_SECS: u64 = 30;
 const SEARCH_TIMEOUT_SECS: u64 = 20;
 const AUSTLII_REFERER: &str = "https://classic.austlii.edu.au/";
+const SINO_SEARCH_HOST: &str = "classic.austlii.edu.au";
+const SINO_SEARCH_URL: &str = "https://classic.austlii.edu.au/cgi-bin/sinosrch.cgi";
+const SINO_SEARCH_REFERER: &str = "https://classic.austlii.edu.au/forms/search1.html";
 const BRAVE_SEARCH_REFERER: &str = "https://search.brave.com/";
 const BRAVE_SEARCH_URL: &str = "https://search.brave.com/search";
 const ACCEPT_HTML: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
 const ACCEPT_LANGUAGE: &str = "en-AU,en;q=0.9";
 const FETCH_CHALLENGE_HINT: &str =
     "AustLII may be presenting a bot challenge for this document fetch.";
-const AUSTLII_NATIVE_SEARCH_UNAVAILABLE: &str =
-    "AustLII's native SINO CGI search endpoint (/cgi-bin/sinosrch.cgi) is unavailable";
+const AUSTLII_NATIVE_SEARCH_SETUP_HINT: &str =
+    "Run `ato-mcp austlii setup` to verify AustLII in a browser and enable native SINO full-text search.";
+const SINO_SEARCH_BACKEND: &str = "austlii_sino";
 const TITLE_INDEX_SEARCH_BACKEND: &str = "austlii_title_index";
 const WEB_INDEX_SEARCH_BACKEND: &str = "brave_web";
 const WEB_FALLBACK_ENV: &str = "ATO_MCP_AUSTLII_WEB_FALLBACK";
+pub(crate) const SINO_VALIDATION_QUERY: &str = "Mabo Queensland";
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const MAX_SEARCH_LIMIT: usize = 50;
 const MAX_TITLE_INDEX_LETTERS: usize = 4;
@@ -149,7 +156,11 @@ pub(crate) fn fetch_austlii_doc(path: &str, allow_ocr: bool) -> Result<String> {
 }
 
 fn austlii_fetch_url(path: &str) -> String {
-    if path.ends_with(".html") || path.ends_with(".pdf") || path.ends_with('/') {
+    if path.ends_with(".html")
+        || path.ends_with(".htm")
+        || path.ends_with(".pdf")
+        || path.ends_with('/')
+    {
         format!("https://classic.austlii.edu.au/{path}")
     } else if is_probable_legislation_root(path) {
         format!("https://classic.austlii.edu.au/{path}/")
@@ -165,6 +176,7 @@ fn is_probable_legislation_root(path: &str) -> bool {
     let last = path.rsplit('/').next().unwrap_or_default();
     if last.is_empty()
         || last.ends_with(".html")
+        || last.ends_with(".htm")
         || last.ends_with(".pdf")
         || matches!(last, "index" | "notes" | "longtitle")
     {
@@ -361,8 +373,8 @@ fn strip_austlii_noise(html: &str) -> String {
 }
 
 /// Options accepted by the CLI and MCP `search_austlii` surfaces. Native
-/// SINO search is unavailable; the title-index backend uses these for result
-/// limiting and post-filtering where possible.
+/// SINO search uses these to build the submitted query where possible; the
+/// title-index fallback uses them for result limiting and post-filtering.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct SearchAustliiOptions {
     pub(crate) jurisdictions: Option<Vec<String>>,
@@ -370,10 +382,12 @@ pub(crate) struct SearchAustliiOptions {
     pub(crate) sort_by_date: bool,
 }
 
-/// Search AustLII's static title indexes. The returned hits are AustLII
-/// document URLs normalised to exact `austlii:<path>` fetch URIs. Set
-/// ATO_MCP_AUSTLII_WEB_FALLBACK=1 to append a public web-index fallback when
-/// title indexes do not produce enough hits.
+/// Search AustLII. A Cloudflare-validated session enables native SINO
+/// full-text search; without one, the function falls back to AustLII's static
+/// title indexes. The returned hits are AustLII document URLs normalised to
+/// exact `austlii:<path>` fetch URIs. Set ATO_MCP_AUSTLII_WEB_FALLBACK=1 to
+/// append a public web-index fallback when title indexes do not produce
+/// enough hits.
 pub(crate) fn search_austlii(query: &str, opts: SearchAustliiOptions) -> Result<String> {
     let query = query.trim();
     if query.is_empty() {
@@ -389,19 +403,47 @@ pub(crate) fn search_austlii(query: &str, opts: SearchAustliiOptions) -> Result<
 
     let mut diagnostics = Vec::new();
     let mut hits = direct_neutral_citation_hits(query);
+    let mut source = "live_title_index";
+    let mut used_sino = false;
+    let mut used_title_index = false;
+    let mut used_web_index = false;
+
+    match cookies::load_session()? {
+        Some(mut session) => {
+            match search_sino_with_session(query, &jurisdictions, limit, &mut session) {
+                Ok(native_hits) => {
+                    if let Err(err) = cookies::save_session(&session) {
+                        diagnostics.push(format!(
+                            "saving updated AustLII session cookies failed: {err:#}"
+                        ));
+                    }
+                    used_sino = true;
+                    source = "live_sino";
+                    hits.extend(native_hits);
+                }
+                Err(err) => diagnostics.push(format!(
+                    "native SINO search failed; {AUSTLII_NATIVE_SEARCH_SETUP_HINT} Error: {err:#}"
+                )),
+            }
+        }
+        None => diagnostics.push(format!(
+            "native SINO search is not configured; {AUSTLII_NATIVE_SEARCH_SETUP_HINT}"
+        )),
+    }
+
     if hits.len() < limit {
+        used_title_index = true;
         let title_index =
             search_title_indexes(query, &jurisdictions, limit, user_agent, &mut diagnostics)?;
         hits.extend(title_index);
     }
 
     let web_fallback_enabled = env_flag_enabled(WEB_FALLBACK_ENV);
-    let mut search_backend = TITLE_INDEX_SEARCH_BACKEND.to_string();
     if hits.len() < limit && web_fallback_enabled {
         let backend_query = build_web_index_query(query, &jurisdictions);
         match search_web_index(&backend_query, &jurisdictions, user_agent) {
             Ok(web_hits) => {
-                search_backend = format!("{TITLE_INDEX_SEARCH_BACKEND}+{WEB_INDEX_SEARCH_BACKEND}");
+                used_web_index = true;
                 hits.extend(web_hits);
             }
             Err(err) => diagnostics.push(format!("web fallback failed: {err}")),
@@ -412,29 +454,217 @@ pub(crate) fn search_austlii(query: &str, opts: SearchAustliiOptions) -> Result<
     hits.retain(|hit| seen.insert(hit.fetch_uri.clone()));
     hits.truncate(limit);
 
+    let mut backend_parts = Vec::new();
+    if used_sino {
+        backend_parts.push(SINO_SEARCH_BACKEND);
+    }
+    if used_title_index {
+        backend_parts.push(TITLE_INDEX_SEARCH_BACKEND);
+    }
+    if used_web_index {
+        backend_parts.push(WEB_INDEX_SEARCH_BACKEND);
+    }
+    if backend_parts.is_empty() {
+        backend_parts.push(TITLE_INDEX_SEARCH_BACKEND);
+    }
+    let search_backend = backend_parts.join("+");
+
     let mut response = serde_json::Map::new();
-    response.insert(
-        "source".to_string(),
-        JsonValue::String("live_title_index".to_string()),
-    );
+    response.insert("source".to_string(), JsonValue::String(source.to_string()));
     response.insert(
         "search_backend".to_string(),
         JsonValue::String(search_backend),
     );
-    response.insert(
-        "warning".to_string(),
-        JsonValue::String(format!(
-            "Results come from AustLII title indexes, not full-text native SINO search. {AUSTLII_NATIVE_SEARCH_UNAVAILABLE}. Fetch and verify each returned source."
-        )),
-    );
+    if !used_sino {
+        response.insert(
+            "warning".to_string(),
+            JsonValue::String(
+                "Results come from AustLII title indexes, not native SINO full-text search. Fetch and verify each returned source.".to_string(),
+            ),
+        );
+    } else if used_title_index {
+        diagnostics.push(
+            "AustLII title-index fallback was appended because native SINO returned fewer hits than requested.".to_string(),
+        );
+    }
     if opts.sort_by_date {
-        diagnostics.push("sort_by_date is not supported by AustLII title-index search".to_string());
+        diagnostics.push(
+            "sort_by_date is not supported by AustLII SINO or title-index search".to_string(),
+        );
     }
     if !diagnostics.is_empty() {
         response.insert("diagnostics".to_string(), json!(diagnostics));
     }
     response.insert("hits".to_string(), json!(hits));
     Ok(serde_json::to_string_pretty(&JsonValue::Object(response))?)
+}
+
+pub(crate) fn sino_setup_url() -> Result<String> {
+    build_sino_search_url(SINO_VALIDATION_QUERY, &[])
+}
+
+pub(crate) fn validate_sino_session(session: &mut cookies::AustliiSession) -> Result<usize> {
+    let hits = search_sino_with_session(SINO_VALIDATION_QUERY, &[], DEFAULT_SEARCH_LIMIT, session)
+        .context("validating AustLII SINO session")?;
+    if hits.is_empty() {
+        bail!("AustLII SINO validation returned no parsed results for `{SINO_VALIDATION_QUERY}`");
+    }
+    session.sino_validated_at = Some(Utc::now().to_rfc3339());
+    session.sino_validation_query = Some(SINO_VALIDATION_QUERY.to_string());
+    Ok(hits.len())
+}
+
+fn search_sino_with_session(
+    query: &str,
+    jurisdictions: &[String],
+    limit: usize,
+    session: &mut cookies::AustliiSession,
+) -> Result<Vec<SearchHit>> {
+    if cookies::cf_clearance(session).is_none() {
+        bail!("stored AustLII session has no cf_clearance cookie");
+    }
+    let cookie_header = cookies::cookie_header_for_host(session, SINO_SEARCH_HOST);
+    if cookie_header.is_empty() {
+        bail!("stored AustLII session has no unexpired cookies for {SINO_SEARCH_HOST}");
+    }
+    let url = build_sino_search_url(query, jurisdictions)?;
+    let cookie_jar =
+        tempfile::NamedTempFile::new().context("creating temporary AustLII SINO cookie jar")?;
+    cookies::write_curl_cookie_jar(session, cookie_jar.path())?;
+    let html = fetch_sino_search(&url, &session.user_agent, cookie_jar.path())?;
+    let _ = cookies::merge_curl_cookie_jar(session, cookie_jar.path())?;
+    let mut hits = parse_search_results(&html);
+    if hits.is_empty() {
+        bail!(
+            "AustLII SINO returned no parsed results; page shape: {}",
+            html_debug_summary(&html)
+        );
+    }
+    if !jurisdictions.is_empty() {
+        hits.retain(|hit| hit_matches_jurisdictions(hit, jurisdictions));
+    }
+    hits.truncate(limit);
+    Ok(hits)
+}
+
+fn build_sino_search_url(query: &str, jurisdictions: &[String]) -> Result<String> {
+    let mut url = url::Url::parse(SINO_SEARCH_URL).context("parsing AustLII SINO search URL")?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs
+            .append_pair("query", query)
+            .append_pair("results", "50")
+            .append_pair("submit", "Search")
+            .append_pair("mask_world", "");
+        let mask_paths = sino_mask_paths(jurisdictions);
+        if mask_paths.is_empty() {
+            pairs.append_pair("mask_path", "");
+        } else {
+            for mask_path in mask_paths {
+                pairs.append_pair("mask_path", &mask_path);
+            }
+        }
+        pairs
+            .append_pair("callback", "on")
+            .append_pair("method", "auto")
+            .append_pair("meta", "/au");
+    }
+    Ok(url.to_string())
+}
+
+fn sino_mask_paths(jurisdictions: &[String]) -> Vec<String> {
+    jurisdictions
+        .iter()
+        .filter_map(|jurisdiction| {
+            let value = jurisdiction.trim().trim_matches('/').replace('\\', "/");
+            if value.is_empty() {
+                return None;
+            }
+            if value.starts_with("au/") || value.starts_with("nz/") {
+                return Some(value);
+            }
+            let parts: Vec<&str> = value.split('/').collect();
+            if parts.len() == 1 {
+                return Some(format!("au/cases/{0} au/legis/{0}", parts[0]));
+            }
+            if looks_like_legislation_path(&parts) {
+                Some(format!("au/legis/{value}"))
+            } else {
+                Some(format!("au/cases/{value}"))
+            }
+        })
+        .collect()
+}
+
+fn looks_like_legislation_path(parts: &[&str]) -> bool {
+    parts
+        .get(1)
+        .map(|part| {
+            let lower = part.to_ascii_lowercase();
+            lower.contains("legis")
+                || lower.contains("act")
+                || lower.contains("reg")
+                || lower.contains("bill")
+                || lower.starts_with("consol")
+                || lower.starts_with("num_")
+                || lower.starts_with("repealed")
+        })
+        .unwrap_or(false)
+}
+
+fn fetch_sino_search(url: &str, user_agent: &str, cookie_jar: &Path) -> Result<String> {
+    let output = Command::new("curl")
+        .arg("-LfsS")
+        .arg("--compressed")
+        .arg("--max-time")
+        .arg(SEARCH_TIMEOUT_SECS.to_string())
+        .arg("-A")
+        .arg(user_agent)
+        .arg("-H")
+        .arg(format!("Accept: {ACCEPT_HTML}"))
+        .arg("-H")
+        .arg(format!("Accept-Language: {ACCEPT_LANGUAGE}"))
+        .arg("-H")
+        .arg(format!("Referer: {SINO_SEARCH_REFERER}"))
+        .arg("-b")
+        .arg(cookie_jar)
+        .arg("-c")
+        .arg(cookie_jar)
+        .arg(url)
+        .output()
+        .context("running curl for AustLII SINO search")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!(
+            "curl exited with status {} for AustLII SINO search: {stderr}",
+            output.status
+        );
+    }
+    let html = String::from_utf8_lossy(&output.stdout).to_string();
+    if html.contains("Just a moment") && html.contains("Cloudflare") {
+        bail!("AustLII returned a Cloudflare verification page");
+    }
+    Ok(html)
+}
+
+fn html_debug_summary(html: &str) -> String {
+    let doc = Html::parse_document(html);
+    let title_selector = Selector::parse("title").expect("valid title selector");
+    let title = doc
+        .select(&title_selector)
+        .next()
+        .map(element_text)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "<no title>".to_string());
+    let body_selector = Selector::parse("body").expect("valid body selector");
+    let body = doc
+        .select(&body_selector)
+        .next()
+        .map(element_text)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| normalize_ws(html));
+    let snippet: String = body.chars().take(160).collect();
+    format!("title={title:?}; body={snippet:?}")
 }
 
 fn search_web_index(
@@ -877,7 +1107,7 @@ fn fetch_web_index_search_with_reqwest(url: &str, user_agent: &str) -> Result<St
     if status.as_u16() == 403 || status.as_u16() == 429 {
         bail!(
             "web-index search provider returned HTTP {} for {url}; \
-             AustLII native SINO search is also unavailable",
+             AustLII native SINO search requires a validated session",
             status.as_u16()
         );
     }
@@ -957,7 +1187,8 @@ fn parse_austlii_links(doc: &Html) -> Vec<SearchHit> {
     doc.select(&a_selector)
         .filter_map(|link| {
             let href = link.value().attr("href")?;
-            let fetch_uri = austlii_url_to_uri(href)?;
+            let absolute = absolutise_austlii_url(href);
+            let fetch_uri = austlii_url_to_uri(&absolute)?;
             let url = canonical_url_from_fetch_uri(&fetch_uri)?;
             let title = element_text(link);
             let title = if title.is_empty() {
@@ -1022,17 +1253,53 @@ fn hit_matches_jurisdictions(hit: &SearchHit, jurisdictions: &[String]) -> bool 
     })
 }
 
-#[cfg(test)]
 fn parse_search_results(html: &str) -> Vec<SearchHit> {
     let doc = Html::parse_document(html);
     let item_selector =
         Selector::parse("li[data-count].multi").expect("valid SINO result selector");
-    doc.select(&item_selector)
+    let mut hits: Vec<SearchHit> = doc
+        .select(&item_selector)
         .filter_map(parse_search_hit)
+        .collect();
+    if hits.is_empty() {
+        hits = parse_classic_sino_results(&doc);
+    }
+    if hits.is_empty() {
+        hits = parse_austlii_links(&doc);
+    }
+    hits
+}
+
+fn parse_classic_sino_results(doc: &Html) -> Vec<SearchHit> {
+    let item_selector = Selector::parse("li").expect("valid classic SINO item selector");
+    let link_selector = Selector::parse("a[href]").expect("valid classic SINO link selector");
+    let small_selector = Selector::parse("small").expect("valid classic SINO summary selector");
+    doc.select(&item_selector)
+        .filter_map(|item| {
+            let link = item.select(&link_selector).find(|link| {
+                link.value()
+                    .attr("href")
+                    .map(|href| href.contains("/cgi-bin/disp.pl/"))
+                    .unwrap_or(false)
+            })?;
+            let href = link.value().attr("href")?;
+            let absolute = absolutise_austlii_url(href);
+            let fetch_uri = austlii_url_to_uri(&absolute)?;
+            let url = canonical_url_from_fetch_uri(&fetch_uri)?;
+            let title = element_text(link);
+            if title.is_empty() {
+                return None;
+            }
+            let summary = item
+                .select(&small_selector)
+                .next()
+                .map(element_text)
+                .filter(|s| !s.is_empty());
+            Some(search_hit(title, fetch_uri, url, summary))
+        })
         .collect()
 }
 
-#[cfg(test)]
 fn parse_search_hit(node: ElementRef<'_>) -> Option<SearchHit> {
     let a_selector = Selector::parse("a").expect("valid selector");
     let meta_selector = Selector::parse("p.meta").expect("valid selector");
@@ -1066,7 +1333,6 @@ fn parse_search_hit(node: ElementRef<'_>) -> Option<SearchHit> {
     })
 }
 
-#[cfg(test)]
 fn absolutise_austlii_url(href: &str) -> String {
     if href.starts_with("http://") || href.starts_with("https://") {
         return href.to_string();
@@ -1094,7 +1360,12 @@ fn austlii_url_to_uri(url: &str) -> Option<String> {
         return None;
     }
     let mut path = parsed.path().trim_start_matches('/').to_string();
-    for prefix in ["cgi-bin/viewdoc/", "cgi-bin/sinodisp/", "cgi-bin/viewdb/"] {
+    for prefix in [
+        "cgi-bin/viewdoc/",
+        "cgi-bin/sinodisp/",
+        "cgi-bin/viewdb/",
+        "cgi-bin/disp.pl/",
+    ] {
         if let Some(rest) = path.strip_prefix(prefix) {
             path = rest.to_string();
         }
@@ -1199,6 +1470,39 @@ mod tests {
         assert_eq!(
             build_web_index_query("mabo", &["cth/HCA".to_string()]),
             "site:classic.austlii.edu.au/au mabo cth/HCA"
+        );
+    }
+
+    #[test]
+    fn build_sino_search_url_matches_austlii_form() {
+        let url = build_sino_search_url("Mabo Queensland", &["cth/HCA".to_string()]).unwrap();
+        assert!(url.starts_with("https://classic.austlii.edu.au/cgi-bin/sinosrch.cgi?"));
+        assert!(url.contains("query=Mabo+Queensland"), "url = {url}");
+        assert!(url.contains("results=50"), "url = {url}");
+        assert!(url.contains("submit=Search"), "url = {url}");
+        assert!(url.contains("mask_world="), "url = {url}");
+        assert!(url.contains("callback=on"), "url = {url}");
+        assert!(url.contains("method=auto"), "url = {url}");
+        assert!(url.contains("meta=%2Fau"), "url = {url}");
+        assert!(
+            url.contains("mask_path=au%2Fcases%2Fcth%2FHCA"),
+            "url = {url}"
+        );
+    }
+
+    #[test]
+    fn sino_mask_paths_normalise_short_jurisdictions() {
+        assert_eq!(
+            sino_mask_paths(&[
+                "cth".to_string(),
+                "cth/consol_act".to_string(),
+                "au/cases/wa/WASC".to_string()
+            ]),
+            vec![
+                "au/cases/cth au/legis/cth".to_string(),
+                "au/legis/cth/consol_act".to_string(),
+                "au/cases/wa/WASC".to_string()
+            ]
         );
     }
 
@@ -1343,6 +1647,10 @@ mod tests {
             "https://classic.austlii.edu.au/au/journals/JlATax/2021/4.pdf"
         );
         assert_eq!(
+            austlii_fetch_url("au/other/media/example.htm"),
+            "https://classic.austlii.edu.au/au/other/media/example.htm"
+        );
+        assert_eq!(
             austlii_fetch_url("au/legis/cth/consol_act/pa1988108"),
             "https://classic.austlii.edu.au/au/legis/cth/consol_act/pa1988108/"
         );
@@ -1418,5 +1726,33 @@ mod tests {
         );
         assert_eq!(hits[1].fetch_uri, "austlii:au/cases/cth/HCA/1966/48");
         assert_eq!(hits[1].neutral_citation.as_deref(), Some("[1966] HCA 48"));
+    }
+
+    #[test]
+    fn parse_search_results_reads_classic_sino_result_html() {
+        let html = r#"<html><body>
+            <ol>
+              <li><p>
+                <a href="https://classic.austlii.edu.au/cgi-bin/disp.pl/au/cases/cth/HCASCF/1992/116.html?stem=0&query=Mabo Queensland ">Mabo &amp; Ors v Queensland [1992] HCASCF 116</a> [18%]<br>
+                <small>(From <a href="/au/cases/cth/HCASCF">High Court of Australia - Seminal Case Files</a>; 3 June 1992; 631 KB)</small>
+              </p></li>
+            </ol>
+        </body></html>"#;
+        let hits = parse_search_results(html);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].fetch_uri, "austlii:au/cases/cth/HCASCF/1992/116");
+        assert_eq!(
+            hits[0].url,
+            "https://classic.austlii.edu.au/au/cases/cth/HCASCF/1992/116.html"
+        );
+        assert_eq!(
+            hits[0].neutral_citation.as_deref(),
+            Some("[1992] HCASCF 116")
+        );
+        assert!(hits[0]
+            .summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Seminal Case Files"));
     }
 }

@@ -77,15 +77,21 @@ The `austlii:` URI scheme for `fetch` reaches `classic.austlii.edu.au` for
 known case and legislation paths, for example
 `austlii:au/cases/cth/HCA/1992/23`.
 
-AustLII's published SINO CGI endpoint (`/cgi-bin/sinosrch.cgi`) is no longer
-available, so this is not a cookie-configuration problem. `search_austlii`
-uses AustLII title indexes (`search_backend: "austlii_title_index"`) and returns
-normalised `austlii:<path>` fetch URIs. It may use a temporary curl cookie jar
-for AustLII's short-lived bot-management cookie, but it does not persist or ask
-the user to configure cookies. Do not ask users to open a SINO browser URL,
-paste a Cookie header, or run browser cookie-store extraction.
-`ato-mcp austlii setup` is a no-op; `ato-mcp austlii clear` deletes any legacy
-session file.
+AustLII's SINO CGI endpoint (`/cgi-bin/sinosrch.cgi`) is Cloudflare-gated.
+`search_austlii` uses native SINO full-text search when a validated AustLII
+session exists (`search_backend: "austlii_sino"`), and falls back to AustLII
+title indexes (`search_backend: "austlii_title_index"`) when native search is
+not configured or fails. Returned results are normalised `austlii:<path>` fetch
+URIs and should be fetched and verified.
+
+Run `ato-mcp austlii setup` to configure native SINO. Setup first tries local
+browser cookies. If no valid Cloudflare session is available, it opens the
+AustLII SINO validation URL in the user's browser, waits for the user to
+complete Cloudflare verification, then re-reads the browser cookie store and
+validates the session before saving metadata. Manual locked-down fallback:
+`ato-mcp austlii setup --cookie '<cf_clearance>' --user-agent '<matching UA>'`
+or `--cookie-header '<Cookie header>' --user-agent '<matching UA>'`.
+`ato-mcp austlii clear` deletes the persisted session file.
 
 ## Updates
 
@@ -139,4 +145,4 @@ checkout plus model assets. Don't run them on a user install.
 | `ato-mcp serve: bind ... already in use` | Stop whatever holds the port, or run `ato-mcp serve --port <other>`; the new URL is written back into `.mcp.json` and the user exits + resumes the session. |
 | `stats` reports zero documents | `update` didn't complete; rerun after deleting the incomplete `live/` dir. |
 | `search` returns no hits | Confirm `stats` shows `chunks > 0`; use `include_old=true` for older authorities. |
-| `austlii search` returns weak or stale results | The tool uses AustLII title indexes because native SINO full-text search is unavailable. Fetch and verify returned sources. |
+| `austlii search` returns weak or stale results | Check `ato-mcp stats`: if `austlii.native_search_available` is false, run `ato-mcp austlii setup`; if native SINO is configured, fetch and verify returned sources. |

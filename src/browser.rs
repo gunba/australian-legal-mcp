@@ -315,9 +315,16 @@ impl OsLabel {
 fn build_user_agent(family: BrowserFamily, version: &str, os: OsLabel) -> String {
     let os_token = os.token();
     match family {
-        BrowserFamily::Chromium => format!(
-            "Mozilla/5.0 {os_token} AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{version} Safari/537.36"
-        ),
+        BrowserFamily::Chromium => {
+            let major = version
+                .split('.')
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("0");
+            format!(
+                "Mozilla/5.0 {os_token} AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+            )
+        }
         BrowserFamily::Firefox => {
             let major = version
                 .split('.')
@@ -484,7 +491,7 @@ mod tests {
     fn build_user_agent_chromium_windows() {
         let ua = build_user_agent(BrowserFamily::Chromium, "136.0.7103.93", OsLabel::Windows);
         assert!(ua.contains("Windows NT 10.0"), "ua = {ua}");
-        assert!(ua.contains("Chrome/136.0.7103.93"), "ua = {ua}");
+        assert!(ua.contains("Chrome/136.0.0.0"), "ua = {ua}");
         assert!(ua.contains("Safari/537.36"), "ua = {ua}");
     }
 

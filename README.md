@@ -26,7 +26,7 @@ a one-shot corpus download.
 | `get_definition` | Statutory definitions with a labelled ordinary-meaning fallback. |
 | `get_asset` | Resolve a retained image `data-asset-ref` to an MCP image content item plus caption. |
 | `fetch` | Live-fetch a document by URI. `ato:<doc_id>[?pit=...&view=...]` for ATO live retrieval; `austlii:<path>` for AustLII via `classic.austlii.edu.au`. Returns chunks of the same shape as `get_chunks`. Pass `allow_ocr=true` for scanned PDFs (Tesseract on `$PATH`, allow ~120s). |
-| `search_austlii` | Search AustLII title indexes and return exact `austlii:<path>` fetch URIs. Native AustLII SINO full-text search is unavailable, so fetch and verify returned sources. |
+| `search_austlii` | Search AustLII native SINO full-text when a Cloudflare-validated session is configured; otherwise search AustLII title indexes. Returns exact `austlii:<path>` fetch URIs. |
 | `stats` | Index version, counts, default search policy, AustLII session state. |
 
 Document bodies are exposed as cleaned HTML fragments so agents navigate the
@@ -103,20 +103,32 @@ legislation URLs when you already have an `austlii:<path>` URI.
 
 ```bash
 ato-mcp fetch 'austlii:au/cases/cth/HCA/1992/23'
-ato-mcp austlii clear   # delete any legacy persisted session
+ato-mcp austlii setup   # opens a browser if Cloudflare verification is needed
+ato-mcp austlii clear   # delete the persisted AustLII session
 ```
 
-Live AustLII full-text search through SINO is currently disabled. AustLII's published
-`/cgi-bin/sinosrch.cgi` endpoint now reports that the resource is no longer
-available, so this is not a cookie-configuration problem. `search_austlii`
-therefore uses AustLII title indexes, normalises AustLII URLs into
-`austlii:<path>` fetch URIs, and labels responses with
-`search_backend: "austlii_title_index"`. The title-index requests use curl
-with a temporary per-search cookie jar for AustLII's short-lived bot-management
-cookie; no browser session or persisted user cookie is required. Set
-`ATO_MCP_AUSTLII_WEB_FALLBACK=1` to also try a public web-index fallback when
-title-index search is insufficient. `ato-mcp austlii setup` is a no-op; users
-do not need to open a browser or paste cookies.
+Native AustLII full-text search uses SINO at `/cgi-bin/sinosrch.cgi`, but that
+endpoint is Cloudflare-gated. Run `ato-mcp austlii setup` once to collect a
+verified browser session. Setup first tries existing local browser cookies; if
+they do not validate, it opens AustLII in the user's browser, waits for the
+user to complete Cloudflare verification, then re-reads the browser cookie
+store and validates SINO with a known query before saving session metadata.
+
+When setup succeeds, `search_austlii` labels responses with
+`search_backend: "austlii_sino"` and falls back to title indexes only if native
+search cannot be used or returns fewer hits than requested. Without a validated
+session, `search_austlii` still works through AustLII title indexes and labels
+responses with `search_backend: "austlii_title_index"`. The title-index
+requests use curl with a temporary per-search cookie jar for AustLII's
+short-lived bot-management cookie. Set `ATO_MCP_AUSTLII_WEB_FALLBACK=1` to
+also try a public web-index fallback when title-index search is insufficient.
+
+Manual cookie setup is available for locked-down environments:
+
+```bash
+ato-mcp austlii setup --cookie '<cf_clearance value>' --user-agent '<matching browser UA>'
+ato-mcp austlii setup --cookie-header 'cf_clearance=...; __cf_bm=...' --user-agent '<matching browser UA>'
+```
 
 Scanned pre-digital judgments return `error: scanned_pdf` from `fetch` by
 default. Pass `allow_ocr=true` to opt into Tesseract OCR (results are cached
@@ -174,7 +186,7 @@ cargo build --release --features cuda
 ./target/release/ato-mcp link-download   --deduped-links snapshots/.../deduped_links.jsonl --out-dir /path/to/ato_pages
 ./target/release/ato-mcp build           --pages-dir /path/to/ato_pages --db-path ./release/ato.db --model-dir /path/to/granite-embedding-small-r2 --out-dir ./release --profile
 ./target/release/ato-mcp package-corpus  --db-path ./release/ato.db --out ./release/ato.db.zst --manifest ./release/manifest.json
-./target/release/ato-mcp publish-release --out-dir ./release --tag v0.14.5 --repo gunba/ato-mcp --overwrite
+./target/release/ato-mcp publish-release --out-dir ./release --tag v0.14.6 --repo gunba/ato-mcp --overwrite
 ```
 
 `scripts/publish-release.sh <tag>` wraps the `package-corpus` +

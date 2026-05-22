@@ -10,8 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-#[allow(unused_imports)]
-use std::io::Read;
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -171,7 +170,7 @@ enum Command {
         allow_ocr: bool,
     },
     /// AustLII utilities. Direct `fetch austlii:<path>` uses the classic host;
-    /// search uses AustLII title indexes because native SINO is gone.
+    /// search uses native SINO when Cloudflare setup has validated.
     Austlii {
         #[command(subcommand)]
         action: AustliiAction,
@@ -367,25 +366,25 @@ enum SortBy {
 
 #[derive(Subcommand)]
 enum AustliiAction {
-    /// Report that no AustLII cookie setup is required.
+    /// Verify AustLII Cloudflare in a browser and enable native SINO search.
     Setup {
-        /// Accepted for CLI compatibility; not stored.
+        /// Raw cf_clearance value, or a Cookie header containing cf_clearance.
         #[arg(long, value_name = "VALUE", conflicts_with = "cookie_header")]
         cookie: Option<String>,
-        /// Accepted for CLI compatibility; not stored.
+        /// Cookie header copied from a verified AustLII browser request.
         #[arg(long, value_name = "HEADER", conflicts_with = "cookie")]
         cookie_header: Option<String>,
-        /// Accepted for CLI compatibility; not stored.
+        /// User-Agent matching the supplied cookie or browser session.
         #[arg(long, value_name = "VALUE")]
         user_agent: Option<String>,
-        /// Accepted for CLI compatibility; not used.
+        /// Force opening the browser verification page before reading cookies.
         #[arg(long)]
         browser: bool,
-        /// Accepted for CLI compatibility.
+        /// Skip the pre-open confirmation prompt.
         #[arg(long)]
         yes: bool,
     },
-    /// Report that AustLII live search is currently unavailable.
+    /// Search AustLII using native SINO when configured, otherwise title indexes.
     Search {
         query: String,
         #[arg(long, value_delimiter = ',')]
@@ -1622,20 +1621,150 @@ fn austlii_setup(
     manual_cookie_header: Option<&str>,
     manual_user_agent: Option<&str>,
     use_browser: bool,
-    _skip_prompt: bool,
+    skip_prompt: bool,
 ) -> Result<()> {
-    let supplied_cookie = manual_cookie.is_some() || manual_cookie_header.is_some();
-    let supplied_browser_config = manual_user_agent.is_some() || use_browser;
-    if supplied_cookie || supplied_browser_config {
-        println!(
-            "No AustLII cookie or browser setup is required; supplied setup arguments were not stored."
-        );
+    let detected_browser = if manual_user_agent.is_none() {
+        Some(
+            browser::detect()
+                .context(
+                    "detecting default browser for AustLII setup; set ATO_MCP_BROWSER to override",
+                )?
+                .clone(),
+        )
     } else {
-        println!("No AustLII setup is required.");
+        None
+    };
+    let user_agent = manual_user_agent
+        .map(str::to_string)
+        .or_else(|| detected_browser.as_ref().map(|b| b.user_agent.clone()))
+        .ok_or_else(|| anyhow!("no AustLII setup User-Agent available"))?;
+    let browser_name = detected_browser
+        .as_ref()
+        .map(|b| b.name.clone())
+        .unwrap_or_else(|| "manual User-Agent".to_string());
+
+    if let Some(header) = manual_cookie_header {
+        let session = cookies::parse_manual_cookie_header(header, &user_agent, &browser_name)?;
+        return validate_and_save_austlii_session(session, "manual Cookie header");
     }
+    if let Some(cookie) = manual_cookie {
+        let session = if cookie.contains('=') || cookie.contains(';') {
+            cookies::parse_manual_cookie_header(cookie, &user_agent, &browser_name)?
+        } else {
+            cookies::parse_manual_cookie(cookie, &user_agent, &browser_name)?
+        };
+        return validate_and_save_austlii_session(session, "manual cf_clearance cookie");
+    }
+
+    if !use_browser {
+        if let Some(session) = cookies::load_session()? {
+            match validate_and_save_austlii_session(session, "existing AustLII session") {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    println!("Existing AustLII session did not validate: {err:#}");
+                }
+            }
+        }
+        match load_validate_and_save_browser_austlii_session(&user_agent, &browser_name) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                println!("No valid AustLII browser session found yet: {err:#}");
+            }
+        }
+    }
+
+    run_austlii_browser_verification(skip_prompt)?;
+    load_validate_and_save_browser_austlii_session(&user_agent, &browser_name)
+        .context("loading AustLII cookies after browser verification")?;
+    Ok(())
+}
+
+fn validate_and_save_austlii_session(
+    mut session: cookies::AustliiSession,
+    source: &str,
+) -> Result<()> {
+    let hit_count = austlii::validate_sino_session(&mut session)?;
+    cookies::save_session(&session)?;
     println!(
-        "search_austlii uses AustLII title indexes with a temporary per-search curl cookie jar because AustLII's native SINO CGI endpoint is unavailable. Direct fetch uses classic.austlii.edu.au for exact austlii:<path> URIs."
+        "AustLII native SINO search configured from {source}. Validation query `{}` returned {hit_count} hit(s).",
+        austlii::SINO_VALIDATION_QUERY
     );
+    println!(
+        "Saved session metadata at {}",
+        cookies::session_file_path()?.display()
+    );
+    Ok(())
+}
+
+fn load_validate_and_save_browser_austlii_session(
+    user_agent: &str,
+    browser_name: &str,
+) -> Result<()> {
+    let session = cookies::load_browser_session(user_agent, browser_name)?;
+    match validate_and_save_austlii_session(session.clone(), "local browser cookies") {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let shapes = cookies::session_cookie_shapes(&session);
+            if !shapes.is_empty() {
+                println!("AustLII browser cookie metadata seen during setup:");
+                for shape in shapes {
+                    println!("  {shape}");
+                }
+            }
+            Err(err)
+        }
+    }
+}
+
+fn run_austlii_browser_verification(skip_prompt: bool) -> Result<()> {
+    if !io::stdin().is_terminal() {
+        bail!(
+            "AustLII Cloudflare verification requires an interactive terminal. Run `ato-mcp austlii setup` from a terminal, or pass --cookie/--cookie-header with a verified AustLII cf_clearance cookie."
+        );
+    }
+    let url = austlii::sino_setup_url()?;
+    if !skip_prompt {
+        println!("AustLII native SINO search requires a Cloudflare browser verification step.");
+        prompt_enter("Press Enter to open AustLII in your browser.")?;
+    }
+    open_url_in_browser(&url)?;
+    println!("Opened {url}");
+    prompt_enter(
+        "After the AustLII search results page finishes loading in the browser, press Enter here.",
+    )?;
+    Ok(())
+}
+
+fn prompt_enter(prompt: &str) -> Result<()> {
+    print!("{prompt} ");
+    io::stdout().flush().context("flushing prompt")?;
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .context("reading prompt response")?;
+    Ok(())
+}
+
+fn open_url_in_browser(url: &str) -> Result<()> {
+    let status = if cfg!(target_os = "windows") {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .status()
+            .context("opening AustLII verification URL with Windows shell")?
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open")
+            .arg(url)
+            .status()
+            .context("opening AustLII verification URL with `open`")?
+    } else {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .status()
+            .context("opening AustLII verification URL with `xdg-open`")?
+    };
+    if !status.success() {
+        bail!("browser opener exited with status {status}; open {url} manually and rerun setup");
+    }
     Ok(())
 }
 
@@ -1654,7 +1783,7 @@ fn austlii_clear() -> Result<()> {
     Ok(())
 }
 
-const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first; hits are chunk pointers; call `get_chunks` for text. Use `get_doc_anchors` for nav, related, history, and cited-by. Markers: `[doc:X]` is in-corpus; `[fetch:URI]` is external (use `fetch`, e.g. `fetch("austlii:au/cases/cth/HCA/1992/23")`). `search_austlii` uses AustLII title indexes because AustLII SINO CGI is gone; fetch and verify returned sources. No user cookie setup is required. `allow_ocr=true` runs Tesseract for scanned PDFs; set MCP `timeout:120000`. For historical/withdrawn set `current_only=false` and `include_old=true`."##;
+const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first; hits are chunk pointers; call `get_chunks` for text. Use `get_doc_anchors` for nav, related, history, and cited-by. Markers: `[doc:X]` is in-corpus; `[fetch:URI]` is external (use `fetch`, e.g. `fetch("austlii:au/cases/cth/HCA/1992/23")`). `search_austlii` uses native AustLII SINO full-text search when `ato-mcp austlii setup` has validated Cloudflare; otherwise it falls back to title indexes. Fetch and verify returned sources. `allow_ocr=true` runs Tesseract for scanned PDFs; set MCP `timeout:120000`. For historical/withdrawn set `current_only=false` and `include_old=true`."##;
 
 /// Build the `update_notice` carried in `ServerState` for the lifetime of the
 /// server. Runs `check_for_update_availability` once at startup; the result
@@ -1805,7 +1934,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "search_austlii",
-            "description": "Search AustLII title indexes and return exact `austlii:<path>` fetch URIs. Native AustLII SINO full-text search is unavailable; no user cookie setup is required. Fetch and verify returned sources.",
+            "description": "Search AustLII native SINO when Cloudflare setup is configured; otherwise fall back to title indexes. Returns exact `austlii:<path>` fetch URIs. Fetch and verify sources.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
