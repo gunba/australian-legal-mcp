@@ -42,6 +42,7 @@ const WEB_INDEX_SEARCH_BACKEND: &str = "brave_web";
 const WEB_FALLBACK_ENV: &str = "ATO_MCP_AUSTLII_WEB_FALLBACK";
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const MAX_SEARCH_LIMIT: usize = 50;
+const MAX_TITLE_INDEX_LETTERS: usize = 4;
 const PDF_TEXT_MIN_CHARS: usize = 100;
 const OCR_WARNING: &str =
     "Text extracted via Tesseract OCR — may contain errors. Verify against the canonical source.";
@@ -529,9 +530,6 @@ fn search_title_index_group(
     scored: &mut Vec<ScoredSearchHit>,
 ) -> Result<()> {
     for index in indexes {
-        if scored.len() >= env.desired_hits {
-            break;
-        }
         let parent_url = title_index_parent_url(*index)?;
         if let Err(err) = fetch_title_index_bytes(&parent_url, env.user_agent, env.cookie_jar) {
             diagnostics.push(format!(
@@ -540,9 +538,6 @@ fn search_title_index_group(
             ));
         }
         for letter in env.letters {
-            if scored.len() >= env.desired_hits {
-                break;
-            }
             let url = title_index_url(*index, letter)?;
             let html = match fetch_title_index_bytes(&url, env.user_agent, env.cookie_jar) {
                 Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
@@ -555,6 +550,9 @@ fn search_title_index_group(
                 }
             };
             scored.extend(parse_title_index_hits(*index, &url, &html, env.tokens));
+        }
+        if scored.len() >= env.desired_hits {
+            break;
         }
     }
     Ok(())
@@ -710,8 +708,18 @@ fn title_index_matches_jurisdiction(index: AustliiTitleIndex, jurisdiction: &str
 }
 
 fn title_index_letters(query: &str) -> Vec<String> {
+    let tokens = query_tokens(query);
+    let preferred: Vec<&String> = tokens
+        .iter()
+        .filter(|token| !TITLE_SEARCH_GENERIC_TERMS.contains(&token.as_str()))
+        .collect();
+    let candidates = if preferred.is_empty() {
+        tokens.iter().collect()
+    } else {
+        preferred
+    };
     let mut letters = Vec::new();
-    for token in query_tokens(query) {
+    for token in candidates {
         let Some(ch) = token.chars().find(|ch| ch.is_ascii_alphabetic()) else {
             continue;
         };
@@ -719,7 +727,7 @@ fn title_index_letters(query: &str) -> Vec<String> {
         if !letters.contains(&letter) {
             letters.push(letter);
         }
-        if !letters.is_empty() {
+        if letters.len() >= MAX_TITLE_INDEX_LETTERS {
             break;
         }
     }
@@ -738,6 +746,22 @@ fn query_tokens(query: &str) -> Vec<String> {
 
 const TITLE_SEARCH_STOP_WORDS: &[&str] =
     &["and", "for", "in", "no", "of", "or", "the", "to", "v", "vs"];
+
+const TITLE_SEARCH_GENERIC_TERMS: &[&str] = &[
+    "act",
+    "acts",
+    "case",
+    "chapter",
+    "legislation",
+    "part",
+    "regulation",
+    "regulations",
+    "rule",
+    "rules",
+    "schedule",
+    "section",
+    "sections",
+];
 
 fn direct_neutral_citation_hits(query: &str) -> Vec<SearchHit> {
     let Some((year, court, number)) = parse_neutral_citation_parts(query) else {
@@ -1212,9 +1236,15 @@ mod tests {
     }
 
     #[test]
-    fn title_index_letters_use_first_significant_token() {
+    fn title_index_letters_use_meaningful_query_terms() {
         assert_eq!(title_index_letters("Privacy Act"), vec!["P".to_string()]);
+        assert_eq!(title_index_letters("Act Privacy"), vec!["P".to_string()]);
         assert_eq!(title_index_letters("the Mabo case"), vec!["M".to_string()]);
+        assert_eq!(
+            title_index_letters("Queensland Mabo"),
+            vec!["Q".to_string(), "M".to_string()]
+        );
+        assert_eq!(title_index_letters("Act"), vec!["A".to_string()]);
     }
 
     #[test]
