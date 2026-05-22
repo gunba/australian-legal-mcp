@@ -77,12 +77,15 @@ The `austlii:` URI scheme for `fetch` reaches `classic.austlii.edu.au` for
 known case and legislation paths, for example
 `austlii:au/cases/cth/HCA/1992/23`.
 
-Live AustLII search is currently unavailable. AustLII's published SINO CGI
-endpoint (`/cgi-bin/sinosrch.cgi`) now reports that the resource is no longer
-available, so this is not a cookie-configuration problem. Do not ask users to
-open a SINO browser URL, paste a Cookie header, or run browser cookie-store
-extraction. `search_austlii` and `ato-mcp austlii setup` fail fast with the
-same diagnostic. `ato-mcp austlii clear` deletes any legacy session file.
+AustLII's published SINO CGI endpoint (`/cgi-bin/sinosrch.cgi`) is no longer
+available, so this is not a cookie-configuration problem. `search_austlii`
+uses AustLII title indexes (`search_backend: "austlii_title_index"`) and returns
+normalised `austlii:<path>` fetch URIs. It may use a temporary curl cookie jar
+for AustLII's short-lived bot-management cookie, but it does not persist or ask
+the user to configure cookies. Do not ask users to open a SINO browser URL,
+paste a Cookie header, or run browser cookie-store extraction.
+`ato-mcp austlii setup` is a no-op; `ato-mcp austlii clear` deletes any legacy
+session file.
 
 ## Updates
 
@@ -136,4 +139,4 @@ checkout plus model assets. Don't run them on a user install.
 | `ato-mcp serve: bind ... already in use` | Stop whatever holds the port, or run `ato-mcp serve --port <other>`; the new URL is written back into `.mcp.json` and the user exits + resumes the session. |
 | `stats` reports zero documents | `update` didn't complete; rerun after deleting the incomplete `live/` dir. |
 | `search` returns no hits | Confirm `stats` shows `chunks > 0`; use `include_old=true` for older authorities. |
-| `austlii search` is unavailable | AustLII's published SINO CGI endpoint is no longer available. Use `fetch` only when the exact `austlii:<path>` is already known. |
+| `austlii search` returns weak or stale results | The tool uses AustLII title indexes because native SINO full-text search is unavailable. Fetch and verify returned sources. |

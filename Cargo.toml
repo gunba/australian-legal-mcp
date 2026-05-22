@@ -1,6 +1,6 @@
 [package]
 name = "ato-mcp"
-version = "0.14.2"
+version = "0.14.3"
 edition = "2021"
 license = "MIT"
 description = "Standalone MCP server for the Australian Taxation Office legal corpus"
@@ -44,8 +44,9 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # platform TLS stack. AustLII known-document fetches try the system `curl`
 # binary first because classic.austlii.edu.au currently accepts curl where
 # reqwest's client fingerprint can hit Cloudflare; reqwest remains the
-# fallback when curl is unavailable. Live AustLII search is disabled until a
-# supported endpoint replaces the retired SINO CGI path.
+# fallback when curl is unavailable. AustLII search uses classic-host title
+# indexes through curl with a temporary cookie jar because the native SINO CGI
+# endpoint is unavailable.
 # Pure-Rust PDF text extraction. AustLII serves some judgments as PDFs;
 # scanned ones (no text layer) fall through to the OCR path in src/ocr.rs.
 pdf-extract = "0.7"

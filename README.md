@@ -26,7 +26,7 @@ a one-shot corpus download.
 | `get_definition` | Statutory definitions with a labelled ordinary-meaning fallback. |
 | `get_asset` | Resolve a retained image `data-asset-ref` to an MCP image content item plus caption. |
 | `fetch` | Live-fetch a document by URI. `ato:<doc_id>[?pit=...&view=...]` for ATO live retrieval; `austlii:<path>` for AustLII via `classic.austlii.edu.au`. Returns chunks of the same shape as `get_chunks`. Pass `allow_ocr=true` for scanned PDFs (Tesseract on `$PATH`, allow ~120s). |
-| `search_austlii` | Currently unavailable because AustLII's published SINO CGI endpoint now reports that it is no longer available. The tool fails fast with that diagnostic instead of attempting cookie setup. |
+| `search_austlii` | Search AustLII title indexes and return exact `austlii:<path>` fetch URIs. Native AustLII SINO full-text search is unavailable, so fetch and verify returned sources. |
 | `stats` | Index version, counts, default search policy, AustLII session state. |
 
 Document bodies are exposed as cleaned HTML fragments so agents navigate the
@@ -106,11 +106,17 @@ ato-mcp fetch 'austlii:au/cases/cth/HCA/1992/23'
 ato-mcp austlii clear   # delete any legacy persisted session
 ```
 
-Live AustLII search through SINO is currently disabled. AustLII's published
+Live AustLII full-text search through SINO is currently disabled. AustLII's published
 `/cgi-bin/sinosrch.cgi` endpoint now reports that the resource is no longer
 available, so this is not a cookie-configuration problem. `search_austlii`
-and `ato-mcp austlii setup` fail fast with that diagnostic instead of asking
-the user to open a browser or paste cookies.
+therefore uses AustLII title indexes, normalises AustLII URLs into
+`austlii:<path>` fetch URIs, and labels responses with
+`search_backend: "austlii_title_index"`. The title-index requests use curl
+with a temporary per-search cookie jar for AustLII's short-lived bot-management
+cookie; no browser session or persisted user cookie is required. Set
+`ATO_MCP_AUSTLII_WEB_FALLBACK=1` to also try a public web-index fallback when
+title-index search is insufficient. `ato-mcp austlii setup` is a no-op; users
+do not need to open a browser or paste cookies.
 
 Scanned pre-digital judgments return `error: scanned_pdf` from `fetch` by
 default. Pass `allow_ocr=true` to opt into Tesseract OCR (results are cached
@@ -168,7 +174,7 @@ cargo build --release --features cuda
 ./target/release/ato-mcp link-download   --deduped-links snapshots/.../deduped_links.jsonl --out-dir /path/to/ato_pages
 ./target/release/ato-mcp build           --pages-dir /path/to/ato_pages --db-path ./release/ato.db --model-dir /path/to/granite-embedding-small-r2 --out-dir ./release --profile
 ./target/release/ato-mcp package-corpus  --db-path ./release/ato.db --out ./release/ato.db.zst --manifest ./release/manifest.json
-./target/release/ato-mcp publish-release --out-dir ./release --tag v0.14.2 --repo gunba/ato-mcp --overwrite
+./target/release/ato-mcp publish-release --out-dir ./release --tag v0.14.3 --repo gunba/ato-mcp --overwrite
 ```
 
 `scripts/publish-release.sh <tag>` wraps the `package-corpus` +

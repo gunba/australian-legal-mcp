@@ -24,11 +24,11 @@ Closed clap command surface covering end-user MCP/update/doctor/search commands 
 ## Rust Server Wiring
 MCP tool registration, shared ServerState, runtime statistics instructions, install/update notices, and the small explicit tool surface.
 
-- [SW-04 L676] ServerState lazily loads SemanticRuntime on the first semantic query and reuses that runtime for the rest of the process.
+- [SW-04 L672] ServerState lazily loads SemanticRuntime on the first semantic query and reuses that runtime for the rest of the process.
   - There is no reranker state in the MCP surface; non-semantic tools do not load the semantic runtime.
-- [SW-02 L1661] Server instructions are built dynamically at start time from corpus stats (doc count, chunk count, type breakdown, meta keys), so the agent sees up-to-date corpus shape without restart-time configuration.
-- [SW-03 L1663] server_instructions is built from stats(OutputFormat::Json); if stats cannot be read (corpus not yet installed) it returns a static install message telling the agent to ask the user to run ato-mcp update. When the serve-startup probe has stashed an UpdateAvailability on ServerState, both branches append a newer-index-available notice carrying the published index_version.
-- [SW-01 L1695] Eight MCP tools are exposed by tool_descriptors/call_tool: search, get_chunks, get_definition, get_asset, get_doc_anchors, fetch, search_austlii, and stats. get_asset returns an MCP content array (caption + image content item); every other tool returns a single text content item. The surface stays small and explicit; unsupported tools fail through the normal tools/call error path.
+- [SW-02 L1669] Server instructions are built dynamically at start time from corpus stats (doc count, chunk count, type breakdown, meta keys), so the agent sees up-to-date corpus shape without restart-time configuration.
+- [SW-03 L1671] server_instructions is built from stats(OutputFormat::Json); if stats cannot be read (corpus not yet installed) it returns a static install message telling the agent to ask the user to run ato-mcp update. When the serve-startup probe has stashed an UpdateAvailability on ServerState, both branches append a newer-index-available notice carrying the published index_version.
+- [SW-01 L1703] Eight MCP tools are exposed by tool_descriptors/call_tool: search, get_chunks, get_definition, get_asset, get_doc_anchors, fetch, search_austlii, and stats. get_asset returns an MCP content array (caption + image content item); every other tool returns a single text content item. The surface stays small and explicit; unsupported tools fail through the normal tools/call error path.
   - The surface stays small and explicit; unsupported tools fail through the normal tools/call error path.
 
 ## Rust Source Scraper
@@ -40,11 +40,11 @@ Maintainer source acquisition commands for What's New incremental pulls, tree cr
 ## Rust Storage Layer
 SQLite schema, compressed chunk/html storage, FTS5, WAL write handles, pack/assets install, optional minisign release signatures, doc anchors, and derived citations.
 
-- [SL-07 L896] publish-release optionally signs manifest.json by shelling out to the maintainer minisign CLI, then uploads manifest.json.minisig with the release artifacts.
+- [SL-07 L892] publish-release optionally signs manifest.json by shelling out to the maintainer minisign CLI, then uploads manifest.json.minisig with the release artifacts.
 
 ## Rust Update Mechanism
 End-user update flow: update.json fast-path when local DB/model match, otherwise staged model/corpus rebuild and guarded promotion, with single-writer LOCK and doctor rollback backup.
 
-- [UM-03 L1049] Fetch helpers resolve local paths, file://, manifest-relative assets, HTTP(S), and hf:// Granite model file URLs; downloaded model bundle/file bytes are sha256-verified against the manifest's pinned hash.
+- [UM-03 L1045] Fetch helpers resolve local paths, file://, manifest-relative assets, HTTP(S), and hf:// Granite model file URLs; downloaded model bundle/file bytes are sha256-verified against the manifest's pinned hash.
   - HF model installs verify each pinned Granite file and non-HF model bundles require explicit sha256 and positive size metadata.
-- [UM-04 L1056] fetch helpers intentionally don't read GitHub token env vars and don't shell out to gh — private release assets must be exposed through an approved mirror or installed from a local/offline bundle. This keeps the end-user runtime credential-free.
+- [UM-04 L1052] fetch helpers intentionally don't read GitHub token env vars and don't shell out to gh — private release assets must be exposed through an approved mirror or installed from a local/offline bundle. This keeps the end-user runtime credential-free.

@@ -1,12 +1,13 @@
 //! AustLII session cookie persistence.
 //!
 //! Older versions could persist browser cookies for AustLII SINO search.
-//! The search endpoint is no longer a supported retrieval path, but we
-//! still load existing sessions so direct document fetches can reuse the
-//! recorded User-Agent and `stats` can report the installation state
-//! without exposing cookie values. Direct fetches do not send legacy
-//! cookies because stale SINO sessions can break otherwise valid document
-//! requests.
+//! Native SINO is no longer a supported retrieval path, but we still load
+//! existing sessions so direct document fetches can reuse the recorded
+//! User-Agent and `stats` can report the installation state without
+//! exposing cookie values. Direct fetches and title-index search do not send
+//! legacy persisted cookies because stale SINO sessions can break otherwise
+//! valid document requests. Title-index search may use a temporary curl cookie
+//! jar for AustLII's short-lived bot-management cookie.
 
 use crate::config::data_dir;
 use anyhow::{Context, Result};
@@ -78,8 +79,9 @@ pub(crate) fn session_summary_json() -> serde_json::Value {
     match load_session() {
         Ok(Some(session)) => serde_json::json!({
             "session_present": true,
-            "search_available": false,
-            "search_status": "unavailable: AustLII SINO CGI endpoint is no longer available",
+            "search_available": true,
+            "search_backend": "austlii_title_index",
+            "search_status": "available via AustLII title-index search with a temporary curl cookie jar; native AustLII SINO CGI endpoint is unavailable",
             "acquired_at": session.acquired_at,
             "sino_validated": session.sino_validated_at.is_some(),
             "sino_validated_at": session.sino_validated_at,
@@ -91,8 +93,9 @@ pub(crate) fn session_summary_json() -> serde_json::Value {
         }),
         _ => serde_json::json!({
             "session_present": false,
-            "search_available": false,
-            "search_status": "unavailable: AustLII SINO CGI endpoint is no longer available",
+            "search_available": true,
+            "search_backend": "austlii_title_index",
+            "search_status": "available via AustLII title-index search with a temporary curl cookie jar; native AustLII SINO CGI endpoint is unavailable",
         }),
     }
 }

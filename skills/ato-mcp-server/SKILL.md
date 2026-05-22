@@ -58,16 +58,18 @@ ato-mcp update
 After the download completes, restart `ato-mcp serve` so it picks up the
 new corpus, then retry the user's original question.
 
-## When AustLII search is unavailable
+## AustLII search
 
-`search_austlii` and `ato-mcp austlii setup` currently fail fast because
-AustLII's published SINO CGI endpoint is no longer available. This is not a
-cookie-configuration problem.
+`search_austlii` uses AustLII title indexes because AustLII's published SINO
+CGI endpoint is no longer available. Results are AustLII URLs normalised to
+`austlii:<path>` fetch URIs and should be fetched and verified before use.
+The implementation handles AustLII's short-lived bot-management cookie with a
+temporary curl cookie jar during the search call; it does not require a browser
+session or a persisted user cookie.
 
 Do not ask the user to open a SINO browser URL, paste a Cookie header, or run
-browser cookie-store extraction. Use `fetch` only when the exact
-`austlii:<path>` is already known, and otherwise report that live AustLII
-search is unavailable.
+browser cookie-store extraction. `ato-mcp austlii setup` is a no-op because no
+cookie setup is required.
 
 ## What not to do
 

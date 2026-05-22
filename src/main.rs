@@ -170,8 +170,8 @@ enum Command {
         #[arg(long)]
         allow_ocr: bool,
     },
-    /// AustLII utilities. Direct `fetch austlii:<path>` remains supported;
-    /// live search/setup currently report AustLII endpoint unavailability.
+    /// AustLII utilities. Direct `fetch austlii:<path>` uses the classic host;
+    /// search uses AustLII title indexes because native SINO is gone.
     Austlii {
         #[command(subcommand)]
         action: AustliiAction,
@@ -367,22 +367,18 @@ enum SortBy {
 
 #[derive(Subcommand)]
 enum AustliiAction {
-    /// Report that AustLII SINO search setup is currently unavailable.
+    /// Report that no AustLII cookie setup is required.
     Setup {
-        /// Accepted for CLI compatibility; currently not used because
-        /// AustLII's SINO endpoint is unavailable.
+        /// Accepted for CLI compatibility; not stored.
         #[arg(long, value_name = "VALUE", conflicts_with = "cookie_header")]
         cookie: Option<String>,
-        /// Accepted for CLI compatibility; currently not used because
-        /// AustLII's SINO endpoint is unavailable.
+        /// Accepted for CLI compatibility; not stored.
         #[arg(long, value_name = "HEADER", conflicts_with = "cookie")]
         cookie_header: Option<String>,
-        /// Accepted for CLI compatibility; currently not used because
-        /// AustLII's SINO endpoint is unavailable.
+        /// Accepted for CLI compatibility; not stored.
         #[arg(long, value_name = "VALUE")]
         user_agent: Option<String>,
-        /// Accepted for CLI compatibility; currently not used because
-        /// AustLII's SINO endpoint is unavailable.
+        /// Accepted for CLI compatibility; not used.
         #[arg(long)]
         browser: bool,
         /// Accepted for CLI compatibility.
@@ -1622,13 +1618,25 @@ fn austlii_command(action: AustliiAction) -> Result<()> {
 }
 
 fn austlii_setup(
-    _manual_cookie: Option<&str>,
-    _manual_cookie_header: Option<&str>,
-    _manual_user_agent: Option<&str>,
-    _use_browser: bool,
+    manual_cookie: Option<&str>,
+    manual_cookie_header: Option<&str>,
+    manual_user_agent: Option<&str>,
+    use_browser: bool,
     _skip_prompt: bool,
 ) -> Result<()> {
-    bail!("{}", austlii::AUSTLII_SEARCH_UNAVAILABLE)
+    let supplied_cookie = manual_cookie.is_some() || manual_cookie_header.is_some();
+    let supplied_browser_config = manual_user_agent.is_some() || use_browser;
+    if supplied_cookie || supplied_browser_config {
+        println!(
+            "No AustLII cookie or browser setup is required; supplied setup arguments were not stored."
+        );
+    } else {
+        println!("No AustLII setup is required.");
+    }
+    println!(
+        "search_austlii uses AustLII title indexes with a temporary per-search curl cookie jar because AustLII's native SINO CGI endpoint is unavailable. Direct fetch uses classic.austlii.edu.au for exact austlii:<path> URIs."
+    );
+    Ok(())
 }
 
 fn austlii_clear() -> Result<()> {
@@ -1646,7 +1654,7 @@ fn austlii_clear() -> Result<()> {
     Ok(())
 }
 
-const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first; hits are chunk pointers; call `get_chunks` for text. Use `get_doc_anchors` for nav, related, history, and cited-by. Markers: `[doc:X]` is in-corpus; `[fetch:URI]` is external (use `fetch`, e.g. `fetch("austlii:au/cases/cth/HCA/1992/23")`). AustLII live search is unavailable because SINO CGI is gone; use `fetch` only when exact `austlii:<path>` is known. `allow_ocr=true` runs Tesseract for scanned PDFs; set MCP `timeout:120000`. For historical/withdrawn set `current_only=false` and `include_old=true`."##;
+const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first; hits are chunk pointers; call `get_chunks` for text. Use `get_doc_anchors` for nav, related, history, and cited-by. Markers: `[doc:X]` is in-corpus; `[fetch:URI]` is external (use `fetch`, e.g. `fetch("austlii:au/cases/cth/HCA/1992/23")`). `search_austlii` uses AustLII title indexes because AustLII SINO CGI is gone; fetch and verify returned sources. No user cookie setup is required. `allow_ocr=true` runs Tesseract for scanned PDFs; set MCP `timeout:120000`. For historical/withdrawn set `current_only=false` and `include_old=true`."##;
 
 /// Build the `update_notice` carried in `ServerState` for the lifetime of the
 /// server. Runs `check_for_update_availability` once at startup; the result
@@ -1797,7 +1805,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "search_austlii",
-            "description": "Unavailable: AustLII's SINO CGI endpoint is gone. Use `fetch` only when exact `austlii:<path>` is known.",
+            "description": "Search AustLII title indexes and return exact `austlii:<path>` fetch URIs. Native AustLII SINO full-text search is unavailable; no user cookie setup is required. Fetch and verify returned sources.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
