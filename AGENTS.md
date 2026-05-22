@@ -73,36 +73,16 @@ Inside the MCP host, invoke `search` and confirm results include
 
 ## AustLII access
 
-The `austlii:` URI scheme for `fetch` and the `search_austlii` MCP tool reach
-`*.austlii.edu.au` through Cloudflare's bot management. Document fetches
-against `classic.austlii.edu.au` work with a browser-grade User-Agent alone;
-SINO search needs a `cf_clearance` cookie tied to a real browser session
-that's cleared the JS challenge.
+The `austlii:` URI scheme for `fetch` reaches `classic.austlii.edu.au` for
+known case and legislation paths, for example
+`austlii:au/cases/cth/HCA/1992/23`.
 
-The install agent should treat AustLII setup as an explicit consent and
-credential-collection step. Ask the user for a Cookie header and User-Agent
-from a successful SINO request, then run:
-
-```bash
-ato-mcp austlii setup --cookie-header '<Cookie header>' --user-agent '<User-Agent>'
-```
-
-`setup` validates the session against SINO before saving it. If the user
-prefers browser cookie-store extraction, `ato-mcp austlii setup --browser`
-opens a SINO validation URL and then reads the browser cookies, but this is a
-fallback rather than the primary install path. The cookie and the browser's
-User-Agent string are persisted to
-`<data_dir>/austlii_session.json` and reused on subsequent MCP calls.
-`stats` reports the cached browser, cookie age, SINO validation state, and
-`cf_clearance` presence; `ato-mcp austlii clear` deletes the session file.
-
-Override the detected browser with `ATO_MCP_BROWSER=chrome|edge|firefox`
-when the registry / xdg-mime lookup returns the wrong default. Safari
-isn't supported by `rookie`; macOS Safari users either use the manual
-Cookie-header setup or override to Chrome/Firefox for `--browser`.
-
-`ato-mcp austlii search "<query>"` runs the CLI variant of the MCP
-`search_austlii` tool.
+Live AustLII search is currently unavailable. AustLII's published SINO CGI
+endpoint (`/cgi-bin/sinosrch.cgi`) now reports that the resource is no longer
+available, so this is not a cookie-configuration problem. Do not ask users to
+open a SINO browser URL, paste a Cookie header, or run browser cookie-store
+extraction. `search_austlii` and `ato-mcp austlii setup` fail fast with the
+same diagnostic. `ato-mcp austlii clear` deletes any legacy session file.
 
 ## Updates
 
@@ -156,4 +136,4 @@ checkout plus model assets. Don't run them on a user install.
 | `ato-mcp serve: bind ... already in use` | Stop whatever holds the port, or run `ato-mcp serve --port <other>`; the new URL is written back into `.mcp.json` and the user exits + resumes the session. |
 | `stats` reports zero documents | `update` didn't complete; rerun after deleting the incomplete `live/` dir. |
 | `search` returns no hits | Confirm `stats` shows `chunks > 0`; use `include_old=true` for older authorities. |
-| `austlii search` returns 403 | The saved SINO session is invalid or expired. Re-run `ato-mcp austlii setup --cookie-header '<Cookie header>' --user-agent '<User-Agent>'` with headers from a successful SINO request. |
+| `austlii search` is unavailable | AustLII's published SINO CGI endpoint is no longer available. Use `fetch` only when the exact `austlii:<path>` is already known. |

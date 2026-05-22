@@ -11,8 +11,8 @@ a one-shot corpus download.
 
 - A pre-built local corpus of ~158k ATO documents and ~467k chunks, queryable
   with hybrid BM25 + Granite vector search.
-- Live retrieval for ATO documents the corpus doesn't carry, plus AustLII
-  case law and legislation via the `fetch` and `search_austlii` tools.
+- Live retrieval for ATO documents the corpus doesn't carry, plus known
+  AustLII case law and legislation by URI via the `fetch` tool.
 - Statutory-definition lookup with an ordinary-meaning fallback.
 - All of the above as MCP tools the agent can call directly.
 
@@ -26,7 +26,7 @@ a one-shot corpus download.
 | `get_definition` | Statutory definitions with a labelled ordinary-meaning fallback. |
 | `get_asset` | Resolve a retained image `data-asset-ref` to an MCP image content item plus caption. |
 | `fetch` | Live-fetch a document by URI. `ato:<doc_id>[?pit=...&view=...]` for ATO live retrieval; `austlii:<path>` for AustLII via `classic.austlii.edu.au`. Returns chunks of the same shape as `get_chunks`. Pass `allow_ocr=true` for scanned PDFs (Tesseract on `$PATH`, allow ~120s). |
-| `search_austlii` | Live search of AustLII via SINO. Returns hits with `fetch_uri` ready to pass to `fetch`. Uses the validated session acquired by `ato-mcp austlii setup`. |
+| `search_austlii` | Currently unavailable because AustLII's published SINO CGI endpoint now reports that it is no longer available. The tool fails fast with that diagnostic instead of attempting cookie setup. |
 | `stats` | Index version, counts, default search policy, AustLII session state. |
 
 Document bodies are exposed as cleaned HTML fragments so agents navigate the
@@ -99,21 +99,18 @@ when the user agrees.
 
 ATO commentary cites AustLII material that lives outside the local corpus.
 The `fetch` tool reaches `classic.austlii.edu.au` directly for case and
-legislation URLs. `search_austlii` reaches SINO, which Cloudflare gates with
-a browser session. Setup must use a Cookie header from a successful SINO
-request, not just the classic AustLII home page:
+legislation URLs when you already have an `austlii:<path>` URI.
 
 ```bash
-ato-mcp austlii setup
-ato-mcp austlii setup --cookie-header "<Cookie header>" --user-agent "<User-Agent>"
-ato-mcp austlii setup --browser             # fallback: open SINO and try browser cookie extraction
-ato-mcp austlii clear                       # delete the persisted session
+ato-mcp fetch 'austlii:au/cases/cth/HCA/1992/23'
+ato-mcp austlii clear   # delete any legacy persisted session
 ```
 
-`setup` validates the session against SINO before saving it. `stats` reports
-the persisted session, including whether SINO validation succeeded. Override
-the auto-detected default browser with `ATO_MCP_BROWSER=chrome|edge|firefox`
-if the registry / xdg-mime lookup returns the wrong one.
+Live AustLII search through SINO is currently disabled. AustLII's published
+`/cgi-bin/sinosrch.cgi` endpoint now reports that the resource is no longer
+available, so this is not a cookie-configuration problem. `search_austlii`
+and `ato-mcp austlii setup` fail fast with that diagnostic instead of asking
+the user to open a browser or paste cookies.
 
 Scanned pre-digital judgments return `error: scanned_pdf` from `fetch` by
 default. Pass `allow_ocr=true` to opt into Tesseract OCR (results are cached
@@ -154,7 +151,7 @@ ato-mcp/
 │   ├── model_fp16.onnx_data
 │   └── tokenizer.json
 ├── installed_manifest.json
-├── austlii_session.json   # only when `austlii setup` has run
+├── austlii_session.json   # optional legacy AustLII session from older versions
 └── staging/               # transient during update
 ```
 
@@ -171,7 +168,7 @@ cargo build --release --features cuda
 ./target/release/ato-mcp link-download   --deduped-links snapshots/.../deduped_links.jsonl --out-dir /path/to/ato_pages
 ./target/release/ato-mcp build           --pages-dir /path/to/ato_pages --db-path ./release/ato.db --model-dir /path/to/granite-embedding-small-r2 --out-dir ./release --profile
 ./target/release/ato-mcp package-corpus  --db-path ./release/ato.db --out ./release/ato.db.zst --manifest ./release/manifest.json
-./target/release/ato-mcp publish-release --out-dir ./release --tag v0.14.1 --repo gunba/ato-mcp --overwrite
+./target/release/ato-mcp publish-release --out-dir ./release --tag v0.14.2 --repo gunba/ato-mcp --overwrite
 ```
 
 `scripts/publish-release.sh <tag>` wraps the `package-corpus` +

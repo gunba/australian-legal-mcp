@@ -1,20 +1,15 @@
-//! AustLII session cookie acquisition and persistence.
+//! AustLII session cookie persistence.
 //!
-//! AustLII's SINO search endpoint is gated by Cloudflare. Acquiring a
-//! `cf_clearance` cookie requires clearing the JS challenge in a real
-//! browser, which the user has already done while normally using the
-//! internet. We borrow that clearance by reading the AustLII cookies out
-//! of the user's browser cookie store via the `rookie` crate, and persist
-//! them to disk so subsequent MCP calls don't need to re-read the
-//! (potentially-locked) browser DB.
-//!
-//! Safari is unsupported by rookie's stable API surface; macOS users with
-//! Safari as default should use manual Cookie-header setup, or override to
-//! Chrome/Firefox via `ATO_MCP_BROWSER` when using `austlii setup --browser`.
+//! Older versions could persist browser cookies for AustLII SINO search.
+//! The search endpoint is no longer a supported retrieval path, but we
+//! still load existing sessions so direct document fetches can reuse the
+//! recorded User-Agent and `stats` can report the installation state
+//! without exposing cookie values. Direct fetches do not send legacy
+//! cookies because stale SINO sessions can break otherwise valid document
+//! requests.
 
-use crate::browser::{self, BrowserFamily};
 use crate::config::data_dir;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -47,102 +42,6 @@ pub(crate) fn session_file_path() -> Result<PathBuf> {
     Ok(data_dir()?.join(SESSION_FILE))
 }
 
-const AUSTLII_DOMAINS: &[&str] = &[
-    "austlii.edu.au",
-    "www.austlii.edu.au",
-    "classic.austlii.edu.au",
-];
-
-/// Read AustLII cookies from the user's detected browser. Returns Ok(None)
-/// when the browser store contains no AustLII cookies (user hasn't visited
-/// AustLII yet, or did so under a profile we can't see). Errors are
-/// surfaced rather than swallowed so the CLI can offer the manual-paste
-/// fallback when EDR / file-lock issues block extraction.
-pub(crate) fn read_browser_cookies() -> Result<Option<Vec<NamedCookie>>> {
-    let browser = browser::detect()?;
-    let domains: Vec<String> = AUSTLII_DOMAINS.iter().map(|s| s.to_string()).collect();
-    let cookies = match browser.family {
-        BrowserFamily::Chromium => read_chromium_cookies(domains)?,
-        BrowserFamily::Firefox => read_firefox_cookies(domains)?,
-        BrowserFamily::Safari => {
-            bail!(
-                "Safari cookie extraction is not supported. Use manual setup with \
-                 `ato-mcp austlii setup --cookie-header <header> --user-agent <ua>`, \
-                 or override the detected browser via `ATO_MCP_BROWSER=chrome` \
-                 (or firefox/edge) for `austlii setup --browser`."
-            );
-        }
-    };
-    if cookies.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(cookies))
-}
-
-fn read_chromium_cookies(domains: Vec<String>) -> Result<Vec<NamedCookie>> {
-    // Chromium-family browsers all share the same on-disk cookie DB
-    // format. Try Chrome first, then Edge, then Brave — whichever has the
-    // AustLII cookie wins. Errors from one engine don't abort the whole
-    // probe so a missing browser doesn't mask a present one.
-    let mut last_err: Option<anyhow::Error> = None;
-    match rookie::chrome(Some(domains.clone())) {
-        Ok(cookies) if !cookies.is_empty() => {
-            return Ok(cookies.into_iter().map(convert_cookie).collect());
-        }
-        Ok(_) => {}
-        Err(e) => last_err = Some(anyhow!("rookie chrome: {e}")),
-    }
-    match rookie::edge(Some(domains.clone())) {
-        Ok(cookies) if !cookies.is_empty() => {
-            return Ok(cookies.into_iter().map(convert_cookie).collect());
-        }
-        Ok(_) => {}
-        Err(e) => last_err = Some(anyhow!("rookie edge: {e}")),
-    }
-    match rookie::brave(Some(domains)) {
-        Ok(cookies) if !cookies.is_empty() => {
-            return Ok(cookies.into_iter().map(convert_cookie).collect());
-        }
-        Ok(_) => {}
-        Err(e) => last_err = Some(anyhow!("rookie brave: {e}")),
-    }
-    if let Some(err) = last_err {
-        return Err(err);
-    }
-    Ok(Vec::new())
-}
-
-fn read_firefox_cookies(domains: Vec<String>) -> Result<Vec<NamedCookie>> {
-    let cookies = rookie::firefox(Some(domains))
-        .map_err(|e| anyhow!("rookie firefox extraction failed: {e}"))?;
-    Ok(cookies.into_iter().map(convert_cookie).collect())
-}
-
-fn convert_cookie(c: rookie::common::enums::Cookie) -> NamedCookie {
-    NamedCookie {
-        domain: c.domain,
-        name: c.name,
-        value: c.value,
-        expires: c.expires,
-    }
-}
-
-/// Atomically persist the session to disk.
-pub(crate) fn save_session(session: &AustliiSession) -> Result<()> {
-    let path = session_file_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating data dir {}", parent.display()))?;
-    }
-    let json = serde_json::to_string_pretty(session)?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, json)
-        .with_context(|| format!("writing temp session file {}", tmp.display()))?;
-    fs::rename(&tmp, &path)
-        .with_context(|| format!("renaming session file to {}", path.display()))?;
-    Ok(())
-}
-
 pub(crate) fn load_session() -> Result<Option<AustliiSession>> {
     let path = session_file_path()?;
     if !path.exists() {
@@ -173,13 +72,14 @@ pub(crate) fn cf_clearance(session: &AustliiSession) -> Option<&str> {
 }
 
 /// JSON summary of the persisted AustLII session for `stats` output.
-/// Returns `null` when no session is persisted. The `cf_clearance_present`
-/// boolean lets callers see whether search is functional without exposing
-/// the cookie value itself.
+/// The `cf_clearance_present` boolean reports legacy session shape without
+/// exposing the cookie value itself.
 pub(crate) fn session_summary_json() -> serde_json::Value {
     match load_session() {
         Ok(Some(session)) => serde_json::json!({
             "session_present": true,
+            "search_available": false,
+            "search_status": "unavailable: AustLII SINO CGI endpoint is no longer available",
             "acquired_at": session.acquired_at,
             "sino_validated": session.sino_validated_at.is_some(),
             "sino_validated_at": session.sino_validated_at,
@@ -191,6 +91,8 @@ pub(crate) fn session_summary_json() -> serde_json::Value {
         }),
         _ => serde_json::json!({
             "session_present": false,
+            "search_available": false,
+            "search_status": "unavailable: AustLII SINO CGI endpoint is no longer available",
         }),
     }
 }

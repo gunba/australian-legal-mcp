@@ -2,12 +2,8 @@
 //!
 //! AustLII's Cloudflare-managed access gates traffic on TLS fingerprint and
 //! User-Agent. Reusing the UA string that the user's own browser sends
-//! (rather than a hardcoded Chrome version) keeps our requests
-//! indistinguishable from a normal user clicking a link — they land in a
-//! behavioural profile Cloudflare already accepts because the user has
-//! cleared the JS challenge in their browser. The same machinery feeds
-//! the AustLII cookie module so the cf_clearance value we extract is
-//! actually valid for the UA we send.
+//! (rather than a hardcoded Chrome version) keeps known-document fetches
+//! closer to normal browser traffic without adding a second TLS stack.
 //!
 //! Override the auto-detected browser with `ATO_MCP_BROWSER=chrome|edge|firefox|safari`
 //! for users on managed endpoints where the registry / xdg-mime lookup
@@ -31,18 +27,6 @@ pub(crate) enum BrowserFamily {
     Chromium,
     Firefox,
     Safari,
-}
-
-impl BrowserFamily {
-    /// Domains we expect to find this family's cookies under. Matches
-    /// rookie's per-browser API surface.
-    pub(crate) fn cookie_source_label(&self) -> &'static str {
-        match self {
-            BrowserFamily::Chromium => "chromium-based browser cookie store",
-            BrowserFamily::Firefox => "firefox cookie store",
-            BrowserFamily::Safari => "safari cookie store (macOS Keychain)",
-        }
-    }
 }
 
 static CACHE: OnceLock<DetectedBrowser> = OnceLock::new();
@@ -106,9 +90,9 @@ fn detect_native() -> Result<DetectedBrowser> {
     let cmd_key = class_root
         .open_subkey(format!("{prog_id}\\shell\\open\\command"))
         .with_context(|| format!("opening HKCR\\{prog_id}\\shell\\open\\command"))?;
-    let cmd_line: String = cmd_key
-        .get_value("")
-        .with_context(|| format!("reading default value of HKCR\\{prog_id}\\shell\\open\\command"))?;
+    let cmd_line: String = cmd_key.get_value("").with_context(|| {
+        format!("reading default value of HKCR\\{prog_id}\\shell\\open\\command")
+    })?;
     let exe_path = parse_command_line_exe(&cmd_line)?;
     let (family, name) = classify_windows_exe(&exe_path)?;
     let version = run_version_probe(&exe_path)?;
@@ -422,11 +406,7 @@ fn parse_command_line_exe(cmd: &str) -> Result<String> {
             .ok_or_else(|| anyhow!("unterminated quote in registry command line `{cmd}`"))?;
         Ok(rest[..end].to_string())
     } else {
-        Ok(trimmed
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_string())
+        Ok(trimmed.split_whitespace().next().unwrap_or("").to_string())
     }
 }
 
@@ -552,7 +532,8 @@ mod tests {
 
     #[test]
     fn parse_browser_version_output_recognises_chromium() {
-        let (name, family, version) = parse_browser_version_output("Chromium 137.0.7151.119 snap\n").unwrap();
+        let (name, family, version) =
+            parse_browser_version_output("Chromium 137.0.7151.119 snap\n").unwrap();
         assert_eq!(name, "Chromium");
         assert_eq!(family, BrowserFamily::Chromium);
         // Trailing "snap" word is skipped because it carries no digits.
@@ -572,14 +553,16 @@ mod tests {
             r#""C:\Program Files\Google\Chrome\Application\chrome.exe" -- "%1""#,
         )
         .unwrap();
-        assert_eq!(exe, r"C:\Program Files\Google\Chrome\Application\chrome.exe");
+        assert_eq!(
+            exe,
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+        );
     }
 
     #[cfg(target_os = "windows")]
     #[test]
     fn parse_command_line_exe_unquoted_path() {
-        let exe =
-            parse_command_line_exe(r"C:\Windows\System32\notepad.exe %1").unwrap();
+        let exe = parse_command_line_exe(r"C:\Windows\System32\notepad.exe %1").unwrap();
         assert_eq!(exe, r"C:\Windows\System32\notepad.exe");
     }
 

@@ -58,25 +58,16 @@ ato-mcp update
 After the download completes, restart `ato-mcp serve` so it picks up the
 new corpus, then retry the user's original question.
 
-## When AustLII search is not configured
+## When AustLII search is unavailable
 
-`stats` reports `austlii.sino_validated=false` or `search_austlii` returns
-HTTP 403. Do not send the user to a blind browser-opening flow. Collect the
-exact information needed from the user as part of setup:
+`search_austlii` and `ato-mcp austlii setup` currently fail fast because
+AustLII's published SINO CGI endpoint is no longer available. This is not a
+cookie-configuration problem.
 
-1. Ask the user to open this SINO search URL in their browser:
-   `https://www.austlii.edu.au/cgi-bin/sinosrch.cgi?query=income+tax+residency&meta=%2Fau&method=auto&results=10&view=relevance`
-
-2. Ask them to copy the request's `Cookie` header and `User-Agent` header
-   from browser DevTools after the page loads successfully.
-
-3. Run:
-   ```bash
-   ato-mcp austlii setup --cookie-header '<Cookie header>' --user-agent '<User-Agent>'
-   ```
-
-`setup` validates the session against SINO before saving it. If validation
-fails, report that result; do not claim AustLII search is configured.
+Do not ask the user to open a SINO browser URL, paste a Cookie header, or run
+browser cookie-store extraction. Use `fetch` only when the exact
+`austlii:<path>` is already known, and otherwise report that live AustLII
+search is unavailable.
 
 ## What not to do
 

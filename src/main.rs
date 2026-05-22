@@ -170,8 +170,8 @@ enum Command {
         #[arg(long)]
         allow_ocr: bool,
     },
-    /// Manage the persisted AustLII session cookie used for SINO search
-    /// access through Cloudflare. See AGENTS.md for the consent flow.
+    /// AustLII utilities. Direct `fetch austlii:<path>` remains supported;
+    /// live search/setup currently report AustLII endpoint unavailability.
     Austlii {
         #[command(subcommand)]
         action: AustliiAction,
@@ -367,33 +367,29 @@ enum SortBy {
 
 #[derive(Subcommand)]
 enum AustliiAction {
-    /// Save and validate a SINO-ready AustLII session. By default this
-    /// collects a Cookie header and User-Agent interactively; use --browser
-    /// to try browser cookie-store extraction instead.
+    /// Report that AustLII SINO search setup is currently unavailable.
     Setup {
-        /// Skip browser launch + automatic extraction and accept a
-        /// manually-pasted cf_clearance value. Useful for Safari or
-        /// EDR-locked endpoints where rookie can't read the cookie store.
+        /// Accepted for CLI compatibility; currently not used because
+        /// AustLII's SINO endpoint is unavailable.
         #[arg(long, value_name = "VALUE", conflicts_with = "cookie_header")]
         cookie: Option<String>,
-        /// Skip browser launch + automatic extraction and accept a full
-        /// Cookie header copied from a SINO request in the user's browser.
+        /// Accepted for CLI compatibility; currently not used because
+        /// AustLII's SINO endpoint is unavailable.
         #[arg(long, value_name = "HEADER", conflicts_with = "cookie")]
         cookie_header: Option<String>,
-        /// Browser User-Agent that produced the manual cookie/header. When
-        /// omitted, the detected default browser's User-Agent is used.
+        /// Accepted for CLI compatibility; currently not used because
+        /// AustLII's SINO endpoint is unavailable.
         #[arg(long, value_name = "VALUE")]
         user_agent: Option<String>,
-        /// Open the SINO validation URL and try to read cookies from the
-        /// browser cookie store. Manual Cookie-header setup is preferred.
+        /// Accepted for CLI compatibility; currently not used because
+        /// AustLII's SINO endpoint is unavailable.
         #[arg(long)]
         browser: bool,
-        /// Skip the interactive consent prompt (for scripted use).
+        /// Accepted for CLI compatibility.
         #[arg(long)]
         yes: bool,
     },
-    /// Live-search AustLII via the SINO CGI. Requires a session cookie
-    /// from `ato-mcp austlii setup`.
+    /// Report that AustLII live search is currently unavailable.
     Search {
         query: String,
         #[arg(long, value_delimiter = ',')]
@@ -1626,253 +1622,13 @@ fn austlii_command(action: AustliiAction) -> Result<()> {
 }
 
 fn austlii_setup(
-    manual_cookie: Option<&str>,
-    manual_cookie_header: Option<&str>,
-    manual_user_agent: Option<&str>,
-    use_browser: bool,
-    skip_prompt: bool,
+    _manual_cookie: Option<&str>,
+    _manual_cookie_header: Option<&str>,
+    _manual_user_agent: Option<&str>,
+    _use_browser: bool,
+    _skip_prompt: bool,
 ) -> Result<()> {
-    use std::io::Write;
-
-    let session_path = cookies::session_file_path()?;
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-
-    if !use_browser {
-        let user_agent = match manual_user_agent {
-            Some(value) => value.to_string(),
-            None if !skip_prompt => prompt_required_line("Paste the browser User-Agent")?,
-            None => browser::detect()
-                .context(
-                    "detecting default browser for User-Agent; pass --user-agent to avoid detection",
-                )?
-                .user_agent
-                .clone(),
-        };
-        let cookies = match (manual_cookie_header, manual_cookie) {
-            (Some(header), _) => parse_manual_cookie_header(header)?,
-            (None, Some(cookie)) => vec![cookies::NamedCookie {
-                domain: ".austlii.edu.au".to_string(),
-                name: "cf_clearance".to_string(),
-                value: cookie.to_string(),
-                expires: None,
-            }],
-            (None, None) if !skip_prompt => {
-                let header =
-                    prompt_required_line("Paste the Cookie header from a successful SINO request")?;
-                parse_manual_cookie_header(&header)?
-            }
-            (None, None) => {
-                bail!(
-                    "manual AustLII setup requires --cookie-header or --cookie when --yes is used"
-                );
-            }
-        };
-        let cookie_count = cookies.len();
-        let session = cookies::AustliiSession {
-            acquired_at: now.clone(),
-            sino_validated_at: None,
-            sino_validation_query: None,
-            browser_name: "manual cookie".to_string(),
-            user_agent,
-            cookies,
-        };
-        let session = validate_and_stamp_austlii_session(session)?;
-        cookies::save_session(&session)?;
-        println!(
-            "Saved {} validated AustLII cookies to {}",
-            cookie_count,
-            session_path.display()
-        );
-        println!("Ready. `ato-mcp austlii search \"<query>\"` will now use this session.");
-        return Ok(());
-    }
-
-    let browser = browser::detect().context(
-        "detecting default browser; set ATO_MCP_BROWSER=chrome|edge|firefox to override",
-    )?;
-    println!("Detected browser: {} {}", browser.name, browser.version);
-    println!("User agent: {}", browser.user_agent);
-    println!();
-
-    if manual_cookie.is_some() || manual_cookie_header.is_some() {
-        let user_agent = match manual_user_agent {
-            Some(value) => value.to_string(),
-            None => browser.user_agent.clone(),
-        };
-        let cookies = if let Some(header) = manual_cookie_header {
-            parse_manual_cookie_header(header)?
-        } else {
-            vec![cookies::NamedCookie {
-                domain: ".austlii.edu.au".to_string(),
-                name: "cf_clearance".to_string(),
-                value: manual_cookie
-                    .expect("manual_cookie is present when no cookie_header is set")
-                    .to_string(),
-                expires: None,
-            }]
-        };
-        let session = cookies::AustliiSession {
-            acquired_at: now.clone(),
-            sino_validated_at: None,
-            sino_validation_query: None,
-            browser_name: format!("{} (manual cookie)", browser.name),
-            user_agent,
-            cookies,
-        };
-        let session = validate_and_stamp_austlii_session(session)?;
-        cookies::save_session(&session)?;
-        println!(
-            "Saved validated manual AustLII session to {}",
-            session_path.display()
-        );
-        return Ok(());
-    }
-
-    println!("ato-mcp needs a Cloudflare clearance cookie from your browser to access");
-    println!("AustLII's SINO search endpoint. This will:");
-    println!("  1. Open an AustLII SINO search URL in your default browser");
-    println!("  2. Wait for you to confirm the search page loaded without a challenge");
-    println!(
-        "  3. Read AustLII cookies from {}",
-        browser.family.cookie_source_label()
-    );
-    println!("  4. Save them to {}", session_path.display());
-
-    if !skip_prompt {
-        print!("\nContinue? [y/N] ");
-        std::io::stdout().flush().ok();
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
-        let answer = line.trim().to_lowercase();
-        if answer != "y" && answer != "yes" {
-            println!("Aborted.");
-            return Ok(());
-        }
-    }
-
-    println!("\nLaunching browser…");
-    open::that(austlii::SINO_SETUP_URL)
-        .context("launching default browser via the `open` crate")?;
-
-    println!("\nWhen the AustLII SINO page has fully loaded without a challenge,");
-    println!("press Enter here to read the cookies.");
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-
-    println!(
-        "\nReading cookies from {} ({})…",
-        browser.name,
-        browser.family.cookie_source_label()
-    );
-    let cookies = cookies::read_browser_cookies().context(
-        "reading AustLII cookies from browser; if your endpoint blocks cookie access \
-         re-run with `--cookie-header '<Cookie header>' --user-agent '<User-Agent>'`",
-    )?;
-    let cookies = match cookies {
-        Some(c) => c,
-        None => {
-            bail!(
-                "no AustLII cookies found in {}. The browser may not have visited the \
-                 page successfully, or your cookies live in a profile we can't see. \
-                 Try `ato-mcp austlii setup --cookie-header '<Cookie header>' \
-                 --user-agent '<User-Agent>'` as a manual fallback.",
-                browser.name
-            );
-        }
-    };
-
-    let has_cf_clearance = cookies
-        .iter()
-        .any(|c| c.name.eq_ignore_ascii_case("cf_clearance"));
-    let cookie_count = cookies.len();
-
-    let session = cookies::AustliiSession {
-        acquired_at: now.clone(),
-        sino_validated_at: None,
-        sino_validation_query: None,
-        browser_name: browser.name.clone(),
-        user_agent: browser.user_agent.clone(),
-        cookies,
-    };
-    let session = validate_and_stamp_austlii_session(session)?;
-    cookies::save_session(&session)?;
-    println!(
-        "Saved {} validated cookies to {}",
-        cookie_count,
-        session_path.display()
-    );
-
-    if !has_cf_clearance {
-        println!();
-        println!("WARNING: no cf_clearance cookie was found. AustLII search will hit the");
-        println!("Cloudflare challenge until one is present. Click through any AustLII");
-        println!("challenge page in your browser, then re-run `ato-mcp austlii setup`.");
-    } else {
-        println!("\nReady. `ato-mcp austlii search \"<query>\"` will now use this session.");
-    }
-    Ok(())
-}
-
-fn validate_and_stamp_austlii_session(
-    mut session: cookies::AustliiSession,
-) -> Result<cookies::AustliiSession> {
-    austlii::validate_sino_session(&session)?;
-    session.sino_validated_at = Some(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
-    session.sino_validation_query = Some(austlii::SINO_VALIDATION_QUERY.to_string());
-    Ok(session)
-}
-
-fn prompt_required_line(prompt: &str) -> Result<String> {
-    use std::io::Write;
-
-    print!("{prompt}: ");
-    std::io::stdout().flush().ok();
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    let value = line.trim().to_string();
-    if value.is_empty() {
-        bail!("{prompt} cannot be empty");
-    }
-    Ok(value)
-}
-
-fn parse_manual_cookie_header(header: &str) -> Result<Vec<cookies::NamedCookie>> {
-    let trimmed = header.trim();
-    let raw = trimmed
-        .strip_prefix("Cookie:")
-        .or_else(|| trimmed.strip_prefix("cookie:"))
-        .unwrap_or(trimmed);
-    let mut cookies = Vec::new();
-    for part in raw.split(';') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let Some((name, value)) = part.split_once('=') else {
-            bail!("cookie header item has no '=': {part}");
-        };
-        let name = name.trim();
-        let value = value.trim();
-        if name.is_empty() || value.is_empty() {
-            bail!("cookie header contains an empty cookie name or value");
-        }
-        cookies.push(cookies::NamedCookie {
-            domain: ".austlii.edu.au".to_string(),
-            name: name.to_string(),
-            value: value.to_string(),
-            expires: None,
-        });
-    }
-    if cookies.is_empty() {
-        bail!("cookie header contained no cookies");
-    }
-    if !cookies
-        .iter()
-        .any(|cookie| cookie.name.eq_ignore_ascii_case("cf_clearance"))
-    {
-        bail!("cookie header must include cf_clearance");
-    }
-    Ok(cookies)
+    bail!("{}", austlii::AUSTLII_SEARCH_UNAVAILABLE)
 }
 
 fn austlii_clear() -> Result<()> {
@@ -1890,7 +1646,7 @@ fn austlii_clear() -> Result<()> {
     Ok(())
 }
 
-const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first; hits are chunk pointers — call `get_chunks` for text. Use `get_doc_anchors` for nav, related, history, and cited-by. Chunk markers self-describe: `[doc:X]` is in-corpus (resolve via `get_chunks` / `get_doc_anchors`), `[fetch:URI]` is external (use `fetch`, e.g. `fetch("austlii:au/cases/cth/HCA/1992/23")`). For AustLII lookups, run `search_austlii` first to get a `fetch_uri`. `fetch(uri, allow_ocr=true)` opts into Tesseract OCR for scanned PDFs — set MCP `timeout: 120000` for that. For historical/withdrawn material set `current_only=false` and `include_old=true`."##;
+const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first; hits are chunk pointers; call `get_chunks` for text. Use `get_doc_anchors` for nav, related, history, and cited-by. Markers: `[doc:X]` is in-corpus; `[fetch:URI]` is external (use `fetch`, e.g. `fetch("austlii:au/cases/cth/HCA/1992/23")`). AustLII live search is unavailable because SINO CGI is gone; use `fetch` only when exact `austlii:<path>` is known. `allow_ocr=true` runs Tesseract for scanned PDFs; set MCP `timeout:120000`. For historical/withdrawn set `current_only=false` and `include_old=true`."##;
 
 /// Build the `update_notice` carried in `ServerState` for the lifetime of the
 /// server. Runs `check_for_update_availability` once at startup; the result
@@ -2019,7 +1775,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "stats",
-            "description": "Return index version, counts, search policy, and prefix breakdown.",
+            "description": "Return index version, counts, search policy, AustLII availability, and prefix breakdown.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2041,7 +1797,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "search_austlii",
-            "description": "Live-search AustLII via SINO. Hits include `fetch_uri` to pass to `fetch`. Requires `ato-mcp austlii setup` first. Optional `jurisdictions` (e.g. `au/cases/cth/HCA`), `limit` (1-50), `sort_by_date`.",
+            "description": "Unavailable: AustLII's SINO CGI endpoint is gone. Use `fetch` only when exact `austlii:<path>` is known.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

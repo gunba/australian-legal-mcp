@@ -1,6 +1,6 @@
 [package]
 name = "ato-mcp"
-version = "0.14.1"
+version = "0.14.2"
 edition = "2021"
 license = "MIT"
 description = "Standalone MCP server for the Australian Taxation Office legal corpus"
@@ -40,18 +40,12 @@ zstd = "0.13"
 # outbound fetch path (`fetch` live-fetcher, tree-crawl, link-download,
 # whats-new, update); the MCP transport itself is plain localhost HTTP.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls"] }
-# AustLII integration: rookie reads cf_clearance from the user's actual
-# browser cookie store (Chrome/Edge/Firefox/Safari) so requests look
-# legitimate; open launches the user's default browser during the
-# `austlii setup` consent flow to acquire the cookie. AustLII fetches go
-# through the same reqwest+native-tls path as ATO — system OpenSSL on
-# Linux/macOS and SChannel on Windows give a fingerprint indistinguishable
-# from curl (which the issue russellbrenner/auslaw-mcp#101 verified
-# bypasses AustLII's Cloudflare gate on classic.austlii.edu.au), without
-# the symbol-collision a BoringSSL-based wreq would create against
-# native-tls's openssl-sys.
-rookie = "0.5"
-open = "5"
+# ATO outbound requests use reqwest+native-tls so the runtime stays on the
+# platform TLS stack. AustLII known-document fetches try the system `curl`
+# binary first because classic.austlii.edu.au currently accepts curl where
+# reqwest's client fingerprint can hit Cloudflare; reqwest remains the
+# fallback when curl is unavailable. Live AustLII search is disabled until a
+# supported endpoint replaces the retired SINO CGI path.
 # Pure-Rust PDF text extraction. AustLII serves some judgments as PDFs;
 # scanned ones (no text layer) fall through to the OCR path in src/ocr.rs.
 pdf-extract = "0.7"

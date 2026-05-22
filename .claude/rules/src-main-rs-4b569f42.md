@@ -10,32 +10,32 @@ Tag line: `L<n>`; code usually starts at `L<n+1>`.
 ## Granite Embedding Model
 Granite ONNX semantic runtime: CPU by default, optional CUDA for maintainer builds, 1024-token dynamic padding, sentence_embedding or mean-pooling, 256-d int8 vectors.
 
-- [EM-05 L73] Stored semantic vectors use the first EMBEDDING_DIM=256 dimensions of the Granite output before normalisation and int8 quantisation.
-- [EM-03 L76] The tokenizer truncates semantic inputs at EMBEDDING_INPUT_MAX_TOKENS=1024 and pads dynamically to the batch max sequence length.
-- [EM-02 L79] Granite embedding inputs use source-derived text directly; EMBEDDING_TEXT_PREFIX is empty, so neither stored chunk bodies nor runtime queries get query/passage prompt prefixes.
+- [EM-05 L67] Stored semantic vectors use the first EMBEDDING_DIM=256 dimensions of the Granite output before normalisation and int8 quantisation.
+- [EM-03 L70] The tokenizer truncates semantic inputs at EMBEDDING_INPUT_MAX_TOKENS=1024 and pads dynamically to the batch max sequence length.
+- [EM-02 L73] Granite embedding inputs use source-derived text directly; EMBEDDING_TEXT_PREFIX is empty, so neither stored chunk bodies nor runtime queries get query/passage prompt prefixes.
 
 ## Rust CLI Commands
 Closed clap command surface covering end-user MCP/update/doctor/search commands plus maintainer source, build, and release commands in the Rust binary.
 
-- [CC-01 L116] One Rust binary owns both end-user commands (serve, update, stats, search, retrieval helpers, austlii subcommand, fetch) and maintainer-only source, build, and release commands; AGENTS.md documents which maintainer commands require checkout/source/model/GPU.
-- [CC-06 L119] The CLI surface is a closed clap enum: every external command is declared in Command, with no dynamic plugin subcommands or generated shell-completion surface.
-- [CC-05 L193] Source acquisition and corpus building are separate commands: source commands populate ato_pages/index.jsonl, while build requires pages-dir, model-dir, db-path, and out-dir; the same pages tree can feed repeated builds and supports checkpoint resume in the same output dir.
+- [CC-01 L110] One Rust binary owns both end-user commands (serve, update, stats, search, retrieval helpers, austlii subcommand, fetch) and maintainer-only source, build, and release commands; AGENTS.md documents which maintainer commands require checkout/source/model/GPU.
+- [CC-06 L113] The CLI surface is a closed clap enum: every external command is declared in Command, with no dynamic plugin subcommands or generated shell-completion surface.
+- [CC-05 L187] Source acquisition and corpus building are separate commands: source commands populate ato_pages/index.jsonl, while build requires pages-dir, model-dir, db-path, and out-dir; the same pages tree can feed repeated builds and supports checkpoint resume in the same output dir.
 
 ## Rust Server Wiring
 MCP tool registration, shared ServerState, runtime statistics instructions, install/update notices, and the small explicit tool surface.
 
-- [SW-04 L674] ServerState lazily loads SemanticRuntime on the first semantic query and reuses that runtime for the rest of the process.
+- [SW-04 L676] ServerState lazily loads SemanticRuntime on the first semantic query and reuses that runtime for the rest of the process.
   - There is no reranker state in the MCP surface; non-semantic tools do not load the semantic runtime.
-- [SW-02 L1745] Server instructions are built dynamically at start time from corpus stats (doc count, chunk count, type breakdown, meta keys), so the agent sees up-to-date corpus shape without restart-time configuration.
-- [SW-03 L1747] server_instructions is built from stats(OutputFormat::Json); if stats cannot be read (corpus not yet installed) it returns a static install message telling the agent to ask the user to run ato-mcp update. When the serve-startup probe has stashed an UpdateAvailability on ServerState, both branches append a newer-index-available notice carrying the published index_version.
-- [SW-01 L1779] Eight MCP tools are exposed by tool_descriptors/call_tool: search, get_chunks, get_definition, get_asset, get_doc_anchors, fetch, search_austlii, and stats. get_asset returns an MCP content array (caption + image content item); every other tool returns a single text content item. The surface stays small and explicit; unsupported tools fail through the normal tools/call error path.
+- [SW-02 L1661] Server instructions are built dynamically at start time from corpus stats (doc count, chunk count, type breakdown, meta keys), so the agent sees up-to-date corpus shape without restart-time configuration.
+- [SW-03 L1663] server_instructions is built from stats(OutputFormat::Json); if stats cannot be read (corpus not yet installed) it returns a static install message telling the agent to ask the user to run ato-mcp update. When the serve-startup probe has stashed an UpdateAvailability on ServerState, both branches append a newer-index-available notice carrying the published index_version.
+- [SW-01 L1695] Eight MCP tools are exposed by tool_descriptors/call_tool: search, get_chunks, get_definition, get_asset, get_doc_anchors, fetch, search_austlii, and stats. get_asset returns an MCP content array (caption + image content item); every other tool returns a single text content item. The surface stays small and explicit; unsupported tools fail through the normal tools/call error path.
   - The surface stays small and explicit; unsupported tools fail through the normal tools/call error path.
 
 ## Rust Source Scraper
 Maintainer source acquisition commands for What's New incremental pulls, tree crawl snapshots, snapshot reduction, deduped catch-up, and paced link download.
 
-- [SS-01 L227] Source acquisition has explicit maintainer modes: whats-new plus scrape-diff for incremental pulls, tree-crawl plus snapshot-reduce for full snapshots, and scrape-diff over deduped links for catch-up gaps.
-- [SS-04 L256] Default maintainer source-download pacing is 0.05s, and link-download defaults to max_workers=4; workers parse/write concurrently while the shared delay lock serializes HTTP issuance.
+- [SS-01 L221] Source acquisition has explicit maintainer modes: whats-new plus scrape-diff for incremental pulls, tree-crawl plus snapshot-reduce for full snapshots, and scrape-diff over deduped links for catch-up gaps.
+- [SS-04 L250] Default maintainer source-download pacing is 0.05s, and link-download defaults to max_workers=4; workers parse/write concurrently while the shared delay lock serializes HTTP issuance.
 
 ## Rust Storage Layer
 SQLite schema, compressed chunk/html storage, FTS5, WAL write handles, pack/assets install, optional minisign release signatures, doc anchors, and derived citations.
