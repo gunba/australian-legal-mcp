@@ -9,9 +9,8 @@
 //! (potentially-locked) browser DB.
 //!
 //! Safari is unsupported by rookie's stable API surface; macOS users with
-//! Safari as default should override to Chrome/Firefox via
-//! `ATO_MCP_BROWSER` or paste the cf_clearance manually using
-//! `ato-mcp austlii setup --cookie '<value>'`.
+//! Safari as default should use manual Cookie-header setup, or override to
+//! Chrome/Firefox via `ATO_MCP_BROWSER` when using `austlii setup --browser`.
 
 use crate::browser::{self, BrowserFamily};
 use crate::config::data_dir;
@@ -27,6 +26,10 @@ const SESSION_FILE: &str = "austlii_session.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AustliiSession {
     pub(crate) acquired_at: String,
+    #[serde(default)]
+    pub(crate) sino_validated_at: Option<String>,
+    #[serde(default)]
+    pub(crate) sino_validation_query: Option<String>,
     pub(crate) browser_name: String,
     pub(crate) user_agent: String,
     pub(crate) cookies: Vec<NamedCookie>,
@@ -63,10 +66,10 @@ pub(crate) fn read_browser_cookies() -> Result<Option<Vec<NamedCookie>>> {
         BrowserFamily::Firefox => read_firefox_cookies(domains)?,
         BrowserFamily::Safari => {
             bail!(
-                "Safari cookie extraction is not supported. Override the \
-                 detected browser via `ATO_MCP_BROWSER=chrome` (or firefox/edge), \
-                 or paste the cf_clearance value manually with \
-                 `ato-mcp austlii setup --cookie <value>`."
+                "Safari cookie extraction is not supported. Use manual setup with \
+                 `ato-mcp austlii setup --cookie-header <header> --user-agent <ua>`, \
+                 or override the detected browser via `ATO_MCP_BROWSER=chrome` \
+                 (or firefox/edge) for `austlii setup --browser`."
             );
         }
     };
@@ -128,9 +131,8 @@ fn convert_cookie(c: rookie::common::enums::Cookie) -> NamedCookie {
 pub(crate) fn save_session(session: &AustliiSession) -> Result<()> {
     let path = session_file_path()?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("creating data dir {}", parent.display())
-        })?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating data dir {}", parent.display()))?;
     }
     let json = serde_json::to_string_pretty(session)?;
     let tmp = path.with_extension("json.tmp");
@@ -146,18 +148,17 @@ pub(crate) fn load_session() -> Result<Option<AustliiSession>> {
     if !path.exists() {
         return Ok(None);
     }
-    let contents = fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let session: AustliiSession = serde_json::from_str(&contents)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let contents =
+        fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let session: AustliiSession =
+        serde_json::from_str(&contents).with_context(|| format!("parsing {}", path.display()))?;
     Ok(Some(session))
 }
 
 pub(crate) fn clear_session() -> Result<()> {
     let path = session_file_path()?;
     if path.exists() {
-        fs::remove_file(&path)
-            .with_context(|| format!("removing {}", path.display()))?;
+        fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
     }
     Ok(())
 }
@@ -180,6 +181,9 @@ pub(crate) fn session_summary_json() -> serde_json::Value {
         Ok(Some(session)) => serde_json::json!({
             "session_present": true,
             "acquired_at": session.acquired_at,
+            "sino_validated": session.sino_validated_at.is_some(),
+            "sino_validated_at": session.sino_validated_at,
+            "sino_validation_query": session.sino_validation_query,
             "browser_name": session.browser_name,
             "user_agent": session.user_agent,
             "cookie_count": session.cookies.len(),
@@ -199,6 +203,8 @@ mod tests {
     fn cf_clearance_finds_named_cookie_case_insensitively() {
         let session = AustliiSession {
             acquired_at: "2026-05-21T00:00:00Z".to_string(),
+            sino_validated_at: None,
+            sino_validation_query: None,
             browser_name: "Google Chrome".to_string(),
             user_agent: "Mozilla/5.0".to_string(),
             cookies: vec![
@@ -223,6 +229,8 @@ mod tests {
     fn cf_clearance_returns_none_when_absent() {
         let session = AustliiSession {
             acquired_at: "2026-05-21T00:00:00Z".to_string(),
+            sino_validated_at: None,
+            sino_validation_query: None,
             browser_name: "Google Chrome".to_string(),
             user_agent: "Mozilla/5.0".to_string(),
             cookies: vec![NamedCookie {

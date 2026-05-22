@@ -49,7 +49,7 @@ last query.
 
 `stats` (or the MCP `initialize` instructions) reports "corpus is not yet
 installed" on a fresh machine. Offer to run the download for the user
-(~4 GB, 5-10 min):
+(~1.5 GB, 5-10 min):
 
 ```bash
 ato-mcp update
@@ -57,6 +57,26 @@ ato-mcp update
 
 After the download completes, restart `ato-mcp serve` so it picks up the
 new corpus, then retry the user's original question.
+
+## When AustLII search is not configured
+
+`stats` reports `austlii.sino_validated=false` or `search_austlii` returns
+HTTP 403. Do not send the user to a blind browser-opening flow. Collect the
+exact information needed from the user as part of setup:
+
+1. Ask the user to open this SINO search URL in their browser:
+   `https://www.austlii.edu.au/cgi-bin/sinosrch.cgi?query=income+tax+residency&meta=%2Fau&method=auto&results=10&view=relevance`
+
+2. Ask them to copy the request's `Cookie` header and `User-Agent` header
+   from browser DevTools after the page loads successfully.
+
+3. Run:
+   ```bash
+   ato-mcp austlii setup --cookie-header '<Cookie header>' --user-agent '<User-Agent>'
+   ```
+
+`setup` validates the session against SINO before saving it. If validation
+fails, report that result; do not claim AustLII search is configured.
 
 ## What not to do
 

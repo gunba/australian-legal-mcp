@@ -26,7 +26,7 @@ a one-shot corpus download.
 | `get_definition` | Statutory definitions with a labelled ordinary-meaning fallback. |
 | `get_asset` | Resolve a retained image `data-asset-ref` to an MCP image content item plus caption. |
 | `fetch` | Live-fetch a document by URI. `ato:<doc_id>[?pit=...&view=...]` for ATO live retrieval; `austlii:<path>` for AustLII via `classic.austlii.edu.au`. Returns chunks of the same shape as `get_chunks`. Pass `allow_ocr=true` for scanned PDFs (Tesseract on `$PATH`, allow ~120s). |
-| `search_austlii` | Live search of AustLII via SINO. Returns hits with `fetch_uri` ready to pass to `fetch`. Uses the `cf_clearance` session acquired by `ato-mcp austlii setup`. |
+| `search_austlii` | Live search of AustLII via SINO. Returns hits with `fetch_uri` ready to pass to `fetch`. Uses the validated session acquired by `ato-mcp austlii setup`. |
 | `stats` | Index version, counts, default search policy, AustLII session state. |
 
 Document bodies are exposed as cleaned HTML fragments so agents navigate the
@@ -100,18 +100,20 @@ when the user agrees.
 ATO commentary cites AustLII material that lives outside the local corpus.
 The `fetch` tool reaches `classic.austlii.edu.au` directly for case and
 legislation URLs. `search_austlii` reaches SINO, which Cloudflare gates with
-a JS challenge — that needs a clearance cookie from your real browser:
+a browser session. Setup must use a Cookie header from a successful SINO
+request, not just the classic AustLII home page:
 
 ```bash
-ato-mcp austlii setup                       # opens AustLII in your browser, reads cf_clearance
-ato-mcp austlii setup --cookie "<value>"    # manual paste fallback (Safari, EDR-locked endpoints)
+ato-mcp austlii setup
+ato-mcp austlii setup --cookie-header "<Cookie header>" --user-agent "<User-Agent>"
+ato-mcp austlii setup --browser             # fallback: open SINO and try browser cookie extraction
 ato-mcp austlii clear                       # delete the persisted session
 ```
 
-`stats` reports the persisted session (browser, cookie age, cf_clearance
-presence). Override the auto-detected default browser with
-`ATO_MCP_BROWSER=chrome|edge|firefox` if the registry / xdg-mime lookup
-returns the wrong one.
+`setup` validates the session against SINO before saving it. `stats` reports
+the persisted session, including whether SINO validation succeeded. Override
+the auto-detected default browser with `ATO_MCP_BROWSER=chrome|edge|firefox`
+if the registry / xdg-mime lookup returns the wrong one.
 
 Scanned pre-digital judgments return `error: scanned_pdf` from `fetch` by
 default. Pass `allow_ocr=true` to opt into Tesseract OCR (results are cached
@@ -169,7 +171,7 @@ cargo build --release --features cuda
 ./target/release/ato-mcp link-download   --deduped-links snapshots/.../deduped_links.jsonl --out-dir /path/to/ato_pages
 ./target/release/ato-mcp build           --pages-dir /path/to/ato_pages --db-path ./release/ato.db --model-dir /path/to/granite-embedding-small-r2 --out-dir ./release --profile
 ./target/release/ato-mcp package-corpus  --db-path ./release/ato.db --out ./release/ato.db.zst --manifest ./release/manifest.json
-./target/release/ato-mcp publish-release --out-dir ./release --tag v0.14.0 --repo gunba/ato-mcp --overwrite
+./target/release/ato-mcp publish-release --out-dir ./release --tag v0.14.1 --repo gunba/ato-mcp --overwrite
 ```
 
 `scripts/publish-release.sh <tag>` wraps the `package-corpus` +

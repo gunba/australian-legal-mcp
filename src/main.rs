@@ -17,12 +17,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use url::Url;
 
-mod build;
+mod austlii;
 mod browser;
+mod build;
 mod chunker;
 mod config;
 mod cookies;
-mod austlii;
 mod db;
 mod extract;
 mod html;
@@ -34,31 +34,25 @@ mod semantic;
 mod source;
 mod uri;
 
-use config::{
-    default_manifest_url, live_dir, model_data_path, model_path, tokenizer_path,
-};
 use build::{
-    build_corpus, bundle_localize_manifest, package_corpus,
-    update_manifest_with_db, BuildCorpusArgs,
+    build_corpus, bundle_localize_manifest, package_corpus, update_manifest_with_db,
+    BuildCorpusArgs,
 };
+use config::{default_manifest_url, live_dir, model_data_path, model_path, tokenizer_path};
 use retrieval::{
-    fetch, get_asset_mcp, get_chunks_mcp,
-    get_definition, get_doc_anchors_mcp, pit_to_date,
+    fetch, get_asset_mcp, get_chunks_mcp, get_definition, get_doc_anchors_mcp, pit_to_date,
     GetDefinitionOptions,
 };
-use search::{
-    search, search_cli, SearchOptions,
+use search::{search, search_cli, SearchOptions};
+#[cfg(test)]
+use semantic::dot_i8_scalar_reference;
+use semantic::{
+    SemanticEncodeStats, SemanticModelPaths, SemanticRuntime, EMBEDDING_MODEL_HF_FILES,
 };
 use source::{
     apply_update, check_for_update_availability, link_download, scrape_diff, snapshot_reduce,
     stats, tree_crawl, LinkDownloadArgs, Manifest, ModelInfo, StagedModel, UpdateAvailability,
 };
-use semantic::{
-    SemanticEncodeStats, SemanticModelPaths, SemanticRuntime,
-    EMBEDDING_MODEL_HF_FILES,
-};
-#[cfg(test)]
-use semantic::dot_i8_scalar_reference;
 
 pub(crate) const APP_NAME: &str = "ato-mcp";
 pub(crate) const DEFAULT_RELEASES_URL: &str =
@@ -373,15 +367,27 @@ enum SortBy {
 
 #[derive(Subcommand)]
 enum AustliiAction {
-    /// Acquire a Cloudflare clearance cookie from your browser and save
-    /// it to the data directory. Prints a consent prompt before opening
-    /// your browser unless `--yes` is passed.
+    /// Save and validate a SINO-ready AustLII session. By default this
+    /// collects a Cookie header and User-Agent interactively; use --browser
+    /// to try browser cookie-store extraction instead.
     Setup {
         /// Skip browser launch + automatic extraction and accept a
         /// manually-pasted cf_clearance value. Useful for Safari or
         /// EDR-locked endpoints where rookie can't read the cookie store.
-        #[arg(long, value_name = "VALUE")]
+        #[arg(long, value_name = "VALUE", conflicts_with = "cookie_header")]
         cookie: Option<String>,
+        /// Skip browser launch + automatic extraction and accept a full
+        /// Cookie header copied from a SINO request in the user's browser.
+        #[arg(long, value_name = "HEADER", conflicts_with = "cookie")]
+        cookie_header: Option<String>,
+        /// Browser User-Agent that produced the manual cookie/header. When
+        /// omitted, the detected default browser's User-Agent is used.
+        #[arg(long, value_name = "VALUE")]
+        user_agent: Option<String>,
+        /// Open the SINO validation URL and try to read cookies from the
+        /// browser cookie store. Manual Cookie-header setup is preferred.
+        #[arg(long)]
+        browser: bool,
         /// Skip the interactive consent prompt (for scripted use).
         #[arg(long)]
         yes: bool,
@@ -707,8 +713,6 @@ pub(crate) const ATO_USER_AGENT: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "; +https://github.com/gunba/ato-mcp)"
 );
-
-
 
 // ----- publish-release (port of src/ato_mcp/indexer/release.py:publish) -----
 
@@ -1054,7 +1058,11 @@ pub(crate) fn fetch_bytes(url_or_path: &str, context: &UrlContext) -> Result<Vec
 }
 
 // [UM-04] The Rust downloader is credential-free: no GitHub token env vars and no gh shell-out.
-pub(crate) fn fetch_bytes_with(url_or_path: &str, context: &UrlContext, client: &Client) -> Result<Vec<u8>> {
+pub(crate) fn fetch_bytes_with(
+    url_or_path: &str,
+    context: &UrlContext,
+    client: &Client,
+) -> Result<Vec<u8>> {
     if let Some(path) = local_path_from_urlish(url_or_path) {
         return Ok(fs::read(path)?);
     }
@@ -1392,7 +1400,6 @@ fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<(
     Ok(())
 }
 
-
 fn handle_rpc(message: JsonValue, state: &ServerState) -> Option<JsonValue> {
     if message.is_array() {
         let responses: Vec<JsonValue> = message
@@ -1583,7 +1590,19 @@ pub(crate) fn optional_string_array(args: &JsonValue, name: &str) -> Result<Opti
 
 fn austlii_command(action: AustliiAction) -> Result<()> {
     match action {
-        AustliiAction::Setup { cookie, yes } => austlii_setup(cookie.as_deref(), yes),
+        AustliiAction::Setup {
+            cookie,
+            cookie_header,
+            user_agent,
+            browser,
+            yes,
+        } => austlii_setup(
+            cookie.as_deref(),
+            cookie_header.as_deref(),
+            user_agent.as_deref(),
+            browser,
+            yes,
+        ),
         AustliiAction::Search {
             query,
             jurisdictions,
@@ -1606,39 +1625,113 @@ fn austlii_command(action: AustliiAction) -> Result<()> {
     }
 }
 
-fn austlii_setup(manual_cookie: Option<&str>, skip_prompt: bool) -> Result<()> {
+fn austlii_setup(
+    manual_cookie: Option<&str>,
+    manual_cookie_header: Option<&str>,
+    manual_user_agent: Option<&str>,
+    use_browser: bool,
+    skip_prompt: bool,
+) -> Result<()> {
     use std::io::Write;
-
-    let browser = browser::detect()
-        .context("detecting default browser; set ATO_MCP_BROWSER=chrome|edge|firefox to override")?;
-    println!("Detected browser: {} {}", browser.name, browser.version);
-    println!("User agent: {}", browser.user_agent);
-    println!();
 
     let session_path = cookies::session_file_path()?;
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-    if let Some(cookie_value) = manual_cookie {
-        let session = cookies::AustliiSession {
-            acquired_at: now,
-            browser_name: format!("{} (manual cookie)", browser.name),
-            user_agent: browser.user_agent.clone(),
-            cookies: vec![cookies::NamedCookie {
-                domain: "www.austlii.edu.au".to_string(),
+    if !use_browser {
+        let user_agent = match manual_user_agent {
+            Some(value) => value.to_string(),
+            None if !skip_prompt => prompt_required_line("Paste the browser User-Agent")?,
+            None => browser::detect()
+                .context(
+                    "detecting default browser for User-Agent; pass --user-agent to avoid detection",
+                )?
+                .user_agent
+                .clone(),
+        };
+        let cookies = match (manual_cookie_header, manual_cookie) {
+            (Some(header), _) => parse_manual_cookie_header(header)?,
+            (None, Some(cookie)) => vec![cookies::NamedCookie {
+                domain: ".austlii.edu.au".to_string(),
                 name: "cf_clearance".to_string(),
-                value: cookie_value.to_string(),
+                value: cookie.to_string(),
                 expires: None,
             }],
+            (None, None) if !skip_prompt => {
+                let header =
+                    prompt_required_line("Paste the Cookie header from a successful SINO request")?;
+                parse_manual_cookie_header(&header)?
+            }
+            (None, None) => {
+                bail!(
+                    "manual AustLII setup requires --cookie-header or --cookie when --yes is used"
+                );
+            }
         };
+        let cookie_count = cookies.len();
+        let session = cookies::AustliiSession {
+            acquired_at: now.clone(),
+            sino_validated_at: None,
+            sino_validation_query: None,
+            browser_name: "manual cookie".to_string(),
+            user_agent,
+            cookies,
+        };
+        let session = validate_and_stamp_austlii_session(session)?;
         cookies::save_session(&session)?;
-        println!("Saved manually-pasted cf_clearance to {}", session_path.display());
+        println!(
+            "Saved {} validated AustLII cookies to {}",
+            cookie_count,
+            session_path.display()
+        );
+        println!("Ready. `ato-mcp austlii search \"<query>\"` will now use this session.");
+        return Ok(());
+    }
+
+    let browser = browser::detect().context(
+        "detecting default browser; set ATO_MCP_BROWSER=chrome|edge|firefox to override",
+    )?;
+    println!("Detected browser: {} {}", browser.name, browser.version);
+    println!("User agent: {}", browser.user_agent);
+    println!();
+
+    if manual_cookie.is_some() || manual_cookie_header.is_some() {
+        let user_agent = match manual_user_agent {
+            Some(value) => value.to_string(),
+            None => browser.user_agent.clone(),
+        };
+        let cookies = if let Some(header) = manual_cookie_header {
+            parse_manual_cookie_header(header)?
+        } else {
+            vec![cookies::NamedCookie {
+                domain: ".austlii.edu.au".to_string(),
+                name: "cf_clearance".to_string(),
+                value: manual_cookie
+                    .expect("manual_cookie is present when no cookie_header is set")
+                    .to_string(),
+                expires: None,
+            }]
+        };
+        let session = cookies::AustliiSession {
+            acquired_at: now.clone(),
+            sino_validated_at: None,
+            sino_validation_query: None,
+            browser_name: format!("{} (manual cookie)", browser.name),
+            user_agent,
+            cookies,
+        };
+        let session = validate_and_stamp_austlii_session(session)?;
+        cookies::save_session(&session)?;
+        println!(
+            "Saved validated manual AustLII session to {}",
+            session_path.display()
+        );
         return Ok(());
     }
 
     println!("ato-mcp needs a Cloudflare clearance cookie from your browser to access");
     println!("AustLII's SINO search endpoint. This will:");
-    println!("  1. Open https://classic.austlii.edu.au/ in your default browser");
-    println!("  2. Wait for you to confirm the page loaded (and any JS challenge cleared)");
+    println!("  1. Open an AustLII SINO search URL in your default browser");
+    println!("  2. Wait for you to confirm the search page loaded without a challenge");
     println!(
         "  3. Read AustLII cookies from {}",
         browser.family.cookie_source_label()
@@ -1658,10 +1751,10 @@ fn austlii_setup(manual_cookie: Option<&str>, skip_prompt: bool) -> Result<()> {
     }
 
     println!("\nLaunching browser…");
-    open::that("https://classic.austlii.edu.au/")
+    open::that(austlii::SINO_SETUP_URL)
         .context("launching default browser via the `open` crate")?;
 
-    println!("\nWhen the AustLII page has fully loaded (including any Cloudflare challenge),");
+    println!("\nWhen the AustLII SINO page has fully loaded without a challenge,");
     println!("press Enter here to read the cookies.");
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
@@ -1673,7 +1766,7 @@ fn austlii_setup(manual_cookie: Option<&str>, skip_prompt: bool) -> Result<()> {
     );
     let cookies = cookies::read_browser_cookies().context(
         "reading AustLII cookies from browser; if your endpoint blocks cookie access \
-         re-run with `--cookie '<value pasted from DevTools>'`",
+         re-run with `--cookie-header '<Cookie header>' --user-agent '<User-Agent>'`",
     )?;
     let cookies = match cookies {
         Some(c) => c,
@@ -1681,8 +1774,8 @@ fn austlii_setup(manual_cookie: Option<&str>, skip_prompt: bool) -> Result<()> {
             bail!(
                 "no AustLII cookies found in {}. The browser may not have visited the \
                  page successfully, or your cookies live in a profile we can't see. \
-                 Try `ato-mcp austlii setup --cookie '<value pasted from DevTools>'` \
-                 as a manual fallback.",
+                 Try `ato-mcp austlii setup --cookie-header '<Cookie header>' \
+                 --user-agent '<User-Agent>'` as a manual fallback.",
                 browser.name
             );
         }
@@ -1694,14 +1787,17 @@ fn austlii_setup(manual_cookie: Option<&str>, skip_prompt: bool) -> Result<()> {
     let cookie_count = cookies.len();
 
     let session = cookies::AustliiSession {
-        acquired_at: now,
+        acquired_at: now.clone(),
+        sino_validated_at: None,
+        sino_validation_query: None,
         browser_name: browser.name.clone(),
         user_agent: browser.user_agent.clone(),
         cookies,
     };
+    let session = validate_and_stamp_austlii_session(session)?;
     cookies::save_session(&session)?;
     println!(
-        "Saved {} cookies to {}",
+        "Saved {} validated cookies to {}",
         cookie_count,
         session_path.display()
     );
@@ -1717,6 +1813,68 @@ fn austlii_setup(manual_cookie: Option<&str>, skip_prompt: bool) -> Result<()> {
     Ok(())
 }
 
+fn validate_and_stamp_austlii_session(
+    mut session: cookies::AustliiSession,
+) -> Result<cookies::AustliiSession> {
+    austlii::validate_sino_session(&session)?;
+    session.sino_validated_at = Some(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
+    session.sino_validation_query = Some(austlii::SINO_VALIDATION_QUERY.to_string());
+    Ok(session)
+}
+
+fn prompt_required_line(prompt: &str) -> Result<String> {
+    use std::io::Write;
+
+    print!("{prompt}: ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let value = line.trim().to_string();
+    if value.is_empty() {
+        bail!("{prompt} cannot be empty");
+    }
+    Ok(value)
+}
+
+fn parse_manual_cookie_header(header: &str) -> Result<Vec<cookies::NamedCookie>> {
+    let trimmed = header.trim();
+    let raw = trimmed
+        .strip_prefix("Cookie:")
+        .or_else(|| trimmed.strip_prefix("cookie:"))
+        .unwrap_or(trimmed);
+    let mut cookies = Vec::new();
+    for part in raw.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = part.split_once('=') else {
+            bail!("cookie header item has no '=': {part}");
+        };
+        let name = name.trim();
+        let value = value.trim();
+        if name.is_empty() || value.is_empty() {
+            bail!("cookie header contains an empty cookie name or value");
+        }
+        cookies.push(cookies::NamedCookie {
+            domain: ".austlii.edu.au".to_string(),
+            name: name.to_string(),
+            value: value.to_string(),
+            expires: None,
+        });
+    }
+    if cookies.is_empty() {
+        bail!("cookie header contained no cookies");
+    }
+    if !cookies
+        .iter()
+        .any(|cookie| cookie.name.eq_ignore_ascii_case("cf_clearance"))
+    {
+        bail!("cookie header must include cf_clearance");
+    }
+    Ok(cookies)
+}
+
 fn austlii_clear() -> Result<()> {
     let path = cookies::session_file_path()?;
     let existed = path.exists();
@@ -1724,11 +1882,13 @@ fn austlii_clear() -> Result<()> {
     if existed {
         println!("Cleared session at {}", path.display());
     } else {
-        println!("No session to clear (file {} did not exist).", path.display());
+        println!(
+            "No session to clear (file {} did not exist).",
+            path.display()
+        );
     }
     Ok(())
 }
-
 
 const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first; hits are chunk pointers — call `get_chunks` for text. Use `get_doc_anchors` for nav, related, history, and cited-by. Chunk markers self-describe: `[doc:X]` is in-corpus (resolve via `get_chunks` / `get_doc_anchors`), `[fetch:URI]` is external (use `fetch`, e.g. `fetch("austlii:au/cases/cth/HCA/1992/23")`). For AustLII lookups, run `search_austlii` first to get a `fetch_uri`. `fetch(uri, allow_ocr=true)` opts into Tesseract OCR for scanned PDFs — set MCP `timeout: 120000` for that. For historical/withdrawn material set `current_only=false` and `include_old=true`."##;
 
@@ -1762,7 +1922,7 @@ fn server_instructions(update_notice: Option<&UpdateAvailability>) -> String {
             ATO_MCP_USE_INSTRUCTIONS,
         ),
         None => format!(
-            "The ATO corpus is not yet installed on this machine. Run `ato-mcp update` in a terminal to download it (~4 GB, takes 5-10 min). Restart the MCP client after the download completes.\n\n{}",
+            "The ATO corpus is not yet installed on this machine. Run `ato-mcp update` in a terminal to download it (~1.5 GB, takes 5-10 min). Restart the MCP client after the download completes.\n\n{}",
             ATO_MCP_USE_INSTRUCTIONS
         ),
     };
@@ -2212,7 +2372,11 @@ mod tests {
         with_data_dir(dir.path(), || -> Result<()> {
             let content = get_asset("ato-image://DOC_HTML/0")?;
             let items = content.as_array().expect("content array");
-            assert_eq!(items.len(), 2, "expected caption + image item, got {content:?}");
+            assert_eq!(
+                items.len(),
+                2,
+                "expected caption + image item, got {content:?}"
+            );
             assert_eq!(items[0]["type"], "text");
             assert!(
                 items[0]["text"]
@@ -2556,7 +2720,8 @@ mod tests {
             },
             db: ManifestDb {
                 url: "ato.db.zst".to_string(),
-                sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
                 size: 1,
             },
         };
@@ -2662,7 +2827,8 @@ mod tests {
             },
             db: ManifestDb {
                 url: "ato.db.zst".to_string(),
-                sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
                 size: 1,
             },
         };
@@ -2773,7 +2939,8 @@ mod tests {
             },
             db: ManifestDb {
                 url: "ato.db.zst".to_string(),
-                sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
                 size: 1,
             },
         }
@@ -2795,7 +2962,7 @@ mod tests {
                 text.contains("ato-mcp update"),
                 "missing install command in: {text}"
             );
-            assert!(text.contains("4 GB"), "missing size hint in: {text}");
+            assert!(text.contains("1.5 GB"), "missing size hint in: {text}");
         });
         Ok(())
     }
@@ -2923,7 +3090,8 @@ mod tests {
             },
             db: ManifestDb {
                 url: "ato.db.zst".to_string(),
-                sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
                 size: 1,
             },
         };
@@ -2969,7 +3137,8 @@ mod tests {
             },
             db: ManifestDb {
                 url: "ato.db.zst".to_string(),
-                sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
                 size: 1,
             },
         };
@@ -3776,7 +3945,8 @@ mod tests {
             },
             db: ManifestDb {
                 url: "ato.db.zst".to_string(),
-                sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
                 size: 1,
             },
         };
@@ -4105,11 +4275,7 @@ mod tests {
         // The regex matches `[doc:...]` only, so an already-rewritten
         // `[fetch:...]` marker passes through untouched (idempotent).
         assert_eq!(
-            annotate_doc_refs_with(
-                "see [fetch:ato:LRP/X]",
-                "SRC",
-                &corpus,
-            ),
+            annotate_doc_refs_with("see [fetch:ato:LRP/X]", "SRC", &corpus,),
             "see [fetch:ato:LRP/X]"
         );
         // View qualifier becomes a URI query parameter on the rewritten
@@ -4126,11 +4292,7 @@ mod tests {
         );
         // Combined PiT + view qualifiers stack into one query string.
         assert_eq!(
-            annotate_doc_refs_with(
-                "see [doc:LRP/X@19960320000001 view=HISTFT]",
-                "SRC",
-                &corpus,
-            ),
+            annotate_doc_refs_with("see [doc:LRP/X@19960320000001 view=HISTFT]", "SRC", &corpus,),
             "see [fetch:ato:LRP/X?pit=19960320000001&view=HISTFT]"
         );
         // Multiple markers in one text, mixed in/out of corpus.

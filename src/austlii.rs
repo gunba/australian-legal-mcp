@@ -13,7 +13,7 @@
 //!
 //! See README.md "AustLII access" for the setup flow.
 
-use crate::browser::{self, DetectedBrowser};
+use crate::browser;
 use crate::chunker::{chunk_html, EMBED_MAX_TOKENS};
 use crate::cookies::{self, AustliiSession};
 use crate::ocr;
@@ -29,11 +29,12 @@ const FETCH_TIMEOUT_SECS: u64 = 30;
 const SEARCH_TIMEOUT_SECS: u64 = 30;
 const AUSTLII_REFERER: &str = "https://classic.austlii.edu.au/";
 const AUSTLII_SEARCH_FORM_REFERER: &str = "https://www.austlii.edu.au/forms/search1.html";
-const ACCEPT_HTML: &str =
-    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+pub(crate) const SINO_VALIDATION_QUERY: &str = "income tax residency";
+pub(crate) const SINO_SETUP_URL: &str = "https://www.austlii.edu.au/cgi-bin/sinosrch.cgi?query=income+tax+residency&meta=%2Fau&method=auto&results=10&view=relevance";
+const ACCEPT_HTML: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
 const ACCEPT_LANGUAGE: &str = "en-AU,en;q=0.9";
 const SETUP_REQUIRED_HINT: &str =
-    "Run `ato-mcp austlii setup` to acquire or refresh the AustLII session cookie.";
+    "Run `ato-mcp austlii setup --cookie-header '<Cookie header>' --user-agent '<User-Agent>'` with headers from a successful SINO request.";
 const PDF_TEXT_MIN_CHARS: usize = 100;
 const OCR_WARNING: &str =
     "Text extracted via Tesseract OCR — may contain errors. Verify against the canonical source.";
@@ -69,11 +70,17 @@ fn format_cookie_header(session: &AustliiSession) -> Option<String> {
 /// explicitly — OCR can take 10-30s and risks tripping the MCP
 /// request timeout if the client isn't configured for it.
 pub(crate) fn fetch_austlii_doc(path: &str, allow_ocr: bool) -> Result<String> {
-    let browser = browser::detect().context(
-        "detecting default browser for AustLII fetch; set ATO_MCP_BROWSER to override",
-    )?;
     let session = cookies::load_session()?;
-    let client = build_client(&browser.user_agent, FETCH_TIMEOUT_SECS)?;
+    let user_agent = match session.as_ref() {
+        Some(session) => session.user_agent.as_str(),
+        None => browser::detect()
+            .context(
+                "detecting default browser for AustLII fetch; set ATO_MCP_BROWSER to override",
+            )?
+            .user_agent
+            .as_str(),
+    };
+    let client = build_client(user_agent, FETCH_TIMEOUT_SECS)?;
 
     let url = format!("https://classic.austlii.edu.au/{path}.html");
     let mut req = client
@@ -86,9 +93,7 @@ pub(crate) fn fetch_austlii_doc(path: &str, allow_ocr: bool) -> Result<String> {
             req = req.header("Cookie", cookie_header);
         }
     }
-    let resp = req
-        .send()
-        .with_context(|| format!("fetching {url}"))?;
+    let resp = req.send().with_context(|| format!("fetching {url}"))?;
     let status = resp.status();
     if status.as_u16() == 403 {
         bail!(
@@ -138,12 +143,7 @@ pub(crate) fn fetch_austlii_doc(path: &str, allow_ocr: bool) -> Result<String> {
     }))?)
 }
 
-fn handle_pdf_response(
-    path: &str,
-    url: &str,
-    bytes: &[u8],
-    allow_ocr: bool,
-) -> Result<String> {
+fn handle_pdf_response(path: &str, url: &str, bytes: &[u8], allow_ocr: bool) -> Result<String> {
     let embedded = extract_pdf_text(bytes).unwrap_or_default();
     let (text, ocr_used) = if embedded.trim().len() >= PDF_TEXT_MIN_CHARS {
         (embedded, false)
@@ -168,7 +168,10 @@ fn handle_pdf_response(
     let canonical_uri = format!("austlii:{path}");
     let mut response = serde_json::Map::new();
     response.insert("uri".to_string(), JsonValue::String(canonical_uri));
-    response.insert("canonical_url".to_string(), JsonValue::String(url.to_string()));
+    response.insert(
+        "canonical_url".to_string(),
+        JsonValue::String(url.to_string()),
+    );
     response.insert("title".to_string(), JsonValue::String(title));
     response.insert("source".to_string(), JsonValue::String("live".to_string()));
     response.insert("ocr_used".to_string(), JsonValue::Bool(ocr_used));
@@ -183,8 +186,7 @@ fn handle_pdf_response(
 }
 
 fn extract_pdf_text(bytes: &[u8]) -> Result<String> {
-    pdf_extract::extract_text_from_mem(bytes)
-        .map_err(|e| anyhow!("pdf_extract failed: {e}"))
+    pdf_extract::extract_text_from_mem(bytes).map_err(|e| anyhow!("pdf_extract failed: {e}"))
 }
 
 /// Derive a human-readable title from the AustLII path when the PDF
@@ -246,14 +248,13 @@ fn strip_austlii_noise(html: &str) -> String {
     static STYLE_RE: OnceLock<Regex> = OnceLock::new();
     static NAV_RE: OnceLock<Regex> = OnceLock::new();
     static COMMENT_RE: OnceLock<Regex> = OnceLock::new();
-    let script = SCRIPT_RE.get_or_init(|| {
-        Regex::new(r"(?is)<script\b[^>]*>.*?</script>").expect("valid regex")
-    });
+    let script = SCRIPT_RE
+        .get_or_init(|| Regex::new(r"(?is)<script\b[^>]*>.*?</script>").expect("valid regex"));
     let style = STYLE_RE
         .get_or_init(|| Regex::new(r"(?is)<style\b[^>]*>.*?</style>").expect("valid regex"));
-    let nav = NAV_RE.get_or_init(|| Regex::new(r"(?is)<nav\b[^>]*>.*?</nav>").expect("valid regex"));
-    let comment = COMMENT_RE
-        .get_or_init(|| Regex::new(r"(?is)<!--.*?-->").expect("valid regex"));
+    let nav =
+        NAV_RE.get_or_init(|| Regex::new(r"(?is)<nav\b[^>]*>.*?</nav>").expect("valid regex"));
+    let comment = COMMENT_RE.get_or_init(|| Regex::new(r"(?is)<!--.*?-->").expect("valid regex"));
     let s = script.replace_all(html, "").to_string();
     let s = style.replace_all(&s, "").to_string();
     let s = nav.replace_all(&s, "").to_string();
@@ -280,14 +281,114 @@ pub(crate) fn search_austlii(query: &str, opts: SearchAustliiOptions) -> Result<
     if query.trim().is_empty() {
         bail!("search_austlii: query string is empty");
     }
-    let browser: &DetectedBrowser = browser::detect()?;
     let session = cookies::load_session()?.ok_or_else(|| {
         anyhow!("search_austlii: no AustLII session on disk. {SETUP_REQUIRED_HINT}")
     })?;
-    let cookie_header = format_cookie_header(&session)
+    search_austlii_with_session(query, opts, &session)
+}
+
+pub(crate) fn validate_sino_session(session: &AustliiSession) -> Result<()> {
+    let opts = SearchAustliiOptions {
+        limit: Some(3),
+        ..SearchAustliiOptions::default()
+    };
+    let body = issue_sino_search(SINO_VALIDATION_QUERY, opts, session)
+        .context("validating AustLII SINO session")?;
+    if body.trim().is_empty() {
+        bail!("AustLII SINO validation returned an empty response body");
+    }
+    Ok(())
+}
+
+fn search_austlii_with_session(
+    query: &str,
+    opts: SearchAustliiOptions,
+    session: &AustliiSession,
+) -> Result<String> {
+    let limit = opts.limit.unwrap_or(10).clamp(1, 50);
+    let sort_by = if opts.sort_by_date {
+        "date"
+    } else {
+        "relevance"
+    };
+    let body = issue_sino_search(query, opts, session)?;
+    let hits = parse_search_results(&body);
+    Ok(serde_json::to_string_pretty(&json!({
+        "query": query,
+        "hits": hits,
+        "meta": {
+            "source": "austlii.sinosrch",
+            "result_count": hits.len(),
+            "limit": limit,
+            "sort_by": sort_by,
+        },
+    }))?)
+}
+
+fn issue_sino_search(
+    query: &str,
+    opts: SearchAustliiOptions,
+    session: &AustliiSession,
+) -> Result<String> {
+    let cookie_header = format_cookie_header(session)
         .ok_or_else(|| anyhow!("session has no cookies. {SETUP_REQUIRED_HINT}"))?;
     let limit = opts.limit.unwrap_or(10).clamp(1, 50);
 
+    let url = build_sino_search_url(query, &opts, limit);
+
+    let client = build_client(&session.user_agent, SEARCH_TIMEOUT_SECS)?;
+    let resp = client
+        .get(url.as_str())
+        .header("Accept", ACCEPT_HTML)
+        .header("Accept-Language", ACCEPT_LANGUAGE)
+        .header("Referer", AUSTLII_SEARCH_FORM_REFERER)
+        .header("Cookie", cookie_header)
+        .send()
+        .with_context(|| format!("issuing AustLII search request {}", url.as_str()))?;
+    let status = resp.status();
+    if status.as_u16() == 403 {
+        bail!(
+            "AustLII SINO search returned HTTP 403 (Cloudflare challenge). \
+             {} {SETUP_REQUIRED_HINT}",
+            session_diagnostic(session)
+        );
+    }
+    if !status.is_success() {
+        bail!(
+            "AustLII SINO search returned HTTP {} for {}",
+            status.as_u16(),
+            url.as_str()
+        );
+    }
+    resp.text().context("reading AustLII search response body")
+}
+
+fn session_diagnostic(session: &AustliiSession) -> String {
+    let cf = cookies::cf_clearance(session).is_some();
+    let mut names: Vec<&str> = session
+        .cookies
+        .iter()
+        .map(|cookie| cookie.name.as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let mut domains: Vec<&str> = session
+        .cookies
+        .iter()
+        .map(|cookie| cookie.domain.as_str())
+        .collect();
+    domains.sort_unstable();
+    domains.dedup();
+    format!(
+        "Saved session has {} cookies, cf_clearance_present={}, cookie_names=[{}], domains=[{}].",
+        session.cookies.len(),
+        cf,
+        names.join(","),
+        domains.join(",")
+    )
+}
+
+fn build_sino_search_url(query: &str, opts: &SearchAustliiOptions, limit: usize) -> url::Url {
     let mut url = url::Url::parse("https://www.austlii.edu.au/cgi-bin/sinosrch.cgi")
         .expect("static URL parses");
     {
@@ -307,44 +408,7 @@ pub(crate) fn search_austlii(query: &str, opts: SearchAustliiOptions) -> Result<
             }
         }
     }
-
-    let client = build_client(&browser.user_agent, SEARCH_TIMEOUT_SECS)?;
-    let resp = client
-        .get(url.as_str())
-        .header("Accept", ACCEPT_HTML)
-        .header("Accept-Language", ACCEPT_LANGUAGE)
-        .header("Referer", AUSTLII_SEARCH_FORM_REFERER)
-        .header("Cookie", cookie_header)
-        .send()
-        .with_context(|| format!("issuing AustLII search request {}", url.as_str()))?;
-    let status = resp.status();
-    if status.as_u16() == 403 {
-        bail!(
-            "AustLII SINO search returned HTTP 403 (Cloudflare challenge). \
-             {SETUP_REQUIRED_HINT}"
-        );
-    }
-    if !status.is_success() {
-        bail!(
-            "AustLII SINO search returned HTTP {} for {}",
-            status.as_u16(),
-            url.as_str()
-        );
-    }
-    let body = resp
-        .text()
-        .context("reading AustLII search response body")?;
-    let hits = parse_search_results(&body);
-    Ok(serde_json::to_string_pretty(&json!({
-        "query": query,
-        "hits": hits,
-        "meta": {
-            "source": "austlii.sinosrch",
-            "result_count": hits.len(),
-            "limit": limit,
-            "sort_by": if opts.sort_by_date { "date" } else { "relevance" },
-        },
-    }))?)
+    url
 }
 
 #[derive(Debug, serde::Serialize, PartialEq, Eq)]
@@ -515,6 +579,8 @@ mod tests {
     fn format_cookie_header_joins_pairs() {
         let session = AustliiSession {
             acquired_at: "2026-05-21T00:00:00Z".to_string(),
+            sino_validated_at: None,
+            sino_validation_query: None,
             browser_name: "Google Chrome".to_string(),
             user_agent: "Mozilla/5.0".to_string(),
             cookies: vec![
@@ -573,9 +639,7 @@ mod tests {
             Some("austlii:au/cases/cth/HCA/1992/23".to_string())
         );
         assert_eq!(
-            austlii_url_to_uri(
-                "https://classic.austlii.edu.au/au/cases/cth/HCA/1992/23.html"
-            ),
+            austlii_url_to_uri("https://classic.austlii.edu.au/au/cases/cth/HCA/1992/23.html"),
             Some("austlii:au/cases/cth/HCA/1992/23".to_string())
         );
         assert_eq!(
@@ -650,9 +714,8 @@ mod tests {
             SearchHit {
                 title: "Mabo v Queensland (No 2) [1992] HCA 23; (1992) 175 CLR 1".to_string(),
                 fetch_uri: "austlii:au/cases/cth/HCA/1992/23".to_string(),
-                url:
-                    "https://www.austlii.edu.au/cgi-bin/viewdoc/au/cases/cth/HCA/1992/23.html"
-                        .to_string(),
+                url: "https://www.austlii.edu.au/cgi-bin/viewdoc/au/cases/cth/HCA/1992/23.html"
+                    .to_string(),
                 neutral_citation: Some("[1992] HCA 23".to_string()),
                 reported_citation: Some("(1992) 175 CLR 1".to_string()),
                 summary: Some("High Court of Australia - 3 June 1992".to_string()),
