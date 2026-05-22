@@ -24,7 +24,7 @@ a one-shot corpus download.
 | `get_chunks` | Fetch chunk bodies by `chunk_id`, with optional neighbour context. `[doc:X]` markers point into the corpus and resolve via `get_chunks` / `get_doc_anchors`; `[fetch:URI]` markers point outside the corpus and resolve via `fetch`. |
 | `get_doc_anchors` | In-document anchors, related documents, historical-version URLs, and reverse citations for a corpus document. |
 | `get_definition` | Statutory definitions with a labelled ordinary-meaning fallback. |
-| `get_asset` | Resolve a retained image `data-asset-ref` to a local file path. |
+| `get_asset` | Resolve a retained image `data-asset-ref` to an MCP image content item plus caption. |
 | `fetch` | Live-fetch a document by URI. `ato:<doc_id>[?pit=...&view=...]` for ATO live retrieval; `austlii:<path>` for AustLII via `classic.austlii.edu.au`. Returns chunks of the same shape as `get_chunks`. Pass `allow_ocr=true` for scanned PDFs (Tesseract on `$PATH`, allow ~120s). |
 | `search_austlii` | Live search of AustLII via SINO. Returns hits with `fetch_uri` ready to pass to `fetch`. Uses the `cf_clearance` session acquired by `ato-mcp austlii setup`. |
 | `stats` | Index version, counts, default search policy, AustLII session state. |
@@ -61,9 +61,21 @@ If you ever see "ATO MCP tools unavailable" the agent will offer to start
 the server for you via the plugin's skill. Same flow — start the server,
 exit and resume the session.
 
+For Codex, register the HTTP endpoint directly. Use a fixed port so the
+Codex config remains stable across restarts:
+
+```bash
+ato-mcp serve --port 34893
+codex mcp add ato --url http://127.0.0.1:34893/mcp
+```
+
+Do not configure Codex with `command = "ato-mcp"` and `args = ["serve"]`.
+`serve` is an HTTP MCP server; launching it as a stdio MCP server causes
+Codex to wait for stdio initialization until it times out.
+
 On first start the server tells the agent the corpus isn't installed yet;
 the agent will offer to run `ato-mcp update`, which downloads `ato.db.zst`
-(~4 GB, 5–10 min) from the latest GitHub release and atomic-swaps it into
+(~1.5 GB, 5–10 min) from the latest GitHub release and atomic-swaps it into
 place. After the download completes, restart `ato-mcp serve` so it picks
 up the new corpus.
 
@@ -136,7 +148,6 @@ Override with `ATO_MCP_DATA_DIR`. Layout:
 ato-mcp/
 ├── live/
 │   ├── ato.db
-│   ├── assets/
 │   ├── model_fp16.onnx
 │   ├── model_fp16.onnx_data
 │   └── tokenizer.json
@@ -158,7 +169,7 @@ cargo build --release --features cuda
 ./target/release/ato-mcp link-download   --deduped-links snapshots/.../deduped_links.jsonl --out-dir /path/to/ato_pages
 ./target/release/ato-mcp build           --pages-dir /path/to/ato_pages --db-path ./release/ato.db --model-dir /path/to/granite-embedding-small-r2 --out-dir ./release --profile
 ./target/release/ato-mcp package-corpus  --db-path ./release/ato.db --out ./release/ato.db.zst --manifest ./release/manifest.json
-./target/release/ato-mcp publish-release --out-dir ./release --tag v0.13.0 --repo gunba/ato-mcp --overwrite
+./target/release/ato-mcp publish-release --out-dir ./release --tag v0.14.0 --repo gunba/ato-mcp --overwrite
 ```
 
 `scripts/publish-release.sh <tag>` wraps the `package-corpus` +

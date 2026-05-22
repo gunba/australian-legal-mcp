@@ -246,7 +246,6 @@ echo "== build corpus =="
     --db-path   "$RELEASE_DIR/ato.db" \
     --model-dir "$MODEL_DIR" \
     --out-dir   "$RELEASE_DIR" \
-    --gpu \
     --profile
 
 echo "== package corpus (zstd -$ZSTD_LEVEL) =="
