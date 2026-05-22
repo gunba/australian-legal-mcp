@@ -533,12 +533,7 @@ fn search_title_index_group(
             break;
         }
         let parent_url = title_index_parent_url(*index)?;
-        if let Err(err) = fetch_austlii_bytes_with_curl(
-            &parent_url,
-            env.user_agent,
-            SEARCH_TIMEOUT_SECS,
-            Some(env.cookie_jar),
-        ) {
+        if let Err(err) = fetch_title_index_bytes(&parent_url, env.user_agent, env.cookie_jar) {
             diagnostics.push(format!(
                 "title index cookie prime failed for {}: {err}",
                 index.path
@@ -549,12 +544,7 @@ fn search_title_index_group(
                 break;
             }
             let url = title_index_url(*index, letter)?;
-            let html = match fetch_austlii_bytes_with_curl(
-                &url,
-                env.user_agent,
-                SEARCH_TIMEOUT_SECS,
-                Some(env.cookie_jar),
-            ) {
+            let html = match fetch_title_index_bytes(&url, env.user_agent, env.cookie_jar) {
                 Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
                 Err(err) => {
                     diagnostics.push(format!(
@@ -568,6 +558,16 @@ fn search_title_index_group(
         }
     }
     Ok(())
+}
+
+fn fetch_title_index_bytes(url: &str, user_agent: &str, cookie_jar: &Path) -> Result<Vec<u8>> {
+    match fetch_austlii_bytes_with_curl(url, user_agent, SEARCH_TIMEOUT_SECS, Some(cookie_jar)) {
+        Ok(bytes) => Ok(bytes),
+        Err(first_err) => {
+            fetch_austlii_bytes_with_curl(url, user_agent, SEARCH_TIMEOUT_SECS, Some(cookie_jar))
+                .with_context(|| format!("first curl attempt failed: {first_err}"))
+        }
+    }
 }
 
 fn ordered_title_index_groups(
