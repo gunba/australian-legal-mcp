@@ -196,6 +196,22 @@ pub(crate) fn cookie_header_for_host(session: &AustliiSession, host: &str) -> St
         .join("; ")
 }
 
+pub(crate) fn has_unexpired_cookie_for_host(
+    session: &AustliiSession,
+    host: &str,
+    name: &str,
+) -> bool {
+    let now = Utc::now().timestamp().max(0) as u64;
+    session.cookies.iter().any(|cookie| {
+        cookie.name.eq_ignore_ascii_case(name)
+            && cookie_matches_host(cookie, host)
+            && cookie
+                .expires
+                .map(|expires| expires == 0 || expires > now)
+                .unwrap_or(true)
+    })
+}
+
 pub(crate) fn session_cookie_shapes(session: &AustliiSession) -> Vec<String> {
     session
         .cookies
@@ -319,38 +335,7 @@ fn cookie_preferred(candidate: &NamedCookie, existing: &NamedCookie, host: &str)
 /// exposing the cookie value itself.
 pub(crate) fn session_summary_json() -> serde_json::Value {
     match load_session() {
-        Ok(Some(session)) => {
-            let cf_clearance_present = cf_clearance(&session).is_some();
-            let sino_validated = session.sino_validated_at.is_some();
-            let search_backend = if sino_validated && cf_clearance_present {
-                "austlii_sino"
-            } else {
-                "austlii_title_index"
-            };
-            let search_status = if sino_validated && cf_clearance_present {
-                "native AustLII SINO full-text search configured; title-index fallback remains available"
-            } else if cf_clearance_present {
-                "AustLII session present but not SINO-validated; run `ato-mcp austlii setup` to validate native search"
-            } else {
-                "AustLII session present without cf_clearance; run `ato-mcp austlii setup` to verify Cloudflare"
-            };
-            serde_json::json!({
-                "session_present": true,
-                "search_available": true,
-                "search_backend": search_backend,
-                "search_status": search_status,
-                "native_search_available": sino_validated && cf_clearance_present,
-                "title_index_fallback_available": true,
-                "acquired_at": session.acquired_at,
-                "sino_validated": sino_validated,
-                "sino_validated_at": session.sino_validated_at,
-                "sino_validation_query": session.sino_validation_query,
-                "browser_name": session.browser_name,
-                "user_agent": session.user_agent,
-                "cookie_count": session.cookies.len(),
-                "cf_clearance_present": cf_clearance_present,
-            })
-        }
+        Ok(Some(session)) => session_summary_json_for(&session),
         _ => serde_json::json!({
             "session_present": false,
             "search_available": true,
@@ -360,6 +345,43 @@ pub(crate) fn session_summary_json() -> serde_json::Value {
             "title_index_fallback_available": true,
         }),
     }
+}
+
+fn session_summary_json_for(session: &AustliiSession) -> serde_json::Value {
+    let cf_clearance_present =
+        has_unexpired_cookie_for_host(session, "classic.austlii.edu.au", "cf_clearance");
+    let cf_bm_present = has_unexpired_cookie_for_host(session, "classic.austlii.edu.au", "__cf_bm");
+    let sino_validated = session.sino_validated_at.is_some();
+    let native_search_available = sino_validated && cf_clearance_present && cf_bm_present;
+    let search_backend = if native_search_available {
+        "austlii_sino"
+    } else {
+        "austlii_title_index"
+    };
+    let search_status = if native_search_available {
+        "native AustLII SINO full-text search configured; title-index fallback remains available"
+    } else if cf_clearance_present {
+        "AustLII session present but native SINO is not currently validated; search will try local browser cookies, or run `ato-mcp austlii setup`"
+    } else {
+        "AustLII session present without cf_clearance; run `ato-mcp austlii setup` to verify Cloudflare"
+    };
+    serde_json::json!({
+        "session_present": true,
+        "search_available": true,
+        "search_backend": search_backend,
+        "search_status": search_status,
+        "native_search_available": native_search_available,
+        "title_index_fallback_available": true,
+        "acquired_at": session.acquired_at,
+        "sino_validated": sino_validated,
+        "sino_validated_at": session.sino_validated_at,
+        "sino_validation_query": session.sino_validation_query,
+        "browser_name": session.browser_name,
+        "user_agent": session.user_agent,
+        "cookie_count": session.cookies.len(),
+        "cf_clearance_present": cf_clearance_present,
+        "cf_bm_present": cf_bm_present,
+    })
 }
 
 #[cfg(test)]
@@ -449,5 +471,67 @@ mod tests {
             cookie_header_for_host(&session, "www.austlii.edu.au"),
             "cf_clearance=host"
         );
+    }
+
+    #[test]
+    fn session_summary_requires_current_bot_cookie_for_native_search() {
+        let now = Utc::now().timestamp().max(0) as u64;
+        let session = AustliiSession {
+            acquired_at: "2026-05-21T00:00:00Z".to_string(),
+            sino_validated_at: Some("2026-05-21T00:01:00Z".to_string()),
+            sino_validation_query: Some("Mabo Queensland".to_string()),
+            browser_name: "Google Chrome".to_string(),
+            user_agent: "Mozilla/5.0".to_string(),
+            cookies: vec![
+                NamedCookie {
+                    domain: ".austlii.edu.au".to_string(),
+                    name: "cf_clearance".to_string(),
+                    value: "clearance".to_string(),
+                    expires: Some(now + 3600),
+                },
+                NamedCookie {
+                    domain: ".austlii.edu.au".to_string(),
+                    name: "__cf_bm".to_string(),
+                    value: "bot-cookie".to_string(),
+                    expires: Some(now.saturating_sub(1)),
+                },
+            ],
+        };
+        let summary = session_summary_json_for(&session);
+        assert_eq!(summary["cf_clearance_present"], true);
+        assert_eq!(summary["cf_bm_present"], false);
+        assert_eq!(summary["native_search_available"], false);
+        assert_eq!(summary["search_backend"], "austlii_title_index");
+    }
+
+    #[test]
+    fn session_summary_reports_native_search_for_valid_cookie_pair() {
+        let now = Utc::now().timestamp().max(0) as u64;
+        let session = AustliiSession {
+            acquired_at: "2026-05-21T00:00:00Z".to_string(),
+            sino_validated_at: Some("2026-05-21T00:01:00Z".to_string()),
+            sino_validation_query: Some("Mabo Queensland".to_string()),
+            browser_name: "Google Chrome".to_string(),
+            user_agent: "Mozilla/5.0".to_string(),
+            cookies: vec![
+                NamedCookie {
+                    domain: ".austlii.edu.au".to_string(),
+                    name: "cf_clearance".to_string(),
+                    value: "clearance".to_string(),
+                    expires: Some(now + 3600),
+                },
+                NamedCookie {
+                    domain: ".austlii.edu.au".to_string(),
+                    name: "__cf_bm".to_string(),
+                    value: "bot-cookie".to_string(),
+                    expires: Some(now + 3600),
+                },
+            ],
+        };
+        let summary = session_summary_json_for(&session);
+        assert_eq!(summary["cf_clearance_present"], true);
+        assert_eq!(summary["cf_bm_present"], true);
+        assert_eq!(summary["native_search_available"], true);
+        assert_eq!(summary["search_backend"], "austlii_sino");
     }
 }

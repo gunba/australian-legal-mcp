@@ -396,10 +396,9 @@ pub(crate) fn search_austlii(query: &str, opts: SearchAustliiOptions) -> Result<
     let limit = opts.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
     let limit = limit.clamp(1, MAX_SEARCH_LIMIT);
     let jurisdictions = opts.jurisdictions.unwrap_or_default();
-    let user_agent = browser::detect()
-        .context("detecting default browser for AustLII search; set ATO_MCP_BROWSER to override")?
-        .user_agent
-        .as_str();
+    let detected_browser = browser::detect()
+        .context("detecting default browser for AustLII search; set ATO_MCP_BROWSER to override")?;
+    let user_agent = detected_browser.user_agent.as_str();
 
     let mut diagnostics = Vec::new();
     let mut hits = direct_neutral_citation_hits(query);
@@ -421,14 +420,47 @@ pub(crate) fn search_austlii(query: &str, opts: SearchAustliiOptions) -> Result<
                     source = "live_sino";
                     hits.extend(native_hits);
                 }
+                Err(err) => {
+                    diagnostics.push(format!(
+                        "native SINO search failed with the stored session; trying local browser cookies. Error: {err:#}"
+                    ));
+                    match search_sino_with_browser_cookies(
+                        query,
+                        &jurisdictions,
+                        limit,
+                        detected_browser,
+                    ) {
+                        Ok(native_hits) => {
+                            diagnostics.push(
+                                "native SINO session refreshed from local browser cookies"
+                                    .to_string(),
+                            );
+                            used_sino = true;
+                            source = "live_sino";
+                            hits.extend(native_hits);
+                        }
+                        Err(refresh_err) => diagnostics.push(format!(
+                            "refreshing native SINO from local browser cookies failed; {AUSTLII_NATIVE_SEARCH_SETUP_HINT} Error: {refresh_err:#}"
+                        )),
+                    }
+                }
+            }
+        }
+        None => {
+            match search_sino_with_browser_cookies(query, &jurisdictions, limit, detected_browser) {
+                Ok(native_hits) => {
+                    diagnostics.push(
+                        "native SINO session configured from local browser cookies".to_string(),
+                    );
+                    used_sino = true;
+                    source = "live_sino";
+                    hits.extend(native_hits);
+                }
                 Err(err) => diagnostics.push(format!(
-                    "native SINO search failed; {AUSTLII_NATIVE_SEARCH_SETUP_HINT} Error: {err:#}"
+                    "native SINO search is not configured and local browser cookies did not validate; {AUSTLII_NATIVE_SEARCH_SETUP_HINT} Error: {err:#}"
                 )),
             }
         }
-        None => diagnostics.push(format!(
-            "native SINO search is not configured; {AUSTLII_NATIVE_SEARCH_SETUP_HINT}"
-        )),
     }
 
     if hits.len() < limit {
@@ -509,9 +541,22 @@ pub(crate) fn validate_sino_session(session: &mut cookies::AustliiSession) -> Re
     if hits.is_empty() {
         bail!("AustLII SINO validation returned no parsed results for `{SINO_VALIDATION_QUERY}`");
     }
-    session.sino_validated_at = Some(Utc::now().to_rfc3339());
-    session.sino_validation_query = Some(SINO_VALIDATION_QUERY.to_string());
     Ok(hits.len())
+}
+
+fn search_sino_with_browser_cookies(
+    query: &str,
+    jurisdictions: &[String],
+    limit: usize,
+    detected_browser: &browser::DetectedBrowser,
+) -> Result<Vec<SearchHit>> {
+    let mut session =
+        cookies::load_browser_session(&detected_browser.user_agent, &detected_browser.name)
+            .context("loading AustLII cookies from local browsers")?;
+    let hits = search_sino_with_session(query, jurisdictions, limit, &mut session)
+        .context("validating AustLII SINO with local browser cookies")?;
+    cookies::save_session(&session).context("saving refreshed AustLII browser session")?;
+    Ok(hits)
 }
 
 fn search_sino_with_session(
@@ -540,11 +585,17 @@ fn search_sino_with_session(
             html_debug_summary(&html)
         );
     }
+    mark_sino_validated(session, query);
     if !jurisdictions.is_empty() {
         hits.retain(|hit| hit_matches_jurisdictions(hit, jurisdictions));
     }
     hits.truncate(limit);
     Ok(hits)
+}
+
+fn mark_sino_validated(session: &mut cookies::AustliiSession, query: &str) {
+    session.sino_validated_at = Some(Utc::now().to_rfc3339());
+    session.sino_validation_query = Some(query.to_string());
 }
 
 fn build_sino_search_url(query: &str, jurisdictions: &[String]) -> Result<String> {

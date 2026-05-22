@@ -81,7 +81,9 @@ AustLII's SINO CGI endpoint (`/cgi-bin/sinosrch.cgi`) is Cloudflare-gated.
 `search_austlii` uses native SINO full-text search when a validated AustLII
 session exists (`search_backend: "austlii_sino"`), and falls back to AustLII
 title indexes (`search_backend: "austlii_title_index"`) when native search is
-not configured or fails. Returned results are normalised `austlii:<path>` fetch
+not configured or fails. AustLII's bot-management cookie is short-lived; on a
+stored-session failure the tool tries to refresh from local browser cookies
+once before falling back. Returned results are normalised `austlii:<path>` fetch
 URIs and should be fetched and verified.
 
 Run `ato-mcp austlii setup` to configure native SINO. Setup first tries local

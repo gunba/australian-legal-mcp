@@ -116,12 +116,14 @@ store and validates SINO with a known query before saving session metadata.
 
 When setup succeeds, `search_austlii` labels responses with
 `search_backend: "austlii_sino"` and falls back to title indexes only if native
-search cannot be used or returns fewer hits than requested. Without a validated
-session, `search_austlii` still works through AustLII title indexes and labels
-responses with `search_backend: "austlii_title_index"`. The title-index
-requests use curl with a temporary per-search cookie jar for AustLII's
-short-lived bot-management cookie. Set `ATO_MCP_AUSTLII_WEB_FALLBACK=1` to
-also try a public web-index fallback when title-index search is insufficient.
+search cannot be used or returns fewer hits than requested. AustLII's
+bot-management cookie is short-lived; if the stored session fails,
+`search_austlii` tries to refresh from local browser cookies once before
+falling back. Without a validated native session, `search_austlii` still works
+through AustLII title indexes and labels responses with
+`search_backend: "austlii_title_index"`. The title-index requests use curl with
+a temporary per-search cookie jar. Set `ATO_MCP_AUSTLII_WEB_FALLBACK=1` to also
+try a public web-index fallback when title-index search is insufficient.
 
 Manual cookie setup is available for locked-down environments:
 
@@ -186,7 +188,7 @@ cargo build --release --features cuda
 ./target/release/ato-mcp link-download   --deduped-links snapshots/.../deduped_links.jsonl --out-dir /path/to/ato_pages
 ./target/release/ato-mcp build           --pages-dir /path/to/ato_pages --db-path ./release/ato.db --model-dir /path/to/granite-embedding-small-r2 --out-dir ./release --profile
 ./target/release/ato-mcp package-corpus  --db-path ./release/ato.db --out ./release/ato.db.zst --manifest ./release/manifest.json
-./target/release/ato-mcp publish-release --out-dir ./release --tag v0.14.6 --repo gunba/ato-mcp --overwrite
+./target/release/ato-mcp publish-release --out-dir ./release --tag v0.14.7 --repo gunba/ato-mcp --overwrite
 ```
 
 `scripts/publish-release.sh <tag>` wraps the `package-corpus` +

@@ -63,8 +63,8 @@ new corpus, then retry the user's original question.
 `search_austlii` uses native AustLII SINO full-text search when a validated
 AustLII session exists. Results are AustLII URLs normalised to
 `austlii:<path>` fetch URIs and should be fetched and verified before use. If
-native SINO is not configured or fails, the tool falls back to AustLII title
-indexes.
+native SINO is not configured or fails, the tool tries one local browser-cookie
+refresh and then falls back to AustLII title indexes.
 
 If `stats` reports `austlii.native_search_available=false`, run
 `ato-mcp austlii setup`. Setup first tries local browser cookies. If no valid

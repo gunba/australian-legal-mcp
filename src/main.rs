@@ -1674,9 +1674,17 @@ fn austlii_setup(
     }
 
     run_austlii_browser_verification(skip_prompt)?;
-    load_validate_and_save_browser_austlii_session(&user_agent, &browser_name)
-        .context("loading AustLII cookies after browser verification")?;
-    Ok(())
+    loop {
+        match load_validate_and_save_browser_austlii_session(&user_agent, &browser_name) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                println!("AustLII browser cookies did not validate yet: {err:#}");
+                prompt_enter(
+                    "Reload or complete verification in the browser, then press Enter to retry.",
+                )?;
+            }
+        }
+    }
 }
 
 fn validate_and_save_austlii_session(
@@ -1739,9 +1747,12 @@ fn prompt_enter(prompt: &str) -> Result<()> {
     print!("{prompt} ");
     io::stdout().flush().context("flushing prompt")?;
     let mut line = String::new();
-    io::stdin()
+    let bytes = io::stdin()
         .read_line(&mut line)
         .context("reading prompt response")?;
+    if bytes == 0 {
+        bail!("input closed while waiting for AustLII browser verification");
+    }
     Ok(())
 }
 

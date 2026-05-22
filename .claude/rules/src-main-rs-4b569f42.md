@@ -26,9 +26,9 @@ MCP tool registration, shared ServerState, runtime statistics instructions, inst
 
 - [SW-04 L671] ServerState lazily loads SemanticRuntime on the first semantic query and reuses that runtime for the rest of the process.
   - There is no reranker state in the MCP surface; non-semantic tools do not load the semantic runtime.
-- [SW-02 L1798] Server instructions are built dynamically at start time from corpus stats (doc count, chunk count, type breakdown, meta keys), so the agent sees up-to-date corpus shape without restart-time configuration.
-- [SW-03 L1800] server_instructions is built from stats(OutputFormat::Json); if stats cannot be read (corpus not yet installed) it returns a static install message telling the agent to ask the user to run ato-mcp update. When the serve-startup probe has stashed an UpdateAvailability on ServerState, both branches append a newer-index-available notice carrying the published index_version.
-- [SW-01 L1832] Eight MCP tools are exposed by tool_descriptors/call_tool: search, get_chunks, get_definition, get_asset, get_doc_anchors, fetch, search_austlii, and stats. get_asset returns an MCP content array (caption + image content item); every other tool returns a single text content item. The surface stays small and explicit; unsupported tools fail through the normal tools/call error path.
+- [SW-02 L1809] Server instructions are built dynamically at start time from corpus stats (doc count, chunk count, type breakdown, meta keys), so the agent sees up-to-date corpus shape without restart-time configuration.
+- [SW-03 L1811] server_instructions is built from stats(OutputFormat::Json); if stats cannot be read (corpus not yet installed) it returns a static install message telling the agent to ask the user to run ato-mcp update. When the serve-startup probe has stashed an UpdateAvailability on ServerState, both branches append a newer-index-available notice carrying the published index_version.
+- [SW-01 L1843] Eight MCP tools are exposed by tool_descriptors/call_tool: search, get_chunks, get_definition, get_asset, get_doc_anchors, fetch, search_austlii, and stats. get_asset returns an MCP content array (caption + image content item); every other tool returns a single text content item. The surface stays small and explicit; unsupported tools fail through the normal tools/call error path.
   - The surface stays small and explicit; unsupported tools fail through the normal tools/call error path.
 
 ## Rust Source Scraper
