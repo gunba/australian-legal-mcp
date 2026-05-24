@@ -50,6 +50,11 @@ exit and resume the agent session once so the MCP host reloads the generated
 URL. The user should not have to choose a port, edit config, or run terminal
 commands.
 
+The binary location and corpus location are separate. Enterprise installs may
+place `ato-mcp.exe` under the user's local app-data area, but normal installs
+should leave `ATO_MCP_DATA_DIR` unset so `ato-mcp update`, `ato-mcp serve`,
+and MCP calls all use the same default user data directory.
+
 After the session resumes, the agent verifies:
 
 ```bash
@@ -112,7 +117,12 @@ macOS:   ~/Library/Application Support/ato-mcp
 Windows: %APPDATA%\ato-mcp
 ```
 
-Override with `ATO_MCP_DATA_DIR`. Layout:
+Override with `ATO_MCP_DATA_DIR`. Use it only for a deliberate portable or
+offline install where every later `ato-mcp` command and server start will
+receive the same environment variable. Do not point it at a temporary
+extraction directory for a normal install; `ato-mcp serve` without that
+variable will look in the default user data directory and report a missing
+corpus. Layout:
 
 ```text
 ato-mcp/

@@ -29,6 +29,16 @@ For the required first-run restart:
 
 `ato-mcp serve` is an HTTP MCP server, not stdio.
 
+The binary path and corpus data directory are separate. For normal installs,
+leave `ATO_MCP_DATA_DIR` unset. Enterprise policy may require the binary to
+live under local app data, but the corpus still belongs in the default user
+data dir used by `ato-mcp update` and `ato-mcp serve`.
+
+Use `ATO_MCP_DATA_DIR` only for a deliberate portable/offline install. If you
+set it for `ato-mcp update`, you must also set the same value for every future
+`ato-mcp serve`, `stats`, and MCP call. Never point it at a temporary
+extraction directory for a normal install.
+
 Port behavior:
 
 - `.mcp.json` initially contains `http://127.0.0.1:0/mcp`; `:0` is a sentinel.
@@ -83,6 +93,11 @@ ato-mcp update
 
 After update, restart `ato-mcp serve`, verify `ato-mcp stats`, then continue.
 If restart rewrites the port, ask the user to exit/resume first.
+
+If an earlier setup downloaded the corpus under a temporary
+`ATO_MCP_DATA_DIR`, do not rely on that temporary path. Rerun
+`ato-mcp update` with `ATO_MCP_DATA_DIR` unset so the corpus is installed into
+the default user data dir, then restart `ato-mcp serve`.
 
 ## Newer Corpus Available
 
