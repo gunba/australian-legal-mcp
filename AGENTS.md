@@ -66,12 +66,14 @@ port rewrite. The user should only be asked to exit + resume the agent session
 when a port rewrite means the MCP host must reload config.
 
 The binary install location is independent from the corpus data directory.
-For ordinary installs, do not set `ATO_MCP_DATA_DIR`; let update, serve, and
-MCP calls use the same default user data dir (`%APPDATA%\ato-mcp` on Windows,
-`~/.local/share/ato-mcp` on Linux, and `~/Library/Application Support/ato-mcp`
-on macOS). Use `ATO_MCP_DATA_DIR` only for a deliberate portable/offline
-install, and then persist that same environment for every future `ato-mcp`
-command and server start.
+Installer agents must choose one corpus data directory and use it consistently
+for `ato-mcp update`, `ato-mcp serve`, `stats`, and verification searches.
+Default mode leaves `ATO_MCP_DATA_DIR` unset and uses the default user data dir
+(`%APPDATA%\ato-mcp` on Windows, `~/.local/share/ato-mcp` on Linux, and
+`~/Library/Application Support/ato-mcp` on macOS). Portable/co-located mode
+sets `ATO_MCP_DATA_DIR` to a stable directory next to the binary for every
+future `ato-mcp` command and server start. Do not install the corpus under a
+temporary extraction directory.
 
 On the first MCP `initialize`, the server tells the agent whether the corpus
 is installed. If not, the agent explains the large download and runs

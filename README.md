@@ -51,9 +51,15 @@ URL. The user should not have to choose a port, edit config, or run terminal
 commands.
 
 The binary location and corpus location are separate. Enterprise installs may
-place `ato-mcp.exe` under the user's local app-data area, but normal installs
-should leave `ATO_MCP_DATA_DIR` unset so `ato-mcp update`, `ato-mcp serve`,
-and MCP calls all use the same default user data directory.
+place `ato-mcp.exe` under the user's local app-data area. The installer must
+choose one corpus data directory and use it consistently for `ato-mcp update`,
+`ato-mcp serve`, and verification commands.
+
+Default mode: leave `ATO_MCP_DATA_DIR` unset, and the corpus installs into the
+default user data directory. Portable/co-located mode: set `ATO_MCP_DATA_DIR`
+to a stable data directory next to the binary for every `ato-mcp` command and
+server start. Do not run `update` with a non-default data dir and later start
+`serve` without the same setting.
 
 After the session resumes, the agent verifies:
 
@@ -117,12 +123,12 @@ macOS:   ~/Library/Application Support/ato-mcp
 Windows: %APPDATA%\ato-mcp
 ```
 
-Override with `ATO_MCP_DATA_DIR`. Use it only for a deliberate portable or
-offline install where every later `ato-mcp` command and server start will
-receive the same environment variable. Do not point it at a temporary
-extraction directory for a normal install; `ato-mcp serve` without that
-variable will look in the default user data directory and report a missing
-corpus. Layout:
+Override with `ATO_MCP_DATA_DIR` for a deliberate portable or offline install
+where every later `ato-mcp` command and server start will receive the same
+environment variable. Do not point it at a temporary extraction directory; use
+a stable install directory. If the corpus is installed with a non-default data
+dir and `serve` is later started without that setting, the server will look in
+the default user data directory and report a missing corpus. Layout:
 
 ```text
 ato-mcp/
