@@ -43,7 +43,8 @@ entry point without that same setting.
 
 MCP startup behavior:
 
-- `.mcp.json` should contain `command: ato-mcp` and `args: ["mcp"]`.
+- `.mcp.json` should contain an `mcpServers.ato` entry with
+  `command: ato-mcp` and `args: ["mcp"]`.
 - `ato-mcp mcp` checks `<data_dir>/http.json` for an existing backend.
 - If that backend answers MCP `initialize` with the same binary version, the
   stdio command reuses it.

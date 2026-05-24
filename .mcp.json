@@ -1,6 +1,8 @@
 {
-  "ato": {
-    "command": "ato-mcp",
-    "args": ["mcp"]
+  "mcpServers": {
+    "ato": {
+      "command": "ato-mcp",
+      "args": ["mcp"]
+    }
   }
 }

@@ -266,6 +266,26 @@ fn parse_url_port(url: &str) -> Option<u16> {
     port.parse().ok()
 }
 
+fn ato_mcp_entry(value: &JsonValue) -> Option<&JsonValue> {
+    value
+        .get("mcpServers")
+        .and_then(|servers| servers.get("ato"))
+        .or_else(|| value.get("ato"))
+}
+
+fn ato_mcp_entry_mut(value: &mut JsonValue) -> Option<&mut JsonValue> {
+    if value
+        .get("mcpServers")
+        .and_then(|servers| servers.get("ato"))
+        .is_some()
+    {
+        return value
+            .get_mut("mcpServers")
+            .and_then(|servers| servers.get_mut("ato"));
+    }
+    value.get_mut("ato")
+}
+
 /// Update the `ato` MCP server entry in the plugin's `.mcp.json` to point at
 /// the given URL. Used when `ato-mcp serve` had to pick a new port and the
 /// plugin's existing URL is stale. Returns `true` when the file was actually
@@ -274,8 +294,7 @@ pub(crate) fn update_plugin_mcp_json_url(path: &std::path::Path, new_url: &str) 
     let raw = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut value: JsonValue =
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
-    let entry = value
-        .get_mut("ato")
+    let entry = ato_mcp_entry_mut(&mut value)
         .ok_or_else(|| anyhow!("{} has no `ato` entry", path.display()))?;
     if entry.get("command").is_some() {
         return Ok(false);
@@ -327,7 +346,7 @@ pub(crate) fn resolve_serve_port(cli_override: Option<u16>) -> Result<PortChoice
         fs::read_to_string(&mcp_json).with_context(|| format!("reading {}", mcp_json.display()))?;
     let value: JsonValue =
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", mcp_json.display()))?;
-    let entry = value.get("ato");
+    let entry = ato_mcp_entry(&value);
     if entry.and_then(|v| v.get("command")).is_some() {
         return Ok(PortChoice::Cli(pick_free_port()?));
     }
@@ -383,10 +402,12 @@ mod tests {
         fs::write(
             &path,
             r#"{
-  "ato": {
-    "command": "ato-mcp",
-    "args": ["mcp"],
-    "url": "http://127.0.0.1:9/mcp"
+  "mcpServers": {
+    "ato": {
+      "command": "ato-mcp",
+      "args": ["mcp"],
+      "url": "http://127.0.0.1:9/mcp"
+    }
   }
 }
 "#,
@@ -395,7 +416,10 @@ mod tests {
 
         assert!(!update_plugin_mcp_json_url(&path, "http://127.0.0.1:12345/mcp").unwrap());
         let value: JsonValue = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(value["ato"]["url"].as_str(), Some("http://127.0.0.1:9/mcp"));
+        assert_eq!(
+            value["mcpServers"]["ato"]["url"].as_str(),
+            Some("http://127.0.0.1:9/mcp")
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

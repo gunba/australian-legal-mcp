@@ -82,6 +82,17 @@ For manual MCP clients, register `ato-mcp mcp` as the stdio MCP command. Do
 not configure `ato-mcp serve` as a stdio MCP command; it is the backend HTTP
 server.
 
+```json
+{
+  "mcpServers": {
+    "ato": {
+      "command": "ato-mcp",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
 ## Updates
 
 ```bash

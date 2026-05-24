@@ -41,10 +41,11 @@ git clone https://github.com/gunba/ato-mcp.git
 claude plugin install ./ato-mcp
 ```
 
-The plugin's `.mcp.json` registers `ato-mcp mcp` as a stdio MCP command.
-That command starts or reuses one local loopback HTTP backend and proxies MCP
-messages to it. This avoids first-run generated-port reloads while keeping the
-SQLite corpus and semantic model in one backend process per user data dir.
+The plugin's `.mcp.json` registers `mcpServers.ato` as the stdio command
+`ato-mcp mcp`. That command starts or reuses one local loopback HTTP backend
+and proxies MCP messages to it. This avoids first-run generated-port reloads
+while keeping the SQLite corpus and semantic model in one backend process per
+user data dir.
 
 ```bash
 ato-mcp mcp               # MCP host entry point
