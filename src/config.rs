@@ -94,12 +94,12 @@ pub(crate) fn pick_free_port() -> Result<u16> {
     Ok(port)
 }
 
-/// Locate the plugin's installed `.mcp.json` by reading Claude Code's
-/// `installed_plugins.json`. Returns `Ok(None)` when the file doesn't exist
-/// or has no entry for this plugin — that's the "binary running outside any
-/// plugin context" case, which is fine; the caller falls back to standalone
-/// serve and the URL written to the plugin's `.mcp.json` simply isn't kept
-/// in sync.
+/// Locate the `.mcp.json` file Claude Code will read for the installed plugin.
+///
+/// Directory marketplaces are special: Claude keeps an install record in
+/// `installed_plugins.json`, but loads plugin components from the source
+/// directory recorded in `known_marketplaces.json`. In that case the source
+/// `.mcp.json` is the file that must be rewritten.
 pub(crate) fn locate_plugin_mcp_json() -> Result<Option<PathBuf>> {
     let manifest = match claude_plugins_manifest_path()? {
         Some(p) => p,
@@ -108,22 +108,32 @@ pub(crate) fn locate_plugin_mcp_json() -> Result<Option<PathBuf>> {
     if !manifest.exists() {
         return Ok(None);
     }
-    let raw = fs::read_to_string(&manifest)
-        .with_context(|| format!("reading {}", manifest.display()))?;
-    let value: JsonValue = serde_json::from_str(&raw)
-        .with_context(|| format!("parsing {}", manifest.display()))?;
-    let plugins = value.get("plugins").and_then(|v| v.as_object());
-    let Some(plugins) = plugins else {
-        return Ok(None);
-    };
+    let raw =
+        fs::read_to_string(&manifest).with_context(|| format!("reading {}", manifest.display()))?;
+    let value: JsonValue =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", manifest.display()))?;
+    let known_marketplaces = read_claude_known_marketplaces()?;
+    Ok(plugin_mcp_json_from_manifests(
+        &value,
+        known_marketplaces.as_ref(),
+    ))
+}
+
+fn plugin_mcp_json_from_manifests(
+    installed_plugins: &JsonValue,
+    known_marketplaces: Option<&JsonValue>,
+) -> Option<PathBuf> {
+    let plugins = installed_plugins
+        .get("plugins")
+        .and_then(|v| v.as_object())?;
     // Entries are keyed like `ato-mcp@<marketplace>`; the value is an array of
     // install records. Take the newest install of any entry whose key starts
     // with `ato-mcp@`.
-    let mut newest: Option<(String, PathBuf)> = None;
+    let mut newest: Option<(String, String, PathBuf)> = None;
     for (key, installs) in plugins {
-        if !key.starts_with("ato-mcp@") {
+        let Some(marketplace) = key.strip_prefix("ato-mcp@") else {
             continue;
-        }
+        };
         let Some(records) = installs.as_array() else {
             continue;
         };
@@ -135,24 +145,30 @@ pub(crate) fn locate_plugin_mcp_json() -> Result<Option<PathBuf>> {
                 .get("lastUpdated")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let candidate = (updated.to_string(), PathBuf::from(path));
+            let candidate = (
+                updated.to_string(),
+                marketplace.to_string(),
+                PathBuf::from(path),
+            );
             if newest
                 .as_ref()
-                .map(|(prev, _)| candidate.0 > *prev)
+                .map(|(prev, _, _)| candidate.0 > *prev)
                 .unwrap_or(true)
             {
                 newest = Some(candidate);
             }
         }
     }
-    let Some((_, install_path)) = newest else {
-        return Ok(None);
-    };
+    let (_, marketplace, install_path) = newest?;
+    if let Some(source_mcp_json) = directory_marketplace_mcp_json(known_marketplaces, &marketplace)
+    {
+        return Some(source_mcp_json);
+    }
     let mcp_json = install_path.join(".mcp.json");
     if mcp_json.exists() {
-        Ok(Some(mcp_json))
+        Some(mcp_json)
     } else {
-        Ok(None)
+        None
     }
 }
 
@@ -161,15 +177,68 @@ pub(crate) fn locate_plugin_mcp_json() -> Result<Option<PathBuf>> {
 fn claude_plugins_manifest_path() -> Result<Option<PathBuf>> {
     if let Ok(home) = std::env::var("CLAUDE_HOME") {
         return Ok(Some(
-            PathBuf::from(home).join("plugins").join("installed_plugins.json"),
+            PathBuf::from(home)
+                .join("plugins")
+                .join("installed_plugins.json"),
         ));
     }
     let Some(home) = dirs::home_dir() else {
         return Ok(None);
     };
     Ok(Some(
-        home.join(".claude").join("plugins").join("installed_plugins.json"),
+        home.join(".claude")
+            .join("plugins")
+            .join("installed_plugins.json"),
     ))
+}
+
+fn read_claude_known_marketplaces() -> Result<Option<JsonValue>> {
+    let Some(path) = claude_known_marketplaces_path()? else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let value: JsonValue =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(Some(value))
+}
+
+fn claude_known_marketplaces_path() -> Result<Option<PathBuf>> {
+    if let Ok(home) = std::env::var("CLAUDE_HOME") {
+        return Ok(Some(
+            PathBuf::from(home)
+                .join("plugins")
+                .join("known_marketplaces.json"),
+        ));
+    }
+    let Some(home) = dirs::home_dir() else {
+        return Ok(None);
+    };
+    Ok(Some(
+        home.join(".claude")
+            .join("plugins")
+            .join("known_marketplaces.json"),
+    ))
+}
+
+fn directory_marketplace_mcp_json(
+    known_marketplaces: Option<&JsonValue>,
+    marketplace: &str,
+) -> Option<PathBuf> {
+    let entry = known_marketplaces?.get(marketplace)?;
+    let source = entry.get("source")?;
+    if source.get("source").and_then(|v| v.as_str()) != Some("directory") {
+        return None;
+    }
+    let path = source.get("path").and_then(|v| v.as_str())?;
+    let mcp_json = PathBuf::from(path).join(".mcp.json");
+    if mcp_json.exists() {
+        Some(mcp_json)
+    } else {
+        None
+    }
 }
 
 /// Read the port out of an `http://host:port/...` URL string.
@@ -185,8 +254,7 @@ fn parse_url_port(url: &str) -> Option<u16> {
 /// plugin's existing URL is stale. Returns `true` when the file was actually
 /// changed.
 pub(crate) fn update_plugin_mcp_json_url(path: &std::path::Path, new_url: &str) -> Result<bool> {
-    let raw =
-        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let raw = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut value: JsonValue =
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
     let entry = value
@@ -233,10 +301,10 @@ pub(crate) fn resolve_serve_port(cli_override: Option<u16>) -> Result<PortChoice
         // Standalone serve (no plugin installed locally) — just pick a port.
         return Ok(PortChoice::Cli(pick_free_port()?));
     };
-    let raw = fs::read_to_string(&mcp_json)
-        .with_context(|| format!("reading {}", mcp_json.display()))?;
-    let value: JsonValue = serde_json::from_str(&raw)
-        .with_context(|| format!("parsing {}", mcp_json.display()))?;
+    let raw =
+        fs::read_to_string(&mcp_json).with_context(|| format!("reading {}", mcp_json.display()))?;
+    let value: JsonValue =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", mcp_json.display()))?;
     let url = value
         .get("ato")
         .and_then(|v| v.get("url"))
@@ -273,5 +341,68 @@ mod tests {
         assert_eq!(parse_url_port("http://localhost:0/mcp"), Some(0));
         assert_eq!(parse_url_port("http://127.0.0.1/mcp"), None);
         assert_eq!(parse_url_port("not a url"), None);
+    }
+
+    #[test]
+    fn directory_marketplace_mcp_json_wins_over_cache_install() {
+        let root = std::env::temp_dir().join(format!(
+            "ato-mcp-config-test-{}-directory",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source_dir = root.join("source");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(source_dir.join(".mcp.json"), "{}\n").unwrap();
+        fs::write(cache_dir.join(".mcp.json"), "{}\n").unwrap();
+
+        let installed = serde_json::json!({
+            "plugins": {
+                "ato-mcp@ato-mcp": [{
+                    "installPath": cache_dir,
+                    "lastUpdated": "2026-05-24T10:42:04Z"
+                }]
+            }
+        });
+        let known = serde_json::json!({
+            "ato-mcp": {
+                "source": {
+                    "source": "directory",
+                    "path": source_dir
+                }
+            }
+        });
+
+        assert_eq!(
+            plugin_mcp_json_from_manifests(&installed, Some(&known)),
+            Some(root.join("source").join(".mcp.json"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugin_mcp_json_falls_back_to_cache_install() {
+        let root =
+            std::env::temp_dir().join(format!("ato-mcp-config-test-{}-cache", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(cache_dir.join(".mcp.json"), "{}\n").unwrap();
+
+        let installed = serde_json::json!({
+            "plugins": {
+                "ato-mcp@ato-mcp": [{
+                    "installPath": cache_dir,
+                    "lastUpdated": "2026-05-24T10:42:04Z"
+                }]
+            }
+        });
+
+        assert_eq!(
+            plugin_mcp_json_from_manifests(&installed, None),
+            Some(root.join("cache").join(".mcp.json"))
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

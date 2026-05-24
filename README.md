@@ -142,7 +142,7 @@ cargo build --release --features cuda
 ./target/release/ato-mcp link-download   --deduped-links snapshots/.../deduped_links.jsonl --out-dir /path/to/ato_pages
 ./target/release/ato-mcp build           --pages-dir /path/to/ato_pages --db-path ./release/ato.db --model-dir /path/to/granite-embedding-small-r2 --out-dir ./release --profile
 ./target/release/ato-mcp package-corpus  --db-path ./release/ato.db --out ./release/ato.db.zst --manifest ./release/manifest.json
-./target/release/ato-mcp publish-release --out-dir ./release --tag v0.15.0 --repo gunba/ato-mcp --overwrite
+./target/release/ato-mcp publish-release --out-dir ./release --tag v0.15.1 --repo gunba/ato-mcp --overwrite
 ```
 
 `scripts/publish-release.sh <tag>` wraps the `package-corpus` +
