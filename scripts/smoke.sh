@@ -112,7 +112,7 @@ fi
 help_text="$("$BIN" --help 2>&1)"
 
 # Subcommands that MUST be present.
-for cmd in serve update stats search fetch austlii \
+for cmd in serve update stats search fetch \
            get-definition build tree-crawl snapshot-reduce link-download scrape-diff \
            bundle-localize-manifest publish-release help; do
     if grep -qE "^[[:space:]]+${cmd}[[:space:]]" <<<"$help_text"; then
@@ -123,7 +123,7 @@ for cmd in serve update stats search fetch austlii \
 done
 
 # Subcommands that MUST NOT appear (removed during the cleanup).
-for cmd in daemon install-http doctor search-austlii extract extract-definitions extract-anchors \
+for cmd in daemon install-http doctor extract extract-definitions extract-anchors \
            extract-currency chunk-html doc-meta doc-id-from-link pack-write \
            manifest-rewrite-urls bundle-model ato-fetch-nodes embed whats-new \
            normalize-doc-href check-build-checkpoint; do
@@ -152,7 +152,6 @@ assert_jq_count "stats.prefix_breakdown items" "$stats_json" '.prefix_breakdown 
 assert_jq_nonempty "stats.embedding_model_id" "$stats_json" '.embedding_model_id'
 assert_jq_nonempty "stats.index_version"      "$stats_json" '.index_version'
 assert_jq "stats.semantic_search_ready"      "$stats_json" '.semantic_search_ready' 'true'
-assert_jq_nonempty "stats.austlii block present" "$stats_json" '.austlii'
 
 # ---------------- Section 3: CLI search ----------------
 
@@ -325,7 +324,7 @@ assert_jq "initialize: server name is ato-mcp" "$init_resp" '.result.serverInfo.
 assert_jq_nonempty "initialize: instructions present"   "$init_resp" '.result.instructions'
 
 tools_resp="$(rpc 2 tools/list '')"
-expected_tools=(search get_chunks get_definition get_asset get_doc_anchors fetch search_austlii stats)
+expected_tools=(search get_chunks get_definition get_asset get_doc_anchors fetch stats)
 actual_tools="$(printf '%s' "$tools_resp" | jq -r '.result.tools[].name' 2>/dev/null | sort | tr '\n' ' ')"
 expected_sorted="$(printf '%s\n' "${expected_tools[@]}" | sort | tr '\n' ' ')"
 if [[ "$actual_tools" == "$expected_sorted" ]]; then

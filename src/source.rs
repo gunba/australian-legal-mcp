@@ -192,7 +192,6 @@ pub(crate) fn stats() -> Result<String> {
             "old_content_exception_types": LEGISLATION_TYPE_PREFIXES,
             "old_content_exception_type_labels": [LEGISLATION_TYPE],
         },
-        "austlii": crate::cookies::session_summary_json(),
     });
     // [OF-06] JSON outputs use serde_json pretty rendering before return/write.
     Ok(serde_json::to_string_pretty(&payload)?)

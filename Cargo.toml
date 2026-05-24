@@ -1,6 +1,6 @@
 [package]
 name = "ato-mcp"
-version = "0.14.7"
+version = "0.15.0"
 edition = "2021"
 license = "MIT"
 description = "Standalone MCP server for the Australian Taxation Office legal corpus"
@@ -18,7 +18,6 @@ dirs = "6.0"
 fs2 = "0.4"
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 regex = "1.11"
-rookie = "0.5.6"
 rusqlite = { version = "0.31", features = ["bundled", "functions"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -42,15 +41,7 @@ zstd = "0.13"
 # whats-new, update); the MCP transport itself is plain localhost HTTP.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls"] }
 # ATO outbound requests use reqwest+native-tls so the runtime stays on the
-# platform TLS stack. AustLII known-document fetches try the system `curl`
-# binary first because classic.austlii.edu.au currently accepts curl where
-# reqwest's client fingerprint can hit Cloudflare; reqwest remains the
-# fallback when curl is unavailable. AustLII SINO search also uses the system
-# curl binary with a Cloudflare-validated browser session; title indexes remain
-# the no-session fallback.
-# Pure-Rust PDF text extraction. AustLII serves some judgments as PDFs;
-# scanned ones (no text layer) fall through to the OCR path in src/ocr.rs.
-pdf-extract = "0.7"
+# platform TLS stack.
 
 [features]
 default = []
@@ -58,11 +49,6 @@ cuda = ["ort/cuda"]
 
 [target.'cfg(windows)'.dependencies]
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["load-dynamic", "api-24", "ndarray"] }
-# Windows default-browser detection reads
-# HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice
-# to find the registered ProgID, then resolves the exe path via the
-# corresponding `<ProgID>\shell\open\command` key.
-winreg = "0.55"
 
 [target.'cfg(not(windows))'.dependencies]
 ort = "2.0.0-rc.12"

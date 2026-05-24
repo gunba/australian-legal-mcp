@@ -53,7 +53,7 @@ pub(crate) fn clean_ato_html(html: &str) -> CleanedAtoDoc {
 
     let doc = Html::parse_document(html);
 
-    // Browser tab title (for hint / display).
+    // Page title (for hint / display).
     let title_selector = Selector::parse("title").unwrap();
     let raw_title = doc
         .select(&title_selector)

@@ -58,23 +58,6 @@ ato-mcp update
 After the download completes, restart `ato-mcp serve` so it picks up the
 new corpus, then retry the user's original question.
 
-## AustLII search
-
-`search_austlii` uses native AustLII SINO full-text search when a validated
-AustLII session exists. Results are AustLII URLs normalised to
-`austlii:<path>` fetch URIs and should be fetched and verified before use. If
-native SINO is not configured or fails, the tool tries one local browser-cookie
-refresh and then falls back to AustLII title indexes.
-
-If `stats` reports `austlii.native_search_available=false`, run
-`ato-mcp austlii setup`. Setup first tries local browser cookies. If no valid
-Cloudflare session is available, it opens the AustLII SINO validation URL in
-the user's browser, waits for the user to complete Cloudflare verification,
-then re-reads the browser cookie store and validates the session before saving
-metadata. Manual fallback for locked-down environments:
-`ato-mcp austlii setup --cookie '<cf_clearance>' --user-agent '<matching UA>'`
-or `ato-mcp austlii setup --cookie-header '<Cookie header>' --user-agent '<matching UA>'`.
-
 ## What not to do
 
 - Don't run `ato-mcp serve` in the foreground (it blocks the Bash tool).

@@ -145,30 +145,20 @@ pub(crate) fn annotate_doc_refs_with(
 
 /// Public entry point for the `fetch` MCP tool. Parses the URI scheme and
 /// dispatches to the per-source live-fetch implementation. Returns a JSON
-/// string with the shape `{uri, canonical_url, title, source, ocr_used,
-/// chunks}` regardless of source so callers don't branch on the scheme.
-pub(crate) fn fetch(uri_string: &str, allow_ocr: bool) -> Result<String> {
+/// string with the shape `{uri, canonical_url, title, source, chunks}`.
+pub(crate) fn fetch(uri_string: &str) -> Result<String> {
     let uri = parse_doc_uri(uri_string)?;
     match uri {
-        DocUri::Ato { doc_id, pit, view } => fetch_ato_doc(
-            &doc_id,
-            pit.as_deref(),
-            view.as_deref(),
-            allow_ocr,
-        ),
-        DocUri::Austlii { path } => crate::austlii::fetch_austlii_doc(&path, allow_ocr),
+        DocUri::Ato { doc_id, pit, view } => {
+            fetch_ato_doc(&doc_id, pit.as_deref(), view.as_deref())
+        }
     }
 }
 
 /// Live-fetch an ATO document outside the local corpus. Returns the same
-/// `{uri, canonical_url, title, source, ocr_used, chunks}` shape as other
-/// `fetch` paths so callers don't need to branch on the scheme.
-pub(crate) fn fetch_ato_doc(
-    doc_id: &str,
-    pit: Option<&str>,
-    view: Option<&str>,
-    _allow_ocr: bool,
-) -> Result<String> {
+/// `{uri, canonical_url, title, source, chunks}` shape as other retrieval
+/// responses.
+pub(crate) fn fetch_ato_doc(doc_id: &str, pit: Option<&str>, view: Option<&str>) -> Result<String> {
     let mut url = format!("https://www.ato.gov.au/law/view/document?docid={}", doc_id);
     if let Some(p) = pit.filter(|s| !s.is_empty()) {
         url.push_str(&format!("&PiT={}", p));
@@ -247,7 +237,6 @@ pub(crate) fn fetch_ato_doc(
         "canonical_url": url,
         "title": cleaned.title,
         "source": "live",
-        "ocr_used": false,
         "chunks": chunk_json,
     }))?)
 }

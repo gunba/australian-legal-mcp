@@ -10,22 +10,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use url::Url;
 
-mod austlii;
-mod browser;
 mod build;
 mod chunker;
 mod config;
-mod cookies;
 mod db;
 mod extract;
 mod html;
-mod ocr;
 mod retrieval;
 mod rules;
 mod search;
@@ -128,7 +124,7 @@ enum Command {
     /// Download or refresh the local corpus. Always performs a full
     /// replacement; there is no partial-update path.
     Update {},
-    /// Print index version, counts, and AustLII session status (JSON).
+    /// Print index version, counts, and search-policy status (JSON).
     Stats {},
     /// Run a search from the CLI.
     Search {
@@ -156,25 +152,11 @@ enum Command {
         #[arg(long)]
         seed_text: Option<String>,
     },
-    /// Live-fetch a document by URI. Schemes:
-    ///   - `ato:<doc_id>[?pit=...&view=...]` (e.g. `ato:JUD/2025ATC20-969/00002`)
-    ///   - `austlii:<path>` (e.g. `austlii:au/cases/cth/HCA/1992/23`)
-    ///
+    /// Live-fetch an ATO document by URI.
+    /// Example: `ato:JUD/2025ATC20-969/00002`.
     /// The cleaned HTML is chunked the same way the build pipeline chunks
-    /// corpus docs, so external docs read like corpus docs. `--allow-ocr`
-    /// authorises Tesseract OCR fallback for scanned-PDF responses (off by
-    /// default since OCR can exceed MCP request timeouts).
-    Fetch {
-        uri: String,
-        #[arg(long)]
-        allow_ocr: bool,
-    },
-    /// AustLII utilities. Direct `fetch austlii:<path>` uses the classic host;
-    /// search uses native SINO when Cloudflare setup has validated.
-    Austlii {
-        #[command(subcommand)]
-        action: AustliiAction,
-    },
+    /// corpus docs, so live docs read like corpus docs.
+    Fetch { uri: String },
     /// In-binary build orchestrator. Reads `pages_dir/index.jsonl` (one
     /// record per line with canonical_id and payload_path), runs each doc
     /// through the cleaning pipeline, the chunker, the rules-engine
@@ -362,40 +344,6 @@ enum Command {
 enum SortBy {
     Relevance,
     Recency,
-}
-
-#[derive(Subcommand)]
-enum AustliiAction {
-    /// Verify AustLII Cloudflare in a browser and enable native SINO search.
-    Setup {
-        /// Raw cf_clearance value, or a Cookie header containing cf_clearance.
-        #[arg(long, value_name = "VALUE", conflicts_with = "cookie_header")]
-        cookie: Option<String>,
-        /// Cookie header copied from a verified AustLII browser request.
-        #[arg(long, value_name = "HEADER", conflicts_with = "cookie")]
-        cookie_header: Option<String>,
-        /// User-Agent matching the supplied cookie or browser session.
-        #[arg(long, value_name = "VALUE")]
-        user_agent: Option<String>,
-        /// Force opening the browser verification page before reading cookies.
-        #[arg(long)]
-        browser: bool,
-        /// Skip the pre-open confirmation prompt.
-        #[arg(long)]
-        yes: bool,
-    },
-    /// Search AustLII using native SINO when configured, otherwise title indexes.
-    Search {
-        query: String,
-        #[arg(long, value_delimiter = ',')]
-        jurisdictions: Vec<String>,
-        #[arg(short, long, default_value_t = 10)]
-        k: usize,
-        #[arg(long, default_value_t = false)]
-        sort_by_date: bool,
-    },
-    /// Delete the persisted session file. (Status info is in `ato-mcp stats`.)
-    Clear,
 }
 
 impl SortBy {
@@ -591,11 +539,10 @@ fn main() -> Result<()> {
             packs_dir,
             model_bundle,
         } => bundle_localize_manifest(&manifest, &packs_dir, &model_bundle),
-        Command::Fetch { uri, allow_ocr } => {
-            println!("{}", fetch(&uri, allow_ocr)?);
+        Command::Fetch { uri } => {
+            println!("{}", fetch(&uri)?);
             Ok(())
         }
-        Command::Austlii { action } => austlii_command(action),
         Command::Build {
             pages_dir,
             db_path,
@@ -1517,20 +1464,7 @@ fn call_tool(params: JsonValue, state: &ServerState) -> Result<JsonValue> {
         "stats" => stats()?,
         "fetch" => {
             let uri = required_str(&args, "uri")?;
-            let allow_ocr = optional_bool(&args, "allow_ocr").unwrap_or(false);
-            fetch(uri, allow_ocr)?
-        }
-        "search_austlii" => {
-            let query = required_str(&args, "query")?;
-            let jurisdictions = optional_string_array(&args, "jurisdictions")?;
-            let limit = optional_usize(&args, "limit");
-            let sort_by_date = optional_bool(&args, "sort_by_date").unwrap_or(false);
-            let opts = austlii::SearchAustliiOptions {
-                jurisdictions,
-                limit,
-                sort_by_date,
-            };
-            austlii::search_austlii(query, opts)?
+            fetch(uri)?
         }
         _ => bail!("unknown tool: {name}"),
     };
@@ -1579,222 +1513,7 @@ pub(crate) fn optional_string_array(args: &JsonValue, name: &str) -> Result<Opti
     Ok(Some(out))
 }
 
-fn austlii_command(action: AustliiAction) -> Result<()> {
-    match action {
-        AustliiAction::Setup {
-            cookie,
-            cookie_header,
-            user_agent,
-            browser,
-            yes,
-        } => austlii_setup(
-            cookie.as_deref(),
-            cookie_header.as_deref(),
-            user_agent.as_deref(),
-            browser,
-            yes,
-        ),
-        AustliiAction::Search {
-            query,
-            jurisdictions,
-            k,
-            sort_by_date,
-        } => {
-            let opts = austlii::SearchAustliiOptions {
-                jurisdictions: if jurisdictions.is_empty() {
-                    None
-                } else {
-                    Some(jurisdictions)
-                },
-                limit: Some(k),
-                sort_by_date,
-            };
-            println!("{}", austlii::search_austlii(&query, opts)?);
-            Ok(())
-        }
-        AustliiAction::Clear => austlii_clear(),
-    }
-}
-
-fn austlii_setup(
-    manual_cookie: Option<&str>,
-    manual_cookie_header: Option<&str>,
-    manual_user_agent: Option<&str>,
-    use_browser: bool,
-    skip_prompt: bool,
-) -> Result<()> {
-    let detected_browser = if manual_user_agent.is_none() {
-        Some(
-            browser::detect()
-                .context(
-                    "detecting default browser for AustLII setup; set ATO_MCP_BROWSER to override",
-                )?
-                .clone(),
-        )
-    } else {
-        None
-    };
-    let user_agent = manual_user_agent
-        .map(str::to_string)
-        .or_else(|| detected_browser.as_ref().map(|b| b.user_agent.clone()))
-        .ok_or_else(|| anyhow!("no AustLII setup User-Agent available"))?;
-    let browser_name = detected_browser
-        .as_ref()
-        .map(|b| b.name.clone())
-        .unwrap_or_else(|| "manual User-Agent".to_string());
-
-    if let Some(header) = manual_cookie_header {
-        let session = cookies::parse_manual_cookie_header(header, &user_agent, &browser_name)?;
-        return validate_and_save_austlii_session(session, "manual Cookie header");
-    }
-    if let Some(cookie) = manual_cookie {
-        let session = if cookie.contains('=') || cookie.contains(';') {
-            cookies::parse_manual_cookie_header(cookie, &user_agent, &browser_name)?
-        } else {
-            cookies::parse_manual_cookie(cookie, &user_agent, &browser_name)?
-        };
-        return validate_and_save_austlii_session(session, "manual cf_clearance cookie");
-    }
-
-    if !use_browser {
-        if let Some(session) = cookies::load_session()? {
-            match validate_and_save_austlii_session(session, "existing AustLII session") {
-                Ok(()) => return Ok(()),
-                Err(err) => {
-                    println!("Existing AustLII session did not validate: {err:#}");
-                }
-            }
-        }
-        match load_validate_and_save_browser_austlii_session(&user_agent, &browser_name) {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                println!("No valid AustLII browser session found yet: {err:#}");
-            }
-        }
-    }
-
-    run_austlii_browser_verification(skip_prompt)?;
-    loop {
-        match load_validate_and_save_browser_austlii_session(&user_agent, &browser_name) {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                println!("AustLII browser cookies did not validate yet: {err:#}");
-                prompt_enter(
-                    "Reload or complete verification in the browser, then press Enter to retry.",
-                )?;
-            }
-        }
-    }
-}
-
-fn validate_and_save_austlii_session(
-    mut session: cookies::AustliiSession,
-    source: &str,
-) -> Result<()> {
-    let hit_count = austlii::validate_sino_session(&mut session)?;
-    cookies::save_session(&session)?;
-    println!(
-        "AustLII native SINO search configured from {source}. Validation query `{}` returned {hit_count} hit(s).",
-        austlii::SINO_VALIDATION_QUERY
-    );
-    println!(
-        "Saved session metadata at {}",
-        cookies::session_file_path()?.display()
-    );
-    Ok(())
-}
-
-fn load_validate_and_save_browser_austlii_session(
-    user_agent: &str,
-    browser_name: &str,
-) -> Result<()> {
-    let session = cookies::load_browser_session(user_agent, browser_name)?;
-    match validate_and_save_austlii_session(session.clone(), "local browser cookies") {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let shapes = cookies::session_cookie_shapes(&session);
-            if !shapes.is_empty() {
-                println!("AustLII browser cookie metadata seen during setup:");
-                for shape in shapes {
-                    println!("  {shape}");
-                }
-            }
-            Err(err)
-        }
-    }
-}
-
-fn run_austlii_browser_verification(skip_prompt: bool) -> Result<()> {
-    if !io::stdin().is_terminal() {
-        bail!(
-            "AustLII Cloudflare verification requires an interactive terminal. Run `ato-mcp austlii setup` from a terminal, or pass --cookie/--cookie-header with a verified AustLII cf_clearance cookie."
-        );
-    }
-    let url = austlii::sino_setup_url()?;
-    if !skip_prompt {
-        println!("AustLII native SINO search requires a Cloudflare browser verification step.");
-        prompt_enter("Press Enter to open AustLII in your browser.")?;
-    }
-    open_url_in_browser(&url)?;
-    println!("Opened {url}");
-    prompt_enter(
-        "After the AustLII search results page finishes loading in the browser, press Enter here.",
-    )?;
-    Ok(())
-}
-
-fn prompt_enter(prompt: &str) -> Result<()> {
-    print!("{prompt} ");
-    io::stdout().flush().context("flushing prompt")?;
-    let mut line = String::new();
-    let bytes = io::stdin()
-        .read_line(&mut line)
-        .context("reading prompt response")?;
-    if bytes == 0 {
-        bail!("input closed while waiting for AustLII browser verification");
-    }
-    Ok(())
-}
-
-fn open_url_in_browser(url: &str) -> Result<()> {
-    let status = if cfg!(target_os = "windows") {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .status()
-            .context("opening AustLII verification URL with Windows shell")?
-    } else if cfg!(target_os = "macos") {
-        std::process::Command::new("open")
-            .arg(url)
-            .status()
-            .context("opening AustLII verification URL with `open`")?
-    } else {
-        std::process::Command::new("xdg-open")
-            .arg(url)
-            .status()
-            .context("opening AustLII verification URL with `xdg-open`")?
-    };
-    if !status.success() {
-        bail!("browser opener exited with status {status}; open {url} manually and rerun setup");
-    }
-    Ok(())
-}
-
-fn austlii_clear() -> Result<()> {
-    let path = cookies::session_file_path()?;
-    let existed = path.exists();
-    cookies::clear_session()?;
-    if existed {
-        println!("Cleared session at {}", path.display());
-    } else {
-        println!(
-            "No session to clear (file {} did not exist).",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first; hits are chunk pointers; call `get_chunks` for text. Use `get_doc_anchors` for nav, related, history, and cited-by. Markers: `[doc:X]` is in-corpus; `[fetch:URI]` is external (use `fetch`, e.g. `fetch("austlii:au/cases/cth/HCA/1992/23")`). `search_austlii` uses native AustLII SINO full-text search when `ato-mcp austlii setup` has validated Cloudflare; otherwise it falls back to title indexes. Fetch and verify returned sources. `allow_ocr=true` runs Tesseract for scanned PDFs; set MCP `timeout:120000`. For historical/withdrawn set `current_only=false` and `include_old=true`."##;
+const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first; hits are chunk pointers; call `get_chunks` for text. Use `get_doc_anchors` for nav, related, history, and cited-by. Markers: `[doc:X]` is in-corpus; `[fetch:ato:X]` is an ATO live fetch target. For historical/withdrawn set `current_only=false` and `include_old=true`."##;
 
 /// Build the `update_notice` carried in `ServerState` for the lifetime of the
 /// server. Runs `check_for_update_availability` once at startup; the result
@@ -1840,9 +1559,9 @@ fn server_instructions(update_notice: Option<&UpdateAvailability>) -> String {
 }
 
 fn tool_descriptors() -> JsonValue {
-    // [SW-01] Eight MCP tools are exposed by tool_descriptors/call_tool:
+    // [SW-01] Seven MCP tools are exposed by tool_descriptors/call_tool:
     // search, get_chunks, get_asset, get_doc_anchors, get_definition, stats,
-    // fetch, search_austlii.
+    // fetch.
     //   The surface stays small and explicit; unsupported tools fail through the
     //   normal tools/call error path.
     json!([
@@ -1923,7 +1642,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "stats",
-            "description": "Return index version, counts, search policy, AustLII availability, and prefix breakdown.",
+            "description": "Return index version, counts, search policy, and prefix breakdown.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1933,31 +1652,13 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "fetch",
-            "description": "Live-fetch a doc outside the corpus. `uri`: `ato:<doc_id>[?pit=...&view=...]` or `austlii:<path>`. Use when chunk text has `[fetch:URI]`. `allow_ocr=true` enables Tesseract for scanned PDFs (slow; set MCP `timeout: 120000`).",
+            "description": "Live-fetch an ATO doc outside the corpus. `uri`: `ato:<doc_id>[?pit=...&view=...]`. Use when chunk text has `[fetch:ato:...]`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "uri": {"type": "string"},
-                    "allow_ocr": {"type": "boolean"}
+                    "uri": {"type": "string"}
                 },
                 "required": ["uri"]
-            }
-        },
-        {
-            "name": "search_austlii",
-            "description": "Search AustLII native SINO when Cloudflare setup is configured; otherwise fall back to title indexes. Returns exact `austlii:<path>` fetch URIs. Fetch and verify sources.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "jurisdictions": {
-                        "type": "array",
-                        "items": {"type": "string"}
-                    },
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 50},
-                    "sort_by_date": {"type": "boolean"}
-                },
-                "required": ["query"]
             }
         }
     ])
