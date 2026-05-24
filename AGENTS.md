@@ -41,14 +41,15 @@ git clone https://github.com/gunba/ato-mcp.git
 claude plugin install ./ato-mcp
 ```
 
-The plugin's `.mcp.json` ships with `http://127.0.0.1:0/mcp` as a sentinel.
-On first start, `ato-mcp serve` picks a free port, binds it, and rewrites
-the URL in the plugin's installed `.mcp.json` to match. The user exits and
-resumes the agent session so the new URL takes effect.
+The plugin's `.mcp.json` registers `ato-mcp mcp` as a stdio MCP command.
+That command starts or reuses one local loopback HTTP backend and proxies MCP
+messages to it. This avoids first-run generated-port reloads while keeping the
+SQLite corpus and semantic model in one backend process per user data dir.
 
 ```bash
-ato-mcp serve              # picks a free port on first run; reuses it after
-ato-mcp serve --port 51235 # explicit override
+ato-mcp mcp               # MCP host entry point
+ato-mcp serve             # advanced/manual HTTP backend
+ato-mcp serve --port 51235
 ```
 
 The plugin includes two skills:
@@ -57,22 +58,22 @@ The plugin includes two skills:
   ordinary ATO/tax research. It tells the agent to use the ATO tools and gives
   the minimal recovery path when the server is down.
 - `skills/setup-ato-mcp/SKILL.md` is the larger install/repair guide. Load it
-  only for first-run setup, 30-second MCP timeouts, missing corpus, corpus
+  only for first-run setup, MCP startup repair, missing corpus, corpus
   updates, or repeated startup failures.
 
-Installer agents should start `ato-mcp serve` for the user, wait for the
-`ato-mcp listening on ...` readiness line, and handle the first-run `.mcp.json`
-port rewrite. The user should only be asked to exit + resume the agent session
-when a port rewrite means the MCP host must reload config.
+Installer agents should not ask the user to choose ports or edit config. The
+MCP host starts `ato-mcp mcp`; if no backend is running, that command starts
+one and records the endpoint in `<data_dir>/http.json`.
 
 The binary install location is independent from the corpus data directory.
 Installer agents must choose one corpus data directory and use it consistently
-for `ato-mcp update`, `ato-mcp serve`, `stats`, and verification searches.
+for `ato-mcp update`, `ato-mcp mcp`, the backend server, `stats`, and
+verification searches.
 Default mode leaves `ATO_MCP_DATA_DIR` unset and uses the default user data dir
 (`%APPDATA%\ato-mcp` on Windows, `~/.local/share/ato-mcp` on Linux, and
 `~/Library/Application Support/ato-mcp` on macOS). Portable/co-located mode
 sets `ATO_MCP_DATA_DIR` to a stable directory next to the binary for every
-future `ato-mcp` command and server start. Do not install the corpus under a
+future `ato-mcp` command and backend start. Do not install the corpus under a
 temporary extraction directory.
 
 On the first MCP `initialize`, the server tells the agent whether the corpus
@@ -97,8 +98,8 @@ ato-mcp update
 
 Full corpus replacement: find the newest release with a corpus
 `manifest.json`, download `ato.db.zst`, verify sha256, atomic-rename into
-`live/`. Restart the MCP client (or the `ato-mcp serve` process) for the new
-corpus to take effect.
+`live/`. Restart the MCP client and local backend process for the new corpus
+to take effect.
 
 When a newer corpus is published, the server's `initialize` instructions
 include the available index version. The agent surfaces the suggestion and
@@ -139,6 +140,7 @@ checkout plus model assets. Don't run them on a user install.
 | Symptom | Fix |
 |---|---|
 | `ato-mcp: command not found` | Put the release binary on `PATH`. |
-| `ato-mcp serve: bind ... already in use` | Stop whatever holds the port, or run `ato-mcp serve --port <other>`; the new URL is written back into `.mcp.json` and the user exits + resumes the session. |
+| MCP startup reports a stdio command failure | Confirm the MCP entry runs `ato-mcp mcp` and that the release binary is on `PATH` or configured by absolute path. |
+| `ato-mcp serve: bind ... already in use` | Stop whatever holds the port, or run `ato-mcp serve --port <other>` for manual HTTP testing. |
 | `stats` reports zero documents | `update` didn't complete; rerun after deleting the incomplete `live/` dir. |
 | `search` returns no hits | Confirm `stats` shows `chunks > 0`; use `include_old=true` for older authorities. |

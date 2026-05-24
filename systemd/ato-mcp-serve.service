@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/ato-mcp daemon
+ExecStart=%h/.local/bin/ato-mcp serve
 Restart=on-failure
 RestartSec=5
 

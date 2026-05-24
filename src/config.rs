@@ -46,6 +46,18 @@ pub(crate) fn lock_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("LOCK"))
 }
 
+pub(crate) fn server_lock_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("SERVER_LOCK"))
+}
+
+pub(crate) fn http_state_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("http.json"))
+}
+
+pub(crate) fn server_log_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("server.log"))
+}
+
 pub(crate) fn model_path() -> Result<PathBuf> {
     Ok(live_dir()?.join("model_fp16.onnx"))
 }
@@ -72,6 +84,18 @@ pub(crate) fn lock_file() -> Result<File> {
         .open(path)?;
     // [UM-02] Single-writer guard around update/install: cross-platform
     // advisory lock via fs2::FileExt on the app LOCK file.
+    file.lock_exclusive()?;
+    Ok(file)
+}
+
+pub(crate) fn server_lock_file() -> Result<File> {
+    let path = server_lock_path()?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
     file.lock_exclusive()?;
     Ok(file)
 }
@@ -253,7 +277,12 @@ pub(crate) fn update_plugin_mcp_json_url(path: &std::path::Path, new_url: &str) 
     let entry = value
         .get_mut("ato")
         .ok_or_else(|| anyhow!("{} has no `ato` entry", path.display()))?;
-    let current_url = entry.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    if entry.get("command").is_some() {
+        return Ok(false);
+    }
+    let Some(current_url) = entry.get("url").and_then(|v| v.as_str()) else {
+        return Ok(false);
+    };
     if current_url == new_url {
         return Ok(false);
     }
@@ -298,11 +327,17 @@ pub(crate) fn resolve_serve_port(cli_override: Option<u16>) -> Result<PortChoice
         fs::read_to_string(&mcp_json).with_context(|| format!("reading {}", mcp_json.display()))?;
     let value: JsonValue =
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", mcp_json.display()))?;
-    let url = value
-        .get("ato")
+    let entry = value.get("ato");
+    if entry.and_then(|v| v.get("command")).is_some() {
+        return Ok(PortChoice::Cli(pick_free_port()?));
+    }
+    let url = entry
         .and_then(|v| v.get("url"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    if url.is_empty() {
+        return Ok(PortChoice::Cli(pick_free_port()?));
+    }
     let stored_port = parse_url_port(url);
     if let Some(port) = stored_port.filter(|p| *p != 0) {
         // Try to claim the stored port. If something else has it, fall
@@ -334,6 +369,35 @@ mod tests {
         assert_eq!(parse_url_port("http://localhost:0/mcp"), Some(0));
         assert_eq!(parse_url_port("http://127.0.0.1/mcp"), None);
         assert_eq!(parse_url_port("not a url"), None);
+    }
+
+    #[test]
+    fn update_plugin_mcp_json_url_ignores_command_entry() {
+        let root = std::env::temp_dir().join(format!(
+            "ato-mcp-config-test-{}-command-entry",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(".mcp.json");
+        fs::write(
+            &path,
+            r#"{
+  "ato": {
+    "command": "ato-mcp",
+    "args": ["mcp"],
+    "url": "http://127.0.0.1:9/mcp"
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        assert!(!update_plugin_mcp_json_url(&path, "http://127.0.0.1:12345/mcp").unwrap());
+        let value: JsonValue = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["ato"]["url"].as_str(), Some("http://127.0.0.1:9/mcp"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

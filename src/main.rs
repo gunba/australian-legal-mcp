@@ -9,9 +9,10 @@ use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtensio
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use url::Url;
@@ -110,17 +111,23 @@ struct Cli {
 // here, with no dynamic plugin subcommands or shell-completion surface.
 #[derive(Subcommand)]
 enum Command {
-    /// Run the HTTP MCP server in the foreground. On first run the server
-    /// picks a free port and writes the URL into the plugin's installed
-    /// `.mcp.json`; subsequent runs reuse the same port. After the URL is
-    /// updated the user must restart their MCP client (exit + resume the
-    /// Claude Code session) so it re-reads `.mcp.json`. Override the port
-    /// with `--port` for testing or to force a specific binding.
+    /// Run the MCP stdio entry point. This is the preferred MCP-host command:
+    /// it connects to one shared local HTTP server, starting that server in
+    /// the background when needed, so the heavy semantic runtime is not loaded
+    /// once per agent host.
+    #[command(alias = "stdio")]
+    Mcp {},
+    /// Run the HTTP MCP backend in the foreground. `ato-mcp mcp` starts this
+    /// automatically for MCP hosts; use `serve` directly only for manual HTTP
+    /// testing or legacy HTTP MCP config. Override the port with `--port` for
+    /// testing or to force a specific binding.
     Serve {
         #[arg(long)]
         port: Option<u16>,
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
+        #[arg(long, hide = true)]
+        ready_stdout: bool,
     },
     /// Download or refresh the local corpus. Always performs a full
     /// replacement; there is no partial-update path.
@@ -376,13 +383,18 @@ impl SearchMode {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { port, bind } => {
+        Command::Mcp {} => serve_stdio_mcp(),
+        Command::Serve {
+            port,
+            bind,
+            ready_stdout,
+        } => {
             let choice = config::resolve_serve_port(port)?;
             let state = ServerState {
                 update_notice: resolve_startup_update_notice(),
                 ..Default::default()
             };
-            serve(choice, &bind, Arc::new(state))
+            serve(choice, &bind, ready_stdout, Arc::new(state))
         }
         Command::Update {} => {
             let manifest_url = resolve_latest_corpus_manifest_url()?;
@@ -1251,7 +1263,12 @@ fn stage_hf_embedding_model(repo: &str, revision: &str, staging: &Path) -> Resul
     Ok(())
 }
 
-fn serve(choice: config::PortChoice, bind: &str, state: Arc<ServerState>) -> Result<()> {
+fn serve(
+    choice: config::PortChoice,
+    bind: &str,
+    ready_stdout: bool,
+    state: Arc<ServerState>,
+) -> Result<()> {
     let port = match &choice {
         config::PortChoice::Cli(p) => *p,
         config::PortChoice::PluginUnchanged(p) => *p,
@@ -1264,7 +1281,8 @@ fn serve(choice: config::PortChoice, bind: &str, state: Arc<ServerState>) -> Res
         )
     })?;
     let url = config::server_url(port);
-    eprintln!("ato-mcp listening on {url}");
+    write_http_state(port, &url)?;
+    emit_ready_line(&url, ready_stdout)?;
     if let config::PortChoice::PluginNeedsRewrite { mcp_json, .. } = &choice {
         match config::update_plugin_mcp_json_url(mcp_json, &url) {
             Ok(true) => {
@@ -1292,6 +1310,209 @@ fn serve(choice: config::PortChoice, bind: &str, state: Arc<ServerState>) -> Res
         });
     }
     Ok(())
+}
+
+fn emit_ready_line(url: &str, ready_stdout: bool) -> Result<()> {
+    if ready_stdout {
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "ato-mcp listening on {url}")?;
+        stdout.flush()?;
+    } else {
+        eprintln!("ato-mcp listening on {url}");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct HttpState {
+    port: u16,
+    url: String,
+}
+
+fn write_http_state(port: u16, url: &str) -> Result<()> {
+    let path = config::http_state_path()?;
+    let state = HttpState {
+        port,
+        url: url.to_string(),
+    };
+    let serialised = serde_json::to_string_pretty(&state)?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, format!("{serialised}\n"))
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, &path)
+        .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+fn read_http_state() -> Result<Option<HttpState>> {
+    let path = config::http_state_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let value: JsonValue = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let Some(port) = value.get("port").and_then(|v| v.as_u64()) else {
+        return Ok(None);
+    };
+    let Ok(port) = u16::try_from(port) else {
+        return Ok(None);
+    };
+    let url = value
+        .get("url")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| config::server_url(port));
+    Ok(Some(HttpState { port, url }))
+}
+
+fn serve_stdio_mcp() -> Result<()> {
+    let mut url = ensure_http_server()?;
+    let client = mcp_http_client(Duration::from_secs(300))?;
+    let stdin = io::stdin();
+    let mut stdout = io::stdout().lock();
+
+    for line in stdin.lock().lines() {
+        let line = line.context("reading MCP stdio message")?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let response = match post_mcp_line(&client, &url, &line) {
+            Ok(response) => response,
+            Err(first_err) => {
+                url = ensure_http_server().with_context(|| {
+                    format!("restarting local ATO HTTP server after request failed: {first_err}")
+                })?;
+                post_mcp_line(&client, &url, &line)
+                    .with_context(|| format!("forwarding MCP request to {url}"))?
+            }
+        };
+        if let Some(value) = response {
+            serde_json::to_writer(&mut stdout, &value)?;
+            stdout.write_all(b"\n")?;
+            stdout.flush()?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_http_server() -> Result<String> {
+    let health_client = mcp_http_client(Duration::from_secs(5))?;
+    if let Some(state) = read_http_state()? {
+        if http_backend_ready(&health_client, &state.url) {
+            return Ok(state.url);
+        }
+    }
+
+    let _guard = config::server_lock_file()?;
+    if let Some(state) = read_http_state()? {
+        if http_backend_ready(&health_client, &state.url) {
+            return Ok(state.url);
+        }
+    }
+
+    let port = config::pick_free_port()?;
+    let url = config::server_url(port);
+    spawn_http_server(port, &url)?;
+    write_http_state(port, &url)?;
+    if !http_backend_ready(&health_client, &url) {
+        bail!("local ATO HTTP server printed readiness but did not answer initialize at {url}");
+    }
+    Ok(url)
+}
+
+fn mcp_http_client(timeout: Duration) -> Result<Client> {
+    Ok(Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(timeout)
+        .build()?)
+}
+
+fn http_backend_ready(client: &Client, url: &str) -> bool {
+    let message = r#"{"jsonrpc":"2.0","id":"ato-mcp-health","method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ato-mcp-shim","version":"0"}}}"#;
+    match post_mcp_line(client, url, message) {
+        Ok(Some(value)) => {
+            value
+                .pointer("/result/serverInfo/version")
+                .and_then(|version| version.as_str())
+                == Some(env!("CARGO_PKG_VERSION"))
+        }
+        _ => false,
+    }
+}
+
+fn spawn_http_server(port: u16, expected_url: &str) -> Result<()> {
+    let exe = std::env::current_exe().context("resolving ato-mcp executable path")?;
+    let log_path = config::server_log_path()?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("opening {}", log_path.display()))?;
+    let stderr = log.try_clone()?;
+    let mut child = ProcessCommand::new(exe)
+        .arg("serve")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--ready-stdout")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .context("starting local ATO HTTP server")?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("local ATO HTTP server stdout was not piped"))?;
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    let read = reader
+        .read_line(&mut line)
+        .context("waiting for local ATO HTTP server readiness")?;
+    if read == 0 {
+        let status = child.try_wait().ok().flatten();
+        bail!(
+            "local ATO HTTP server exited before readiness{}; see {}",
+            status
+                .map(|s| format!(" ({s})"))
+                .unwrap_or_else(String::new),
+            log_path.display()
+        );
+    }
+    let expected_line = format!("ato-mcp listening on {expected_url}");
+    if line.trim() != expected_line {
+        bail!(
+            "unexpected local ATO HTTP server readiness line `{}`; expected `{expected_line}`; see {}",
+            line.trim(),
+            log_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn post_mcp_line(client: &Client, url: &str, line: &str) -> Result<Option<JsonValue>> {
+    let response = client
+        .post(url)
+        .header("content-type", "application/json")
+        .body(line.to_string())
+        .send()
+        .with_context(|| format!("POST {url}"))?;
+    let status = response.status();
+    if status.as_u16() == 204 {
+        return Ok(None);
+    }
+    let body = response
+        .text()
+        .with_context(|| format!("reading response from {url}"))?;
+    if !status.is_success() {
+        bail!("POST {url} returned HTTP {status}: {body}");
+    }
+    let value: JsonValue =
+        serde_json::from_str(&body).with_context(|| format!("parsing response from {url}"))?;
+    Ok(Some(value))
 }
 
 fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<()> {
@@ -1547,13 +1768,13 @@ fn server_instructions(update_notice: Option<&UpdateAvailability>) -> String {
             ATO_MCP_USE_INSTRUCTIONS,
         ),
         None => format!(
-            "The ATO corpus is not yet installed on this machine. Offer to run `ato-mcp update` for the user as a visible setup step (~1.5 GB, takes 5-10 min), then restart `ato-mcp serve` after the download completes.\n\n{}",
+            "The ATO corpus is not yet installed on this machine. Offer to run `ato-mcp update` for the user as a visible setup step (~1.5 GB, takes 5-10 min), then restart the MCP host/backend after the download completes.\n\n{}",
             ATO_MCP_USE_INSTRUCTIONS
         ),
     };
     match update_notice {
         Some(notice) => format!(
-            "{body}\n\nA newer ATO corpus index is available ({}). Ask whether to run `ato-mcp update` now or continue with the installed corpus; restart `ato-mcp serve` after updating.",
+            "{body}\n\nA newer ATO corpus index is available ({}). Ask whether to run `ato-mcp update` now or continue with the installed corpus; restart the MCP host/backend after updating.",
             notice.available_index_version
         ),
         None => body,
@@ -2058,6 +2279,26 @@ mod tests {
             std::env::remove_var("ATO_MCP_DATA_DIR");
         }
         result
+    }
+
+    #[test]
+    fn read_http_state_accepts_legacy_port_only_file() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join("http.json"),
+            r#"{
+  "bind": "127.0.0.1",
+  "port": 37409
+}
+"#,
+        )?;
+        with_data_dir(dir.path(), || {
+            let state = read_http_state()?.expect("state");
+            assert_eq!(state.port, 37409);
+            assert_eq!(state.url, "http://127.0.0.1:37409/mcp");
+            Ok(())
+        })
     }
 
     // ----- W1.5 manifest version guards -----

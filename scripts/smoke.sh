@@ -8,6 +8,7 @@
 #      sort, seed_text fast path, direct doc_id title hit, include_old)
 #   4. CLI retrieval (get-definition, fetch)
 #   5. MCP HTTP transport (serve, initialize, tools/list, all tools)
+#   6. MCP stdio shim (`ato-mcp mcp`) against the same backend
 #
 # Read-only against the live corpus; the HTTP transport tests use a tempdir
 # so they do not collide with the user's running server.
@@ -112,7 +113,7 @@ fi
 help_text="$("$BIN" --help 2>&1)"
 
 # Subcommands that MUST be present.
-for cmd in serve update stats search fetch \
+for cmd in mcp serve update stats search fetch \
            get-definition build tree-crawl snapshot-reduce link-download scrape-diff \
            bundle-localize-manifest publish-release help; do
     if grep -qE "^[[:space:]]+${cmd}[[:space:]]" <<<"$help_text"; then
@@ -397,6 +398,24 @@ if printf '%s' "$err_resp" | jq -e '.error.code' >/dev/null 2>&1; then
     ok "unknown tool: returns JSON-RPC error"
 else
     bad "unknown tool" "expected error envelope, got: ${err_resp:0:160}"
+fi
+
+# ---------------- Section 6: MCP stdio shim ----------------
+
+section "Section 6: MCP stdio shim"
+
+stdio_out="$(printf '%s\n%s\n' \
+    '{"jsonrpc":"2.0","id":11,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"smoke","version":"0"},"capabilities":{}}}' \
+    '{"jsonrpc":"2.0","id":12,"method":"tools/list"}' \
+    | "$BIN" mcp)"
+stdio_init="$(sed -n '1p' <<<"$stdio_out")"
+stdio_tools="$(sed -n '2p' <<<"$stdio_out")"
+assert_jq "stdio initialize: server name is ato-mcp" "$stdio_init" '.result.serverInfo.name' 'ato-mcp'
+stdio_actual_tools="$(printf '%s' "$stdio_tools" | jq -r '.result.tools[].name' 2>/dev/null | sort | tr '\n' ' ')"
+if [[ "$stdio_actual_tools" == "$expected_sorted" ]]; then
+    ok "stdio tools/list: exactly the expected tools"
+else
+    bad "stdio tools/list mismatch" "expected: $expected_sorted | got: $stdio_actual_tools"
 fi
 
 # ---------------- summary ----------------

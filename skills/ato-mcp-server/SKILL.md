@@ -22,31 +22,17 @@ If the `ato` tools are missing or a call returns a connection error:
 
 1. Tell the user:
 
-   > This is best answered against the local ATO corpus. I am going to start
-   > the local ATO research service and then continue.
+   > This is best answered against the local ATO corpus. I am going to check
+   > the local ATO tool setup and then continue.
 
-2. Start the server in the background:
+2. Load the `setup-ato-mcp` skill and repair the MCP entry. The MCP host
+   should run:
 
    ```bash
-   ato-mcp serve
+   ato-mcp mcp
    ```
 
-3. Wait for the readiness line:
-
-   ```text
-   ato-mcp listening on http://127.0.0.1:<port>/mcp
-   ```
-
-4. If the output says it wrote a new URL to `.mcp.json`, tell the user:
-
-   > The local ATO service is running. This agent session needs one restart to
-   > load its generated local port. Please exit and resume this session; after
-   > it reopens, I will verify the ATO tools. You do not need to run any
-   > commands.
-
-   Stop there. Do not call the `ato` tools again in this pre-restart session.
-
-5. If no URL rewrite occurred, retry the original tool call.
+3. After the MCP host reconnects, retry the original tool call.
 
 Use the `setup-ato-mcp` skill only for install, first-run handoff, timeout
 diagnosis, missing corpus, corpus update, or repeated startup failures.

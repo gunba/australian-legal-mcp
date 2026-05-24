@@ -1,8 +1,9 @@
 # ato-mcp
 
 Local search and retrieval over the Australian Taxation Office legal corpus.
-Ships as a local HTTP MCP server with plugin metadata, a Rust binary, and a
-one-shot corpus download.
+Ships as a local MCP command with plugin metadata, a Rust binary, and a
+one-shot corpus download. The MCP command starts or reuses one local HTTP
+backend so the SQLite corpus and semantic model are shared per user.
 
 > Retrieval infrastructure, not tax advice. Verify cited ATO material and
 > apply professional judgment before relying on an answer.
@@ -39,29 +40,25 @@ Agent flow from a fresh checkout:
 ```bash
 git clone https://github.com/gunba/ato-mcp.git
 claude plugin install ./ato-mcp
-# start in the background from the agent's shell/tool
-ato-mcp serve
 ```
 
-The first `serve` picks a free local port, prints
-`ato-mcp listening on http://127.0.0.1:<port>/mcp`, and rewrites `.mcp.json`
-from `http://127.0.0.1:0/mcp` to the real URL. The agent tells the user to
-exit and resume the agent session once so the MCP host reloads the generated
-URL. The user should not have to choose a port, edit config, or run terminal
-commands.
+The plugin registers `ato-mcp mcp` as a stdio MCP command. On MCP startup it
+starts or reuses a local loopback HTTP backend, records the chosen endpoint in
+the user data dir, and proxies MCP messages to that backend. There is no
+first-run port edit and no required session restart for a generated URL.
 
 The binary location and corpus location are separate. Enterprise installs may
 place `ato-mcp.exe` under the user's local app-data area. The installer must
 choose one corpus data directory and use it consistently for `ato-mcp update`,
-`ato-mcp serve`, and verification commands.
+`ato-mcp mcp`, the backend server, and verification commands.
 
 Default mode: leave `ATO_MCP_DATA_DIR` unset, and the corpus installs into the
 default user data directory. Portable/co-located mode: set `ATO_MCP_DATA_DIR`
 to a stable data directory next to the binary for every `ato-mcp` command and
 server start. Do not run `update` with a non-default data dir and later start
-`serve` without the same setting.
+`mcp` or `serve` without the same setting.
 
-After the session resumes, the agent verifies:
+After install or update, the agent verifies:
 
 ```bash
 ato-mcp stats
@@ -69,7 +66,7 @@ ato-mcp search "research and development tax incentive eligibility" --k 1
 ```
 
 If the corpus is missing, the agent explains the large one-time download,
-runs the update, restarts `ato-mcp serve`, and verifies again:
+runs the update, restarts the MCP host or `ato-mcp mcp`, and verifies again:
 
 ```bash
 ato-mcp update
@@ -81,8 +78,9 @@ The plugin includes two agent skills:
 - `setup-ato-mcp`: detailed install, timeout, port, and corpus-update recovery
   skill loaded only when setup or repair is needed.
 
-For manual MCP clients, register the HTTP endpoint directly. Do not configure
-`ato-mcp serve` as a stdio MCP command; it is an HTTP server.
+For manual MCP clients, register `ato-mcp mcp` as the stdio MCP command. Do
+not configure `ato-mcp serve` as a stdio MCP command; it is the backend HTTP
+server.
 
 ## Updates
 
@@ -93,8 +91,8 @@ ato-mcp update
 Full corpus replacement: the binary finds the newest release that includes a
 corpus `manifest.json`, downloads `ato.db.zst`, verifies its sha256, and
 atomic-renames it into the live data dir. The MCP server reads its corpus
-once at startup, so restart the MCP client (or the `ato-mcp serve` process)
-for a new corpus to take effect.
+once at startup, so restart the MCP client and the local backend process for a
+new corpus to take effect.
 
 When a newer corpus is published, the server's `initialize` instructions tell
 the agent — the agent surfaces the suggestion to the user and runs the update
@@ -127,8 +125,9 @@ Override with `ATO_MCP_DATA_DIR` for a deliberate portable or offline install
 where every later `ato-mcp` command and server start will receive the same
 environment variable. Do not point it at a temporary extraction directory; use
 a stable install directory. If the corpus is installed with a non-default data
-dir and `serve` is later started without that setting, the server will look in
-the default user data directory and report a missing corpus. Layout:
+dir and `mcp` or `serve` is later started without that setting, the server
+will look in the default user data directory and report a missing corpus.
+Layout:
 
 ```text
 ato-mcp/
@@ -138,6 +137,8 @@ ato-mcp/
 │   ├── model_fp16.onnx_data
 │   └── tokenizer.json
 ├── installed_manifest.json
+├── http.json              # current local backend endpoint
+├── server.log             # backend stderr when started by `ato-mcp mcp`
 └── staging/               # transient during update
 ```
 
