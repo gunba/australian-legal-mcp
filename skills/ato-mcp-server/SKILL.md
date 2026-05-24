@@ -1,68 +1,56 @@
 ---
-description: "Ensure the local ato-mcp HTTP server is reachable before using ato-mcp tools. Run this when you encounter an Australian tax-law question, an ATO ruling reference, or an unreachable-MCP-server error from the ato plugin."
+description: "Use the local ato-mcp tools for Australian tax-law research. Run for ATO/tax questions, ATO document references, rulings, definitions, or when local ATO source retrieval would improve the answer."
 ---
 
-# Starting the ato-mcp server
+# ATO MCP Research
 
-The `ato` plugin connects to a local HTTP server started by the user
-(`ato-mcp serve`). If that server isn't running, the `ato` tools won't be
-available in this MCP session.
+Use the `ato` MCP tools before answering Australian tax-law questions where
+ATO guidance, rulings, determinations, legislation, definitions, or document
+citations would improve the answer.
 
-## When the `ato` tools aren't in your tool list
+Normal flow:
 
-That means the MCP host couldn't connect to the URL in the plugin's
-`.mcp.json`. The first run hasn't happened, so the URL still has the `:0`
-sentinel. The user needs to start the server, which auto-picks a free port
-and writes the real URL back into `.mcp.json`. After that they exit and
-resume the session and the tools show up.
+1. Use `search` first.
+2. Use `get_chunks` for source text from search hits.
+3. Use `get_doc_anchors` for in-document navigation, related/history links,
+   and cited-by material.
+4. Use `fetch` for `[fetch:ato:...]` markers or live ATO documents outside
+   the corpus.
+5. Cite the ATO source details returned by the tools.
 
-Walk the user through it in one turn:
+If the `ato` tools are missing or a call returns a connection error:
 
-1. Ask:
-   > The ATO plugin's local server isn't running. Should I start it for you
-   > in the background? It'll pick a free port and update the plugin
-   > config; you'll need to exit and resume this Claude Code session
-   > afterwards so the new URL takes effect.
+1. Tell the user:
 
-2. On approval, run via the **Bash tool with `run_in_background: true`**:
+   > This is best answered against the local ATO corpus. I am going to start
+   > the local ATO research service and then continue.
+
+2. Start the server in the background:
+
    ```bash
    ato-mcp serve
    ```
-   `serve` prints the chosen URL on stderr and rewrites the plugin's
-   `.mcp.json`. The background process keeps running.
 
-3. Tell the user:
-   > Server is up. Exit and resume this Claude Code session, then ask me
-   > your question again — the ATO tools will be loaded.
+3. Wait for the readiness line:
 
-Don't wait for them; that's the end of this turn.
+   ```text
+   ato-mcp listening on http://127.0.0.1:<port>/mcp
+   ```
 
-## When the `ato` tools ARE in the list but a call returns a connection error
+4. If the output says it wrote a new URL to `.mcp.json`, tell the user:
 
-The server was running and stopped (machine restart, terminal closed,
-process killed). Same flow as above — `ato-mcp serve` will reuse the port
-that's already in `.mcp.json`, so no restart is needed unless the port has
-been taken by something else. Run it in the background and retry the user's
-last query.
+   > The local ATO service is running. This agent session needs one restart to
+   > load its generated local port. Please exit and resume this session; after
+   > it reopens, I will verify the ATO tools. You do not need to run any
+   > commands.
 
-## When the corpus isn't installed yet
+   Stop there. Do not call the `ato` tools again in this pre-restart session.
 
-`stats` (or the MCP `initialize` instructions) reports "corpus is not yet
-installed" on a fresh machine. Offer to run the download for the user
-(~1.5 GB, 5-10 min):
+5. If no URL rewrite occurred, retry the original tool call.
 
-```bash
-ato-mcp update
-```
+Use the `setup-ato-mcp` skill only for install, first-run handoff, timeout
+diagnosis, missing corpus, corpus update, or repeated startup failures.
 
-After the download completes, restart `ato-mcp serve` so it picks up the
-new corpus, then retry the user's original question.
-
-## What not to do
-
-- Don't run `ato-mcp serve` in the foreground (it blocks the Bash tool).
-  Always use `run_in_background: true`.
-- Don't poll the server with `sleep` loops; if it's down, run `serve` once
-  and tell the user to resume the session.
-- Don't fall back to web-search for ATO content silently. The corpus is the
-  authority; if it's unreachable, tell the user.
+Do not silently substitute web search when the local ATO corpus should be
+used. If ATO MCP cannot be started, tell the user what failed and what you
+will try next.

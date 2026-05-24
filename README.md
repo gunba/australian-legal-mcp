@@ -1,8 +1,8 @@
 # ato-mcp
 
 Local search and retrieval over the Australian Taxation Office legal corpus.
-Ships as a Claude Code plugin that bundles an MCP server, a Rust binary, and
-a one-shot corpus download.
+Ships as a local HTTP MCP server with plugin metadata, a Rust binary, and a
+one-shot corpus download.
 
 > Retrieval infrastructure, not tax advice. Verify cited ATO material and
 > apply professional judgment before relying on an answer.
@@ -32,50 +32,46 @@ source structure directly. Search chunks are plain text derived from that
 HTML; heading paths live in metadata, links and images contribute only their
 visible text.
 
-## Install
+## Install For An Agent
 
-The plugin is installed through Claude Code:
+Agent flow from a fresh checkout:
 
 ```bash
 git clone https://github.com/gunba/ato-mcp.git
 claude plugin install ./ato-mcp
-```
-
-The plugin's `.mcp.json` ships with `http://127.0.0.1:0/mcp` as a sentinel
-— `:0` means "the server will pick a port on first run." Start the server
-from a terminal:
-
-```bash
+# start in the background from the agent's shell/tool
 ato-mcp serve
 ```
 
-On first run, `serve` picks a free port, binds it, and writes the actual
-URL back into the plugin's `.mcp.json` so Claude Code can find it. **Exit
-and resume the Claude Code session** so it re-reads the updated config.
-Subsequent runs reuse the same port from `.mcp.json`; pass `--port <N>`
-to force a different binding.
+The first `serve` picks a free local port, prints
+`ato-mcp listening on http://127.0.0.1:<port>/mcp`, and rewrites `.mcp.json`
+from `http://127.0.0.1:0/mcp` to the real URL. The agent tells the user to
+exit and resume the agent session once so the MCP host reloads the generated
+URL. The user should not have to choose a port, edit config, or run terminal
+commands.
 
-If you ever see "ATO MCP tools unavailable" the agent will offer to start
-the server for you via the plugin's skill. Same flow — start the server,
-exit and resume the session.
-
-For Codex, register the HTTP endpoint directly. Use a fixed port so the
-Codex config remains stable across restarts:
+After the session resumes, the agent verifies:
 
 ```bash
-ato-mcp serve --port 34893
-codex mcp add ato --url http://127.0.0.1:34893/mcp
+ato-mcp stats
+ato-mcp search "research and development tax incentive eligibility" --k 1
 ```
 
-Do not configure Codex with `command = "ato-mcp"` and `args = ["serve"]`.
-`serve` is an HTTP MCP server; launching it as a stdio MCP server causes
-Codex to wait for stdio initialization until it times out.
+If the corpus is missing, the agent explains the large one-time download,
+runs the update, restarts `ato-mcp serve`, and verifies again:
 
-On first start the server tells the agent the corpus isn't installed yet;
-the agent will offer to run `ato-mcp update`, which downloads `ato.db.zst`
-(~1.5 GB, 5–10 min) from the latest GitHub release and atomic-swaps it into
-place. After the download completes, restart `ato-mcp serve` so it picks
-up the new corpus.
+```bash
+ato-mcp update
+```
+
+The plugin includes two agent skills:
+
+- `ato-mcp-server`: small research skill loaded for ordinary ATO/tax queries.
+- `setup-ato-mcp`: detailed install, timeout, port, and corpus-update recovery
+  skill loaded only when setup or repair is needed.
+
+For manual MCP clients, register the HTTP endpoint directly. Do not configure
+`ato-mcp serve` as a stdio MCP command; it is an HTTP server.
 
 ## Updates
 
@@ -83,11 +79,11 @@ up the new corpus.
 ato-mcp update
 ```
 
-Full corpus replacement: the binary fetches the published `manifest.json`,
-downloads the new `ato.db.zst`, verifies its sha256, and atomic-renames it
-into the live data dir. The MCP server reads its corpus once at startup, so
-restart the MCP client (or the `ato-mcp serve` process) for a new corpus to
-take effect.
+Full corpus replacement: the binary finds the newest release that includes a
+corpus `manifest.json`, downloads `ato.db.zst`, verifies its sha256, and
+atomic-renames it into the live data dir. The MCP server reads its corpus
+once at startup, so restart the MCP client (or the `ato-mcp serve` process)
+for a new corpus to take effect.
 
 When a newer corpus is published, the server's `initialize` instructions tell
 the agent — the agent surfaces the suggestion to the user and runs the update
@@ -142,14 +138,13 @@ cargo build --release --features cuda
 ./target/release/ato-mcp link-download   --deduped-links snapshots/.../deduped_links.jsonl --out-dir /path/to/ato_pages
 ./target/release/ato-mcp build           --pages-dir /path/to/ato_pages --db-path ./release/ato.db --model-dir /path/to/granite-embedding-small-r2 --out-dir ./release --profile
 ./target/release/ato-mcp package-corpus  --db-path ./release/ato.db --out ./release/ato.db.zst --manifest ./release/manifest.json
-./target/release/ato-mcp publish-release --out-dir ./release --tag v0.15.1 --repo gunba/ato-mcp --overwrite
+./target/release/ato-mcp publish-release --out-dir ./release --tag vX.Y.Z --repo gunba/ato-mcp --overwrite
 ```
 
 `scripts/publish-release.sh <tag>` wraps the `package-corpus` +
-`publish-release` steps. Releases live on a single rolling tag: binary
-archives publish on tag push, and the maintainer GPU host attaches
-`manifest.json` and `ato.db.zst` to the same tag. End users hit
-`releases/latest/download/manifest.json`.
+`publish-release` steps. Binary archives publish on tag push. Corpus releases
+attach `manifest.json` and `ato.db.zst`; `ato-mcp update` finds the newest
+release that includes those corpus assets.
 
 ## Development
 

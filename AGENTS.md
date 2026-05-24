@@ -44,22 +44,30 @@ claude plugin install ./ato-mcp
 The plugin's `.mcp.json` ships with `http://127.0.0.1:0/mcp` as a sentinel.
 On first start, `ato-mcp serve` picks a free port, binds it, and rewrites
 the URL in the plugin's installed `.mcp.json` to match. The user exits and
-resumes the Claude Code session so the new URL takes effect.
+resumes the agent session so the new URL takes effect.
 
 ```bash
 ato-mcp serve              # picks a free port on first run; reuses it after
 ato-mcp serve --port 51235 # explicit override
 ```
 
-The plugin includes a skill (`skills/ato-mcp-server/SKILL.md`) that the
-agent loads on ATO-related queries. If the `ato` tools aren't in the agent's
-tool list, the skill instructs the agent to ask the user for permission to
-start the server via a background `ato-mcp serve` invocation and to exit +
-resume the session.
+The plugin includes two skills:
+
+- `skills/ato-mcp-server/SKILL.md` is intentionally small and is loaded for
+  ordinary ATO/tax research. It tells the agent to use the ATO tools and gives
+  the minimal recovery path when the server is down.
+- `skills/setup-ato-mcp/SKILL.md` is the larger install/repair guide. Load it
+  only for first-run setup, 30-second MCP timeouts, missing corpus, corpus
+  updates, or repeated startup failures.
+
+Installer agents should start `ato-mcp serve` for the user, wait for the
+`ato-mcp listening on ...` readiness line, and handle the first-run `.mcp.json`
+port rewrite. The user should only be asked to exit + resume the agent session
+when a port rewrite means the MCP host must reload config.
 
 On the first MCP `initialize`, the server tells the agent whether the corpus
-is installed. If not, the agent surfaces "run `ato-mcp update`" to the user;
-the agent can invoke that via Bash with the user's approval.
+is installed. If not, the agent explains the large download and runs
+`ato-mcp update` with the user's approval.
 
 ## Verify the install
 
@@ -77,9 +85,10 @@ Inside the MCP host, invoke `search` and confirm results include
 ato-mcp update
 ```
 
-Full corpus replacement: fetch the published `manifest.json`, download the
-new `ato.db.zst`, verify sha256, atomic-rename into `live/`. Restart the MCP
-client (or the `ato-mcp serve` process) for the new corpus to take effect.
+Full corpus replacement: find the newest release with a corpus
+`manifest.json`, download `ato.db.zst`, verify sha256, atomic-rename into
+`live/`. Restart the MCP client (or the `ato-mcp serve` process) for the new
+corpus to take effect.
 
 When a newer corpus is published, the server's `initialize` instructions
 include the available index version. The agent surfaces the suggestion and

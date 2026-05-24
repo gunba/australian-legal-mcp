@@ -33,7 +33,7 @@ use build::{
     build_corpus, bundle_localize_manifest, package_corpus, update_manifest_with_db,
     BuildCorpusArgs,
 };
-use config::{default_manifest_url, live_dir, model_data_path, model_path, tokenizer_path};
+use config::{live_dir, model_data_path, model_path, tokenizer_path};
 use retrieval::{
     fetch, get_asset_mcp, get_chunks_mcp, get_definition, get_doc_anchors_mcp, pit_to_date,
     GetDefinitionOptions,
@@ -45,13 +45,14 @@ use semantic::{
     SemanticEncodeStats, SemanticModelPaths, SemanticRuntime, EMBEDDING_MODEL_HF_FILES,
 };
 use source::{
-    apply_update, check_for_update_availability, link_download, scrape_diff, snapshot_reduce,
-    stats, tree_crawl, LinkDownloadArgs, Manifest, ModelInfo, StagedModel, UpdateAvailability,
+    apply_update, check_for_update_availability, link_download, resolve_latest_corpus_manifest_url,
+    resolve_latest_corpus_manifest_url_with, scrape_diff, snapshot_reduce, stats, tree_crawl,
+    LinkDownloadArgs, Manifest, ModelInfo, StagedModel, UpdateAvailability,
 };
 
 pub(crate) const APP_NAME: &str = "ato-mcp";
-pub(crate) const DEFAULT_RELEASES_URL: &str =
-    "https://github.com/gunba/ato-mcp/releases/latest/download";
+pub(crate) const DEFAULT_RELEASES_API_URL: &str =
+    "https://api.github.com/repos/gunba/ato-mcp/releases?per_page=20";
 pub(crate) const DEFAULT_K: usize = 8;
 pub(crate) const MAX_K: usize = 50;
 /// Cap on the `title_hits` sidebar `search` returns alongside chunk hits.
@@ -384,7 +385,8 @@ fn main() -> Result<()> {
             serve(choice, &bind, Arc::new(state))
         }
         Command::Update {} => {
-            let stats = apply_update(&default_manifest_url())?;
+            let manifest_url = resolve_latest_corpus_manifest_url()?;
+            let stats = apply_update(&manifest_url)?;
             println!(
                 "update complete ({:.2} MB downloaded)",
                 stats.bytes_downloaded as f64 / 1_000_000.0,
@@ -1518,11 +1520,11 @@ const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first; hits are chunk po
 /// Build the `update_notice` carried in `ServerState` for the lifetime of the
 /// server. Runs `check_for_update_availability` once at startup; the result
 /// (newer index version, if any) is folded into the MCP `initialize`
-/// instructions so the agent can suggest the user run `ato-mcp update`.
+/// instructions so the agent can offer to run `ato-mcp update`.
 fn resolve_startup_update_notice() -> Option<UpdateAvailability> {
-    check_for_update_availability(&default_manifest_url())
-        .ok()
-        .flatten()
+    let client = source::http_probe_client().ok()?;
+    let manifest_url = resolve_latest_corpus_manifest_url_with(&client).ok()?;
+    check_for_update_availability(&manifest_url).ok().flatten()
 }
 
 // [SW-02] Server instructions are built dynamically at start time from corpus
@@ -1545,13 +1547,13 @@ fn server_instructions(update_notice: Option<&UpdateAvailability>) -> String {
             ATO_MCP_USE_INSTRUCTIONS,
         ),
         None => format!(
-            "The ATO corpus is not yet installed on this machine. Run `ato-mcp update` in a terminal to download it (~1.5 GB, takes 5-10 min). Restart the MCP client after the download completes.\n\n{}",
+            "The ATO corpus is not yet installed on this machine. Offer to run `ato-mcp update` for the user as a visible setup step (~1.5 GB, takes 5-10 min), then restart `ato-mcp serve` after the download completes.\n\n{}",
             ATO_MCP_USE_INSTRUCTIONS
         ),
     };
     match update_notice {
         Some(notice) => format!(
-            "{body}\n\nA newer ATO corpus index is available ({}). Run `ato-mcp update` in a terminal when convenient and restart the MCP client to pick it up.",
+            "{body}\n\nA newer ATO corpus index is available ({}). Ask whether to run `ato-mcp update` now or continue with the installed corpus; restart `ato-mcp serve` after updating.",
             notice.available_index_version
         ),
         None => body,
@@ -2670,6 +2672,51 @@ mod tests {
         assert!(
             result?.is_none(),
             "probe must return None when no installed manifest is present"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn latest_corpus_manifest_url_skips_binary_only_releases() -> Result<()> {
+        let releases = json!([
+            {
+                "tag_name": "v0.15.1",
+                "assets": [
+                    {
+                        "name": "ato-mcp-x86_64-unknown-linux-gnu.tar.gz",
+                        "browser_download_url": "https://example.test/v0.15.1/linux.tar.gz"
+                    }
+                ]
+            },
+            {
+                "tag_name": "v0.15.0-rc1",
+                "prerelease": true,
+                "assets": [
+                    {
+                        "name": "manifest.json",
+                        "browser_download_url": "https://example.test/v0.15.0-rc1/manifest.json"
+                    }
+                ]
+            },
+            {
+                "tag_name": "v0.14.7",
+                "assets": [
+                    {
+                        "name": "ato.db.zst",
+                        "browser_download_url": "https://example.test/v0.14.7/ato.db.zst"
+                    },
+                    {
+                        "name": "manifest.json",
+                        "browser_download_url": "https://example.test/v0.14.7/manifest.json"
+                    }
+                ]
+            }
+        ]);
+        assert_eq!(
+            source::latest_corpus_manifest_url_from_releases_json(
+                &serde_json::to_vec(&releases)?
+            )?,
+            "https://example.test/v0.14.7/manifest.json"
         );
         Ok(())
     }

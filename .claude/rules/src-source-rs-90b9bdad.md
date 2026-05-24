@@ -22,17 +22,17 @@ JSON output for hits, document outline + section + full renderers.
 MCP tool registration, shared ServerState, runtime statistics instructions, install/update notices, and the small explicit tool surface.
 
 - [SW-05 L168] prefix_breakdown is corpus-derived: per-prefix doc counts plus a sample title used as the description. Replaces the hand-maintained prefix-to-doc-type map; surfaced via stats() so agents discover the canonical `doc_scope="<PREFIX>/%"` filter idiom for every prefix in the corpus.
-- [SW-06 L779] Serve startup runs a synchronous non-mutating availability probe (check_for_update_availability + http_probe_client + fetch_bytes_probe) with a tight 5s budget. It reuses the same fingerprint/compat helpers as the update flow; every error / timeout / missing installed manifest / incompatible manifest collapses to None, so a slow network cannot stall the MCP HTTP server. The Option<UpdateAvailability> is stashed on ServerState and read by server_instructions to surface the update-available notice to the agent.
+- [SW-06 L794] Serve startup runs a synchronous non-mutating availability probe (check_for_update_availability + http_probe_client + fetch_bytes_probe) with a tight 5s budget. It reuses the same fingerprint/compat helpers as the update flow; every error / timeout / missing installed manifest / incompatible manifest collapses to None, so a slow network cannot stall the MCP HTTP server. The Option<UpdateAvailability> is stashed on ServerState and read by server_instructions to surface the update-available notice to the agent.
   - ATO_MCP_OFFLINE=1 short-circuits the probe before any I/O.
 
 ## Rust Source Scraper
 Maintainer source acquisition commands for What's New incremental pulls, tree crawl snapshots, snapshot reduction, deduped catch-up, and paced link download.
 
-- [SS-02 L910] fetch_nodes_blocking calls the ATO browse-content API through a reqwest blocking client and expects the response payload to be a JSON list.
-- [SS-03 L962] Maintainer ATO API pacing uses a mutex-protected Instant before outgoing tree-crawl/link-download requests, serializing issuance across workers for the configured interval.
-- [SS-07 L1170] snapshot_reduce dedupes canonical IDs across the tree, chooses a representative_path, records redundant folders, and filters excluded titles plus descendants before writing deduped_links and skip lists.
-- [SS-06 L1482] link-download builds payload paths under payloads/ from each link record representative_path, so catch-up records inherit the reducer source path without manual category assignment.
-- [SS-08 L1578] link_download uses up to max_workers threads with a shared queue, reqwest client, index map/writer, progress counters, and request-delay lock.
+- [SS-02 L962] fetch_nodes_blocking calls the ATO browse-content API through a reqwest blocking client and expects the response payload to be a JSON list.
+- [SS-03 L1014] Maintainer ATO API pacing uses a mutex-protected Instant before outgoing tree-crawl/link-download requests, serializing issuance across workers for the configured interval.
+- [SS-07 L1222] snapshot_reduce dedupes canonical IDs across the tree, chooses a representative_path, records redundant folders, and filters excluded titles plus descendants before writing deduped_links and skip lists.
+- [SS-06 L1534] link-download builds payload paths under payloads/ from each link record representative_path, so catch-up records inherit the reducer source path without manual category assignment.
+- [SS-08 L1630] link_download uses up to max_workers threads with a shared queue, reqwest client, index map/writer, progress counters, and request-delay lock.
 
 ## Rust Update Mechanism
 End-user update flow: update.json fast-path when local DB/model match, otherwise staged model/corpus rebuild and guarded promotion, with single-writer LOCK and doctor rollback backup.

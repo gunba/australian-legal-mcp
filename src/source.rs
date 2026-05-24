@@ -16,7 +16,7 @@ use crate::semantic::EMBEDDING_MODEL_HF_FILES;
 use crate::{
     fetch_bytes, fetch_bytes_with, stage_model,
     validate_manifest_model_source, UrlContext,
-    ATO_USER_AGENT, DEFAULT_EXCLUDED_TYPES, EDITED_PRIVATE_ADVICE_LABEL, EMBEDDING_MODEL_ID, LEGISLATION_TYPE, LEGISLATION_TYPE_PREFIXES,
+    ATO_USER_AGENT, DEFAULT_EXCLUDED_TYPES, DEFAULT_RELEASES_API_URL, EDITED_PRIVATE_ADVICE_LABEL, EMBEDDING_MODEL_ID, LEGISLATION_TYPE, LEGISLATION_TYPE_PREFIXES,
     OLD_CONTENT_CUTOFF, SUPPORTED_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -776,6 +776,21 @@ pub(crate) struct UpdateAvailability {
     pub(crate) available_index_version: String,
 }
 
+#[derive(Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Deserialize)]
+struct GithubRelease {
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
+    assets: Vec<GithubReleaseAsset>,
+}
+
 // [SW-06] Serve startup probe: 5s budget, non-mutating, errors collapse to None.
 pub(crate) fn http_probe_client() -> Result<Client> {
     // Tight budget: this client runs synchronously inside `serve` startup.
@@ -789,6 +804,43 @@ pub(crate) fn http_probe_client() -> Result<Client> {
 
 pub(crate) fn fetch_bytes_probe(url_or_path: &str, context: &UrlContext) -> Result<Vec<u8>> {
     fetch_bytes_with(url_or_path, context, &http_probe_client()?)
+}
+
+pub(crate) fn resolve_latest_corpus_manifest_url() -> Result<String> {
+    resolve_latest_corpus_manifest_url_with(
+        &Client::builder()
+            .user_agent(ATO_USER_AGENT)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()?,
+    )
+}
+
+pub(crate) fn resolve_latest_corpus_manifest_url_with(client: &Client) -> Result<String> {
+    let bytes = client
+        .get(DEFAULT_RELEASES_API_URL)
+        .header("user-agent", ATO_USER_AGENT)
+        .header("accept", "application/vnd.github+json")
+        .send()?
+        .error_for_status()
+        .context("fetching GitHub release list")?
+        .bytes()?;
+    latest_corpus_manifest_url_from_releases_json(&bytes)
+}
+
+pub(crate) fn latest_corpus_manifest_url_from_releases_json(bytes: &[u8]) -> Result<String> {
+    let releases: Vec<GithubRelease> = serde_json::from_slice(bytes)?;
+    for release in releases {
+        if release.draft || release.prerelease {
+            continue;
+        }
+        for asset in release.assets {
+            if asset.name == "manifest.json" {
+                return Ok(asset.browser_download_url);
+            }
+        }
+    }
+    bail!("no published ato-mcp release with manifest.json was found")
 }
 
 /// Non-mutating availability probe. Returns `Some(UpdateAvailability)` only

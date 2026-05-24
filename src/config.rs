@@ -76,13 +76,6 @@ pub(crate) fn lock_file() -> Result<File> {
     Ok(file)
 }
 
-pub(crate) fn default_manifest_url() -> String {
-    format!(
-        "{}/manifest.json",
-        crate::DEFAULT_RELEASES_URL.trim_end_matches('/')
-    )
-}
-
 /// Bind 127.0.0.1:0, ask the OS for a free port, release the socket, and
 /// return the chosen port. There's a tight race between discovery and the
 /// next bind; the caller reports any error cleanly.

@@ -1,6 +1,6 @@
 {
   "name": "ato-mcp",
-  "version": "0.15.1",
+  "version": "0.15.2",
   "description": "Local search and retrieval over the Australian Taxation Office legal corpus.",
   "author": {
     "name": "gunba",
