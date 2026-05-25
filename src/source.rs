@@ -143,33 +143,50 @@ pub(crate) fn parse_whats_new(html: &str, base_url: &str) -> Result<Vec<WhatsNew
 
 pub(crate) fn stats() -> Result<String> {
     let conn = open_read()?;
-    let docs: i64 = conn.query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))?;
-    let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
-    let embeddings: i64 = if table_exists(&conn, "chunk_embeddings")? {
-        conn.query_row("SELECT COUNT(*) FROM chunk_embeddings", [], |r| r.get(0))?
-    } else {
-        0
+    // Prefer counts persisted at build time (sub-ms `meta` reads) over live
+    // COUNT(*) scans, which take 5-10s on a cold multi-GB corpus. Old
+    // corpora without these keys fall through to the scan path so they
+    // keep working at the previous speed.
+    let docs = read_count_meta(&conn, "documents_count")?
+        .map(Ok::<_, anyhow::Error>)
+        .unwrap_or_else(|| count_table(&conn, "documents"))?;
+    let chunks = read_count_meta(&conn, "chunks_count")?
+        .map(Ok::<_, anyhow::Error>)
+        .unwrap_or_else(|| count_table(&conn, "chunks"))?;
+    let embeddings = match read_count_meta(&conn, "chunk_embeddings_count")? {
+        Some(n) => n,
+        None => {
+            if table_exists(&conn, "chunk_embeddings")? {
+                count_table(&conn, "chunk_embeddings")?
+            } else {
+                0
+            }
+        }
     };
-    let definitions: i64 = if table_exists(&conn, "definitions")? {
-        conn.query_row("SELECT COUNT(*) FROM definitions", [], |r| r.get(0))?
-    } else {
-        0
+    let definitions = match read_count_meta(&conn, "definitions_count")? {
+        Some(n) => n,
+        None => {
+            if table_exists(&conn, "definitions")? {
+                count_table(&conn, "definitions")?
+            } else {
+                0
+            }
+        }
     };
-    let mut types = BTreeMap::new();
-    let mut stmt =
-        conn.prepare("SELECT type, COUNT(*) AS n FROM documents GROUP BY type ORDER BY n DESC")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })?;
-    for row in rows {
-        let (typ, n) = row?;
-        types.insert(typ, n);
-    }
+    let types = match get_meta(&conn, "documents_by_type_json")? {
+        Some(json) => serde_json::from_str::<BTreeMap<String, i64>>(&json)
+            .context("parsing cached documents_by_type_json")?,
+        None => compute_documents_by_type(&conn)?,
+    };
     // [SW-05] prefix_breakdown is corpus-derived: doc_id-prefix counts plus a
     // sample title per prefix as the description. Replaces the hand-maintained
     // prefix-to-doc-type map; agents read this to discover the canonical
     // ``doc_scope="<PREFIX>/*"`` filter idiom for every prefix in the corpus.
-    let prefix_breakdown = collect_prefix_breakdown(&conn)?;
+    let prefix_breakdown = match get_meta(&conn, "prefix_breakdown_json")? {
+        Some(json) => serde_json::from_str::<Vec<JsonValue>>(&json)
+            .context("parsing cached prefix_breakdown_json")?,
+        None => collect_prefix_breakdown(&conn)?,
+    };
     let semantic_search_ready = ensure_vector_search_ready(&conn).is_ok();
     let payload = json!({
         "data_dir": data_dir()?.display().to_string(),
@@ -195,6 +212,30 @@ pub(crate) fn stats() -> Result<String> {
     });
     // [OF-06] JSON outputs use serde_json pretty rendering before return/write.
     Ok(serde_json::to_string_pretty(&payload)?)
+}
+
+fn read_count_meta(conn: &Connection, key: &str) -> Result<Option<i64>> {
+    Ok(get_meta(conn, key)?.and_then(|s| s.trim().parse::<i64>().ok()))
+}
+
+fn count_table(conn: &Connection, table: &str) -> Result<i64> {
+    // Caller passes a compile-time string literal; no user input reaches here.
+    let sql = format!("SELECT COUNT(*) FROM {table}");
+    Ok(conn.query_row(&sql, [], |r| r.get(0))?)
+}
+
+pub(crate) fn compute_documents_by_type(conn: &Connection) -> Result<BTreeMap<String, i64>> {
+    let mut types = BTreeMap::new();
+    let mut stmt =
+        conn.prepare("SELECT type, COUNT(*) AS n FROM documents GROUP BY type ORDER BY n DESC")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (typ, n) = row?;
+        types.insert(typ, n);
+    }
+    Ok(types)
 }
 
 /// Per-prefix corpus breakdown — doc_id-prefix counts plus a sample-title

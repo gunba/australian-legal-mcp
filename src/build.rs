@@ -20,7 +20,8 @@ use crate::semantic::{
     SemanticEncodeStats, SemanticModelPaths,
 };
 use crate::source::{
-    verify_semantic_install, Manifest, ManifestDb, ModelInfo,
+    collect_prefix_breakdown, compute_documents_by_type, verify_semantic_install, Manifest,
+    ManifestDb, ModelInfo,
 };
 
 // BuildCheckpoint carries minimal per-doc records purely for resume tracking.
@@ -1156,6 +1157,39 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
     // [IB-20] Build finalisation derives citations from stored [doc:X]
     // markers before manifest/update metadata is written.
     derive_citations(&final_tx)?;
+    // Precompute the corpus-shape values runtime stats() returns so MCP
+    // `initialize` becomes a meta key/value read (sub-ms) instead of a
+    // multi-table COUNT(*) + GROUP BY scan (5-10s cold on a multi-GB DB).
+    // The corpus is read-only for the server lifetime — `ato-mcp update`
+    // requires a restart — so caching at build time is safe.
+    let documents_count: i64 =
+        final_tx.query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))?;
+    let chunks_count: i64 =
+        final_tx.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
+    let chunk_embeddings_count: i64 =
+        final_tx.query_row("SELECT COUNT(*) FROM chunk_embeddings", [], |r| r.get(0))?;
+    let definitions_count: i64 =
+        final_tx.query_row("SELECT COUNT(*) FROM definitions", [], |r| r.get(0))?;
+    set_meta(&final_tx, "documents_count", &documents_count.to_string())?;
+    set_meta(&final_tx, "chunks_count", &chunks_count.to_string())?;
+    set_meta(
+        &final_tx,
+        "chunk_embeddings_count",
+        &chunk_embeddings_count.to_string(),
+    )?;
+    set_meta(&final_tx, "definitions_count", &definitions_count.to_string())?;
+    let documents_by_type = compute_documents_by_type(&final_tx)?;
+    set_meta(
+        &final_tx,
+        "documents_by_type_json",
+        &serde_json::to_string(&documents_by_type)?,
+    )?;
+    let prefix_breakdown = collect_prefix_breakdown(&final_tx)?;
+    set_meta(
+        &final_tx,
+        "prefix_breakdown_json",
+        &serde_json::to_string(&prefix_breakdown)?,
+    )?;
     verify_semantic_install(&final_tx, &manifest)?;
     final_tx.commit()?;
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
