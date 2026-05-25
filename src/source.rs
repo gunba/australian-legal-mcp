@@ -147,12 +147,14 @@ pub(crate) fn stats() -> Result<String> {
     // COUNT(*) scans, which take 5-10s on a cold multi-GB corpus. Old
     // corpora without these keys fall through to the scan path so they
     // keep working at the previous speed.
-    let docs = read_count_meta(&conn, "documents_count")?
-        .map(Ok::<_, anyhow::Error>)
-        .unwrap_or_else(|| count_table(&conn, "documents"))?;
-    let chunks = read_count_meta(&conn, "chunks_count")?
-        .map(Ok::<_, anyhow::Error>)
-        .unwrap_or_else(|| count_table(&conn, "chunks"))?;
+    let docs = match read_count_meta(&conn, "documents_count")? {
+        Some(n) => n,
+        None => count_table(&conn, "documents")?,
+    };
+    let chunks = match read_count_meta(&conn, "chunks_count")? {
+        Some(n) => n,
+        None => count_table(&conn, "chunks")?,
+    };
     let embeddings = match read_count_meta(&conn, "chunk_embeddings_count")? {
         Some(n) => n,
         None => {
@@ -221,7 +223,8 @@ fn read_count_meta(conn: &Connection, key: &str) -> Result<Option<i64>> {
 fn count_table(conn: &Connection, table: &str) -> Result<i64> {
     // Caller passes a compile-time string literal; no user input reaches here.
     let sql = format!("SELECT COUNT(*) FROM {table}");
-    Ok(conn.query_row(&sql, [], |r| r.get(0))?)
+    conn.query_row(&sql, [], |r| r.get(0))
+        .with_context(|| format!("counting rows in {table}"))
 }
 
 pub(crate) fn compute_documents_by_type(conn: &Connection) -> Result<BTreeMap<String, i64>> {
