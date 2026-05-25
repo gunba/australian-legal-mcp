@@ -393,7 +393,6 @@ fn main() -> Result<()> {
             let update_notice = resolve_startup_update_notice();
             let cached_instructions = server_instructions(update_notice.as_ref());
             let state = ServerState {
-                update_notice,
                 cached_instructions,
                 ..Default::default()
             };
@@ -591,11 +590,12 @@ fn empty_vec_as_none(values: Vec<String>) -> Option<Vec<String>> {
 struct ServerState {
     semantic_runtime: Mutex<Option<SemanticRuntime>>,
     semantic_model_paths: Option<SemanticModelPaths>,
-    update_notice: Option<UpdateAvailability>,
     // Rendered once at server start so MCP initialize is a cheap field read
     // instead of re-running stats() (~5-10s on a cold 4 GB corpus) per call.
     // The corpus is immutable for the server lifetime — `ato-mcp update`
-    // requires a restart — so a single render is correct.
+    // requires a restart — so a single render is correct. Carries the
+    // startup update-notice via server_instructions(); no separate field
+    // is needed because nothing else reads it.
     cached_instructions: String,
 }
 
@@ -604,7 +604,6 @@ impl ServerState {
         Self {
             semantic_runtime: Mutex::new(None),
             semantic_model_paths: None,
-            update_notice: None,
             cached_instructions: String::new(),
         }
     }
@@ -613,7 +612,6 @@ impl ServerState {
         Self {
             semantic_runtime: Mutex::new(None),
             semantic_model_paths: Some(semantic_model_paths),
-            update_notice: None,
             cached_instructions: String::new(),
         }
     }
@@ -1752,10 +1750,10 @@ pub(crate) fn optional_string_array(args: &JsonValue, name: &str) -> Result<Opti
 
 const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first; hits are chunk pointers; call `get_chunks` for text. Use `get_doc_anchors` for nav, related, history, and cited-by. Markers: `[doc:X]` is in-corpus; `[fetch:ato:X]` is an ATO live fetch target. For historical/withdrawn set `current_only=false` and `include_old=true`."##;
 
-/// Build the `update_notice` carried in `ServerState` for the lifetime of the
-/// server. Runs `check_for_update_availability` once at startup; the result
-/// (newer index version, if any) is folded into the MCP `initialize`
-/// instructions so the agent can offer to run `ato-mcp update`.
+/// Probe for a newer corpus index at startup. Runs
+/// `check_for_update_availability` once and is folded directly into the
+/// cached MCP `initialize` instructions by `server_instructions`, so the
+/// agent can offer to run `ato-mcp update`.
 fn resolve_startup_update_notice() -> Option<UpdateAvailability> {
     let client = source::http_probe_client().ok()?;
     let manifest_url = resolve_latest_corpus_manifest_url_with(&client).ok()?;
