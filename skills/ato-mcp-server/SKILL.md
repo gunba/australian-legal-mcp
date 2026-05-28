@@ -1,6 +1,7 @@
 ---
 name: ato-mcp-server
 description: "Use the local ato-mcp tools for Australian tax-law research. Run for ATO/tax questions, ATO document references, rulings, definitions, or when local ATO source retrieval would improve the answer."
+disable-model-invocation: true
 ---
 
 # ATO MCP Research
