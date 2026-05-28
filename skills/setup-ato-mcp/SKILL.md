@@ -1,5 +1,8 @@
 ---
+name: setup-ato-mcp
 description: "Detailed setup and recovery for ato-mcp. Use only when installing the ATO MCP plugin, repairing MCP startup, diagnosing a 30-second MCP timeout, fixing missing/stale corpus, or recovering repeated ato-mcp startup failures."
+metadata:
+  parent_skill: ato-mcp-server
 ---
 
 # Setup ATO MCP
