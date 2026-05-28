@@ -42,7 +42,21 @@ git clone https://github.com/gunba/ato-mcp.git
 claude plugin install ./ato-mcp
 ```
 
-The plugin registers `ato-mcp mcp` as a stdio MCP command. On MCP startup it
+Pi uses the same MCP command through `pi-mcp-adapter`. Install the Pi MCP
+adapter once, then install this checkout as a Pi package so the ATO skills are
+available in Pi:
+
+```bash
+pi install npm:pi-mcp-adapter
+pi install ./ato-mcp
+```
+
+The repository `.mcp.json` registers `ato-mcp mcp` for project-local MCP
+clients that read standard MCP config. For user-global Pi access from any
+project, add the same `mcpServers.ato` entry to `~/.config/mcp/mcp.json` or
+`~/.pi/agent/mcp.json`.
+
+The plugin/package registers `ato-mcp mcp` as a stdio MCP command. On MCP startup it
 starts or reuses a local loopback HTTP backend, records the chosen endpoint in
 the user data dir, and proxies MCP messages to that backend. There is no
 first-run port edit and no required session restart for a generated URL.
