@@ -2391,8 +2391,9 @@ fn indexed_payload_path(out_dir: &Path, record: &JsonValue) -> Option<PathBuf> {
     {
         return None;
     }
-    let canonical = out_dir.join(raw).canonicalize().ok()?;
-    canonical.starts_with(out_dir).then_some(canonical)
+    let canonical_root = out_dir.canonicalize().ok()?;
+    let canonical = canonical_root.join(raw).canonicalize().ok()?;
+    canonical.starts_with(&canonical_root).then_some(canonical)
 }
 
 fn immutable_payload_path(base_path: &Path, sha256: &str) -> Result<PathBuf> {
@@ -3404,7 +3405,8 @@ mod security_tests {
     #[test]
     fn failed_refresh_preserves_last_verified_payload_for_builds() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let payload = root.path().join("document.html");
+        let root_path = root.path().canonicalize()?;
+        let payload = root_path.join("document.html");
         fs::write(&payload, b"verified source")?;
         let canonical_id = "/law/view/document?docid=JUD/KEEP/00001";
         let mut index = std::collections::HashMap::from([(
@@ -3420,7 +3422,7 @@ mod security_tests {
         let record = record_link_refresh_failure(
             &mut index,
             canonical_id,
-            root.path(),
+            &root_path,
             LinkRefreshFailure {
                 status: "failed",
                 error: "transient".to_string(),
@@ -3458,7 +3460,7 @@ mod security_tests {
         let replacement = b"new verified source";
         let replacement_sha = format!("{:x}", Sha256::digest(replacement));
         let replacement_path = immutable_payload_path(&payload, &replacement_sha)?;
-        persist_immutable_payload(root.path(), &replacement_path, replacement)?;
+        persist_immutable_payload(&root_path, &replacement_path, replacement)?;
         assert_eq!(fs::read(&payload)?, b"verified source");
         assert_eq!(fs::read(&replacement_path)?, replacement);
         Ok(())
