@@ -1,7 +1,6 @@
 ---
 name: ato-mcp-server
 description: "Use the local ato-mcp tools for Australian tax-law research. Run for ATO/tax questions, ATO document references, rulings, definitions, or when local ATO source retrieval would improve the answer."
-disable-model-invocation: true
 ---
 
 # ATO MCP Research
@@ -12,7 +11,9 @@ citations would improve the answer.
 
 Normal flow:
 
-1. Use `search` first.
+1. Use `search` first. Prefer the default hybrid mode for natural-language or
+   mixed title/body queries. If filtering by `types`, use exact codes from
+   `stats.types`; judgments and cases use `JUD`.
 2. Use `get_chunks` for source text from search hits.
 3. Use `get_doc_anchors` for in-document navigation, related/history links,
    and cited-by material.

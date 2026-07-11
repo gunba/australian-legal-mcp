@@ -4,6 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
+EnvironmentFile=-%h/.config/ato-mcp/environment
 ExecStart=%h/.local/bin/ato-mcp serve
 Restart=on-failure
 RestartSec=5

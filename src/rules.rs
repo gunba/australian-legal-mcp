@@ -3,7 +3,6 @@
 //! template-specific extractor for (title, date). Port of the Python
 //! src/ato_mcp/indexer/rules.py.
 
-
 // =====================================================================
 // Rules engine — template-based metadata classifier
 //

@@ -6,12 +6,23 @@ use anyhow::{anyhow, Context, Result};
 use fs2::FileExt;
 use serde_json::Value as JsonValue;
 use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use url::Url;
+
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn data_dir() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("ATO_MCP_DATA_DIR") {
-        let path = PathBuf::from(path);
+    if let Some(value) = std::env::var_os("ATO_MCP_DATA_DIR") {
+        let value = value
+            .to_str()
+            .ok_or_else(|| anyhow!("ATO_MCP_DATA_DIR must contain valid Unicode"))?;
+        if value.trim().is_empty() {
+            return Err(anyhow!("ATO_MCP_DATA_DIR must not be empty or whitespace"));
+        }
+        let path = PathBuf::from(value);
         fs::create_dir_all(&path)?;
         return Ok(path);
     }
@@ -22,7 +33,58 @@ pub(crate) fn data_dir() -> Result<PathBuf> {
     Ok(path)
 }
 
+fn validate_generation_key(key: &str) -> Result<()> {
+    if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow!("active corpus generation key is malformed"));
+    }
+    Ok(())
+}
+
+pub(crate) fn generations_dir() -> Result<PathBuf> {
+    let path = data_dir()?.join("generations");
+    fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
+pub(crate) fn generation_dir(key: &str) -> Result<PathBuf> {
+    validate_generation_key(key)?;
+    Ok(generations_dir()?.join(key))
+}
+
+pub(crate) fn active_generation_key() -> Result<Option<String>> {
+    let path = data_dir()?.join("active-generation");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let key = fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .trim()
+        .to_ascii_lowercase();
+    validate_generation_key(&key)?;
+    if !generation_dir(&key)?.is_dir() {
+        return Err(anyhow!(
+            "active corpus generation {key} is missing; run `ato-mcp update`"
+        ));
+    }
+    Ok(Some(key))
+}
+
+pub(crate) fn activate_generation(key: &str) -> Result<()> {
+    validate_generation_key(key)?;
+    let generation = generation_dir(key)?;
+    if !generation.is_dir() {
+        return Err(anyhow!(
+            "cannot activate missing corpus generation {}",
+            generation.display()
+        ));
+    }
+    atomic_write(&data_dir()?.join("active-generation"), key.as_bytes())
+}
+
 pub(crate) fn live_dir() -> Result<PathBuf> {
+    if let Some(key) = active_generation_key()? {
+        return generation_dir(&key);
+    }
     let path = data_dir()?.join("live");
     fs::create_dir_all(&path)?;
     Ok(path)
@@ -38,7 +100,14 @@ pub(crate) fn db_path() -> Result<PathBuf> {
     Ok(live_dir()?.join("ato.db"))
 }
 
+pub(crate) fn ann_path() -> Result<PathBuf> {
+    Ok(live_dir()?.join(crate::ann::ANN_FILENAME))
+}
+
 pub(crate) fn installed_manifest_path() -> Result<PathBuf> {
+    if let Some(key) = active_generation_key()? {
+        return Ok(generation_dir(&key)?.join("installed_manifest.json"));
+    }
     Ok(data_dir()?.join("installed_manifest.json"))
 }
 
@@ -70,10 +139,6 @@ pub(crate) fn tokenizer_path() -> Result<PathBuf> {
     Ok(live_dir()?.join("tokenizer.json"))
 }
 
-pub(crate) fn model_marker_path() -> Result<PathBuf> {
-    Ok(live_dir()?.join(".model.sha256"))
-}
-
 pub(crate) fn lock_file() -> Result<File> {
     let path = lock_path()?;
     let file = OpenOptions::new()
@@ -85,6 +150,18 @@ pub(crate) fn lock_file() -> Result<File> {
     // [UM-02] Single-writer guard around update/install: cross-platform
     // advisory lock via fs2::FileExt on the app LOCK file.
     file.lock_exclusive()?;
+    Ok(file)
+}
+
+pub(crate) fn corpus_read_lock() -> Result<File> {
+    let path = lock_path()?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    fs2::FileExt::lock_shared(&file)?;
     Ok(file)
 }
 
@@ -260,10 +337,9 @@ fn directory_marketplace_mcp_json(
 
 /// Read the port out of an `http://host:port/...` URL string.
 fn parse_url_port(url: &str) -> Option<u16> {
-    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-    let host_port = rest.split_once('/').map(|(hp, _)| hp).unwrap_or(rest);
-    let port = host_port.rsplit_once(':')?.1;
-    port.parse().ok()
+    let parsed = Url::parse(url).ok()?;
+    let port = parsed.port()?;
+    (parsed.as_str() == server_url(port)).then_some(port)
 }
 
 fn ato_mcp_entry(value: &JsonValue) -> Option<&JsonValue> {
@@ -291,6 +367,9 @@ fn ato_mcp_entry_mut(value: &mut JsonValue) -> Option<&mut JsonValue> {
 /// plugin's existing URL is stale. Returns `true` when the file was actually
 /// changed.
 pub(crate) fn update_plugin_mcp_json_url(path: &std::path::Path, new_url: &str) -> Result<bool> {
+    parse_url_port(new_url).ok_or_else(|| {
+        anyhow!("MCP endpoint must be a canonical loopback URL like http://127.0.0.1:<port>/mcp")
+    })?;
     let raw = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut value: JsonValue =
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
@@ -306,13 +385,100 @@ pub(crate) fn update_plugin_mcp_json_url(path: &std::path::Path, new_url: &str) 
         return Ok(false);
     }
     entry["url"] = JsonValue::String(new_url.to_string());
-    let serialised = serde_json::to_string_pretty(&value)?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, format!("{serialised}\n"))
-        .with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
+    let serialised = format!("{}\n", serde_json::to_string_pretty(&value)?);
+    atomic_write(path, serialised.as_bytes())?;
     Ok(true)
+}
+
+pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent)?;
+
+    let mut last_error = None;
+    for _ in 0..100 {
+        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("ato-mcp-state");
+        let temp = parent.join(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            sequence
+        ));
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                last_error = Some(err);
+                continue;
+            }
+            Err(err) => return Err(err).with_context(|| format!("creating {}", temp.display())),
+        };
+
+        let result = (|| -> Result<()> {
+            if let Ok(metadata) = fs::metadata(path) {
+                file.set_permissions(metadata.permissions())?;
+            }
+            file.write_all(contents)?;
+            file.sync_all()?;
+            drop(file);
+            replace_file(&temp, path)?;
+            sync_parent_directory(parent)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        return result.with_context(|| format!("atomically replacing {}", path.display()));
+    }
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::AlreadyExists, "temporary file collision")
+    }))
+    .with_context(|| format!("creating a temporary file beside {}", path.display()))
+}
+
+#[cfg(not(windows))]
+fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+    }
+
+    let existing: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let replacement: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    let ok = unsafe {
+        MoveFileExW(
+            existing.as_ptr(),
+            replacement.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> io::Result<()> {
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// Pick the port `ato-mcp serve` should bind. Precedence:
@@ -385,9 +551,42 @@ mod tests {
     #[test]
     fn parses_url_port_from_typical_shapes() {
         assert_eq!(parse_url_port("http://127.0.0.1:51234/mcp"), Some(51234));
-        assert_eq!(parse_url_port("http://localhost:0/mcp"), Some(0));
+        assert_eq!(parse_url_port("http://127.0.0.1:0/mcp"), Some(0));
+        assert_eq!(parse_url_port("http://localhost:51234/mcp"), None);
+        assert_eq!(parse_url_port("http://192.0.2.1:51234/mcp"), None);
+        assert_eq!(parse_url_port("http://127.0.0.1:51234/other"), None);
+        assert_eq!(parse_url_port("https://127.0.0.1:51234/mcp"), None);
         assert_eq!(parse_url_port("http://127.0.0.1/mcp"), None);
         assert_eq!(parse_url_port("not a url"), None);
+    }
+
+    #[test]
+    fn data_dir_rejects_empty_or_whitespace_override() {
+        for value in ["", " ", "\t\n"] {
+            let _environment =
+                crate::TestEnvironment::set(&[("ATO_MCP_DATA_DIR", std::ffi::OsStr::new(value))]);
+            let error = data_dir().unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("must not be empty or whitespace"));
+        }
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_file() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("state.json");
+        fs::write(&path, b"old")?;
+        atomic_write(&path, b"new")?;
+        assert_eq!(fs::read(&path)?, b"new");
+        assert!(fs::read_dir(root.path())?.all(|entry| {
+            !entry
+                .expect("directory entry")
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+        Ok(())
     }
 
     #[test]

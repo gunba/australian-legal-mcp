@@ -2,9 +2,15 @@
 //! each to plaintext with markdown markers, then greedy-packs blocks into
 //! chunks bounded by `max_tokens`. Mirrors src/ato_mcp/indexer/chunk.py.
 
+use crate::config::tokenizer_path;
 use crate::html::{collect_referenced_anchors, render_node};
+use crate::EMBEDDING_TEXT_PREFIX;
 use regex::Regex;
 use serde::Serialize;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
+use tokenizers::Tokenizer;
 
 // ----- Chunker (port of src/ato_mcp/indexer/chunk.py) -----
 //
@@ -478,7 +484,10 @@ pub(crate) fn chunker_flush_inline(
 ///   1. oversize tables -> row split (rows stay whole).
 ///   2. prose -> sentence split, greedy-pack within budget.
 ///   3. word-window split as last-resort (single sentence/row over budget).
-pub(crate) fn chunker_split_oversize_block(block: &ChunkBlock, max_tokens: usize) -> Vec<(String, String)> {
+pub(crate) fn chunker_split_oversize_block(
+    block: &ChunkBlock,
+    max_tokens: usize,
+) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     if block.is_oversize_table {
         if let Some(html) = block.table_html.as_deref() {
@@ -538,7 +547,10 @@ pub(crate) fn chunker_enforce_max_tokens(
     out
 }
 
-pub(crate) fn chunker_table_row_split(table_html: &str, max_tokens: usize) -> Vec<(String, String)> {
+pub(crate) fn chunker_table_row_split(
+    table_html: &str,
+    max_tokens: usize,
+) -> Vec<(String, String)> {
     let frag = scraper::Html::parse_fragment(table_html);
     let row_sel = scraper::Selector::parse("tr").unwrap();
     let cell_sel = scraper::Selector::parse("th, td").unwrap();
@@ -706,6 +718,98 @@ pub(crate) fn chunker_pack(blocks: Vec<ChunkBlock>, max_tokens: usize) -> Vec<Ch
     chunks
 }
 
+fn chunker_enforce_final_token_limit<F>(
+    chunks: Vec<Chunk>,
+    max_tokens: usize,
+    token_count: F,
+) -> Vec<Chunk>
+where
+    F: Fn(&str) -> usize,
+{
+    let mut output = Vec::new();
+    for chunk in chunks {
+        let prefixed_count = |text: &str| token_count(&format!("{EMBEDDING_TEXT_PREFIX}{text}"));
+        if prefixed_count(&chunk.text) <= max_tokens {
+            output.push(chunk);
+            continue;
+        }
+
+        let mut pieces = Vec::new();
+        let mut remaining = chunk.text.as_str();
+        while !remaining.is_empty() {
+            if prefixed_count(remaining) <= max_tokens {
+                pieces.push(remaining.to_string());
+                break;
+            }
+            let boundaries = remaining
+                .char_indices()
+                .map(|(index, _)| index)
+                .skip(1)
+                .chain(std::iter::once(remaining.len()))
+                .collect::<Vec<_>>();
+            let mut low = 0usize;
+            let mut high = boundaries.len();
+            while low < high {
+                let mid = low + (high - low) / 2;
+                if prefixed_count(&remaining[..boundaries[mid]]) <= max_tokens {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+            assert!(low > 0, "a single character exceeds the tokenizer limit");
+            let split = boundaries[low - 1];
+            pieces.push(remaining[..split].to_string());
+            remaining = &remaining[split..];
+        }
+
+        for (piece_index, piece) in pieces.into_iter().enumerate() {
+            output.push(Chunk {
+                ord: output.len() as i64,
+                anchor: chunk.anchor.clone(),
+                text: piece,
+                definition_text: (piece_index == 0)
+                    .then(|| chunk.definition_text.clone())
+                    .flatten(),
+            });
+        }
+    }
+    for (ord, chunk) in output.iter_mut().enumerate() {
+        chunk.ord = ord as i64;
+    }
+    output
+}
+
+fn chunker_apply_live_tokenizer_limit(chunks: Vec<Chunk>, max_tokens: usize) -> Vec<Chunk> {
+    let Ok(path) = tokenizer_path() else {
+        return chunks;
+    };
+    static TOKENIZERS: OnceLock<Mutex<HashMap<PathBuf, Arc<Tokenizer>>>> = OnceLock::new();
+    let cache = TOKENIZERS.get_or_init(|| Mutex::new(HashMap::new()));
+    let tokenizer = {
+        let Ok(mut cache) = cache.lock() else {
+            return chunks;
+        };
+        if let Some(tokenizer) = cache.get(&path) {
+            Arc::clone(tokenizer)
+        } else {
+            let Ok(tokenizer) = Tokenizer::from_file(&path) else {
+                return chunks;
+            };
+            let tokenizer = Arc::new(tokenizer);
+            cache.insert(path, Arc::clone(&tokenizer));
+            tokenizer
+        }
+    };
+    chunker_enforce_final_token_limit(chunks, max_tokens, |text| {
+        tokenizer
+            .encode(text, true)
+            .expect("installed tokenizer failed to encode chunk text")
+            .get_ids()
+            .len()
+    })
+}
+
 pub(crate) fn chunk_html(html: &str, root_title: Option<&str>, max_tokens: usize) -> Vec<Chunk> {
     if html.trim().is_empty() {
         return Vec::new();
@@ -719,9 +823,59 @@ pub(crate) fn chunk_html(html: &str, root_title: Option<&str>, max_tokens: usize
     let body_sel = scraper::Selector::parse("body").unwrap();
     let walk_root = doc.select(&body_sel).next().unwrap_or(root);
     chunker_walk(walk_root, &mut blocks, &referenced, root_title);
-    chunker_pack(blocks, max_tokens)
+    let chunks = chunker_pack(blocks, max_tokens);
+    chunker_apply_live_tokenizer_limit(chunks, max_tokens)
 }
 
 // ----- end chunker -----
 
 // ----- Metadata helpers (port of src/ato_mcp/indexer/metadata.py) -----
+
+#[cfg(test)]
+mod tests {
+    use super::{chunker_enforce_final_token_limit, Chunk};
+
+    #[test]
+    fn final_limit_uses_tokenizer_counts_including_the_embedding_prefix() {
+        let chunks = vec![Chunk {
+            ord: 9,
+            anchor: Some("section".to_string()),
+            text: "aa bb cc dd".to_string(),
+            definition_text: Some("different".to_string()),
+        }];
+        let chunks = chunker_enforce_final_token_limit(chunks, 5, |text| text.len());
+
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.text.as_str())
+                .collect::<String>(),
+            "aa bb cc dd"
+        );
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.ord).collect::<Vec<_>>(),
+            (0..chunks.len() as i64).collect::<Vec<_>>()
+        );
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.anchor.as_deref() == Some("section")));
+        assert_eq!(chunks[0].definition_text.as_deref(), Some("different"));
+        assert!(chunks
+            .iter()
+            .skip(1)
+            .all(|chunk| chunk.definition_text.is_none()));
+    }
+
+    #[test]
+    fn final_limit_keeps_a_chunk_at_the_exact_tokenizer_limit() {
+        let chunks = vec![Chunk {
+            ord: 0,
+            anchor: None,
+            text: "abc".to_string(),
+            definition_text: None,
+        }];
+        let chunks = chunker_enforce_final_token_limit(chunks, 3, |text| text.len());
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "abc");
+    }
+}

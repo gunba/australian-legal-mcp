@@ -110,10 +110,11 @@ Inside the MCP host, invoke `search` and confirm results include
 ato-mcp update
 ```
 
-Full corpus replacement: find the newest release with a corpus
-`manifest.json`, download `ato.db.zst`, verify sha256, atomic-rename into
-`live/`. Restart the MCP client and local backend process for the new corpus
-to take effect.
+Full corpus replacement uses paginated release discovery to find the newest
+non-prerelease `manifest.json`, streams and verifies `ato.db.zst`, `ato.ann`,
+and model artifacts, then assembles an immutable generation. Atomic replacement
+of `active-generation` activates the complete set; restart the MCP client and
+local backend to use it.
 
 When a newer corpus is published, the server's `initialize` instructions
 include the available index version. The agent surfaces the suggestion and

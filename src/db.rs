@@ -170,7 +170,8 @@ pub(crate) fn init_db(conn: &Connection) -> Result<()> {
             target_doc_id    TEXT NOT NULL,
             PRIMARY KEY (source_chunk_id, target_doc_id)
         );
-        CREATE INDEX IF NOT EXISTS idx_citations_target ON citations(target_doc_id);
+        CREATE INDEX IF NOT EXISTS idx_citations_target_source
+            ON citations(target_doc_id, source_doc_id);
 
         CREATE TABLE IF NOT EXISTS chunk_embeddings (
             chunk_id   INTEGER PRIMARY KEY REFERENCES chunks(chunk_id) ON DELETE CASCADE,
@@ -197,7 +198,11 @@ pub(crate) fn init_db(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
-    set_meta(conn, "schema_version", &SUPPORTED_SCHEMA_VERSION.to_string())?;
+    set_meta(
+        conn,
+        "schema_version",
+        &SUPPORTED_SCHEMA_VERSION.to_string(),
+    )?;
     Ok(())
 }
 
@@ -226,7 +231,7 @@ pub(crate) fn canonical_url(doc_id: &str) -> String {
 
 pub(crate) fn decompress_text(blob: Vec<u8>) -> Result<String> {
     let bytes = zstd::stream::decode_all(Cursor::new(blob))?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(String::from_utf8(bytes)?)
 }
 
 pub(crate) fn compress_text(text: &str) -> Result<Vec<u8>> {
@@ -240,4 +245,42 @@ pub(crate) fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
         |row| row.get(0),
     )?;
     Ok(exists != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn citation_lookup_uses_covering_index() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        init_db(&conn)?;
+
+        let plan: String = conn.query_row(
+            "EXPLAIN QUERY PLAN \
+             SELECT DISTINCT source_doc_id FROM citations WHERE target_doc_id = ?1",
+            ["target"],
+            |row| row.get(3),
+        )?;
+
+        assert!(
+            plan.contains("COVERING INDEX idx_citations_target_source"),
+            "unexpected query plan: {plan}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn decompress_text_reuses_valid_utf8_buffer() -> Result<()> {
+        let text = "Tax guidance — valid UTF-8";
+        assert_eq!(decompress_text(compress_text(text)?)?, text);
+        Ok(())
+    }
+
+    #[test]
+    fn decompress_text_rejects_invalid_utf8() -> Result<()> {
+        let compressed = zstd::stream::encode_all(Cursor::new([0xff, 0xfe]), 3)?;
+        assert!(decompress_text(compressed).is_err());
+        Ok(())
+    }
 }

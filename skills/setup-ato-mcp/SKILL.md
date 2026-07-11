@@ -28,6 +28,15 @@ or reuses one local loopback HTTP backend and proxies MCP messages to that
 backend. `ato-mcp serve` is the backend HTTP server for advanced/manual use;
 do not configure `serve` directly as a stdio MCP command.
 
+Before configuring MCP, resolve one installed executable path and verify it.
+Release archives must be checked against the release `SHA256SUMS` before
+extraction. Install the executable into a stable per-user `PATH` directory
+(`~/.local/bin` on Linux/macOS, or a fixed local-app-data Programs directory on
+Windows), then confirm `command -v ato-mcp` / `Get-Command ato-mcp` resolves that
+exact file and run `ato-mcp --version`. On Windows keep the verified
+`onnxruntime.dll` beside `ato-mcp.exe`. Never configure an executable inside a
+temporary extraction directory.
+
 The binary path and corpus data directory are separate. Enterprise policy may
 require the binary to live under local app data. That is fine, but the
 installer must choose one corpus data directory and use it consistently.
@@ -60,7 +69,10 @@ MCP startup behavior:
 Manual stdio smoke:
 
 ```bash
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}' | ato-mcp mcp
+request='{"jsonrpc":"2.0","id":1,"method":"initialize",'
+request+='"params":{"protocolVersion":"2025-06-18","capabilities":{},'
+request+='"clientInfo":{"name":"smoke","version":"1"}}}'
+printf '%s\n' "$request" | ato-mcp mcp
 ```
 
 If MCP host config changed, ask the user to exit/resume the agent session so

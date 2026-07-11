@@ -490,87 +490,130 @@ pub(crate) fn render_inner_string(
     inner
 }
 
-pub(crate) fn doc_id_from_ato_link(
-    target: &str,
-) -> Option<(String, Option<String>, Option<String>)> {
-    let mut t = target.trim();
-    if t.starts_with('<') && t.ends_with('>') && t.len() >= 2 {
-        t = &t[1..t.len() - 1];
+pub(crate) fn is_ato_hostname(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    host.eq_ignore_ascii_case("ato.gov.au")
+        || host
+            .to_ascii_lowercase()
+            .strip_suffix(".ato.gov.au")
+            .is_some_and(|prefix| !prefix.is_empty())
+}
+
+fn has_valid_percent_encoding(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len()
+                || !bytes[i + 1].is_ascii_hexdigit()
+                || !bytes[i + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
     }
-    if let Some(idx) = t.find(' ') {
-        t = &t[..idx];
-    }
-    let parsed = if t.starts_with('/') {
-        let base = url::Url::parse("https://www.ato.gov.au").ok()?;
-        base.join(t).ok()?
-    } else {
-        url::Url::parse(t).ok()?
-    };
-    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
-    let path_lower = parsed.path().to_ascii_lowercase();
-    let is_ato_host = host.ends_with("ato.gov.au");
-    let has_ato_path = ATO_DOC_PATH_HINTS
-        .iter()
-        .any(|hint| path_lower.contains(hint));
-    if !(is_ato_host || has_ato_path) {
+    true
+}
+
+fn collect_ato_query(
+    query: &str,
+    raw: &mut Option<String>,
+    pit: &mut Option<String>,
+    view: &mut Option<String>,
+) -> Option<()> {
+    if query.is_empty() || !has_valid_percent_encoding(query) {
         return None;
     }
-    let (mut raw, mut pit, mut view) = (None, None, None);
-    for (k, v) in parsed.query_pairs() {
-        let key_lc = k.to_ascii_lowercase();
-        match key_lc.as_str() {
-            "docid" | "locid" if raw.is_none() => {
-                raw = Some(v.into_owned());
+    let mut saw_raw = false;
+    let mut saw_pit = false;
+    let mut saw_view = false;
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        match key.to_ascii_lowercase().as_str() {
+            "docid" | "locid" => {
+                if saw_raw || raw.is_some() {
+                    return None;
+                }
+                saw_raw = true;
+                *raw = Some(value.into_owned());
             }
-            "pit" if pit.is_none() => {
-                let s = v.trim().to_string();
-                if !s.is_empty() {
-                    pit = Some(s);
+            "pit" => {
+                if saw_pit || pit.is_some() {
+                    return None;
+                }
+                saw_pit = true;
+                let value = value.trim();
+                if !value.is_empty() {
+                    *pit = Some(value.to_string());
                 }
             }
-            "db" if view.is_none() => {
-                let s = v.trim().to_ascii_uppercase();
-                if ATO_KNOWN_VIEWS.iter().any(|kv| *kv == s) {
-                    view = Some(s);
+            "db" => {
+                if saw_view || view.is_some() {
+                    return None;
+                }
+                saw_view = true;
+                let value = value.trim().to_ascii_uppercase();
+                if ATO_KNOWN_VIEWS.iter().any(|known| *known == value) {
+                    *view = Some(value);
                 }
             }
             _ => {}
         }
     }
+    Some(())
+}
+
+pub(crate) fn doc_id_from_ato_link(
+    target: &str,
+) -> Option<(String, Option<String>, Option<String>)> {
+    let mut target = target.trim();
+    if target.starts_with('<') && target.ends_with('>') && target.len() >= 2 {
+        target = &target[1..target.len() - 1];
+    }
+    if let Some(index) = target.find(' ') {
+        target = &target[..index];
+    }
+    if !has_valid_percent_encoding(target) {
+        return None;
+    }
+    let parsed = if target.starts_with('/') {
+        url::Url::parse("https://www.ato.gov.au")
+            .ok()?
+            .join(target)
+            .ok()?
+    } else {
+        url::Url::parse(target).ok()?
+    };
+    if parsed.scheme() != "https" || !is_ato_hostname(parsed.host_str()?) {
+        return None;
+    }
+    let path = parsed.path().to_ascii_lowercase();
+    if !ATO_DOC_PATH_HINTS.iter().any(|hint| path.contains(hint)) {
+        return None;
+    }
+
+    let (mut raw, mut pit, mut view) = (None, None, None);
+    if let Some(query) = parsed.query() {
+        collect_ato_query(query, &mut raw, &mut pit, &mut view)?;
+    }
     if raw.is_none() {
-        if let Some(frag) = parsed.fragment() {
-            if let Some(qpos) = frag.find('?') {
-                let frag_query = &frag[qpos + 1..];
-                for (k, v) in url::form_urlencoded::parse(frag_query.as_bytes()) {
-                    let key_lc = k.to_ascii_lowercase();
-                    match key_lc.as_str() {
-                        "docid" | "locid" if raw.is_none() => {
-                            raw = Some(v.into_owned());
-                        }
-                        "pit" if pit.is_none() => {
-                            let s = v.trim().to_string();
-                            if !s.is_empty() {
-                                pit = Some(s);
-                            }
-                        }
-                        "db" if view.is_none() => {
-                            let s = v.trim().to_ascii_uppercase();
-                            if ATO_KNOWN_VIEWS.iter().any(|kv| *kv == s) {
-                                view = Some(s);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+        if let Some(fragment) = parsed.fragment() {
+            if let Some((_, query)) = fragment.split_once('?') {
+                collect_ato_query(query, &mut raw, &mut pit, &mut view)?;
             }
         }
     }
-    let raw = raw?;
-    if raw.ends_with('?') {
-        return None;
-    }
-    let doc_id = raw.trim().trim_matches('"').to_string();
-    if doc_id.is_empty() || !doc_id.contains('/') {
+    let doc_id = raw?.trim().trim_matches('"').to_string();
+    if doc_id.is_empty()
+        || !doc_id.contains('/')
+        || doc_id.contains('\\')
+        || doc_id
+            .split('/')
+            .any(|part| matches!(part, "" | "." | ".."))
+        || doc_id.chars().any(char::is_control)
+    {
         return None;
     }
     Some((doc_id, pit, view))
@@ -724,4 +767,39 @@ pub(crate) fn assets_html_escape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn ato_hostname_matching_has_label_boundaries() {
+        for host in ["ato.gov.au", "www.ato.gov.au", "law.ato.gov.au."] {
+            assert!(is_ato_hostname(host), "rejected {host}");
+        }
+        for host in ["evilato.gov.au", "ato.gov.au.evil.test", "gov.au"] {
+            assert!(!is_ato_hostname(host), "accepted {host}");
+        }
+    }
+
+    #[test]
+    fn ato_links_require_https_exact_host_path_and_unique_fields() {
+        let good = "https://www.ato.gov.au/law/view/document?docid=JUD/X/Y&PiT=20250101";
+        assert_eq!(
+            doc_id_from_ato_link(good),
+            Some(("JUD/X/Y".to_string(), Some("20250101".to_string()), None))
+        );
+        for bad in [
+            "https://evilato.gov.au/law/view/document?docid=JUD/X/Y",
+            "http://www.ato.gov.au/law/view/document?docid=JUD/X/Y",
+            "https://www.ato.gov.au/not-law?docid=JUD/X/Y",
+            "https://www.ato.gov.au/law/view/document?docid=JUD/X/Y&locid=JUD/A/B",
+            "https://www.ato.gov.au/law/view/document?docid=JUD/X/Y&pit=1&pit=2",
+            "https://www.ato.gov.au/law/view/document?docid=JUD/%2e%2e/Y",
+            "https://www.ato.gov.au/law/view/document?docid=JUD/X/Y%GG",
+        ] {
+            assert!(doc_id_from_ato_link(bad).is_none(), "accepted {bad}");
+        }
+    }
 }

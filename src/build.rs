@@ -4,21 +4,17 @@
 //! Plus checkpoint resume and `bundle_localize_manifest` for offline bundles.
 
 use crate::chunker::{chunk_html, Chunk, CHUNKER_FORMAT_VERSION, EMBED_MAX_TOKENS};
-use crate::db::{
-    compress_text, init_db, open_write_at, set_meta,
-};
+use crate::db::{compress_text, init_db, open_write_at, set_meta};
 use crate::extract::{
     anchors_node_text, extract_anchors, extract_compose_title, extract_currency,
     extract_definitions, extract_em_front_matter, extract_leading_headings, metadata_content_hash,
-    metadata_doc_id_for, metadata_extract_pub_date, metadata_parse_docid, rewrite_images_html, AnchorRef, CurrencyInfo,
-    DefinitionChunk, ExtractedAsset,
+    metadata_doc_id_for, metadata_extract_pub_date, metadata_parse_docid, rewrite_images_html,
+    AnchorRef, CurrencyInfo, DefinitionChunk, ExtractedAsset,
 };
 use crate::html::{clean_ato_html, normalise_named_anchors, rewrite_links_html, strip_attributes};
 use crate::retrieval::derive_citations;
 use crate::rules::{derive_metadata, RuleInputs};
-use crate::semantic::{
-    SemanticEncodeStats, SemanticModelPaths,
-};
+use crate::semantic::{SemanticEncodeStats, SemanticModelPaths};
 use crate::source::{
     collect_prefix_breakdown, compute_documents_by_type, verify_semantic_install, Manifest,
     ManifestDb, ModelInfo,
@@ -54,9 +50,8 @@ pub(crate) struct PackInfo {
     pub(crate) url: String,
 }
 use crate::{
-    ServerState, EMBEDDING_DIM,
-    EMBEDDING_INPUT_MAX_TOKENS, EMBEDDING_MODEL_FINGERPRINT, EMBEDDING_MODEL_HF_SIZE,
-    EMBEDDING_MODEL_HF_URL, EMBEDDING_MODEL_ID, SUPPORTED_SCHEMA_VERSION,
+    ServerState, EMBEDDING_DIM, EMBEDDING_INPUT_MAX_TOKENS, EMBEDDING_MODEL_FINGERPRINT,
+    EMBEDDING_MODEL_HF_SIZE, EMBEDDING_MODEL_HF_URL, EMBEDDING_MODEL_ID, SUPPORTED_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::Connection;
@@ -295,8 +290,6 @@ pub(crate) fn flush_pending_build_embeddings(
     Ok(())
 }
 
-
-
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BuildCheckpoint {
@@ -438,7 +431,6 @@ pub(crate) fn save_build_checkpoint(args: SaveBuildCheckpointArgs<'_>) -> Result
     Ok(())
 }
 
-
 pub(crate) fn committed_build_doc_count(conn: &Connection) -> Result<usize> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM documents WHERE pack_sha8 <> 'PENDING'",
@@ -457,7 +449,6 @@ pub(crate) fn pending_build_doc_count(conn: &Connection) -> Result<usize> {
     Ok(count as usize)
 }
 
-
 pub(crate) fn remove_build_doc(conn: &Connection, doc_id: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM chunks_fts WHERE rowid IN (SELECT chunk_id FROM chunks WHERE doc_id = ?1)",
@@ -468,7 +459,6 @@ pub(crate) fn remove_build_doc(conn: &Connection, doc_id: &str) -> Result<()> {
     conn.execute("DELETE FROM documents WHERE doc_id = ?1", [doc_id])?;
     Ok(())
 }
-
 
 pub(crate) struct BuildSourceFingerprint<'a> {
     pub(crate) doc_id: &'a str,
@@ -533,12 +523,6 @@ pub(crate) fn build_source_fingerprint_value(input: BuildSourceFingerprint<'_>) 
     })
 }
 
-
-
-
-
-
-
 pub(crate) struct BuildCorpusArgs<'a> {
     pub(crate) pages_dir: &'a Path,
     pub(crate) db_path: &'a Path,
@@ -562,10 +546,20 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         profile_enabled,
     } = args;
 
+    let pages_root = pages_dir
+        .canonicalize()
+        .with_context(|| format!("canonicalizing pages_dir {}", pages_dir.display()))?;
+
     // [IB-17] Maintainer builds require a local pinned Granite model
     // checkout; hosted model metadata is owned by publish/release.
     let semantic_model_paths = SemanticModelPaths::from_model_dir(model_dir)?;
-    let index_path = pages_dir.join("index.jsonl");
+    let index_path = pages_root.join("index.jsonl");
+    if fs::symlink_metadata(&index_path)?.file_type().is_symlink() {
+        bail!(
+            "source index must not be a symlink: {}",
+            index_path.display()
+        );
+    }
     let source_index_sha256 = sha256_file(&index_path)?;
     let index_file =
         File::open(&index_path).with_context(|| format!("opening {}", index_path.display()))?;
@@ -654,7 +648,6 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
 
     let mut pending_embeddings: Vec<PendingBuildEmbedding> =
         Vec::with_capacity(BUILD_EMBED_BATCH_SIZE);
-    let mut doc_hashes: HashMap<String, String> = HashMap::new();
     for line_res in reader.lines() {
         if let Some(n) = limit {
             if processed >= n {
@@ -678,7 +671,7 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
             skipped_no_payload += 1;
             continue;
         }
-        let payload_path = pages_dir.join(payload_path_raw);
+        let payload_path = confined_payload_path(&pages_root, payload_path_raw)?;
         let doc_id = metadata_doc_id_for(canonical_id);
         let checkpoint_verified = checkpoint_doc_ids.contains(&doc_id);
         if !source_doc_ids.insert(doc_id.clone()) {
@@ -707,6 +700,20 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         }
 
         let started = std::time::Instant::now();
+        let expected_size = record
+            .get("size")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| anyhow!("index record missing payload size for {canonical_id}"))?;
+        let expected_sha256 = record
+            .get("sha256")
+            .and_then(JsonValue::as_str)
+            .filter(|sha| sha.len() == 64)
+            .ok_or_else(|| anyhow!("index record missing payload sha256 for {canonical_id}"))?;
+        let actual_size = fs::metadata(&payload_path)?.len();
+        let actual_sha256 = sha256_file(&payload_path)?;
+        if actual_size != expected_size || actual_sha256 != expected_sha256 {
+            bail!("payload integrity mismatch for {canonical_id}");
+        }
         let html = fs::read_to_string(&payload_path)
             .with_context(|| format!("reading payload {}", payload_path.display()))?;
         profile.read += started.elapsed();
@@ -867,10 +874,9 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         }
 
         let now = chrono::Utc::now().to_rfc3339();
-        doc_hashes.insert(doc_id.clone(), content_hash.clone());
-
-        // Pack sha8 placeholder; finalised after all docs processed.
-        let pack_placeholder = "PENDING".to_string();
+        // `pack_sha8` remains a compact deterministic provenance token for
+        // legacy readers even though schema 10 ships one database artifact.
+        let provenance_sha8 = source_hash[..8].to_string();
 
         // Collect headings once: stored on documents.headings for install-time
         // FTS5 rebuild, and re-used below to populate title_fts.headings.
@@ -897,7 +903,7 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
                 derived_date,
                 now,
                 content_hash,
-                pack_placeholder,
+                provenance_sha8.clone(),
                 compress_text(&final_html)?,
                 currency.withdrawn_date.clone(),
                 currency.superseded_by.clone(),
@@ -1038,16 +1044,19 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         }
         profile.assets += started.elapsed();
 
+        documents.push(DocRef {
+            doc_id: doc_id.clone(),
+            content_hash: source_hash,
+            pack_sha8: provenance_sha8,
+            offset: 0,
+            length: 0,
+        });
+
         for (chunk_id, text) in doc_pending_embeddings {
             pending_embeddings.push(PendingBuildEmbedding { chunk_id, text });
         }
         if pending_embeddings.len() >= BUILD_EMBED_PENDING_FLUSH_CHUNKS {
-            flush_pending_build_embeddings(
-                &state,
-                &tx,
-                &mut pending_embeddings,
-                &mut profile,
-            )?;
+            flush_pending_build_embeddings(&state, &tx, &mut pending_embeddings, &mut profile)?;
             // Checkpoint periodically so a long build can resume from an
             // interrupted partial DB.
             let started = std::time::Instant::now();
@@ -1063,7 +1072,6 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
                 verified_source_doc_ids: &source_doc_ids,
             })?;
             profile.checkpoint += started.elapsed();
-            doc_hashes.clear();
             tx = conn.unchecked_transaction()?;
         }
 
@@ -1090,12 +1098,7 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         }
     }
 
-    flush_pending_build_embeddings(
-        &state,
-        &tx,
-        &mut pending_embeddings,
-        &mut profile,
-    )?;
+    flush_pending_build_embeddings(&state, &tx, &mut pending_embeddings, &mut profile)?;
     tx.commit()?;
     let started = std::time::Instant::now();
     save_build_checkpoint(SaveBuildCheckpointArgs {
@@ -1129,8 +1132,9 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
 
     let started = std::time::Instant::now();
     let created_at = chrono::Utc::now().to_rfc3339();
-    let manifest = Manifest {
+    let mut manifest = Manifest {
         schema_version: SUPPORTED_SCHEMA_VERSION as i64,
+        manifest_format_version: Some(crate::SUPPORTED_MANIFEST_FORMAT_VERSION),
         index_version: chrono::Utc::now().format("%Y.%m.%d").to_string(),
         created_at,
         min_client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1147,12 +1151,14 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
             sha256: String::new(),
             size: 0,
         },
+        ann: None,
     };
 
     let final_tx = conn.unchecked_transaction()?;
     set_meta(&final_tx, "index_version", &manifest.index_version)?;
     set_meta(&final_tx, "embedding_model_id", &manifest.model.id)?;
     set_meta(&final_tx, "last_update_at", &manifest.created_at)?;
+    set_meta(&final_tx, "source_index_sha256", &source_index_sha256)?;
     eprintln!("ato-mcp build: deriving citations…");
     // [IB-20] Build finalisation derives citations from stored [doc:X]
     // markers before manifest/update metadata is written.
@@ -1164,8 +1170,7 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
     // requires a restart — so caching at build time is safe.
     let documents_count: i64 =
         final_tx.query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))?;
-    let chunks_count: i64 =
-        final_tx.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
+    let chunks_count: i64 = final_tx.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
     let chunk_embeddings_count: i64 =
         final_tx.query_row("SELECT COUNT(*) FROM chunk_embeddings", [], |r| r.get(0))?;
     let definitions_count: i64 =
@@ -1177,7 +1182,11 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         "chunk_embeddings_count",
         &chunk_embeddings_count.to_string(),
     )?;
-    set_meta(&final_tx, "definitions_count", &definitions_count.to_string())?;
+    set_meta(
+        &final_tx,
+        "definitions_count",
+        &definitions_count.to_string(),
+    )?;
     let documents_by_type = compute_documents_by_type(&final_tx)?;
     set_meta(
         &final_tx,
@@ -1190,12 +1199,27 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         "prefix_breakdown_json",
         &serde_json::to_string(&prefix_breakdown)?,
     )?;
+    let ann_identity = crate::ann::compute_identity(&final_tx, &source_index_sha256)?;
+    set_meta(&final_tx, "corpus_id", &ann_identity.corpus_id)?;
+    set_meta(
+        &final_tx,
+        "embedding_set_sha256",
+        &ann_identity.embedding_set_sha256,
+    )?;
     verify_semantic_install(&final_tx, &manifest)?;
     final_tx.commit()?;
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
 
+    eprintln!("ato-mcp build: constructing deterministic ANN sidecar…");
+    manifest.ann = Some(crate::ann::build_sidecar(
+        &conn,
+        &out_dir.join(crate::ann::ANN_FILENAME),
+        &source_index_sha256,
+        &ann_identity,
+    )?);
+
     let manifest_path = out_dir.join("manifest.json");
-    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    atomic_write(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)?;
     eprintln!("ato-mcp build: wrote {}", manifest_path.display());
     profile.finalise += started.elapsed();
     profile.print();
@@ -1206,7 +1230,6 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
     );
     Ok(())
 }
-
 
 pub(crate) fn sha256_file(path: &Path) -> Result<String> {
     use std::io::Read as _;
@@ -1223,11 +1246,72 @@ pub(crate) fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn confined_payload_path(pages_root: &Path, raw: &str) -> Result<PathBuf> {
+    use std::path::Component;
+
+    if raw.is_empty()
+        || raw.contains(['\\', ':'])
+        || raw.starts_with(['/', '\\'])
+        || raw.contains(['?', '#'])
+    {
+        bail!("unsafe payload path `{raw}`");
+    }
+    let relative = Path::new(raw);
+    let mut components = relative.components();
+    if components.next() != Some(Component::Normal("payloads".as_ref()))
+        || components.any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        bail!("payload path must be a relative path beneath payloads/: `{raw}`");
+    }
+    let mut current = pages_root.to_path_buf();
+    for component in relative.components() {
+        if matches!(component, Component::CurDir) {
+            continue;
+        }
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current)
+            .with_context(|| format!("reading payload path component {}", current.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!("payload path contains symlink {}", current.display());
+        }
+    }
+    let canonical = current.canonicalize()?;
+    if !canonical.starts_with(pages_root) || !canonical.is_file() {
+        bail!("payload path escaped {}", pages_root.display());
+    }
+    Ok(canonical)
+}
+
+#[cfg(unix)]
+fn sync_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        File::open(parent)
+            .with_context(|| format!("opening {} for sync", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("syncing {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    crate::config::atomic_write(path, bytes)
+}
+
 /// Strip FTS5 indexes from a copy of the canonical ato.db, VACUUM, and
 /// zstd-compress to produce a shippable artifact. The input file is never
 /// mutated. Returns {path, sha256, size} for embedding into manifest.json.
 pub(crate) fn package_corpus(db_path: &Path, out: &Path, level: i32) -> Result<JsonValue> {
-    use std::io::{copy as io_copy, BufReader, BufWriter};
+    use std::io::{copy as io_copy, BufReader, BufWriter, Write as _};
 
     if !db_path.is_file() {
         bail!("input DB not found: {}", db_path.display());
@@ -1238,9 +1322,8 @@ pub(crate) fn package_corpus(db_path: &Path, out: &Path, level: i32) -> Result<J
 
     let staging = tempfile::tempdir().context("creating staging dir")?;
     let staged_db = staging.path().join("stage.db");
-    fs::copy(db_path, &staged_db).with_context(|| {
-        format!("copying {} → {}", db_path.display(), staged_db.display())
-    })?;
+    fs::copy(db_path, &staged_db)
+        .with_context(|| format!("copying {} → {}", db_path.display(), staged_db.display()))?;
 
     // Drop FTS5 + VACUUM on the copy. install will rebuild both indexes from
     // chunks.text and documents.headings.
@@ -1256,20 +1339,45 @@ pub(crate) fn package_corpus(db_path: &Path, out: &Path, level: i32) -> Result<J
     // zstd compress with long-distance matching for the high-redundancy DB.
     let input = File::open(&staged_db)
         .with_context(|| format!("opening staged DB {}", staged_db.display()))?;
-    let output = File::create(out).with_context(|| format!("creating {}", out.display()))?;
+    let parent = out.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating temporary artifact in {}", parent.display()))?;
     let mut reader = BufReader::new(input);
-    let writer = BufWriter::new(output);
-    let mut encoder = zstd::stream::Encoder::new(writer, level)
-        .context("creating zstd encoder")?;
+    let writer = BufWriter::new(temp.as_file_mut());
+    let mut encoder = zstd::stream::Encoder::new(writer, level).context("creating zstd encoder")?;
     encoder
         .long_distance_matching(true)
         .context("enabling zstd long-distance matching")?;
     io_copy(&mut reader, &mut encoder).context("compressing staged DB")?;
-    encoder.finish().context("finalising zstd stream")?;
+    let mut writer = encoder.finish().context("finalising zstd stream")?;
+    writer.flush()?;
+    drop(writer);
+    temp.as_file().sync_all()?;
+
+    // Decode the completed temporary stream before promotion so a truncated
+    // or otherwise invalid zstd artifact can never replace the prior output.
+    {
+        use std::io::Seek as _;
+        temp.as_file_mut().rewind()?;
+        let mut decoder = zstd::stream::read::Decoder::new(temp.as_file_mut())
+            .context("validating compressed corpus artifact")?;
+        std::io::copy(&mut decoder, &mut std::io::sink())
+            .context("validating compressed corpus artifact")?;
+    }
 
     // sha256 + size of the compressed artifact.
-    let sha256 = sha256_file(out).context("hashing compressed artifact")?;
-    let size = fs::metadata(out)?.len();
+    let sha256 = sha256_file(temp.path()).context("hashing compressed artifact")?;
+    let size = temp.as_file().metadata()?.len();
+    if size == 0 {
+        bail!("compressed corpus artifact is empty");
+    }
+    temp.persist(out)
+        .map_err(|error| error.error)
+        .with_context(|| format!("atomically replacing {}", out.display()))?;
+    sync_parent(out)?;
+    if sha256_file(out)? != sha256 || fs::metadata(out)?.len() != size {
+        bail!("persisted corpus artifact failed integrity verification");
+    }
 
     Ok(json!({
         "path": out.display().to_string(),
@@ -1308,6 +1416,16 @@ pub(crate) fn update_manifest_with_db(
         .get("size")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| anyhow!("artifact summary missing size"))?;
+    let actual_size = fs::metadata(artifact_path)
+        .with_context(|| format!("reading {} metadata", artifact_path.display()))?
+        .len();
+    let actual_sha256 = sha256_file(artifact_path)?;
+    if actual_size != size || actual_sha256 != sha256 {
+        bail!(
+            "artifact summary does not match {}",
+            artifact_path.display()
+        );
+    }
     obj.insert(
         "db".to_string(),
         json!({
@@ -1321,7 +1439,7 @@ pub(crate) fn update_manifest_with_db(
         json!(SUPPORTED_SCHEMA_VERSION),
     );
     let pretty = serde_json::to_vec_pretty(&value)?;
-    fs::write(manifest_path, pretty)
+    atomic_write(manifest_path, &pretty)
         .with_context(|| format!("writing {}", manifest_path.display()))?;
     Ok(())
 }
@@ -1357,6 +1475,24 @@ pub(crate) fn bundle_localize_manifest(
         }
     }
 
+    if let Some(ann) = manifest.get_mut("ann") {
+        let url = ann
+            .get("url")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let filename = Path::new(url)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("manifest ANN URL has no UTF-8 filename"))?;
+        let path = packs_dir.join(filename);
+        if !path.is_file() {
+            bail!("manifest references missing ANN sidecar: {filename}");
+        }
+        ann["url"] = JsonValue::String(filename.to_string());
+        ann["sha256"] = JsonValue::String(sha256_file(&path)?);
+        ann["size"] = JsonValue::Number(serde_json::Number::from(fs::metadata(path)?.len()));
+    }
+
     let model_filename = model_bundle
         .file_name()
         .and_then(|s| s.to_str())
@@ -1370,11 +1506,58 @@ pub(crate) fn bundle_localize_manifest(
 
     let _: Manifest = serde_json::from_value(manifest.clone())
         .with_context(|| format!("validating {}", manifest_path.display()))?;
-    fs::write(manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    atomic_write(manifest_path, &serde_json::to_vec_pretty(&manifest)?)?;
 
     eprintln!(
         "bundle-localize-manifest: rewrote {}",
         manifest_path.display(),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn build_payloads_are_canonically_confined() {
+        let root = tempfile::tempdir().unwrap();
+        let payloads = root.path().join("payloads");
+        fs::create_dir(&payloads).unwrap();
+        let payload = payloads.join("doc.html");
+        fs::write(&payload, "doc").unwrap();
+        let canonical_root = root.path().canonicalize().unwrap();
+        assert_eq!(
+            confined_payload_path(&canonical_root, "payloads/doc.html").unwrap(),
+            payload.canonicalize().unwrap()
+        );
+        for raw in [
+            "../secret",
+            "/etc/passwd",
+            r"payloads\..\secret",
+            r"C:\secret",
+            "doc.html",
+            "payloads/doc.html?ignored",
+        ] {
+            assert!(
+                confined_payload_path(&canonical_root, raw).is_err(),
+                "accepted {raw}"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&payload, payloads.join("linked.html")).unwrap();
+            assert!(confined_payload_path(&canonical_root, "payloads/linked.html").is_err());
+        }
+    }
+
+    #[test]
+    fn atomic_write_replaces_only_with_complete_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("manifest.json");
+        fs::write(&path, b"old").unwrap();
+        atomic_write(&path, b"new complete value").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new complete value");
+    }
 }

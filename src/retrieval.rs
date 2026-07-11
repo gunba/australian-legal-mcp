@@ -10,22 +10,24 @@ use crate::extract::{extract_anchors, normalize_definition_term};
 use crate::html::clean_ato_html;
 use crate::uri::{parse_doc_uri, DocUri};
 use crate::{
-    fetch_bytes, optional_usize, required_str,
-    UrlContext, ATO_FETCH_TIMEOUT, ATO_USER_AGENT, OEWN_2024_SOURCE, OEWN_2024_URL,
-    ORDINARY_DICTIONARY_PATH_ENV, STATUTORY_DEFINITION_TYPE_PREFIXES,
+    fetch_bytes, optional_usize, required_str, UrlContext, ATO_FETCH_TIMEOUT, ATO_USER_AGENT,
+    OEWN_2024_SOURCE, OEWN_2024_URL, ORDINARY_DICTIONARY_PATH_ENV,
+    STATUTORY_DEFINITION_TYPE_PREFIXES,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
+use chrono::{Datelike, NaiveDate};
 use regex::Regex;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
-use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::{self, OpenOptions};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
+use url::Url;
 use zip::ZipArchive;
 
 pub(crate) const CITED_BY_LIMIT: usize = 100;
@@ -34,6 +36,10 @@ pub(crate) const CITED_BY_LIMIT: usize = 100;
 /// from `documents.doc_id` so the `[doc:X]` annotation pass on chunk hydration
 /// stays O(text length) instead of paying a SQL round-trip per marker.
 static CORPUS_DOC_IDS: OnceLock<HashSet<String>> = OnceLock::new();
+static CORPUS_DOC_IDS_INIT: Mutex<()> = Mutex::new(());
+static ORDINARY_DICTIONARY_INSTALL: Mutex<()> = Mutex::new(());
+static ORDINARY_DICTIONARY_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<OrdinaryDictionaryIndex>>>> =
+    OnceLock::new();
 
 /// `[doc:X]` marker regex. Captures the doc_id (up to whitespace, `]`, or
 /// `@` for the PiT/view qualifier separator) and the trailing qualifier
@@ -50,6 +56,12 @@ pub(crate) fn corpus_doc_id_set() -> Result<&'static HashSet<String>> {
     if let Some(set) = CORPUS_DOC_IDS.get() {
         return Ok(set);
     }
+    let _guard = CORPUS_DOC_IDS_INIT
+        .lock()
+        .map_err(|_| anyhow!("corpus document-id cache lock poisoned"))?;
+    if let Some(set) = CORPUS_DOC_IDS.get() {
+        return Ok(set);
+    }
     let conn = open_read()?;
     let mut stmt = conn.prepare("SELECT doc_id FROM documents")?;
     let mut set = HashSet::new();
@@ -57,7 +69,10 @@ pub(crate) fn corpus_doc_id_set() -> Result<&'static HashSet<String>> {
     for row in rows {
         set.insert(row?);
     }
-    Ok(CORPUS_DOC_IDS.get_or_init(|| set))
+    CORPUS_DOC_IDS
+        .set(set)
+        .map_err(|_| anyhow!("corpus document-id cache initialized concurrently"))?;
+    Ok(CORPUS_DOC_IDS.get().expect("corpus document-id cache set"))
 }
 
 /// Translate an ATO `[doc:X<tail>]` marker tail (everything captured between
@@ -120,7 +135,11 @@ pub(crate) fn ato_marker_tail_to_query_suffix(tail: &str) -> String {
 /// shape, so already-rewritten `[fetch:...]` markers are inherently
 /// idempotent — they don't match and pass through untouched.
 pub(crate) fn annotate_doc_refs(text: &str, self_doc_id: &str) -> Result<String> {
-    Ok(annotate_doc_refs_with(text, self_doc_id, corpus_doc_id_set()?))
+    Ok(annotate_doc_refs_with(
+        text,
+        self_doc_id,
+        corpus_doc_id_set()?,
+    ))
 }
 
 /// Pure helper: same as `annotate_doc_refs` but takes the doc-id set
@@ -159,12 +178,16 @@ pub(crate) fn fetch(uri_string: &str) -> Result<String> {
 /// `{uri, canonical_url, title, source, chunks}` shape as other retrieval
 /// responses.
 pub(crate) fn fetch_ato_doc(doc_id: &str, pit: Option<&str>, view: Option<&str>) -> Result<String> {
-    let mut url = format!("https://www.ato.gov.au/law/view/document?docid={}", doc_id);
-    if let Some(p) = pit.filter(|s| !s.is_empty()) {
-        url.push_str(&format!("&PiT={}", p));
-    }
-    if let Some(v) = view.filter(|s| !s.is_empty()) {
-        url.push_str(&format!("&db={}", v));
+    let mut url = Url::parse("https://www.ato.gov.au/law/view/document")?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("docid", doc_id);
+        if let Some(p) = pit.filter(|s| !s.is_empty()) {
+            query.append_pair("PiT", p);
+        }
+        if let Some(v) = view.filter(|s| !s.is_empty()) {
+            query.append_pair("db", v);
+        }
     }
 
     let client = reqwest::blocking::Client::builder()
@@ -178,7 +201,7 @@ pub(crate) fn fetch_ato_doc(doc_id: &str, pit: Option<&str>, view: Option<&str>)
         .build()
         .context("building HTTP client")?;
     let resp = client
-        .get(&url)
+        .get(url.clone())
         .send()
         .with_context(|| format!("fetching {url}"))?;
     let status = resp.status();
@@ -234,7 +257,7 @@ pub(crate) fn fetch_ato_doc(doc_id: &str, pit: Option<&str>, view: Option<&str>)
     .to_uri_string();
     Ok(serde_json::to_string_pretty(&json!({
         "uri": canonical_uri,
-        "canonical_url": url,
+        "canonical_url": url.as_str(),
         "title": cleaned.title,
         "source": "live",
         "chunks": chunk_json,
@@ -288,6 +311,94 @@ pub(crate) struct DictionaryEntry {
     pub(crate) source: Option<String>,
     #[serde(default)]
     pub(crate) part_of_speech: Option<String>,
+}
+
+#[derive(Debug)]
+struct OrdinaryDictionaryIndex {
+    source: String,
+    definitions: HashMap<String, Vec<OrdinaryDefinition>>,
+}
+
+impl OrdinaryDictionaryIndex {
+    fn parse(raw: &str, default_source: &str) -> Result<Self> {
+        if let Ok(entries) = serde_json::from_str::<Vec<DictionaryEntry>>(raw) {
+            return Ok(Self::from_entries(entries, default_source));
+        }
+        let jsonl = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<DictionaryEntry>(line.trim()).ok())
+            .collect::<Vec<_>>();
+        if !jsonl.is_empty() {
+            return Ok(Self::from_entries(jsonl, default_source));
+        }
+
+        let mut definitions: HashMap<String, Vec<OrdinaryDefinition>> = HashMap::new();
+        for line in raw.lines() {
+            let parts = line.splitn(4, '\t').collect::<Vec<_>>();
+            let (term, definition) = match parts.as_slice() {
+                [norm, _display, part_of_speech, definition] => (
+                    (*norm).to_string(),
+                    OrdinaryDefinition {
+                        part_of_speech: Some((*part_of_speech).to_string()),
+                        definition: (*definition).to_string(),
+                    },
+                ),
+                [term, definition, ..] => (
+                    normalize_definition_term(term),
+                    OrdinaryDefinition {
+                        part_of_speech: None,
+                        definition: (*definition).to_string(),
+                    },
+                ),
+                _ => continue,
+            };
+            if !term.is_empty() {
+                let values = definitions.entry(term).or_default();
+                if values.len() < 5 {
+                    values.push(definition);
+                }
+            }
+        }
+        Ok(Self {
+            source: default_source.to_string(),
+            definitions,
+        })
+    }
+
+    fn from_entries(entries: Vec<DictionaryEntry>, default_source: &str) -> Self {
+        let mut source = default_source.to_string();
+        let mut definitions: HashMap<String, Vec<OrdinaryDefinition>> = HashMap::new();
+        for entry in entries {
+            if let Some(entry_source) = entry.source {
+                source = entry_source;
+            }
+            let values = definitions
+                .entry(normalize_definition_term(&entry.term))
+                .or_default();
+            if values.len() < 5 {
+                values.push(OrdinaryDefinition {
+                    part_of_speech: entry.part_of_speech,
+                    definition: entry.definition,
+                });
+            }
+        }
+        Self {
+            source,
+            definitions,
+        }
+    }
+
+    fn lookup(&self, wanted: &str) -> Option<OrdinaryMeaningHit> {
+        self.definitions
+            .get(wanted)
+            .filter(|definitions| !definitions.is_empty())
+            .map(|definitions| OrdinaryMeaningHit {
+                term: wanted.to_string(),
+                kind: "ordinary".to_string(),
+                source: self.source.clone(),
+                definitions: definitions.clone(),
+            })
+    }
 }
 
 pub(crate) fn context_prefix(context_doc_id: Option<&str>) -> Option<String> {
@@ -373,7 +484,9 @@ pub(crate) fn get_definition(term: &str, opts: GetDefinitionOptions<'_>) -> Resu
     format_definition_response(term, &hits, ordinary, ordinary_error, true)
 }
 
-pub(crate) fn ordinary_meaning_or_error(term: &str) -> (Option<OrdinaryMeaningHit>, Option<String>) {
+pub(crate) fn ordinary_meaning_or_error(
+    term: &str,
+) -> (Option<OrdinaryMeaningHit>, Option<String>) {
     match lookup_ordinary_meaning(term) {
         Ok(hit) => (hit, None),
         Err(err) => (None, Some(err.to_string())),
@@ -402,6 +515,22 @@ pub(crate) fn lookup_ordinary_meaning(term: &str) -> Result<Option<OrdinaryMeani
 
 pub(crate) fn ensure_oewn_ordinary_dictionary() -> Result<PathBuf> {
     let index_path = ordinary_dictionary_index_path()?;
+    if index_path.exists() {
+        return Ok(index_path);
+    }
+    let _guard = ORDINARY_DICTIONARY_INSTALL
+        .lock()
+        .map_err(|_| anyhow!("ordinary-meaning dictionary install lock poisoned"))?;
+    let lock_path = index_path.with_extension("install.lock");
+    let install_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening ordinary-meaning lock {}", lock_path.display()))?;
+    install_file
+        .lock()
+        .with_context(|| format!("locking ordinary-meaning index {}", lock_path.display()))?;
     if index_path.exists() {
         return Ok(index_path);
     }
@@ -513,97 +642,23 @@ pub(crate) fn lookup_ordinary_meaning_file(
     source: &str,
     term: &str,
 ) -> Result<Option<OrdinaryMeaningHit>> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("reading ordinary-meaning dictionary {}", path.display()))?;
     let wanted = normalize_definition_term(term);
-    if let Ok(entries) = serde_json::from_str::<Vec<DictionaryEntry>>(&raw) {
-        return Ok(ordinary_from_dictionary_entries(entries, &wanted, source));
-    }
-    let mut jsonl_entries = Vec::new();
-    let mut saw_jsonl = false;
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<DictionaryEntry>(line) {
-            saw_jsonl = true;
-            jsonl_entries.push(entry);
-        }
-    }
-    if saw_jsonl {
-        return Ok(ordinary_from_dictionary_entries(
-            jsonl_entries,
-            &wanted,
-            source,
-        ));
-    }
-    ordinary_from_tsv(&raw, &wanted, source)
-}
-
-pub(crate) fn ordinary_from_dictionary_entries(
-    entries: Vec<DictionaryEntry>,
-    wanted: &str,
-    default_source: &str,
-) -> Option<OrdinaryMeaningHit> {
-    let mut definitions = Vec::new();
-    let mut source = default_source.to_string();
-    for entry in entries {
-        if normalize_definition_term(&entry.term) != wanted {
-            continue;
-        }
-        if let Some(entry_source) = entry.source {
-            source = entry_source;
-        }
-        definitions.push(OrdinaryDefinition {
-            part_of_speech: entry.part_of_speech,
-            definition: entry.definition,
-        });
-        if definitions.len() >= 5 {
-            break;
-        }
-    }
-    if definitions.is_empty() {
-        None
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let cache = ORDINARY_DICTIONARY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .map_err(|_| anyhow!("ordinary-meaning dictionary cache lock poisoned"))?;
+    let index = if let Some(index) = cache.get(&canonical) {
+        Arc::clone(index)
     } else {
-        Some(OrdinaryMeaningHit {
-            term: wanted.to_string(),
-            kind: "ordinary".to_string(),
-            source,
-            definitions,
-        })
-    }
-}
-
-pub(crate) fn ordinary_from_tsv(raw: &str, wanted: &str, source: &str) -> Result<Option<OrdinaryMeaningHit>> {
-    let mut definitions = Vec::new();
-    for line in raw.lines() {
-        let parts: Vec<&str> = line.splitn(4, '\t').collect();
-        if parts.len() == 4 && parts[0] == wanted {
-            definitions.push(OrdinaryDefinition {
-                part_of_speech: Some(parts[2].to_string()),
-                definition: parts[3].to_string(),
-            });
-        } else if parts.len() >= 2 && normalize_definition_term(parts[0]) == wanted {
-            definitions.push(OrdinaryDefinition {
-                part_of_speech: None,
-                definition: parts[1].to_string(),
-            });
-        }
-        if definitions.len() >= 5 {
-            break;
-        }
-    }
-    if definitions.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(OrdinaryMeaningHit {
-            term: wanted.to_string(),
-            kind: "ordinary".to_string(),
-            source: source.to_string(),
-            definitions,
-        }))
-    }
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("reading ordinary-meaning dictionary {}", path.display()))?;
+        let index = Arc::new(OrdinaryDictionaryIndex::parse(&raw, source)?);
+        cache.insert(canonical, Arc::clone(&index));
+        index
+    };
+    drop(cache);
+    Ok(index.lookup(&wanted))
 }
 
 pub(crate) fn format_definition_response(
@@ -626,7 +681,6 @@ pub(crate) fn format_definition_response(
     }))?)
 }
 
-
 pub(crate) fn get_chunks_mcp(args: &JsonValue) -> Result<String> {
     let ids = args
         .get("chunk_ids")
@@ -639,15 +693,26 @@ pub(crate) fn get_chunks_mcp(args: &JsonValue) -> Result<String> {
                 .ok_or_else(|| anyhow!("chunk_ids must contain integers"))
         })
         .collect::<Result<Vec<_>>>()?;
-    get_chunks(
+    let max_chars = optional_usize(args, "max_chars").unwrap_or(DEFAULT_GET_CHUNKS_MAX_CHARS);
+    let cursor = args
+        .get("cursor")
+        .and_then(JsonValue::as_str)
+        .map(decode_get_chunks_cursor)
+        .transpose()?;
+    get_chunks_from_cursor(
         &chunk_ids,
         GetChunksOptions {
             before: optional_usize(args, "before").unwrap_or(0).min(20),
             after: optional_usize(args, "after").unwrap_or(0).min(20),
-            max_chars: optional_usize(args, "max_chars"),
+            max_chars: Some(max_chars),
         },
+        cursor,
     )
 }
+
+const MAX_GET_CHUNKS_IDS: usize = 100;
+const DEFAULT_GET_CHUNKS_MAX_CHARS: usize = 50_000;
+const HARD_GET_CHUNKS_MAX_CHARS: usize = 200_000;
 
 pub(crate) struct GetChunksOptions {
     pub(crate) before: usize,
@@ -667,6 +732,10 @@ pub(crate) struct HydratedChunk {
     pub(crate) anchor: Option<String>,
     pub(crate) canonical_url: String,
     pub(crate) text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) text_start: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) text_complete: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -676,10 +745,76 @@ pub(crate) struct ChunkPointer {
     pub(crate) ord: i64,
 }
 
-pub(crate) fn get_chunks(chunk_ids: &[i64], opts: GetChunksOptions) -> Result<String> {
-    // [MT-07] get_chunks fetches exact chunk ids, optional neighbours, and truncation next_call.
+#[derive(Debug, Clone)]
+struct ChunkRange {
+    doc_id: String,
+    from_ord: i64,
+    to_ord: i64,
+    request_order: usize,
+}
+
+#[derive(Debug)]
+struct StoredChunk {
+    chunk_id: i64,
+    doc_id: String,
+    doc_type: String,
+    title: String,
+    date: Option<String>,
+    anchor: Option<String>,
+    text_blob: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct GetChunksCursor {
+    chunk_ids: Vec<i64>,
+    before: usize,
+    after: usize,
+    max_chars: usize,
+    item: usize,
+    text_offset: usize,
+}
+
+fn encode_get_chunks_cursor(cursor: &GetChunksCursor) -> Result<String> {
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(cursor)?))
+}
+
+fn decode_get_chunks_cursor(value: &str) -> Result<GetChunksCursor> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value)
+        .context("invalid get_chunks cursor encoding")?;
+    serde_json::from_slice(&bytes).context("invalid get_chunks cursor payload")
+}
+
+fn get_chunks_from_cursor(
+    chunk_ids: &[i64],
+    opts: GetChunksOptions,
+    cursor: Option<GetChunksCursor>,
+) -> Result<String> {
     if chunk_ids.is_empty() {
-        return Ok("_No chunk ids provided._".to_string());
+        bail!("chunk_ids must contain at least one id");
+    }
+    if chunk_ids.len() > MAX_GET_CHUNKS_IDS {
+        bail!("chunk_ids accepts at most {MAX_GET_CHUNKS_IDS} ids per request");
+    }
+    let max_chars = opts.max_chars.unwrap_or(DEFAULT_GET_CHUNKS_MAX_CHARS);
+    if max_chars == 0 || max_chars > HARD_GET_CHUNKS_MAX_CHARS {
+        bail!("max_chars must be between 1 and {HARD_GET_CHUNKS_MAX_CHARS}");
+    }
+    let expected_cursor = GetChunksCursor {
+        chunk_ids: chunk_ids.to_vec(),
+        before: opts.before,
+        after: opts.after,
+        max_chars,
+        item: 0,
+        text_offset: 0,
+    };
+    let cursor = cursor.unwrap_or_else(|| expected_cursor.clone());
+    if cursor.chunk_ids != expected_cursor.chunk_ids
+        || cursor.before != expected_cursor.before
+        || cursor.after != expected_cursor.after
+        || cursor.max_chars != expected_cursor.max_chars
+    {
+        bail!("get_chunks cursor does not match chunk_ids or retrieval options");
     }
     let conn = open_read()?;
     let placeholders = vec!["?"; chunk_ids.len()].join(",");
@@ -700,42 +835,81 @@ pub(crate) fn get_chunks(chunk_ids: &[i64], opts: GetChunksOptions) -> Result<St
         .map(|pointer| (pointer.chunk_id, pointer))
         .collect::<HashMap<_, _>>();
 
-    let mut seen = HashSet::new();
     let requested_set: HashSet<i64> = chunk_ids.iter().copied().collect();
+    let ranges = merged_chunk_ranges(chunk_ids, &pointers, opts.before, opts.after);
+    let mut stored = Vec::new();
+    let mut seen = HashSet::new();
+    for range in ranges {
+        for chunk in
+            load_stored_chunks_by_ord_range(&conn, &range.doc_id, range.from_ord, range.to_ord)?
+        {
+            if seen.insert(chunk.chunk_id) {
+                stored.push(chunk);
+            }
+        }
+    }
+    let stored_len = stored.len();
+    if cursor.item > stored_len || (cursor.item == stored_len && cursor.text_offset != 0) {
+        bail!("get_chunks cursor is beyond the hydrated result set");
+    }
     let mut out = Vec::new();
     let mut returned_chars = 0usize;
-    let mut truncated_at: Option<HydratedChunk> = None;
-    for requested_id in chunk_ids {
-        let Some(pointer) = pointers.get(requested_id) else {
-            continue;
+    let corpus = corpus_doc_id_set()?;
+    let mut next = None;
+    for (index, chunk) in stored.into_iter().enumerate().skip(cursor.item) {
+        let raw_text = decompress_text(chunk.text_blob)?;
+        let text = annotate_doc_refs_with(&raw_text, &chunk.doc_id, corpus);
+        let start = if index == cursor.item {
+            cursor.text_offset
+        } else {
+            0
         };
-        let from_ord = pointer.ord.saturating_sub(opts.before as i64);
-        let to_ord = pointer.ord.saturating_add(opts.after as i64);
-        for mut chunk in load_chunks_by_ord_range(&conn, &pointer.doc_id, from_ord, to_ord)? {
-            chunk.requested = requested_set.contains(&chunk.chunk_id);
-            if !seen.insert(chunk.chunk_id) {
-                continue;
-            }
-            let projected_chars = returned_chars + chunk.text.len();
-            if opts
-                .max_chars
-                .is_some_and(|max| !out.is_empty() && projected_chars > max)
-            {
-                truncated_at = Some(chunk);
-                break;
-            }
-            returned_chars = projected_chars;
-            out.push(chunk);
+        let total_chars = text.chars().count();
+        if start > total_chars {
+            bail!("get_chunks cursor text offset is beyond its chunk");
         }
-        if truncated_at.is_some() {
+        if start == total_chars {
+            continue;
+        }
+        let remaining = max_chars - returned_chars;
+        let available = total_chars - start;
+        let take = available.min(remaining);
+        let body = text.chars().skip(start).take(take).collect::<String>();
+        let complete = take == available;
+        out.push(HydratedChunk {
+            chunk_id: chunk.chunk_id,
+            requested: requested_set.contains(&chunk.chunk_id),
+            doc_id: chunk.doc_id.clone(),
+            doc_type: chunk.doc_type.clone(),
+            title: chunk.title.clone(),
+            date: chunk.date.clone(),
+            anchor: chunk.anchor.clone(),
+            canonical_url: canonical_url(&chunk.doc_id),
+            text: body,
+            text_start: (start != 0 || !complete).then_some(start),
+            text_complete: (start != 0 || !complete).then_some(complete),
+        });
+        returned_chars += take;
+        if !complete {
+            next = Some(GetChunksCursor {
+                item: index,
+                text_offset: start + take,
+                ..expected_cursor.clone()
+            });
+            break;
+        }
+        if returned_chars == max_chars && index + 1 < stored_len {
+            next = Some(GetChunksCursor {
+                item: index + 1,
+                text_offset: 0,
+                ..expected_cursor.clone()
+            });
             break;
         }
     }
-    let next_call = truncated_at
-        .as_ref()
-        .map(|chunk| format!("get_chunks(chunk_ids=[{}])", chunk.chunk_id));
+    let next_call = next.as_ref().map(get_chunks_next_call).transpose()?;
     let mut meta = serde_json::Map::new();
-    if truncated_at.is_some() {
+    if next.is_some() {
         meta.insert("truncated".to_string(), JsonValue::Bool(true));
         if let Some(call) = next_call.as_ref() {
             meta.insert("next_call".to_string(), JsonValue::String(call.to_string()));
@@ -751,6 +925,7 @@ pub(crate) fn get_chunks(chunk_ids: &[i64], opts: GetChunksOptions) -> Result<St
         json!({
             "before": opts.before,
             "after": opts.after,
+            "max_chars": max_chars,
         }),
     );
     response.insert("chunks".to_string(), serde_json::to_value(&out)?);
@@ -760,12 +935,68 @@ pub(crate) fn get_chunks(chunk_ids: &[i64], opts: GetChunksOptions) -> Result<St
     Ok(serde_json::to_string_pretty(&JsonValue::Object(response))?)
 }
 
-pub(crate) fn load_chunks_by_ord_range(
+fn get_chunks_next_call(cursor: &GetChunksCursor) -> Result<String> {
+    let ids = cursor
+        .chunk_ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "get_chunks(chunk_ids=[{ids}], before={}, after={}, max_chars={}, cursor={})",
+        cursor.before,
+        cursor.after,
+        cursor.max_chars,
+        serde_json::to_string(&encode_get_chunks_cursor(cursor)?)?
+    ))
+}
+
+fn merged_chunk_ranges(
+    chunk_ids: &[i64],
+    pointers: &HashMap<i64, ChunkPointer>,
+    before: usize,
+    after: usize,
+) -> Vec<ChunkRange> {
+    let mut by_doc: BTreeMap<String, Vec<ChunkRange>> = BTreeMap::new();
+    for (request_order, chunk_id) in chunk_ids.iter().enumerate() {
+        let Some(pointer) = pointers.get(chunk_id) else {
+            continue;
+        };
+        by_doc
+            .entry(pointer.doc_id.clone())
+            .or_default()
+            .push(ChunkRange {
+                doc_id: pointer.doc_id.clone(),
+                from_ord: pointer.ord.saturating_sub(before as i64),
+                to_ord: pointer.ord.saturating_add(after as i64),
+                request_order,
+            });
+    }
+    let mut merged: Vec<ChunkRange> = Vec::new();
+    for (_, mut ranges) in by_doc {
+        ranges.sort_by_key(|range| (range.from_ord, range.to_ord));
+        for range in ranges {
+            if let Some(previous) = merged.last_mut().filter(|previous| {
+                previous.doc_id == range.doc_id
+                    && range.from_ord <= previous.to_ord.saturating_add(1)
+            }) {
+                previous.to_ord = previous.to_ord.max(range.to_ord);
+                previous.request_order = previous.request_order.min(range.request_order);
+            } else {
+                merged.push(range);
+            }
+        }
+    }
+    merged.sort_by_key(|range| range.request_order);
+    merged
+}
+
+fn load_stored_chunks_by_ord_range(
     conn: &Connection,
     doc_id: &str,
     from_ord: i64,
     to_ord: i64,
-) -> Result<Vec<HydratedChunk>> {
+) -> Result<Vec<StoredChunk>> {
     let mut stmt = conn.prepare(
         r#"
         SELECT c.chunk_id, c.doc_id, c.anchor, c.text,
@@ -788,25 +1019,19 @@ pub(crate) fn load_chunks_by_ord_range(
             row.get::<_, Vec<u8>>("text")?,
         ))
     })?;
-    let mut out = Vec::new();
-    let corpus = corpus_doc_id_set()?;
-    for row in rows {
+    rows.map(|row| {
         let (chunk_id, doc_id, doc_type, title, date, anchor, text_blob) = row?;
-        let raw_text = decompress_text(text_blob)?;
-        let text = annotate_doc_refs_with(&raw_text, &doc_id, corpus);
-        out.push(HydratedChunk {
+        Ok(StoredChunk {
             chunk_id,
-            requested: false,
-            doc_id: doc_id.clone(),
+            doc_id,
             doc_type,
             title,
             date,
             anchor,
-            canonical_url: canonical_url(&doc_id),
-            text,
-        });
-    }
-    Ok(out)
+            text_blob,
+        })
+    })
+    .collect()
 }
 
 pub(crate) fn get_asset_mcp(args: &JsonValue) -> Result<JsonValue> {
@@ -859,14 +1084,17 @@ pub(crate) fn get_doc_anchors_mcp(args: &JsonValue) -> Result<String> {
 /// `YYYY-MM-DD` date. Returns `None` when the input is shorter than 8
 /// characters or its first 8 characters are not all digits.
 pub(crate) fn pit_to_date(pit: &str) -> Option<String> {
-    if pit.len() < 8 {
+    let head = pit.get(..8)?;
+    if !head.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    let head = &pit[..8];
-    if !head.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    Some(format!("{}-{}-{}", &head[..4], &head[4..6], &head[6..8]))
+    let date = NaiveDate::parse_from_str(head, "%Y%m%d").ok()?;
+    Some(format!(
+        "{:04}-{:02}-{:02}",
+        date.year(),
+        date.month(),
+        date.day()
+    ))
 }
 
 pub(crate) fn get_doc_anchors(doc_id: &str) -> Result<String> {
@@ -925,12 +1153,11 @@ pub(crate) fn get_doc_anchors(doc_id: &str) -> Result<String> {
                         // Fully-qualified URL the agent can WebFetch directly.
                         // Historical content is not stored locally — agents
                         // requesting the older version follow this URL.
-                        entry.insert(
-                            "url".to_string(),
-                            JsonValue::String(format!(
-                                "https://www.ato.gov.au/law/view/document?docid={target}&PiT={pit}"
-                            )),
-                        );
+                        let mut url = Url::parse("https://www.ato.gov.au/law/view/document")?;
+                        url.query_pairs_mut()
+                            .append_pair("docid", &target)
+                            .append_pair("PiT", pit);
+                        entry.insert("url".to_string(), JsonValue::String(url.into()));
                     }
                     historical_versions.push(JsonValue::Object(entry));
                 }
@@ -982,7 +1209,10 @@ pub(crate) fn get_doc_anchors(doc_id: &str) -> Result<String> {
     Ok(serde_json::to_string_pretty(&JsonValue::Object(response))?)
 }
 
-pub(crate) fn resolve_in_doc_anchor_chunks(conn: &Connection, doc_id: &str) -> Result<Vec<JsonValue>> {
+pub(crate) fn resolve_in_doc_anchor_chunks(
+    conn: &Connection,
+    doc_id: &str,
+) -> Result<Vec<JsonValue>> {
     let html_blob: Option<Vec<u8>> = conn
         .query_row(
             "SELECT html FROM documents WHERE doc_id = ?",
@@ -1127,4 +1357,126 @@ pub(crate) fn load_cited_by(conn: &Connection, doc_id: &str) -> Result<(Vec<Json
         out.push(JsonValue::Object(entry));
     }
     Ok((out, total))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_cursor_round_trips_all_request_state() -> Result<()> {
+        let cursor = GetChunksCursor {
+            chunk_ids: vec![7, 9, 7],
+            before: 2,
+            after: 3,
+            max_chars: 1234,
+            item: 4,
+            text_offset: 55,
+        };
+        assert_eq!(
+            decode_get_chunks_cursor(&encode_get_chunks_cursor(&cursor)?)?,
+            cursor
+        );
+        let call = get_chunks_next_call(&cursor)?;
+        assert!(call.contains("chunk_ids=[7, 9, 7]"));
+        assert!(call.contains("before=2"));
+        assert!(call.contains("after=3"));
+        assert!(call.contains("max_chars=1234"));
+        Ok(())
+    }
+
+    #[test]
+    fn overlapping_chunk_ranges_merge_before_loading() {
+        let pointers = [
+            (
+                10,
+                ChunkPointer {
+                    chunk_id: 10,
+                    doc_id: "A".into(),
+                    ord: 5,
+                },
+            ),
+            (
+                11,
+                ChunkPointer {
+                    chunk_id: 11,
+                    doc_id: "A".into(),
+                    ord: 7,
+                },
+            ),
+            (
+                20,
+                ChunkPointer {
+                    chunk_id: 20,
+                    doc_id: "B".into(),
+                    ord: 1,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let ranges = merged_chunk_ranges(&[10, 11, 20], &pointers, 1, 1);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(
+            (
+                ranges[0].doc_id.as_str(),
+                ranges[0].from_ord,
+                ranges[0].to_ord
+            ),
+            ("A", 4, 8)
+        );
+        assert_eq!(
+            (
+                ranges[1].doc_id.as_str(),
+                ranges[1].from_ord,
+                ranges[1].to_ord
+            ),
+            ("B", 0, 2)
+        );
+    }
+
+    #[test]
+    fn pit_dates_are_calendar_valid_and_unicode_safe() {
+        assert_eq!(pit_to_date("20240229120000").as_deref(), Some("2024-02-29"));
+        assert_eq!(pit_to_date("20230229120000"), None);
+        assert_eq!(pit_to_date("éééééééé"), None);
+    }
+
+    #[test]
+    fn ordinary_dictionary_builds_a_bounded_lookup_index() -> Result<()> {
+        let raw = "car\tcar\tnoun\ta road vehicle\ncar\tcar\tnoun\nan automobile\n";
+        let index = OrdinaryDictionaryIndex::parse(raw, "test")?;
+        let hit = index.lookup("car").expect("indexed term");
+        assert_eq!(hit.source, "test");
+        assert_eq!(hit.definitions.len(), 2);
+        assert!(index.lookup("missing").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn get_chunks_rejects_empty_and_unbounded_requests_before_opening_the_db() {
+        let empty = get_chunks_from_cursor(
+            &[],
+            GetChunksOptions {
+                before: 0,
+                after: 0,
+                max_chars: Some(10),
+            },
+            None,
+        )
+        .expect_err("empty request must fail");
+        assert!(empty.to_string().contains("at least one"));
+
+        let excessive = get_chunks_from_cursor(
+            &[1],
+            GetChunksOptions {
+                before: 0,
+                after: 0,
+                max_chars: Some(HARD_GET_CHUNKS_MAX_CHARS + 1),
+            },
+            None,
+        )
+        .expect_err("unbounded request must fail");
+        assert!(excessive.to_string().contains("max_chars"));
+    }
 }

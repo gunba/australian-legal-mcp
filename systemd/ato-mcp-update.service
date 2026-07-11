@@ -6,8 +6,10 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+EnvironmentFile=-%h/.config/ato-mcp/environment
 ExecStart=%h/.local/bin/ato-mcp update
-# If your install put the Rust binary elsewhere, adjust above.
+ExecStartPost=/usr/bin/systemctl --user try-restart ato-mcp-serve.service
+ExecStartPost=%h/.local/bin/ato-mcp stats
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7

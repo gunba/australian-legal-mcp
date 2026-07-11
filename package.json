@@ -1,6 +1,6 @@
 {
   "name": "ato-mcp",
-  "version": "0.15.5",
+  "version": "0.16.0",
   "private": true,
   "description": "Local search and retrieval over the Australian Taxation Office legal corpus.",
   "license": "MIT",
@@ -10,6 +10,14 @@
     "mcp",
     "ato",
     "tax"
+  ],
+  "files": [
+    ".claude-plugin/",
+    ".mcp.json",
+    "skills/",
+    "AGENTS.md",
+    "LICENSE",
+    "README.md"
   ],
   "pi": {
     "skills": [

@@ -128,10 +128,7 @@ pub(crate) fn dot_i8(query: &[i8; EMBEDDING_DIM], document: &[u8]) -> Result<f64
 }
 
 #[cfg(test)]
-pub(crate) fn dot_i8_scalar_reference(
-    query: &[i8; EMBEDDING_DIM],
-    document: &[u8],
-) -> Result<f64> {
+pub(crate) fn dot_i8_scalar_reference(query: &[i8; EMBEDDING_DIM], document: &[u8]) -> Result<f64> {
     if document.len() != EMBEDDING_DIM {
         bail!(
             "invalid stored embedding length: got {}, expected {}",
@@ -186,14 +183,16 @@ impl SemanticEncodeStats {
 
 pub(crate) struct SemanticRuntime {
     tokenizer: Tokenizer,
+    validation_tokenizer: Tokenizer,
     session: Session,
     has_token_type_ids: bool,
 }
 
 impl SemanticRuntime {
     pub(crate) fn load(use_gpu: bool, model_paths: &SemanticModelPaths) -> Result<Self> {
-        let mut tokenizer = Tokenizer::from_file(&model_paths.tokenizer)
+        let validation_tokenizer = Tokenizer::from_file(&model_paths.tokenizer)
             .map_err(|err| anyhow!("loading tokenizer: {err}"))?;
+        let mut tokenizer = validation_tokenizer.clone();
         tokenizer
             .with_truncation(Some(TruncationParams {
                 max_length: EMBEDDING_INPUT_MAX_TOKENS,
@@ -226,6 +225,7 @@ impl SemanticRuntime {
 
         Ok(Self {
             tokenizer,
+            validation_tokenizer,
             session,
             has_token_type_ids,
         })
@@ -238,9 +238,24 @@ impl SemanticRuntime {
             .ok_or_else(|| anyhow!("semantic encoder returned no query embedding"))
     }
 
-    pub(crate) fn encode_queries(&mut self, queries: &[String]) -> Result<Vec<[i8; EMBEDDING_DIM]>> {
+    pub(crate) fn encode_queries(
+        &mut self,
+        queries: &[String],
+    ) -> Result<Vec<[i8; EMBEDDING_DIM]>> {
         let (embeddings, _stats) = self.encode_queries_with_stats(queries)?;
         Ok(embeddings)
+    }
+
+    fn validate_input_token_counts(&self, prefixed: &[String]) -> Result<()> {
+        let encodings = self
+            .validation_tokenizer
+            .encode_batch(prefixed.to_vec(), true)
+            .map_err(|err| anyhow!("validating semantic input token counts: {err}"))?;
+        let counts = encodings
+            .iter()
+            .map(|encoding| encoding.get_ids().len())
+            .collect::<Vec<_>>();
+        ensure_token_counts_within_limit(&counts, EMBEDDING_INPUT_MAX_TOKENS)
     }
 
     pub(crate) fn encode_queries_with_stats(
@@ -254,6 +269,7 @@ impl SemanticRuntime {
             .iter()
             .map(|query| format!("{EMBEDDING_TEXT_PREFIX}{query}"))
             .collect();
+        self.validate_input_token_counts(&prefixed)?;
         let mut stats = SemanticEncodeStats::default();
         let started = std::time::Instant::now();
         let encodings = self
@@ -332,6 +348,20 @@ impl SemanticRuntime {
         stats.postprocess += started.elapsed();
         Ok((embeddings, stats))
     }
+}
+
+fn ensure_token_counts_within_limit(counts: &[usize], max_tokens: usize) -> Result<()> {
+    if let Some((index, actual)) = counts
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, count)| *count > max_tokens)
+    {
+        bail!(
+            "semantic input {index} contains {actual} tokens, exceeding the {max_tokens}-token model limit"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
@@ -443,4 +473,23 @@ pub(crate) fn quantize_embedding(values: &[f32]) -> Result<[i8; EMBEDDING_DIM]> 
         out[idx] = ((*value / norm).clamp(-1.0, 1.0) * 127.0).round() as i8;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_token_counts_within_limit;
+
+    #[test]
+    fn actual_token_count_validation_rejects_the_first_oversize_input() {
+        let error = ensure_token_counts_within_limit(&[1024, 1025, 2048], 1024).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "semantic input 1 contains 1025 tokens, exceeding the 1024-token model limit"
+        );
+    }
+
+    #[test]
+    fn actual_token_count_validation_accepts_the_exact_limit() {
+        ensure_token_counts_within_limit(&[0, 1, 1024], 1024).unwrap();
+    }
 }

@@ -6,65 +6,131 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to attach binaries to"
+        description: "Existing vX.Y.Z tag to build and publish"
         required: true
+        type: string
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
+  validate:
+    name: validate release tag
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Match checkout, tag, and Cargo version
+        shell: bash
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git describe --tags --exact-match)" = "$RELEASE_TAG"
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "ato-mcp") | .version')
+          test "v$version" = "$RELEASE_TAG"
+
   build:
     name: build ${{ matrix.asset }}
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
             asset: ato-mcp-x86_64-unknown-linux-gnu.tar.gz
-            binary: target/release/ato-mcp
+            binary: target/x86_64-unknown-linux-gnu/release/ato-mcp
             archive: tar
+            zig: true
           - os: macos-14
+            target: aarch64-apple-darwin
             asset: ato-mcp-aarch64-apple-darwin.tar.gz
-            binary: target/release/ato-mcp
+            binary: target/aarch64-apple-darwin/release/ato-mcp
             archive: tar
+            zig: false
           - os: windows-2022
+            target: x86_64-pc-windows-msvc
             asset: ato-mcp-x86_64-pc-windows-msvc.zip
-            binary: target/release/ato-mcp.exe
+            binary: target/x86_64-pc-windows-msvc/release/ato-mcp.exe
             archive: zip
+            zig: false
             ort_version: 1.24.4
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Build
-        run: cargo build --release --locked
-      - name: Download ONNX Runtime DLL
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          targets: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        if: matrix.zig
+        with:
+          version: 0.14.1
+          use-cache: false
+      - name: Install pinned Linux compatibility builder
+        if: matrix.zig
+        run: cargo install cargo-zigbuild --version 0.20.1 --locked
+      - name: Build Linux for glibc 2.17
+        if: matrix.zig
+        run: >-
+          cargo zigbuild --release --locked
+          --target x86_64-unknown-linux-gnu.2.17
+      - name: Build native target
+        if: ${{ !matrix.zig }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Download and verify ONNX Runtime DLL
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $version = "${{ matrix.ort_version }}"
-          $url = "https://github.com/microsoft/onnxruntime/releases/download/v$version/onnxruntime-win-x64-$version.zip"
+          $base = "https://github.com/microsoft/onnxruntime/releases"
+          $name = "onnxruntime-win-x64-$version.zip"
+          $url = "$base/download/v$version/$name"
           Invoke-WebRequest -Uri $url -OutFile onnxruntime.zip
+          $hash = Get-FileHash onnxruntime.zip -Algorithm SHA256
+          $actual = $hash.Hash.ToLower()
+          $expected = "d2319fddfb6ea4db99ccc4b60c85c517" +
+            "bcd855721f5daa6a06d40d7cb2ee2357"
+          if ($actual -ne $expected) {
+            throw "ONNX Runtime checksum mismatch: $actual"
+          }
           Expand-Archive -Path onnxruntime.zip -DestinationPath onnxruntime
-      - name: Package tar
+      - name: Package and verify tar
         if: matrix.archive == 'tar'
         shell: bash
         run: |
-          mkdir package
-          cp "${{ matrix.binary }}" package/ato-mcp
+          install -Dm755 "${{ matrix.binary }}" package/ato-mcp
           cp README.md LICENSE package/
-          tar -C package -czf "${{ matrix.asset }}" .
-      - name: Package zip
+          package/ato-mcp --version | grep -F "${RELEASE_TAG#v}"
+          COPYFILE_DISABLE=1 tar -C package -czf "${{ matrix.asset }}" .
+          mkdir verify
+          tar -C verify -xzf "${{ matrix.asset }}"
+          verify/ato-mcp --version | grep -F "${RELEASE_TAG#v}"
+      - name: Package and verify zip
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path package
           Copy-Item "${{ matrix.binary }}" package/ato-mcp.exe
-          Copy-Item "onnxruntime/onnxruntime-win-x64-${{ matrix.ort_version }}/lib/onnxruntime.dll" package/onnxruntime.dll
-          Copy-Item README.md package/
-          Copy-Item LICENSE package/
-          Compress-Archive -Path package/* -DestinationPath "${{ matrix.asset }}"
-      - uses: actions/upload-artifact@v7
+          $ort = "${{ matrix.ort_version }}"
+          $dll = "onnxruntime/onnxruntime-win-x64-$ort/lib/onnxruntime.dll"
+          Copy-Item $dll package/
+          Copy-Item README.md, LICENSE package/
+          $version = $env:RELEASE_TAG.Substring(1)
+          & package/ato-mcp.exe --version | Select-String $version
+          Compress-Archive -Path package/* `
+            -DestinationPath "${{ matrix.asset }}"
+          Expand-Archive "${{ matrix.asset }}" verify
+          & verify/ato-mcp.exe --version | Select-String $version
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
@@ -74,15 +140,21 @@ jobs:
     name: upload release assets
     needs: build
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: artifacts
-      - name: Upload to GitHub release
+      - name: Publish archives and checksums
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.inputs.tag || github.ref_name }}
           REPO: ${{ github.repository }}
         run: |
-          gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || gh release create "$TAG" --repo "$REPO" --title "$TAG" --notes "ato-mcp Rust binary release"
-          gh release upload "$TAG" artifacts/*/* --repo "$REPO" --clobber
+          gh release view "$RELEASE_TAG" --repo "$REPO" >/dev/null 2>&1 \
+            || gh release create "$RELEASE_TAG" --repo "$REPO" \
+              --title "$RELEASE_TAG" --generate-notes
+          find artifacts -maxdepth 2 -type f -exec cp {} . \;
+          sha256sum ato-mcp-* > SHA256SUMS
+          gh release upload "$RELEASE_TAG" ato-mcp-* SHA256SUMS \
+            --repo "$REPO" --clobber

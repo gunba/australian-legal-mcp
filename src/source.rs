@@ -4,33 +4,286 @@
 //! refactor — split into scraper.rs, stats.rs, and manifest.rs in a follow-up.
 
 use crate::config::{
-    data_dir, db_path, installed_manifest_path, live_dir, lock_file,
-    model_marker_path, staging_dir,
+    activate_generation, data_dir, generation_dir, generations_dir, installed_manifest_path,
+    live_dir, lock_file, staging_dir,
 };
-use crate::db::{
-    get_meta, open_read, open_write_at, set_meta, table_exists,
-};
+use crate::db::{get_meta, open_read, open_write_at, set_meta, table_exists};
 use crate::extract::anchors_node_text;
 use crate::search::ensure_vector_search_ready;
 use crate::semantic::EMBEDDING_MODEL_HF_FILES;
 use crate::{
-    fetch_bytes, fetch_bytes_with, stage_model,
-    validate_manifest_model_source, UrlContext,
-    ATO_USER_AGENT, DEFAULT_EXCLUDED_TYPES, DEFAULT_RELEASES_API_URL, EDITED_PRIVATE_ADVICE_LABEL, EMBEDDING_MODEL_ID, LEGISLATION_TYPE, LEGISLATION_TYPE_PREFIXES,
+    local_path_from_urlish, resolve_manifest_asset, stage_model, validate_manifest_model_source,
+    UrlContext, ATO_USER_AGENT, DEFAULT_EXCLUDED_TYPES, DEFAULT_RELEASES_API_URL,
+    EDITED_PRIVATE_ADVICE_LABEL, EMBEDDING_MODEL_ID, LEGISLATION_TYPE, LEGISLATION_TYPE_PREFIXES,
     OLD_CONTENT_CUTOFF, SUPPORTED_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, Response};
+use reqwest::redirect::Policy;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{Cursor, Write};
+use std::io::{BufReader, Cursor, Read, Seek, Write};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_ATO_HTML_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_REDIRECTS: usize = 5;
+
+fn approved_https_host(host: &str) -> bool {
+    const ROOTS: &[&str] = &[
+        "ato.gov.au",
+        "github.com",
+        "githubusercontent.com",
+        "githubapis.com",
+        "huggingface.co",
+    ];
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    ROOTS
+        .iter()
+        .any(|root| host == *root || host.ends_with(&format!(".{root}")))
+}
+
+fn public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            !(ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 198 && matches!(octets[1], 18 | 19))
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0))
+        }
+        IpAddr::V6(ip) => {
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return public_ip(IpAddr::V4(v4));
+            }
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip.is_multicast()
+                || ip.segments()[0] == 0x2001 && ip.segments()[1] == 0x0db8)
+        }
+    }
+}
+
+fn validate_remote_url(url: &url::Url) -> Result<(String, Vec<SocketAddr>)> {
+    if url.scheme() != "https" {
+        bail!("acquisition URL must use HTTPS: {url}");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("acquisition URL must not contain credentials: {url}");
+    }
+    if url.port().is_some_and(|port| port != 443) {
+        bail!("acquisition URL must use the default HTTPS port: {url}");
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("acquisition URL has no hostname: {url}"))?;
+    if host.parse::<IpAddr>().is_ok() || !approved_https_host(host) {
+        bail!("unapproved acquisition hostname `{host}`");
+    }
+    let addresses: Vec<_> = (host, 443)
+        .to_socket_addrs()
+        .with_context(|| format!("resolving {host}"))?
+        .collect();
+    if addresses.is_empty() || addresses.iter().any(|address| !public_ip(address.ip())) {
+        bail!("hostname `{host}` resolved to a non-public network address");
+    }
+    Ok((host.to_string(), addresses))
+}
+
+fn secure_get(mut url: url::Url, timeout: Duration) -> Result<Response> {
+    for redirect in 0..=MAX_REDIRECTS {
+        let (host, addresses) = validate_remote_url(&url)?;
+        let client = Client::builder()
+            .user_agent(ATO_USER_AGENT)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(timeout)
+            .redirect(Policy::none())
+            .resolve_to_addrs(&host, &addresses)
+            .build()?;
+        let response = client.get(url.clone()).send()?;
+        if response.status().is_redirection() {
+            if redirect == MAX_REDIRECTS {
+                bail!("too many redirects fetching {url}");
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .ok_or_else(|| anyhow!("redirect from {url} omitted Location"))?
+                .to_str()
+                .context("redirect Location was not valid text")?;
+            url = url.join(location).context("resolving redirect Location")?;
+            continue;
+        }
+        return response
+            .error_for_status()
+            .with_context(|| format!("fetching {url}"));
+    }
+    unreachable!()
+}
+
+fn resolved_source(
+    value: &str,
+    context: &UrlContext,
+) -> Result<std::result::Result<PathBuf, url::Url>> {
+    let resolved = resolve_manifest_asset(value, context);
+    if let Some(path) = local_path_from_urlish(&resolved) {
+        let canonical = path
+            .canonicalize()
+            .with_context(|| format!("canonicalizing {}", path.display()))?;
+        if let Some(root) = &context.manifest_dir {
+            let root = root.canonicalize()?;
+            if !canonical.starts_with(&root) {
+                bail!("manifest asset escaped {}", root.display());
+            }
+        }
+        if !canonical.is_file() {
+            bail!(
+                "manifest asset is not a regular file: {}",
+                canonical.display()
+            );
+        }
+        return Ok(Ok(canonical));
+    }
+    Ok(Err(
+        url::Url::parse(&resolved).with_context(|| format!("parsing URL {resolved}"))?
+    ))
+}
+
+fn secure_fetch_bytes_with_timeout(
+    value: &str,
+    context: &UrlContext,
+    limit: u64,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    let mut reader: Box<dyn Read> = match resolved_source(value, context)? {
+        Ok(path) => {
+            Box::new(File::open(&path).with_context(|| format!("opening {}", path.display()))?)
+        }
+        Err(url) => Box::new(secure_get(url, timeout)?),
+    };
+    let mut bytes = Vec::new();
+    reader.by_ref().take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        bail!("acquisition exceeded {limit} byte limit");
+    }
+    Ok(bytes)
+}
+
+fn secure_fetch_bytes(value: &str, context: &UrlContext, limit: u64) -> Result<Vec<u8>> {
+    secure_fetch_bytes_with_timeout(value, context, limit, Duration::from_secs(120))
+}
+
+#[cfg(unix)]
+fn sync_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    crate::config::atomic_write(path, bytes)
+}
+
+fn sha256_path(path: &Path) -> Result<String> {
+    let mut input = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 128 * 1024];
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn copy_exact_hashed(
+    reader: &mut dyn Read,
+    writer: &mut dyn Write,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<u64> {
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 128 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        total = total
+            .checked_add(count as u64)
+            .ok_or_else(|| anyhow!("artifact byte count overflow"))?;
+        if total > expected_size {
+            bail!("artifact exceeds declared size {expected_size}");
+        }
+        hasher.update(&buffer[..count]);
+        writer.write_all(&buffer[..count])?;
+    }
+    if total != expected_size {
+        bail!("artifact size mismatch: expected {expected_size}, got {total}");
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if !actual.eq_ignore_ascii_case(expected_sha256) {
+        bail!("artifact sha256 mismatch: expected {expected_sha256}, got {actual}");
+    }
+    Ok(total)
+}
+
+/// Stream one integrity-pinned artifact from the approved HTTPS acquisition
+/// surface into `destination`. Every redirect is re-resolved and revalidated;
+/// the temporary file is promoted only after exact size/hash verification.
+pub(crate) fn download_approved_https_to_file(
+    url: &str,
+    destination: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+    timeout: Duration,
+) -> Result<u64> {
+    if expected_size == 0
+        || expected_sha256.len() != 64
+        || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("artifact requires a positive size and 64-digit sha256");
+    }
+    let parsed = url::Url::parse(url).with_context(|| format!("parsing artifact URL {url}"))?;
+    // Validate before touching the destination. `secure_get` repeats this for
+    // the initial request and every redirect after DNS resolution.
+    validate_remote_url(&parsed)?;
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut response = secure_get(parsed, timeout)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    let copied = copy_exact_hashed(&mut response, &mut temp, expected_size, expected_sha256)?;
+    temp.as_file().sync_all()?;
+    temp.persist(destination)
+        .map_err(|error| error.error)
+        .with_context(|| format!("atomically promoting {}", destination.display()))?;
+    sync_parent(destination)?;
+    Ok(copied)
+}
 
 // ----- What's New scraper (port of src/ato_mcp/scraper/whats_new.py) -----
 
@@ -323,18 +576,22 @@ pub(crate) fn description_from_title(title: &str) -> String {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Manifest {
     pub(crate) schema_version: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) manifest_format_version: Option<u32>,
     pub(crate) index_version: String,
     pub(crate) created_at: String,
     pub(crate) min_client_version: String,
     pub(crate) model: ModelInfo,
     pub(crate) db: ManifestDb,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ann: Option<crate::ann::ManifestAnn>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ManifestDb {
     pub(crate) url: String,
@@ -342,7 +599,7 @@ pub(crate) struct ManifestDb {
     pub(crate) size: u64,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ModelInfo {
     pub(crate) id: String,
@@ -391,6 +648,28 @@ pub(crate) fn enforce_manifest_compatibility(manifest: &Manifest) -> Result<()> 
         }
     }
     validate_manifest_model_source(&manifest.model)?;
+    let manifest_format = manifest.manifest_format_version.unwrap_or(1);
+    match manifest_format {
+        1 if manifest.ann.is_some() => {
+            bail!("legacy manifest format 1 cannot declare an ANN sidecar")
+        }
+        1 => {}
+        crate::SUPPORTED_MANIFEST_FORMAT_VERSION if manifest.ann.is_none() => bail!(
+            "manifest format {} requires an ANN sidecar",
+            crate::SUPPORTED_MANIFEST_FORMAT_VERSION
+        ),
+        crate::SUPPORTED_MANIFEST_FORMAT_VERSION => {}
+        other => bail!(
+            "manifest format {other} is not supported by this binary (expects 1 or {})",
+            crate::SUPPORTED_MANIFEST_FORMAT_VERSION
+        ),
+    }
+    if let Some(ann) = manifest.ann.as_ref() {
+        crate::ann::validate_manifest_ann(ann)?;
+        if ann.embedding_model_id != manifest.model.id {
+            bail!("ANN sidecar model does not match manifest model");
+        }
+    }
     Ok(())
 }
 
@@ -422,11 +701,10 @@ pub(crate) fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
     // mid-update.
     let manifest_context = UrlContext::from_manifest_url(manifest_url);
     let staging = staging_dir()?;
-    let manifest_bytes = fetch_bytes(manifest_url, &manifest_context)
+    let manifest_bytes = secure_fetch_bytes(manifest_url, &manifest_context, MAX_MANIFEST_BYTES)
         .with_context(|| format!("fetching manifest from {manifest_url}"))?;
     let new_manifest: Manifest = serde_json::from_slice(&manifest_bytes)?;
     enforce_manifest_compatibility(&new_manifest)?;
-
     let update_root = staging.join("update-apply");
     if update_root.exists() {
         fs::remove_dir_all(&update_root)?;
@@ -455,81 +733,6 @@ pub(crate) struct StagedModel {
     pub(crate) marker_value: String,
 }
 
-pub(crate) struct ModelPromotionGuard {
-    pub(crate) backup_dir: PathBuf,
-    pub(crate) marker_value: String,
-    pub(crate) active: bool,
-}
-
-impl ModelPromotionGuard {
-    fn write_marker(&self) -> Result<()> {
-        fs::write(model_marker_path()?, &self.marker_value)?;
-        Ok(())
-    }
-
-    fn commit(mut self) {
-        self.active = false;
-        let _ = fs::remove_dir_all(&self.backup_dir);
-    }
-}
-
-impl Drop for ModelPromotionGuard {
-    fn drop(&mut self) {
-        if self.active {
-            let _ = restore_model_backup(&self.backup_dir);
-        }
-    }
-}
-
-pub(crate) struct PathPromotionGuard {
-    pub(crate) live_path: PathBuf,
-    pub(crate) backup_path: PathBuf,
-    pub(crate) had_live: bool,
-    pub(crate) active: bool,
-}
-
-impl PathPromotionGuard {
-    fn backup(live_path: PathBuf, backup_path: PathBuf) -> Result<Self> {
-        if let Some(parent) = backup_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        remove_path_if_exists(&backup_path)?;
-        let had_live = live_path.exists();
-        if had_live {
-            fs::rename(&live_path, &backup_path).with_context(|| {
-                format!(
-                    "backing up {} to {}",
-                    live_path.display(),
-                    backup_path.display()
-                )
-            })?;
-        }
-        Ok(Self {
-            live_path,
-            backup_path,
-            had_live,
-            active: true,
-        })
-    }
-
-    fn commit(mut self) {
-        self.active = false;
-        let _ = remove_path_if_exists(&self.backup_path);
-    }
-}
-
-impl Drop for PathPromotionGuard {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        let _ = remove_path_if_exists(&self.live_path);
-        if self.had_live && self.backup_path.exists() {
-            let _ = fs::rename(&self.backup_path, &self.live_path);
-        }
-    }
-}
-
 pub(crate) fn remove_path_if_exists(path: &Path) -> Result<()> {
     let Ok(meta) = fs::symlink_metadata(path) else {
         return Ok(());
@@ -545,6 +748,7 @@ pub(crate) fn remove_path_if_exists(path: &Path) -> Result<()> {
 pub(crate) struct StagedCorpusUpdate {
     pub(crate) staging_root: PathBuf,
     pub(crate) staged_db: PathBuf,
+    pub(crate) staged_ann: Option<PathBuf>,
     pub(crate) stats: UpdateStats,
 }
 
@@ -553,32 +757,132 @@ pub(crate) fn promote_staged_update(
     staged_corpus: StagedCorpusUpdate,
     manifest: &Manifest,
 ) -> Result<()> {
-    let model_guard = match staged_model {
-        Some(model) => Some(promote_staged_model_files(
-            model,
-            &staged_corpus.staging_root.join("model-backup"),
-        )?),
-        None => None,
-    };
-    let db_guard = promote_live_db(
-        &staged_corpus.staged_db,
-        &staged_corpus.staging_root.join("ato.db.backup"),
-    )?;
-    let manifest_guard = promote_installed_manifest(
-        manifest,
-        &staged_corpus
-            .staging_root
-            .join("installed_manifest.json.backup"),
-    )?;
-    if let Some(guard) = model_guard.as_ref() {
-        guard.write_marker()?;
+    promote_generation(staged_model, staged_corpus, manifest)
+}
+
+fn promote_generation(
+    staged_model: Option<&StagedModel>,
+    staged_corpus: StagedCorpusUpdate,
+    manifest: &Manifest,
+) -> Result<()> {
+    let mut generation_hasher = Sha256::new();
+    generation_hasher.update(b"ato-mcp-installed-generation-v1\0");
+    generation_hasher.update(manifest.db.sha256.as_bytes());
+    if let Some(ann) = manifest.ann.as_ref() {
+        let corpus_hash = ann
+            .corpus_id
+            .strip_prefix("sha256:")
+            .ok_or_else(|| anyhow!("ANN corpus_id is malformed"))?;
+        generation_hasher.update(corpus_hash.as_bytes());
+        generation_hasher.update(ann.sha256.as_bytes());
+    } else {
+        generation_hasher.update(b"legacy-exact");
     }
-    if let Some(guard) = model_guard {
-        guard.commit();
+    generation_hasher.update(Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true));
+    generation_hasher.update(std::process::id().to_le_bytes());
+    let key = format!("{:x}", generation_hasher.finalize());
+    let final_dir = generation_dir(&key)?;
+
+    cleanup_incomplete_generations()?;
+    let installing = generations_dir()?.join(format!(".{key}.installing"));
+    remove_path_if_exists(&installing)?;
+    fs::create_dir_all(&installing)?;
+    let result = (|| -> Result<()> {
+        fs::rename(&staged_corpus.staged_db, installing.join("ato.db"))
+            .context("placing database in corpus generation")?;
+        match (manifest.ann.as_ref(), staged_corpus.staged_ann.as_ref()) {
+            (Some(_), Some(staged_ann)) => {
+                fs::rename(staged_ann, installing.join(crate::ann::ANN_FILENAME))
+                    .context("placing ANN sidecar in corpus generation")?;
+            }
+            (Some(_), None) => bail!("ANN-required update did not stage a sidecar"),
+            (None, Some(_)) => bail!("legacy update unexpectedly staged an ANN sidecar"),
+            (None, None) => {}
+        }
+
+        if let Some(model) = staged_model {
+            for file in EMBEDDING_MODEL_HF_FILES {
+                copy_synced(
+                    &model.dir.join(file.output_name),
+                    &installing.join(file.output_name),
+                )?;
+            }
+            fs::write(installing.join(".model.sha256"), &model.marker_value)?;
+            File::open(installing.join(".model.sha256"))?.sync_all()?;
+        } else {
+            let current = live_dir()?;
+            for name in live_model_file_names() {
+                copy_synced(&current.join(name), &installing.join(name)).with_context(|| {
+                    format!("copying installed model file {name} into new corpus generation")
+                })?;
+            }
+        }
+
+        let installed_manifest = installing.join("installed_manifest.json");
+        fs::write(&installed_manifest, serde_json::to_vec_pretty(manifest)?)?;
+        File::open(&installed_manifest)?.sync_all()?;
+        #[cfg(unix)]
+        File::open(&installing)?.sync_all()?;
+        fs::rename(&installing, &final_dir)
+            .with_context(|| format!("committing corpus generation {}", final_dir.display()))?;
+        sync_parent(&final_dir)?;
+        activate_generation(&key)
+    })();
+    if let Err(error) = result {
+        let cleanup = remove_path_if_exists(&installing);
+        if let Err(cleanup_error) = cleanup {
+            return Err(error).context(format!(
+                "also failed to clean incomplete generation {}: {cleanup_error}",
+                installing.display()
+            ));
+        }
+        return Err(error);
     }
-    manifest_guard.commit();
-    db_guard.commit();
     let _ = fs::remove_dir_all(&staged_corpus.staging_root);
+    if let Err(error) = cleanup_inactive_generations(&key) {
+        eprintln!("ato-mcp update: warning: inactive generation cleanup failed: {error}");
+    }
+    Ok(())
+}
+
+fn cleanup_incomplete_generations() -> Result<()> {
+    for entry in fs::read_dir(generations_dir()?)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with('.') && name.ends_with(".installing"))
+        {
+            remove_path_if_exists(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_inactive_generations(active_key: &str) -> Result<()> {
+    for entry in fs::read_dir(generations_dir()?)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name == active_key || name.starts_with('.') || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        // An old backend may still hold mappings on Windows. Failure to clean
+        // an inactive generation is harmless and retried after the next update.
+        let _ = fs::remove_dir_all(entry.path());
+    }
+    let root = data_dir()?;
+    let _ = fs::remove_dir_all(root.join("live"));
+    let _ = fs::remove_file(root.join("installed_manifest.json"));
+    Ok(())
+}
+
+fn copy_synced(source: &Path, destination: &Path) -> Result<()> {
+    fs::copy(source, destination)
+        .with_context(|| format!("copying {} to {}", source.display(), destination.display()))?;
+    File::open(destination)?.sync_all()?;
     Ok(())
 }
 
@@ -591,67 +895,8 @@ pub(crate) fn live_model_file_names() -> Vec<&'static str> {
     names
 }
 
-pub(crate) fn backup_live_model_files(backup_dir: &Path) -> Result<()> {
-    if backup_dir.exists() {
-        fs::remove_dir_all(backup_dir)?;
-    }
-    fs::create_dir_all(backup_dir)?;
-    let live = live_dir()?;
-    for name in live_model_file_names() {
-        let src = live.join(name);
-        if src.exists() {
-            fs::copy(&src, backup_dir.join(name))
-                .with_context(|| format!("backing up {}", src.display()))?;
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn restore_model_backup(backup_dir: &Path) -> Result<()> {
-    let live = live_dir()?;
-    for name in live_model_file_names() {
-        let dest = live.join(name);
-        if dest.exists() {
-            fs::remove_file(&dest).with_context(|| format!("removing {}", dest.display()))?;
-        }
-        let backup = backup_dir.join(name);
-        if backup.exists() {
-            fs::copy(&backup, &dest).with_context(|| format!("restoring {}", dest.display()))?;
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn promote_staged_model_files(
-    staged: &StagedModel,
-    backup_dir: &Path,
-) -> Result<ModelPromotionGuard> {
-    backup_live_model_files(backup_dir)?;
-    let live = live_dir()?;
-    for file in EMBEDDING_MODEL_HF_FILES {
-        let src = staged.dir.join(file.output_name);
-        if !src.is_file() {
-            bail!("staged model missing {}", src.display());
-        }
-        let dest = live.join(file.output_name);
-        if dest.exists() {
-            fs::remove_file(&dest)?;
-        }
-        fs::copy(&src, &dest)
-            .with_context(|| format!("promoting model file {}", dest.display()))?;
-    }
-    Ok(ModelPromotionGuard {
-        backup_dir: backup_dir.to_path_buf(),
-        marker_value: staged.marker_value.clone(),
-        active: true,
-    })
-}
-
-
-/// Install path for manifest schema 5+: download the single zstd-compressed
-/// SQLite artifact, decompress to staging, rebuild FTS5 indexes locally from
-/// the chunks/documents already in the DB, and emit a StagedCorpusUpdate
-/// the caller's promotion guards can swap into live.
+/// Download and verify the database artifact, rebuild local FTS indexes,
+/// verify any required ANN sidecar, and return a complete staged generation.
 pub(crate) fn stage_live_db_from_db_artifact(
     manifest: &Manifest,
     context: &UrlContext,
@@ -666,36 +911,41 @@ pub(crate) fn stage_live_db_from_db_artifact(
     fs::create_dir_all(staging_root)?;
     let staged_db = staging_root.join("ato.db");
 
-    // Download ato.db.zst and verify size + sha256.
-    let compressed = fetch_bytes(&db_info.url, context)
-        .with_context(|| format!("downloading {}", db_info.url))?;
-    if compressed.len() as u64 != db_info.size {
-        bail!(
-            "size mismatch for {}: expected {}, got {}",
-            db_info.url,
-            db_info.size,
-            compressed.len()
-        );
+    if db_info.size == 0 || db_info.sha256.len() != 64 {
+        bail!("manifest DB artifact has invalid integrity metadata");
     }
-    let actual_sha = format!("{:x}", Sha256::digest(&compressed));
-    if actual_sha != db_info.sha256 {
-        bail!(
-            "sha256 mismatch for {}: expected {}, got {}",
-            db_info.url,
-            db_info.sha256,
-            actual_sha
-        );
-    }
-    let bytes_downloaded = manifest_bytes + compressed.len() as u64;
 
-    // Decompress to staged DB.
+    // Stream archive acquisition to a temporary file while enforcing its
+    // declared byte count and digest. This keeps memory bounded independent
+    // of corpus size and leaves no partially valid archive after a crash.
+    let mut archive = tempfile::NamedTempFile::new_in(staging_root)?;
+    let mut input: Box<dyn Read> = match resolved_source(&db_info.url, context)? {
+        Ok(path) => {
+            Box::new(File::open(&path).with_context(|| format!("opening {}", path.display()))?)
+        }
+        Err(url) => Box::new(secure_get(url, Duration::from_secs(60 * 60))?),
+    };
+    let downloaded = copy_exact_hashed(input.as_mut(), &mut archive, db_info.size, &db_info.sha256)
+        .with_context(|| format!("verifying {}", db_info.url))?;
+    archive.as_file().sync_all()?;
+    let mut bytes_downloaded = manifest_bytes + downloaded;
+
+    archive.as_file_mut().rewind()?;
+    let mut decoded = tempfile::NamedTempFile::new_in(staging_root)?;
     {
-        let mut input = Cursor::new(compressed);
-        let mut output = File::create(&staged_db)
-            .with_context(|| format!("creating {}", staged_db.display()))?;
-        zstd::stream::copy_decode(&mut input, &mut output)
+        let mut decoder = zstd::stream::read::Decoder::new(BufReader::new(archive.as_file_mut()))
+            .context("opening corpus zstd stream")?;
+        std::io::copy(&mut decoder, &mut decoded)
             .with_context(|| format!("decompressing into {}", staged_db.display()))?;
     }
+    decoded.as_file().sync_all()?;
+    if decoded.as_file().metadata()?.len() == 0 {
+        bail!("decompressed corpus DB is empty");
+    }
+    decoded
+        .persist(&staged_db)
+        .map_err(|error| error.error)
+        .with_context(|| format!("persisting {}", staged_db.display()))?;
 
     // Open writable and rebuild FTS5 indexes. We register a `zstd_decompress`
     // scalar UDF so the chunks_fts repopulation can run as a single SQL
@@ -710,8 +960,7 @@ pub(crate) fn stage_live_db_from_db_artifact(
             let blob: Vec<u8> = ctx.get(0)?;
             let bytes = zstd::stream::decode_all(Cursor::new(blob))
                 .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-            String::from_utf8(bytes)
-                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))
+            String::from_utf8(bytes).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))
         },
     )
     .context("registering zstd_decompress scalar function")?;
@@ -741,43 +990,78 @@ pub(crate) fn stage_live_db_from_db_artifact(
     set_meta(&conn, "last_update_at", &Utc::now().to_rfc3339())?;
 
     verify_semantic_install(&conn, manifest)?;
+    let integrity: String = conn.query_row("PRAGMA integrity_check;", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        bail!("staged corpus failed SQLite integrity_check: {integrity}");
+    }
+    let foreign_key_errors: i64 =
+        conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if foreign_key_errors != 0 {
+        bail!("staged corpus has {foreign_key_errors} foreign-key integrity errors");
+    }
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    let staged_ann = if let Some(ann_info) = manifest.ann.as_ref() {
+        verify_ann_db_binding(&conn, ann_info)?;
+        verify_ann_db_content(&conn, ann_info)?;
+        let staged_ann = staging_root.join(crate::ann::ANN_FILENAME);
+        let mut input: Box<dyn Read> = match resolved_source(&ann_info.url, context)? {
+            Ok(path) => {
+                Box::new(File::open(&path).with_context(|| format!("opening {}", path.display()))?)
+            }
+            Err(url) => Box::new(secure_get(url, Duration::from_secs(60 * 60))?),
+        };
+        let downloaded =
+            crate::ann::copy_verified(input.as_mut(), &staged_ann, ann_info.size, &ann_info.sha256)
+                .with_context(|| format!("verifying {}", ann_info.url))?;
+        bytes_downloaded = bytes_downloaded
+            .checked_add(downloaded)
+            .ok_or_else(|| anyhow!("update byte count overflow"))?;
+        crate::ann::verify_sidecar(&staged_ann, ann_info)?;
+        Some(staged_ann)
+    } else {
+        None
+    };
     drop(conn);
 
     Ok(StagedCorpusUpdate {
         staging_root: staging_root.to_path_buf(),
         staged_db,
+        staged_ann,
         stats: UpdateStats { bytes_downloaded },
     })
 }
 
-pub(crate) fn promote_live_db(staged_db: &Path, backup: &Path) -> Result<PathPromotionGuard> {
-    let live = live_dir()?;
-    let db = db_path()?;
-    for suffix in ["-wal", "-shm"] {
-        let path = live.join(format!("ato.db{suffix}"));
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
+pub(crate) fn verify_ann_db_binding(
+    conn: &Connection,
+    info: &crate::ann::ManifestAnn,
+) -> Result<()> {
+    let corpus_id = get_meta(conn, "corpus_id")?
+        .ok_or_else(|| anyhow!("ANN-required corpus is missing corpus_id metadata"))?;
+    let embedding_set_sha256 = get_meta(conn, "embedding_set_sha256")?
+        .ok_or_else(|| anyhow!("ANN-required corpus is missing embedding_set_sha256 metadata"))?;
+    if corpus_id != info.corpus_id
+        || embedding_set_sha256 != info.embedding_set_sha256
+        || u64::try_from(chunk_embedding_count(conn)?).ok() != Some(info.vector_count)
+    {
+        bail!("ANN sidecar metadata does not match the staged corpus database");
     }
-    let guard = PathPromotionGuard::backup(db.clone(), backup.to_path_buf())?;
-    fs::rename(staged_db, &db)
-        .with_context(|| format!("promoting staged DB to {}", db.display()))?;
-    Ok(guard)
+    Ok(())
 }
 
-pub(crate) fn promote_installed_manifest(manifest: &Manifest, backup: &Path) -> Result<PathPromotionGuard> {
-    let path = installed_manifest_path()?;
-    let guard = PathPromotionGuard::backup(path.clone(), backup.to_path_buf())?;
-    let tmp = path.with_extension("json.tmp");
-    remove_path_if_exists(&tmp)?;
-    fs::write(&tmp, serde_json::to_vec_pretty(manifest)?)
-        .with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, &path)
-        .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
-    Ok(guard)
+fn verify_ann_db_content(conn: &Connection, info: &crate::ann::ManifestAnn) -> Result<()> {
+    let source_index_sha256 = get_meta(conn, "source_index_sha256")?
+        .ok_or_else(|| anyhow!("ANN-required corpus is missing source_index_sha256 metadata"))?;
+    let actual = crate::ann::compute_identity(conn, &source_index_sha256)?;
+    if actual.corpus_id != info.corpus_id
+        || actual.embedding_set_sha256 != info.embedding_set_sha256
+        || actual.vector_count != info.vector_count
+    {
+        bail!("ANN sidecar embedding digest does not match the staged corpus database");
+    }
+    Ok(())
 }
-
 
 pub(crate) fn verify_semantic_install(conn: &Connection, manifest: &Manifest) -> Result<()> {
     if manifest.model.id != EMBEDDING_MODEL_ID {
@@ -835,56 +1119,80 @@ struct GithubRelease {
     assets: Vec<GithubReleaseAsset>,
 }
 
-// [SW-06] Serve startup probe: 5s budget, non-mutating, errors collapse to None.
-pub(crate) fn http_probe_client() -> Result<Client> {
-    // Tight budget: this client runs synchronously inside `serve` startup.
-    // A slow network must not stall the startup banner — `serve` falls
-    // through to no-notice if the probe doesn't complete in time.
-    Ok(Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(5))
-        .build()?)
-}
+const RELEASES_PER_PAGE: usize = 100;
+const MAX_RELEASE_PAGES: usize = 100;
 
 pub(crate) fn fetch_bytes_probe(url_or_path: &str, context: &UrlContext) -> Result<Vec<u8>> {
-    fetch_bytes_with(url_or_path, context, &http_probe_client()?)
-}
-
-pub(crate) fn resolve_latest_corpus_manifest_url() -> Result<String> {
-    resolve_latest_corpus_manifest_url_with(
-        &Client::builder()
-            .user_agent(ATO_USER_AGENT)
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()?,
+    secure_fetch_bytes_with_timeout(
+        url_or_path,
+        context,
+        MAX_MANIFEST_BYTES,
+        Duration::from_secs(5),
     )
 }
 
-pub(crate) fn resolve_latest_corpus_manifest_url_with(client: &Client) -> Result<String> {
-    let bytes = client
-        .get(DEFAULT_RELEASES_API_URL)
-        .header("user-agent", ATO_USER_AGENT)
-        .header("accept", "application/vnd.github+json")
-        .send()?
-        .error_for_status()
-        .context("fetching GitHub release list")?
-        .bytes()?;
-    latest_corpus_manifest_url_from_releases_json(&bytes)
+fn release_page_url(page: usize) -> Result<String> {
+    let mut url = url::Url::parse(DEFAULT_RELEASES_API_URL)?;
+    url.query_pairs_mut()
+        .append_pair("per_page", &RELEASES_PER_PAGE.to_string())
+        .append_pair("page", &page.to_string());
+    Ok(url.into())
 }
 
-pub(crate) fn latest_corpus_manifest_url_from_releases_json(bytes: &[u8]) -> Result<String> {
+fn manifest_from_release_page(bytes: &[u8]) -> Result<(Option<String>, usize)> {
     let releases: Vec<GithubRelease> = serde_json::from_slice(bytes)?;
+    let count = releases.len();
     for release in releases {
         if release.draft || release.prerelease {
             continue;
         }
-        for asset in release.assets {
-            if asset.name == "manifest.json" {
-                return Ok(asset.browser_download_url);
-            }
+        if let Some(asset) = release
+            .assets
+            .into_iter()
+            .find(|asset| asset.name == "manifest.json")
+        {
+            return Ok((Some(asset.browser_download_url), count));
+        }
+    }
+    Ok((None, count))
+}
+
+pub(crate) fn resolve_corpus_manifest_url_with<F>(mut fetch_page: F) -> Result<String>
+where
+    F: FnMut(usize) -> Result<Vec<u8>>,
+{
+    for page in 1..=MAX_RELEASE_PAGES {
+        let bytes = fetch_page(page)?;
+        let (manifest, release_count) = manifest_from_release_page(&bytes)?;
+        if let Some(manifest) = manifest {
+            return Ok(manifest);
+        }
+        if release_count < RELEASES_PER_PAGE {
+            break;
         }
     }
     bail!("no published ato-mcp release with manifest.json was found")
+}
+
+fn resolve_corpus_manifest_url_with_budget(budget: Duration) -> Result<String> {
+    let deadline = Instant::now() + budget;
+    resolve_corpus_manifest_url_with(|page| {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| anyhow!("corpus manifest discovery timed out"))?;
+        let url = release_page_url(page)?;
+        let context = UrlContext::from_manifest_url(&url);
+        secure_fetch_bytes_with_timeout(&url, &context, MAX_MANIFEST_BYTES, remaining)
+    })
+}
+
+pub(crate) fn resolve_latest_corpus_manifest_url() -> Result<String> {
+    resolve_corpus_manifest_url_with_budget(Duration::from_secs(30))
+}
+
+pub(crate) fn resolve_latest_corpus_manifest_url_probe() -> Result<String> {
+    resolve_corpus_manifest_url_with_budget(Duration::from_secs(5))
 }
 
 /// Non-mutating availability probe. Returns `Some(UpdateAvailability)` only
@@ -896,7 +1204,9 @@ pub(crate) fn latest_corpus_manifest_url_from_releases_json(bytes: &[u8]) -> Res
 /// also returns `None` rather than emitting an "update available" notice the
 /// user could not act on; the next manual `ato-mcp update` will surface the
 /// real upgrade-the-binary error.
-pub(crate) fn check_for_update_availability(manifest_url: &str) -> Result<Option<UpdateAvailability>> {
+pub(crate) fn check_for_update_availability(
+    manifest_url: &str,
+) -> Result<Option<UpdateAvailability>> {
     let Some(installed) = load_installed_manifest()? else {
         return Ok(None);
     };
@@ -912,7 +1222,18 @@ pub(crate) fn check_for_update_availability(manifest_url: &str) -> Result<Option
     if enforce_manifest_compatibility(&manifest).is_err() {
         return Ok(None);
     }
-    if installed.index_version == manifest.index_version {
+    let installed_ann = installed
+        .ann
+        .as_ref()
+        .map(|ann| (&ann.corpus_id, &ann.sha256));
+    let published_ann = manifest
+        .ann
+        .as_ref()
+        .map(|ann| (&ann.corpus_id, &ann.sha256));
+    if installed.index_version == manifest.index_version
+        && installed.db.sha256 == manifest.db.sha256
+        && installed_ann == published_ann
+    {
         return Ok(None);
     }
     Ok(Some(UpdateAvailability {
@@ -1006,7 +1327,7 @@ pub(crate) fn canonical_id_from(data_url: Option<&str>, href: Option<&str>) -> O
 // [SS-02] fetch_nodes_blocking hits the ATO browse-content JSON API through a
 // reqwest blocking client; the response payload is expected to be a JSON list.
 pub(crate) fn fetch_nodes_blocking(
-    client: &reqwest::blocking::Client,
+    _client: &reqwest::blocking::Client,
     base_url: &str,
     query: &str,
 ) -> Result<Vec<JsonValue>> {
@@ -1019,16 +1340,17 @@ pub(crate) fn fetch_nodes_blocking(
             query.trim_start_matches('?')
         )
     };
-    let resp = client
-        .get(&url)
-        .send()
-        .with_context(|| format!("fetching {url}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        bail!("ATO API returned HTTP {status} for {url}");
+    let parsed = url::Url::parse(&url).with_context(|| format!("parsing {url}"))?;
+    let mut response = secure_get(parsed, Duration::from_secs(120))?;
+    let mut bytes = Vec::new();
+    response
+        .by_ref()
+        .take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        bail!("ATO API response exceeded {MAX_MANIFEST_BYTES} bytes");
     }
-    let body = resp.text()?;
-    let payload: JsonValue = serde_json::from_str(&body).context("parsing ATO API JSON")?;
+    let payload: JsonValue = serde_json::from_slice(&bytes).context("parsing ATO API JSON")?;
     let arr = payload
         .as_array()
         .ok_or_else(|| anyhow!("ATO response payload is not a list"))?;
@@ -1572,9 +1894,9 @@ pub(crate) fn slug_for(text: &str, fallback: &str) -> String {
     s.chars().take(80).collect()
 }
 
-pub(crate) fn build_payload_path(out_dir: &Path, link: &JsonValue) -> PathBuf {
+pub(crate) fn build_payload_path(out_dir: &Path, link: &JsonValue) -> Result<PathBuf> {
     let payload_dir = out_dir.join("payloads");
-    let mut dir = payload_dir;
+    let mut dir = payload_dir.clone();
     // [SS-06] Catch-up/download payload paths inherit representative_path
     // from reduced source links.
     if let Some(seg) = link.get("representative_path").and_then(|v| v.as_array()) {
@@ -1587,7 +1909,50 @@ pub(crate) fn build_payload_path(out_dir: &Path, link: &JsonValue) -> PathBuf {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let filename = format!("{}.html", slug_for(canonical_id, "link"));
-    dir.join(filename)
+    let path = dir.join(filename);
+    if !path.starts_with(&payload_dir) {
+        bail!("payload path escaped payload root");
+    }
+    Ok(path)
+}
+
+fn prepare_payload_parent(payload_root: &Path, path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("payload path has no parent"))?;
+    if !path.starts_with(payload_root) {
+        bail!("payload path escaped {}", payload_root.display());
+    }
+    let mut current = payload_root.to_path_buf();
+    for component in parent.strip_prefix(payload_root)?.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                bail!("unsafe payload path component {}", current.display());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&current)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let canonical = current.canonicalize()?;
+        if !canonical.starts_with(payload_root) {
+            bail!("payload directory escaped {}", payload_root.display());
+        }
+    }
+    Ok(())
+}
+
+fn payload_matches_record(path: &Path, record: &JsonValue) -> bool {
+    let Some(expected_sha) = record.get("sha256").and_then(JsonValue::as_str) else {
+        return false;
+    };
+    let Some(expected_size) = record.get("size").and_then(JsonValue::as_u64) else {
+        return false;
+    };
+    fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.len() == expected_size)
+        && sha256_path(path).is_ok_and(|actual| actual == expected_sha)
 }
 
 pub(crate) fn extract_law_contents(html: &str) -> Option<String> {
@@ -1611,9 +1976,21 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
     use std::io::BufRead as _;
     use std::sync::{Arc, Mutex};
 
-    let payload_dir = args.out_dir.join("payloads");
-    let index_path = args.out_dir.join("index.jsonl");
+    fs::create_dir_all(&args.out_dir)?;
+    let out_dir = args.out_dir.canonicalize()?;
+    let payload_dir = out_dir.join("payloads");
+    if fs::symlink_metadata(&payload_dir).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        bail!(
+            "payload root must not be a symlink: {}",
+            payload_dir.display()
+        );
+    }
+    let index_path = out_dir.join("index.jsonl");
     fs::create_dir_all(&payload_dir)?;
+    let payload_dir = payload_dir.canonicalize()?;
+    if !payload_dir.starts_with(&out_dir) {
+        bail!("payload root escaped output directory");
+    }
 
     // Load links.
     let f = File::open(&args.deduped_links)
@@ -1634,35 +2011,50 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
     // Load existing index for resumability.
     let mut index: std::collections::HashMap<String, JsonValue> = std::collections::HashMap::new();
     if index_path.exists() {
-        let f = File::open(&index_path)?;
-        let reader = std::io::BufReader::new(f);
-        for line in reader.lines() {
-            let line = line?;
+        if fs::symlink_metadata(&index_path)?.file_type().is_symlink() {
+            bail!(
+                "resume index must not be a symlink: {}",
+                index_path.display()
+            );
+        }
+        let bytes = fs::read(&index_path)?;
+        let terminated = bytes.ends_with(b"\n");
+        let lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
+        for (line_number, line) in lines.iter().enumerate() {
+            let line = std::str::from_utf8(line).context("resume index is not UTF-8")?;
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            let rec: JsonValue = serde_json::from_str(trimmed)?;
+            let rec: JsonValue = match serde_json::from_str(trimmed) {
+                Ok(record) => record,
+                Err(_) if !terminated && line_number + 1 == lines.len() => break,
+                Err(error) => return Err(error).context("parsing resume index"),
+            };
             if let Some(cid) = rec.get("canonical_id").and_then(|v| v.as_str()) {
                 index.insert(cid.to_string(), rec);
             }
         }
     }
-    let initial_completed = index
-        .values()
-        .filter(|r| r.get("status").and_then(|v| v.as_str()) == Some("success"))
+    let initial_completed = links
+        .iter()
+        .filter(|link| {
+            let Some(canonical_id) = link.get("canonical_id").and_then(JsonValue::as_str) else {
+                return false;
+            };
+            let Ok(path) = build_payload_path(&out_dir, link) else {
+                return false;
+            };
+            index.get(canonical_id).is_some_and(|record| {
+                record.get("status").and_then(JsonValue::as_str) == Some("success")
+                    && payload_matches_record(&path, record)
+            })
+        })
         .count();
     if initial_completed > 0 {
         eprintln!("link-download: resuming with {initial_completed} previously completed");
     }
     let index = Arc::new(Mutex::new(index));
-
-    let client = Arc::new(
-        reqwest::blocking::Client::builder()
-            .user_agent(ATO_USER_AGENT)
-            .timeout(Duration::from_secs_f64(args.timeout_seconds))
-            .build()?,
-    );
 
     let last_request = Arc::new(Mutex::new(
         std::time::Instant::now()
@@ -1688,7 +2080,6 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
     let mut handles = Vec::with_capacity(args.max_workers);
     for worker_id in 0..args.max_workers {
         let work_queue = Arc::clone(&work_queue);
-        let client = Arc::clone(&client);
         let last_request = Arc::clone(&last_request);
         let index = Arc::clone(&index);
         let index_writer = Arc::clone(&index_writer);
@@ -1696,7 +2087,9 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
         let stats_errors = Arc::clone(&stats_errors);
         let stats_skipped = Arc::clone(&stats_skipped);
         let base_url = args.base_url.clone();
-        let out_dir = args.out_dir.clone();
+        let out_dir = out_dir.clone();
+        let payload_dir = payload_dir.clone();
+        let timeout = Duration::from_secs_f64(args.timeout_seconds);
         let force = args.force;
 
         handles.push(std::thread::spawn(move || -> Result<()> {
@@ -1713,46 +2106,19 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
                     .to_string();
                 let href = link.get("href").and_then(|v| v.as_str()).map(String::from);
 
-                let payload_path = build_payload_path(&out_dir, &link);
+                let payload_path = build_payload_path(&out_dir, &link)?;
 
                 // Skip if already done.
                 if !force {
                     let already_done = {
                         let idx = index.lock().unwrap();
-                        idx.get(&canonical_id)
-                            .and_then(|r| r.get("status").and_then(|v| v.as_str()))
-                            == Some("success")
+                        idx.get(&canonical_id).is_some_and(|record| {
+                            record.get("status").and_then(JsonValue::as_str) == Some("success")
+                                && payload_matches_record(&payload_path, record)
+                        })
                     };
                     if already_done {
                         stats_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        continue;
-                    }
-                    if payload_path.exists() {
-                        // Orphan payload — emit synthetic success.
-                        let rel = payload_path
-                            .strip_prefix(&out_dir)
-                            .unwrap_or(&payload_path)
-                            .to_string_lossy()
-                            .to_string();
-                        let now = chrono::Utc::now().to_rfc3339();
-                        let rec = json!({
-                            "canonical_id": canonical_id,
-                            "href": href,
-                            "status": "success",
-                            "payload_path": rel,
-                            "assets": [],
-                            "error": null,
-                            "http_status": null,
-                            "downloaded_at": now,
-                        });
-                        {
-                            use std::io::Write as _;
-                            let mut idx = index.lock().unwrap();
-                            idx.insert(canonical_id.clone(), rec.clone());
-                            let mut w = index_writer.lock().unwrap();
-                            writeln!(w, "{}", serde_json::to_string(&rec)?)?;
-                        }
-                        stats_completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         continue;
                     }
                 }
@@ -1782,35 +2148,22 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
                     }
                 };
 
-                let resp = client.get(&url).send();
+                let parsed_url =
+                    url::Url::parse(&url).with_context(|| format!("parsing acquisition URL {url}"));
+                let resp = parsed_url.and_then(|url| secure_get(url, timeout));
                 let (http_status, html) = match resp {
-                    Ok(r) => {
+                    Ok(mut r) => {
                         let status = r.status();
-                        if !status.is_success() {
-                            eprintln!(
-                                "link-download w{worker_id}: HTTP {status} for {canonical_id}"
-                            );
-                            stats_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let now = chrono::Utc::now().to_rfc3339();
-                            let rec = json!({
-                                "canonical_id": canonical_id,
-                                "href": href,
-                                "status": "failed",
-                                "payload_path": null,
-                                "error": format!("HTTP {status}"),
-                                "http_status": status.as_u16(),
-                                "downloaded_at": now,
-                            });
-                            {
-                                use std::io::Write as _;
-                                let mut idx = index.lock().unwrap();
-                                idx.insert(canonical_id.clone(), rec.clone());
-                                let mut w = index_writer.lock().unwrap();
-                                writeln!(w, "{}", serde_json::to_string(&rec)?)?;
-                            }
-                            continue;
+                        let mut bytes = Vec::new();
+                        r.by_ref()
+                            .take(MAX_ATO_HTML_BYTES + 1)
+                            .read_to_end(&mut bytes)?;
+                        if bytes.len() as u64 > MAX_ATO_HTML_BYTES {
+                            bail!("ATO response exceeded {MAX_ATO_HTML_BYTES} bytes");
                         }
-                        (status.as_u16(), r.text().unwrap_or_default())
+                        let html =
+                            String::from_utf8(bytes).context("ATO response was not UTF-8")?;
+                        (status.as_u16(), html)
                     }
                     Err(e) => {
                         eprintln!("link-download w{worker_id}: failed {canonical_id}: {e}");
@@ -1831,6 +2184,7 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
                             idx.insert(canonical_id.clone(), rec.clone());
                             let mut w = index_writer.lock().unwrap();
                             writeln!(w, "{}", serde_json::to_string(&rec)?)?;
+                            w.sync_data()?;
                         }
                         continue;
                     }
@@ -1859,15 +2213,16 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
                             idx.insert(canonical_id.clone(), rec.clone());
                             let mut w = index_writer.lock().unwrap();
                             writeln!(w, "{}", serde_json::to_string(&rec)?)?;
+                            w.sync_data()?;
                         }
                         continue;
                     }
                 };
 
-                if let Some(parent) = payload_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(&payload_path, &snippet)?;
+                prepare_payload_parent(&payload_dir, &payload_path)?;
+                atomic_write(&payload_path, snippet.as_bytes())?;
+                let payload_sha = sha256_path(&payload_path)?;
+                let payload_size = fs::metadata(&payload_path)?.len();
 
                 let rel = payload_path
                     .strip_prefix(&out_dir)
@@ -1884,6 +2239,8 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
                     "error": null,
                     "http_status": http_status,
                     "downloaded_at": now,
+                    "sha256": payload_sha,
+                    "size": payload_size,
                 });
                 {
                     use std::io::Write as _;
@@ -1891,6 +2248,7 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
                     idx.insert(canonical_id.clone(), rec.clone());
                     let mut w = index_writer.lock().unwrap();
                     writeln!(w, "{}", serde_json::to_string(&rec)?)?;
+                    w.sync_data()?;
                 }
                 let n = stats_completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if n.is_multiple_of(50) {
@@ -1905,21 +2263,24 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
         }));
     }
 
-    for h in handles {
-        h.join().expect("worker panic")?;
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| anyhow!("link-download worker panicked"))??;
     }
 
     // Atomic rewrite of index.jsonl with sorted entries.
     let idx = index.lock().unwrap();
     let mut keys: Vec<&String> = idx.keys().collect();
     keys.sort();
-    let tmp_path = index_path.with_extension("jsonl.tmp");
-    let mut tmp = File::create(&tmp_path)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(&out_dir)?;
     for k in keys {
         use std::io::Write as _;
         writeln!(tmp, "{}", serde_json::to_string(&idx[k])?)?;
     }
-    fs::rename(&tmp_path, &index_path)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(&index_path).map_err(|error| error.error)?;
+    sync_parent(&index_path)?;
 
     // metadata.json.
     let now = chrono::Utc::now().to_rfc3339();
@@ -1930,9 +2291,9 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
         "total_links": total,
         "completed_links": stats_completed.load(std::sync::atomic::Ordering::Relaxed),
     });
-    fs::write(
-        args.out_dir.join("metadata.json"),
-        serde_json::to_vec_pretty(&metadata)?,
+    atomic_write(
+        &out_dir.join("metadata.json"),
+        &serde_json::to_vec_pretty(&metadata)?,
     )?;
 
     eprintln!(
@@ -2114,18 +2475,17 @@ pub(crate) fn scrape_diff(
         }
     } else if let Some(url) = whats_new_url {
         // Incremental mode: fetch What's New live, build pending records.
-        let client = reqwest::blocking::Client::builder()
-            .user_agent(ATO_USER_AGENT)
-            .timeout(Duration::from_secs(30))
-            .build()?;
-        let resp = client
-            .get(url)
-            .send()
-            .with_context(|| format!("fetching {url}"))?;
-        if !resp.status().is_success() {
-            bail!("HTTP {} fetching {}", resp.status(), url);
+        let parsed = url::Url::parse(url).with_context(|| format!("parsing {url}"))?;
+        let mut response = secure_get(parsed, Duration::from_secs(30))?;
+        let mut bytes = Vec::new();
+        response
+            .by_ref()
+            .take(MAX_ATO_HTML_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_ATO_HTML_BYTES {
+            bail!("What's New response exceeded {MAX_ATO_HTML_BYTES} bytes");
         }
-        let html = resp.text()?;
+        let html = String::from_utf8(bytes).context("What's New response was not UTF-8")?;
         let entries = parse_whats_new(&html, "https://www.ato.gov.au")?;
         for e in entries {
             total += 1;
@@ -2166,4 +2526,131 @@ pub(crate) fn scrape_diff(
         eprintln!("  {n:>5} {cat}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn approved_hosts_require_dns_label_boundaries() {
+        for host in [
+            "ato.gov.au",
+            "www.ato.gov.au",
+            "api.github.com",
+            "release-assets.githubusercontent.com",
+            "huggingface.co",
+        ] {
+            assert!(approved_https_host(host), "rejected {host}");
+        }
+        for host in [
+            "evilato.gov.au",
+            "ato.gov.au.evil.test",
+            "github.com.evil.test",
+            "huggingface.co.evil.test",
+        ] {
+            assert!(!approved_https_host(host), "accepted {host}");
+        }
+    }
+
+    #[test]
+    fn private_and_special_networks_are_rejected() {
+        for address in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "100.64.0.1",
+            "169.254.169.254",
+            "192.0.2.1",
+            "198.18.0.1",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "2001:db8::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(!public_ip(address.parse().unwrap()), "accepted {address}");
+        }
+        assert!(public_ip("8.8.8.8".parse().unwrap()));
+        assert!(public_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn streaming_integrity_rejects_short_long_and_corrupt_inputs() {
+        let bytes = b"bounded stream";
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let mut output = Vec::new();
+        assert_eq!(
+            copy_exact_hashed(
+                &mut bytes.as_slice(),
+                &mut output,
+                bytes.len() as u64,
+                &digest
+            )
+            .unwrap(),
+            bytes.len() as u64
+        );
+        assert_eq!(output, bytes);
+
+        for (input, size, sha) in [
+            (
+                &bytes[..bytes.len() - 1],
+                bytes.len() as u64,
+                digest.as_str(),
+            ),
+            (bytes.as_slice(), bytes.len() as u64 - 1, digest.as_str()),
+            (bytes.as_slice(), bytes.len() as u64, "00"),
+        ] {
+            let mut reader = input;
+            assert!(copy_exact_hashed(&mut reader, &mut Vec::new(), size, sha).is_err());
+        }
+    }
+
+    #[test]
+    fn payload_paths_remain_beneath_payload_root() {
+        let root = tempfile::tempdir().unwrap();
+        let link = json!({
+            "canonical_id": "../../JUD\\evil",
+            "representative_path": ["..", "C:\\windows", "/absolute"]
+        });
+        let path = build_payload_path(root.path(), &link).unwrap();
+        assert!(path.starts_with(root.path().join("payloads")));
+        assert!(!path.to_string_lossy().contains(".."));
+    }
+
+    #[test]
+    fn public_download_api_rejects_unsafe_sources_before_file_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("artifact.part");
+        let sha = "00".repeat(32);
+        for url in [
+            "http://github.com/artifact",
+            "https://127.0.0.1/artifact",
+            "https://evilato.gov.au/artifact",
+            "https://github.com.evil.test/artifact",
+            "https://user:secret@github.com/artifact",
+            "https://github.com:8443/artifact",
+        ] {
+            assert!(
+                download_approved_https_to_file(
+                    url,
+                    &destination,
+                    1,
+                    &sha,
+                    Duration::from_secs(1),
+                )
+                .is_err(),
+                "accepted {url}"
+            );
+            assert!(!destination.exists());
+        }
+        assert!(download_approved_https_to_file(
+            "https://github.com/artifact",
+            &destination,
+            0,
+            &sha,
+            Duration::from_secs(1),
+        )
+        .is_err());
+        assert!(!destination.exists());
+    }
 }

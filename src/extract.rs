@@ -2,10 +2,9 @@
 //! leading-heading titles + EM front matter, currency/withdrawal markers,
 //! image assets, and doc_id-derived metadata.
 
-use crate::html::{
-    assets_html_escape, doc_id_from_ato_link, extract_attr,
-};
+use crate::html::{assets_html_escape, doc_id_from_ato_link, extract_attr};
 use crate::pit_to_date;
+use chrono::{Datelike, NaiveDate};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -80,7 +79,13 @@ pub(crate) fn defs_clean_body(body: &str) -> String {
     re.replace_all(trimmed, "\n\n").to_string()
 }
 
-pub(crate) fn defs_definition_id(doc_id: &str, ord: i64, term: &str, body: &str, offset: usize) -> String {
+pub(crate) fn defs_definition_id(
+    doc_id: &str,
+    ord: i64,
+    term: &str,
+    body: &str,
+    offset: usize,
+) -> String {
     let mut h = Sha256::new();
     h.update(doc_id.as_bytes());
     h.update(b"\0");
@@ -580,29 +585,39 @@ pub(crate) fn currency_months() -> &'static std::collections::HashMap<&'static s
     })
 }
 
+fn validated_date(year: i32, month: u32, day: u32) -> Option<String> {
+    let date = NaiveDate::from_ymd_opt(year, month, day)?;
+    Some(format!(
+        "{:04}-{:02}-{:02}",
+        date.year(),
+        date.month(),
+        date.day()
+    ))
+}
+
 pub(crate) fn currency_normalise_date(raw: &str) -> Option<String> {
-    let s = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    // "31 October 2025"
+    let value = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     let prose = Regex::new(r"^(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})$").unwrap();
-    if let Some(c) = prose.captures(&s) {
-        let day: u32 = c.get(1)?.as_str().parse().ok()?;
-        let month_name = c.get(2)?.as_str().to_lowercase();
-        let year: u32 = c.get(3)?.as_str().parse().ok()?;
+    if let Some(captures) = prose.captures(&value) {
+        let day = captures.get(1)?.as_str().parse().ok()?;
+        let month_name = captures.get(2)?.as_str().to_lowercase();
+        let year = captures.get(3)?.as_str().parse().ok()?;
         let month = *currency_months().get(month_name.as_str())?;
-        return Some(format!("{year:04}-{month:02}-{day:02}"));
+        return validated_date(year, month, day);
     }
-    // "31/10/2025"
     let dmy = Regex::new(r"^(\d{1,2})/(\d{1,2})/(\d{4})$").unwrap();
-    if let Some(c) = dmy.captures(&s) {
-        let day: u32 = c.get(1)?.as_str().parse().ok()?;
-        let month: u32 = c.get(2)?.as_str().parse().ok()?;
-        let year: u32 = c.get(3)?.as_str().parse().ok()?;
-        return Some(format!("{year:04}-{month:02}-{day:02}"));
+    if let Some(captures) = dmy.captures(&value) {
+        let day = captures.get(1)?.as_str().parse().ok()?;
+        let month = captures.get(2)?.as_str().parse().ok()?;
+        let year = captures.get(3)?.as_str().parse().ok()?;
+        return validated_date(year, month, day);
     }
-    // "2025-10-31"
     let iso = Regex::new(r"^(\d{4})-(\d{2})-(\d{2})$").unwrap();
-    if iso.is_match(&s) {
-        return Some(s);
+    if let Some(captures) = iso.captures(&value) {
+        let year = captures.get(1)?.as_str().parse().ok()?;
+        let month = captures.get(2)?.as_str().parse().ok()?;
+        let day = captures.get(3)?.as_str().parse().ok()?;
+        return validated_date(year, month, day);
     }
     None
 }
@@ -654,14 +669,16 @@ pub(crate) fn currency_re_withdrawn_by_prose() -> &'static Regex {
 pub(crate) fn currency_re_replacement_verb() -> &'static Regex {
     static R: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     R.get_or_init(|| {
-        Regex::new(r"(?i)\b(replaces|replaced\s+by|supersed(?:e|es|ed|ing)|in\s+lieu\s+of)\b").unwrap()
+        Regex::new(r"(?i)\b(replaces|replaced\s+by|supersed(?:e|es|ed|ing)|in\s+lieu\s+of)\b")
+            .unwrap()
     })
 }
 
 pub(crate) fn currency_re_self_anchor() -> &'static Regex {
     static R: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     R.get_or_init(|| {
-        Regex::new(r"(?i)\bthis\s+(?:Ruling|Determination|Guideline|Practice\s+Statement)\b").unwrap()
+        Regex::new(r"(?i)\bthis\s+(?:Ruling|Determination|Guideline|Practice\s+Statement)\b")
+            .unwrap()
     })
 }
 
@@ -959,15 +976,36 @@ pub(crate) fn assets_guess_media_type(src: &str) -> Option<String> {
 }
 
 pub(crate) fn assets_resolve_path(source_path: Option<&Path>, src: &str) -> Option<PathBuf> {
-    let sp = source_path?;
-    if src.is_empty() {
+    use std::path::Component;
+
+    let source_path = source_path?;
+    if src.is_empty() || src.contains(['?', '#', '\\', ':']) || src.starts_with(['/', '\\']) {
         return None;
     }
-    // Skip URLs with scheme or absolute paths.
-    if src.starts_with('/') || src.contains("://") {
+    let relative = Path::new(src);
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
         return None;
     }
-    sp.parent().map(|p| p.join(src))
+    let root = source_path.parent()?.canonicalize().ok()?;
+    let mut current = root.clone();
+    for component in relative.components() {
+        if matches!(component, Component::CurDir) {
+            continue;
+        }
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current).ok()?;
+        if metadata.file_type().is_symlink() {
+            return None;
+        }
+    }
+    let resolved = current.canonicalize().ok()?;
+    let metadata = fs::metadata(&resolved).ok()?;
+    (resolved.starts_with(&root) && metadata.is_file()).then_some(resolved)
 }
 
 pub(crate) fn assets_text_norm(s: Option<&str>) -> Option<String> {
@@ -1054,7 +1092,6 @@ pub(crate) fn rewrite_images_html(
     (rewritten, assets)
 }
 
-
 pub(crate) fn metadata_extract_docid_path(canonical_id: &str) -> Option<String> {
     let parsed = url::Url::parse(canonical_id)
         .ok()
@@ -1090,12 +1127,12 @@ pub(crate) fn metadata_extract_pub_date(text: &str) -> Option<String> {
     )
     .unwrap();
     let head = text.chars().take(2000).collect::<String>();
-    let m = date_re.captures(&head)?;
-    let day: u32 = m.get(1)?.as_str().parse().ok()?;
-    let month_name = m.get(2)?.as_str().to_lowercase();
-    let year: u32 = m.get(3)?.as_str().parse().ok()?;
+    let captures = date_re.captures(&head)?;
+    let day = captures.get(1)?.as_str().parse().ok()?;
+    let month_name = captures.get(2)?.as_str().to_lowercase();
+    let year = captures.get(3)?.as_str().parse().ok()?;
     let month = currency_months().get(month_name.as_str()).copied()?;
-    Some(format!("{year:04}-{month:02}-{day:02}"))
+    validated_date(year, month, day)
 }
 
 pub(crate) fn metadata_content_hash(text: &str) -> String {
@@ -1109,3 +1146,52 @@ pub(crate) fn metadata_content_hash(text: &str) -> String {
     format!("sha256:{hex}")
 }
 
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn dates_reject_impossible_calendar_values() {
+        for date in ["31 February 2025", "31/04/2025", "2025-02-29"] {
+            assert_eq!(currency_normalise_date(date), None, "accepted {date}");
+        }
+        assert_eq!(
+            currency_normalise_date("29 February 2024").as_deref(),
+            Some("2024-02-29")
+        );
+        assert_eq!(metadata_extract_pub_date("Issued 31 February 2025"), None);
+    }
+
+    #[test]
+    fn asset_paths_are_confined_and_reject_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let payload = root.path().join("payload.html");
+        let image = root.path().join("image.png");
+        fs::write(&payload, "payload").unwrap();
+        fs::write(&image, "image").unwrap();
+        assert_eq!(
+            assets_resolve_path(Some(&payload), "image.png"),
+            Some(image.canonicalize().unwrap())
+        );
+        for src in [
+            "../secret.png",
+            "/etc/passwd",
+            r"..\secret.png",
+            r"C:\secret.png",
+            "image.png?ignored",
+            "https://example.test/image.png",
+        ] {
+            assert_eq!(
+                assets_resolve_path(Some(&payload), src),
+                None,
+                "accepted {src}"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&image, root.path().join("linked.png")).unwrap();
+            assert_eq!(assets_resolve_path(Some(&payload), "linked.png"), None);
+        }
+    }
+}

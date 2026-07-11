@@ -1,5 +1,5 @@
 {
-  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
   "name": "ato-mcp",
   "description": "Local marketplace for the ato-mcp plugin.",
   "owner": {
@@ -9,6 +9,7 @@
   "plugins": [
     {
       "name": "ato-mcp",
+      "version": "0.16.0",
       "description": "Local search and retrieval over the Australian Taxation Office legal corpus.",
       "source": "./",
       "category": "research",

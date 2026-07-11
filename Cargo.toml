@@ -1,6 +1,6 @@
 [package]
 name = "ato-mcp"
-version = "0.15.5"
+version = "0.16.0"
 edition = "2021"
 license = "MIT"
 description = "Standalone MCP server for the Australian Taxation Office legal corpus"
@@ -10,14 +10,25 @@ name = "ato-mcp"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0"
+anyhow = "1.0.103"
+arroy = "=0.6.4"
 base64 = "0.22"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono = { version = "0.4", default-features = false, features = [
+  "clock",
+  "std",
+] }
 clap = { version = "4.5", features = ["derive"] }
 dirs = "6.0"
 fs2 = "0.4"
-flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+flate2 = { version = "1.1", default-features = false, features = [
+  "rust_backend",
+] }
 regex = "1.11"
+heed = { version = "=0.22.1", default-features = false }
+rand = "0.8.5"
+rand_chacha = "=0.3.1"
+rayon = "1.10"
+roaring = "0.10.9"
 rusqlite = { version = "0.31", features = ["bundled", "functions"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -25,12 +36,16 @@ sha2 = "0.10"
 simsimd = "5"
 tar = "0.4"
 tiny_http = "0.12"
-scraper = "0.20"
-ego_tree = { package = "ego-tree", version = "0.6" }
+scraper = "0.27"
+ego_tree = { package = "ego-tree", version = "0.11" }
 tempfile = "3.15"
-tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "0.23", default-features = false, features = [
+  "fancy-regex",
+] }
 url = "2.5"
-zip = { version = "4.6", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "4.6", default-features = false, features = [
+  "deflate-flate2",
+] }
 zstd = "0.13"
 # native-tls (system OpenSSL / Security.framework / SChannel) rather than
 # rustls: rustls hard-errors when an HTTPS peer closes a connection without
@@ -39,7 +54,10 @@ zstd = "0.13"
 # native-tls treats that abrupt close as a normal EOF. Used by every
 # outbound fetch path (`fetch` live-fetcher, tree-crawl, link-download,
 # whats-new, update); the MCP transport itself is plain localhost HTTP.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls"] }
+reqwest = { version = "0.12", default-features = false, features = [
+  "blocking",
+  "native-tls",
+] }
 # ATO outbound requests use reqwest+native-tls so the runtime stays on the
 # platform TLS stack.
 
@@ -48,10 +66,13 @@ default = []
 cuda = ["ort/cuda"]
 
 [target.'cfg(windows)'.dependencies]
-ort = { version = "2.0.0-rc.12", default-features = false, features = ["load-dynamic", "api-24", "ndarray"] }
+ort = { version = "2.0.0-rc.12", default-features = false, features = [
+  "load-dynamic",
+  "api-24",
+  "ndarray",
+] }
 
 [target.'cfg(not(windows))'.dependencies]
 ort = "2.0.0-rc.12"
 
 [dev-dependencies]
-rand = "0.8"

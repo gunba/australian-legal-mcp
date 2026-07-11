@@ -28,15 +28,31 @@ systemctl --user status ato-mcp-serve.service
 
 ## Optional corpus update timer
 
+Install the update and serve units together so a successful update refreshes the
+running backend before verification:
+
 ```bash
 mkdir -p ~/.config/systemd/user
-cp ato-mcp-update.service ato-mcp-update.timer ~/.config/systemd/user/
+cp ato-mcp-serve.service ato-mcp-update.service ato-mcp-update.timer \
+  ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now ato-mcp-update.timer
+systemctl --user enable --now ato-mcp-serve.service ato-mcp-update.timer
 systemctl --user list-timers --all | grep ato-mcp
 ```
 
-Restart the MCP host/backend after an update so it uses the refreshed corpus.
+Both services load the optional
+`~/.config/ato-mcp/environment` file. For a portable corpus, create it once:
+
+```bash
+mkdir -p ~/.config/ato-mcp
+printf 'ATO_MCP_DATA_DIR=%s\n' "$HOME/path/to/stable/ato-mcp-data" \
+  > ~/.config/ato-mcp/environment
+systemctl --user daemon-reload
+systemctl --user restart ato-mcp-serve.service
+```
+
+The update service runs `ato-mcp update`, tries to restart
+`ato-mcp-serve.service`, then runs `ato-mcp stats` in the same data directory.
 
 ## Maintainer timer
 

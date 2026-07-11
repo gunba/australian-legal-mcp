@@ -13,10 +13,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 use url::Url;
 
+mod ann;
 mod build;
 mod chunker;
 mod config;
@@ -47,13 +48,13 @@ use semantic::{
 };
 use source::{
     apply_update, check_for_update_availability, link_download, resolve_latest_corpus_manifest_url,
-    resolve_latest_corpus_manifest_url_with, scrape_diff, snapshot_reduce, stats, tree_crawl,
+    resolve_latest_corpus_manifest_url_probe, scrape_diff, snapshot_reduce, stats, tree_crawl,
     LinkDownloadArgs, Manifest, ModelInfo, StagedModel, UpdateAvailability,
 };
 
 pub(crate) const APP_NAME: &str = "ato-mcp";
 pub(crate) const DEFAULT_RELEASES_API_URL: &str =
-    "https://api.github.com/repos/gunba/ato-mcp/releases?per_page=20";
+    "https://api.github.com/repos/gunba/ato-mcp/releases";
 pub(crate) const DEFAULT_K: usize = 8;
 pub(crate) const MAX_K: usize = 50;
 /// Cap on the `title_hits` sidebar `search` returns alongside chunk hits.
@@ -87,6 +88,7 @@ pub(crate) const ORDINARY_DICTIONARY_PATH_ENV: &str = "ATO_MCP_DICTIONARY_PATH";
 /// always moved together; now they share one identifier. Bump on any
 /// breaking change to the on-disk layout or the manifest contract.
 pub(crate) const SUPPORTED_SCHEMA_VERSION: u32 = 10;
+pub(crate) const SUPPORTED_MANIFEST_FORMAT_VERSION: u32 = 2;
 pub(crate) const EMBEDDING_MODEL_ID: &str = "granite-embedding-small-r2-fp16-256d";
 
 /// Compile-time switch: corpus build and runtime semantic search use the
@@ -96,6 +98,49 @@ pub(crate) const EMBEDDING_MODEL_ID: &str = "granite-embedding-small-r2-fp16-256
 pub(crate) const USE_GPU: bool = cfg!(feature = "cuda");
 pub(crate) const DEFAULT_MAX_PER_DOC: usize = 2;
 pub(crate) const HARD_MAX_PER_DOC: usize = 3;
+const HTTP_WORKERS: usize = 8;
+const HTTP_QUEUE_CAPACITY: usize = 32;
+const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
+
+#[cfg(test)]
+static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+struct TestEnvironment {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+#[cfg(test)]
+impl TestEnvironment {
+    fn set(values: &[(&'static str, &std::ffi::OsStr)]) -> Self {
+        let lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let previous = values
+            .iter()
+            .map(|(name, _)| (*name, std::env::var_os(name)))
+            .collect();
+        let environment = Self {
+            _lock: lock,
+            previous,
+        };
+        for (name, value) in values {
+            std::env::set_var(name, value);
+        }
+        environment
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestEnvironment {
+    fn drop(&mut self) {
+        for (name, previous) in self.previous.iter().rev() {
+            match previous {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "ato-mcp", version, about = "Standalone ATO MCP server")]
@@ -131,7 +176,12 @@ enum Command {
     },
     /// Download or refresh the local corpus. Always performs a full
     /// replacement; there is no partial-update path.
-    Update {},
+    Update {
+        /// Install from an explicit manifest URL or local manifest path.
+        /// Primarily used for verified offline bundles and release testing.
+        #[arg(long)]
+        manifest_url: Option<String>,
+    },
     /// Print index version, counts, and search-policy status (JSON).
     Stats {},
     /// Run a search from the CLI.
@@ -139,6 +189,7 @@ enum Command {
         query: String,
         #[arg(short, long, default_value_t = DEFAULT_K)]
         k: usize,
+        /// Exact corpus type codes or `*` globs; discover codes with `ato-mcp stats`.
         #[arg(long, value_delimiter = ',')]
         types: Vec<String>,
         #[arg(long)]
@@ -166,7 +217,7 @@ enum Command {
     /// corpus docs, so live docs read like corpus docs.
     Fetch { uri: String },
     /// In-binary build orchestrator. Reads `pages_dir/index.jsonl` (one
-    /// record per line with canonical_id and payload_path), runs each doc
+    /// record per line with canonical_id, payload_path, sha256, and size), runs each doc
     /// through the cleaning pipeline, the chunker, the rules-engine
     /// metadata classifier, and the Granite embedder in-process, then
     /// writes documents/chunks/chunk_embeddings/chunks_fts/title_fts/
@@ -238,8 +289,9 @@ enum Command {
     },
     /// [SS-04] Maintainer source download defaults to 0.05s request pacing
     /// and four link-download workers; the rate lock serializes HTTP issuance.
-    /// Download deduped ATO links to local payloads/<Category>/<slug>.html
-    /// + index.jsonl. Mirrors src/ato_mcp/scraper/downloader.py:LinkDownloader.
+    /// Download deduped ATO links to local payloads/<Category>/<slug>.html and
+    /// write integrity-pinned index.jsonl records. Mirrors the Python
+    /// `src/ato_mcp/scraper/downloader.py:LinkDownloader` implementation.
     LinkDownload {
         #[arg(long)]
         deduped_links: PathBuf,
@@ -398,8 +450,11 @@ fn main() -> Result<()> {
             };
             serve(choice, &bind, ready_stdout, Arc::new(state))
         }
-        Command::Update {} => {
-            let manifest_url = resolve_latest_corpus_manifest_url()?;
+        Command::Update { manifest_url } => {
+            let manifest_url = match manifest_url {
+                Some(value) => value,
+                None => resolve_latest_corpus_manifest_url()?,
+            };
             let stats = apply_update(&manifest_url)?;
             println!(
                 "update complete ({:.2} MB downloaded)",
@@ -590,6 +645,7 @@ fn empty_vec_as_none(values: Vec<String>) -> Option<Vec<String>> {
 struct ServerState {
     semantic_runtime: Mutex<Option<SemanticRuntime>>,
     semantic_model_paths: Option<SemanticModelPaths>,
+    corpus_generation: Option<String>,
     // Rendered once at server start so MCP initialize is a cheap field read
     // instead of re-running stats() (~5-10s on a cold 4 GB corpus) per call.
     // The corpus is immutable for the server lifetime — `ato-mcp update`
@@ -604,6 +660,7 @@ impl ServerState {
         Self {
             semantic_runtime: Mutex::new(None),
             semantic_model_paths: None,
+            corpus_generation: config::active_generation_key().ok().flatten(),
             cached_instructions: String::new(),
         }
     }
@@ -612,6 +669,7 @@ impl ServerState {
         Self {
             semantic_runtime: Mutex::new(None),
             semantic_model_paths: Some(semantic_model_paths),
+            corpus_generation: config::active_generation_key().ok().flatten(),
             cached_instructions: String::new(),
         }
     }
@@ -621,6 +679,16 @@ impl ServerState {
         embeddings
             .pop()
             .ok_or_else(|| anyhow!("semantic encoder returned no query embedding"))
+    }
+
+    fn ensure_corpus_generation_unchanged(&self) -> Result<()> {
+        let active = config::active_generation_key()?;
+        if active != self.corpus_generation {
+            bail!(
+                "the installed corpus changed after this process started; restart the ato-mcp backend"
+            );
+        }
+        Ok(())
     }
 
     fn encode_query_embeddings(&self, queries: &[String]) -> Result<Vec<[i8; EMBEDDING_DIM]>> {
@@ -832,7 +900,7 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
 
     // Schema 5+ ships a single ato.db.zst artifact. Rewrite manifest.db.url
     // to the GitHub release URL and queue the local file for upload.
-    let mut artifacts: Vec<PathBuf> = vec![manifest_path.clone()];
+    let mut artifacts: Vec<PathBuf> = Vec::new();
     let db_info = &mut manifest.db;
     let filename = std::path::Path::new(&db_info.url)
         .file_name()
@@ -847,11 +915,36 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
             local.display()
         );
     }
+    if fs::metadata(&local)?.len() != db_info.size {
+        bail!("manifest DB size does not match {}", local.display());
+    }
+    verify_sha256_file(&local, &db_info.sha256)?;
     db_info.url = format!(
         "https://github.com/{repo}/releases/download/{tag}/{filename}",
         tag = args.tag,
     );
     artifacts.push(local);
+
+    if let Some(ann_info) = manifest.ann.as_mut() {
+        let filename = Path::new(&ann_info.url)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("manifest ANN URL has no UTF-8 filename"))?
+            .to_string();
+        let local = args.out_dir.join(&filename);
+        if !local.is_file() {
+            bail!("manifest.ann points at missing {}", local.display());
+        }
+        if fs::metadata(&local)?.len() != ann_info.size {
+            bail!("manifest ANN size does not match {}", local.display());
+        }
+        verify_sha256_file(&local, &ann_info.sha256)?;
+        ann_info.url = format!(
+            "https://github.com/{repo}/releases/download/{tag}/{filename}",
+            tag = args.tag,
+        );
+        artifacts.push(local);
+    }
 
     // Save updated manifest.
     let pretty = serde_json::to_vec_pretty(&manifest)?;
@@ -876,7 +969,7 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
         if !status.success() {
             bail!("minisign signing failed (exit {:?})", status.code());
         }
-        artifacts.insert(1, sig_path);
+        artifacts.push(sig_path);
     }
 
     // Ensure release exists.
@@ -907,23 +1000,79 @@ fn publish_release(args: PublishReleaseArgs) -> Result<()> {
         }
     }
 
-    // Upload artifacts.
-    let mut upload = std::process::Command::new("gh");
-    upload.args(["release", "upload", &args.tag, "--repo", &repo]);
-    for a in &artifacts {
-        upload.arg(a);
+    let assets = std::process::Command::new("gh")
+        .args([
+            "release",
+            "view",
+            &args.tag,
+            "--repo",
+            &repo,
+            "--json",
+            "assets",
+            "--jq",
+            ".assets[].name",
+        ])
+        .output()
+        .context("listing existing release assets")?;
+    if !assets.status.success() {
+        bail!(
+            "gh release asset listing failed (exit {:?})",
+            assets.status.code()
+        );
     }
-    if args.overwrite {
-        upload.arg("--clobber");
+    let has_remote_manifest = String::from_utf8(assets.stdout)?
+        .lines()
+        .any(|name| name == "manifest.json");
+    if has_remote_manifest {
+        if !args.overwrite {
+            bail!(
+                "release {} already has manifest.json; rerun with --overwrite",
+                args.tag
+            );
+        }
+        let status = std::process::Command::new("gh")
+            .args([
+                "release",
+                "delete-asset",
+                &args.tag,
+                "manifest.json",
+                "--repo",
+                &repo,
+                "--yes",
+            ])
+            .status()
+            .context("removing discoverable manifest before artifact replacement")?;
+        if !status.success() {
+            bail!(
+                "could not remove existing manifest before artifact replacement (exit {:?})",
+                status.code()
+            );
+        }
     }
-    let st = upload.status().context("running gh release upload")?;
-    if !st.success() {
-        bail!("gh release upload failed (exit {:?})", st.code());
+
+    // Publish immutable data first and the discoverable manifest last. Each
+    // upload is a separate command so an earlier failure cannot expose a
+    // manifest that references a missing database or ANN sidecar.
+    for artifact in artifacts.iter().chain(std::iter::once(&manifest_path)) {
+        let mut upload = std::process::Command::new("gh");
+        upload.args(["release", "upload", &args.tag, "--repo", &repo]);
+        upload.arg(artifact);
+        if args.overwrite {
+            upload.arg("--clobber");
+        }
+        let st = upload.status().context("running gh release upload")?;
+        if !st.success() {
+            bail!(
+                "gh release upload failed for {} (exit {:?})",
+                artifact.display(),
+                st.code()
+            );
+        }
     }
 
     eprintln!(
         "ato-mcp publish-release: uploaded {} artifacts to {}@{}",
-        artifacts.len(),
+        artifacts.len() + 1,
         repo,
         args.tag,
     );
@@ -1034,7 +1183,7 @@ pub(crate) fn fetch_bytes_with(
                 }
             }
         }
-        if !is_http_url(url_or_path) {
+        if !url_or_path.starts_with("http://") && !url_or_path.starts_with("https://") {
             bail!("release asset not found: {url_or_path}");
         }
     }
@@ -1046,41 +1195,6 @@ pub(crate) fn fetch_bytes_with(
     let mut out = Vec::new();
     resp.copy_to(&mut out)?;
     Ok(out)
-}
-
-fn fetch_to_file(url_or_path: &str, context: &UrlContext, dest: &Path) -> Result<u64> {
-    if let Some(path) = local_path_from_urlish(url_or_path) {
-        fs::copy(path, dest).map_err(Into::into)
-    } else if let Some(dir) = &context.manifest_dir {
-        if let Some(name) = url_or_path.rsplit('/').next() {
-            for candidate in [dir.join(name), dir.join("packs").join(name)] {
-                if candidate.exists() {
-                    return fs::copy(candidate, dest).map_err(Into::into);
-                }
-            }
-        }
-        if !is_http_url(url_or_path) {
-            bail!("release asset not found: {url_or_path}");
-        }
-        fetch_http_to_file(url_or_path, dest)
-    } else {
-        fetch_http_to_file(url_or_path, dest)
-    }
-}
-
-fn is_http_url(value: &str) -> bool {
-    value.starts_with("http://") || value.starts_with("https://")
-}
-
-fn fetch_http_to_file(url: &str, dest: &Path) -> Result<u64> {
-    let client = http_client()?;
-    let mut resp = client.get(url).send()?.error_for_status().with_context(|| {
-        format!(
-            "download failed for {url}. This Rust client does not read GitHub tokens or invoke gh; use a public release, an authenticated mirror, or a file URL."
-        )
-    })?;
-    let mut file = File::create(dest)?;
-    Ok(resp.copy_to(&mut file)?)
 }
 
 pub(crate) fn validate_manifest_model_source(model: &ModelInfo) -> Result<()> {
@@ -1154,6 +1268,48 @@ fn verify_sha256_file(path: &Path, expected: &str) -> Result<()> {
     Ok(())
 }
 
+fn stage_model_artifact(
+    value: &str,
+    context: &UrlContext,
+    destination: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<u64> {
+    let resolved = resolve_manifest_asset(value, context);
+    if let Some(path) = local_path_from_urlish(&resolved) {
+        let path = path
+            .canonicalize()
+            .with_context(|| format!("canonicalizing {}", path.display()))?;
+        if let Some(root) = &context.manifest_dir {
+            let root = root.canonicalize()?;
+            if !path.starts_with(&root) {
+                bail!("model artifact escaped {}", root.display());
+            }
+        }
+        if !path.is_file() {
+            bail!("model artifact is not a regular file: {}", path.display());
+        }
+        let size = fs::copy(&path, destination)?;
+        if size != expected_size {
+            let _ = fs::remove_file(destination);
+            bail!("model artifact size mismatch: got {size}, expected {expected_size}");
+        }
+        if let Err(error) = verify_sha256_file(destination, expected_sha256) {
+            let _ = fs::remove_file(destination);
+            return Err(error);
+        }
+        return Ok(size);
+    }
+
+    source::download_approved_https_to_file(
+        &resolved,
+        destination,
+        expected_size,
+        expected_sha256,
+        Duration::from_secs(60 * 60),
+    )
+}
+
 pub(crate) fn stage_model(
     manifest: &Manifest,
     context: &UrlContext,
@@ -1197,17 +1353,14 @@ pub(crate) fn stage_model(
         );
     }
 
-    let bundle_url = resolve_manifest_asset(&manifest.model.url, context);
     let bundle = staging.join("model-bundle.tar.zst.part");
-    let size = fetch_to_file(&bundle_url, context, &bundle)?;
-    if size != manifest.model.size {
-        bail!(
-            "model bundle size mismatch: got {}, expected {}",
-            size,
-            manifest.model.size
-        );
-    }
-    verify_sha256_file(&bundle, &manifest.model.sha256)?;
+    stage_model_artifact(
+        &manifest.model.url,
+        context,
+        &bundle,
+        manifest.model.size,
+        &manifest.model.sha256,
+    )?;
     let extract_dir = staging.join("model-bundle-extracted");
     if extract_dir.exists() {
         fs::remove_dir_all(&extract_dir)?;
@@ -1247,19 +1400,14 @@ fn stage_hf_embedding_model(repo: &str, revision: &str, staging: &Path) -> Resul
     for file in EMBEDDING_MODEL_HF_FILES {
         let url = hf_resolve_url(repo, revision, file.path);
         let part = download_dir.join(format!("{}.part", file.output_name));
-        fetch_http_to_file(&url, &part)
-            .with_context(|| format!("downloading Hugging Face model file {}", file.path))?;
-        verify_sha256_file(&part, file.sha256)
-            .with_context(|| format!("verifying Hugging Face model file {}", file.path))?;
-        let size = part.metadata()?.len();
-        if size != file.size {
-            bail!(
-                "size mismatch for Hugging Face model file {}: got {}, expected {}",
-                file.path,
-                size,
-                file.size
-            );
-        }
+        source::download_approved_https_to_file(
+            &url,
+            &part,
+            file.size,
+            file.sha256,
+            Duration::from_secs(60 * 60),
+        )
+        .with_context(|| format!("downloading Hugging Face model file {}", file.path))?;
         fs::rename(part, download_dir.join(file.output_name))?;
     }
     for file in EMBEDDING_MODEL_HF_FILES {
@@ -1277,17 +1425,27 @@ fn serve(
     ready_stdout: bool,
     state: Arc<ServerState>,
 ) -> Result<()> {
-    let port = match &choice {
+    if bind != "127.0.0.1" {
+        bail!(
+            "HTTP MCP transport is loopback-only; --bind must be the canonical address 127.0.0.1"
+        );
+    }
+    let requested_port = match &choice {
         config::PortChoice::Cli(p) => *p,
         config::PortChoice::PluginUnchanged(p) => *p,
         config::PortChoice::PluginNeedsRewrite { port, .. } => *port,
     };
-    let addr = format!("{bind}:{port}");
+    let addr = format!("{bind}:{requested_port}");
     let server = tiny_http::Server::http(&addr).map_err(|e| {
         anyhow!(
             "bind {addr}: {e}. If the port is in use, start with `ato-mcp serve --port <free-port>`."
         )
     })?;
+    let port = server
+        .server_addr()
+        .to_ip()
+        .ok_or_else(|| anyhow!("HTTP server did not bind a TCP address"))?
+        .port();
     let url = config::server_url(port);
     write_http_state(port, &url)?;
     emit_ready_line(&url, ready_stdout)?;
@@ -1309,13 +1467,43 @@ fn serve(
         }
     }
 
-    for request in server.incoming_requests() {
+    let (sender, receiver) = mpsc::sync_channel::<tiny_http::Request>(HTTP_QUEUE_CAPACITY);
+    let receiver = Arc::new(Mutex::new(receiver));
+    for worker in 0..HTTP_WORKERS {
+        let receiver = Arc::clone(&receiver);
         let state = Arc::clone(&state);
-        std::thread::spawn(move || {
-            if let Err(err) = handle_http(request, &state) {
-                eprintln!("ato-mcp http handler error: {err}");
+        std::thread::Builder::new()
+            .name(format!("ato-mcp-http-{worker}"))
+            .spawn(move || loop {
+                let request = {
+                    let receiver = receiver.lock().unwrap_or_else(|err| err.into_inner());
+                    receiver.recv()
+                };
+                let Ok(request) = request else {
+                    break;
+                };
+                if let Err(err) = handle_http(request, &state) {
+                    eprintln!("ato-mcp http handler error: {err}");
+                }
+            })
+            .context("starting bounded HTTP worker")?;
+    }
+
+    for request in server.incoming_requests() {
+        match sender.try_send(request) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(request)) => {
+                let response = tiny_http::Response::from_string(
+                    r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"server busy"}}"#,
+                )
+                .with_status_code(503)
+                .with_header(json_content_type());
+                let _ = request.respond(response);
             }
-        });
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                bail!("all HTTP workers stopped unexpectedly")
+            }
+        }
     }
     Ok(())
 }
@@ -1338,17 +1526,16 @@ struct HttpState {
 }
 
 fn write_http_state(port: u16, url: &str) -> Result<()> {
+    if port == 0 || url != config::server_url(port) {
+        bail!("refusing to advertise noncanonical HTTP MCP endpoint `{url}`");
+    }
     let path = config::http_state_path()?;
     let state = HttpState {
         port,
         url: url.to_string(),
     };
-    let serialised = serde_json::to_string_pretty(&state)?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, format!("{serialised}\n"))
-        .with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, &path)
-        .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
+    let serialised = format!("{}\n", serde_json::to_string_pretty(&state)?);
+    config::atomic_write(&path, serialised.as_bytes())?;
     Ok(())
 }
 
@@ -1368,11 +1555,15 @@ fn read_http_state() -> Result<Option<HttpState>> {
     let Ok(port) = u16::try_from(port) else {
         return Ok(None);
     };
-    let url = value
-        .get("url")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| config::server_url(port));
+    if port == 0 {
+        return Ok(None);
+    }
+    let canonical_url = config::server_url(port);
+    let url = match value.get("url") {
+        None => canonical_url,
+        Some(value) if value.as_str() == Some(canonical_url.as_str()) => canonical_url,
+        Some(_) => return Ok(None),
+    };
     Ok(Some(HttpState { port, url }))
 }
 
@@ -1479,11 +1670,24 @@ fn spawn_http_server(port: u16, expected_url: &str) -> Result<()> {
         .stdout
         .take()
         .ok_or_else(|| anyhow!("local ATO HTTP server stdout was not piped"))?;
-    let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    let read = reader
-        .read_line(&mut line)
-        .context("waiting for local ATO HTTP server readiness")?;
+    let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let result = reader.read_line(&mut line).map(|read| (read, line));
+        let _ = ready_sender.send(result);
+    });
+    let (read, line) = match ready_receiver.recv_timeout(Duration::from_secs(20)) {
+        Ok(result) => result.context("waiting for local ATO HTTP server readiness")?,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "timed out waiting for local ATO HTTP server readiness; see {}",
+                log_path.display()
+            );
+        }
+    };
     if read == 0 {
         let status = child.try_wait().ok().flatten();
         bail!(
@@ -1527,8 +1731,20 @@ fn post_mcp_line(client: &Client, url: &str, line: &str) -> Result<Option<JsonVa
     Ok(Some(value))
 }
 
+fn json_content_type() -> tiny_http::Header {
+    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap()
+}
+
 fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<()> {
     use tiny_http::{Header, Method, Response};
+
+    if request
+        .remote_addr()
+        .is_some_and(|address| !address.ip().is_loopback())
+    {
+        let resp = Response::from_string("forbidden").with_status_code(403);
+        return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
+    }
 
     let path = request.url().split('?').next().unwrap_or("/").to_string();
     let is_mcp = path == "/mcp" || path == "/mcp/";
@@ -1544,13 +1760,58 @@ fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<(
         return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
     }
 
-    let mut body = String::new();
+    let is_json = request.headers().iter().any(|header| {
+        header.field.equiv("Content-Type")
+            && header
+                .value
+                .as_str()
+                .split(';')
+                .next()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+    });
+    if !is_json {
+        let resp = Response::from_string(serde_json::to_string(&json_rpc_error(
+            JsonValue::Null,
+            -32600,
+            "content-type must be application/json",
+        ))?)
+        .with_status_code(415)
+        .with_header(json_content_type());
+        return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
+    }
+
+    if request
+        .body_length()
+        .is_some_and(|length| length > MAX_HTTP_BODY_BYTES)
+    {
+        let resp = Response::from_string(serde_json::to_string(&json_rpc_error(
+            JsonValue::Null,
+            -32600,
+            "request body exceeds 1 MiB limit",
+        ))?)
+        .with_status_code(413)
+        .with_header(json_content_type());
+        return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
+    }
+
+    let mut body = Vec::new();
     request
         .as_reader()
-        .read_to_string(&mut body)
+        .take((MAX_HTTP_BODY_BYTES + 1) as u64)
+        .read_to_end(&mut body)
         .context("reading request body")?;
+    if body.len() > MAX_HTTP_BODY_BYTES {
+        let resp = Response::from_string(serde_json::to_string(&json_rpc_error(
+            JsonValue::Null,
+            -32600,
+            "request body exceeds 1 MiB limit",
+        ))?)
+        .with_status_code(413)
+        .with_header(json_content_type());
+        return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
+    }
 
-    let response_json: Option<JsonValue> = match serde_json::from_str::<JsonValue>(&body) {
+    let response_json: Option<JsonValue> = match serde_json::from_slice::<JsonValue>(&body) {
         Ok(message) => handle_rpc(message, state),
         Err(err) => Some(json_rpc_error(
             JsonValue::Null,
@@ -1567,17 +1828,21 @@ fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<(
     };
 
     let body = serde_json::to_string(&value)?;
-    let resp = Response::from_string(body)
-        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
+    let resp = Response::from_string(body).with_header(json_content_type());
     request.respond(resp).map_err(|e| anyhow!("respond: {e}"))?;
     Ok(())
 }
 
 fn handle_rpc(message: JsonValue, state: &ServerState) -> Option<JsonValue> {
-    if message.is_array() {
-        let responses: Vec<JsonValue> = message
-            .as_array()
-            .unwrap()
+    if let Some(messages) = message.as_array() {
+        if messages.is_empty() {
+            return Some(json_rpc_error(
+                JsonValue::Null,
+                -32600,
+                "invalid request: empty batch",
+            ));
+        }
+        let responses: Vec<JsonValue> = messages
             .iter()
             .filter_map(|m| handle_single_rpc(m.clone(), state))
             .collect();
@@ -1592,12 +1857,32 @@ fn handle_rpc(message: JsonValue, state: &ServerState) -> Option<JsonValue> {
 }
 
 fn handle_single_rpc(message: JsonValue, state: &ServerState) -> Option<JsonValue> {
-    let id = message.get("id").cloned();
-    let Some(method) = message.get("method").and_then(|m| m.as_str()) else {
-        return id.map(|id| json_rpc_error(id, -32600, "invalid request"));
+    let Some(object) = message.as_object() else {
+        return Some(json_rpc_error(JsonValue::Null, -32600, "invalid request"));
     };
-    let id = id?;
-    let result = match method {
+    if object.get("jsonrpc").and_then(JsonValue::as_str) != Some("2.0") {
+        return Some(json_rpc_error(JsonValue::Null, -32600, "invalid request"));
+    }
+    let has_id = object.contains_key("id");
+    let id = object.get("id").cloned().unwrap_or(JsonValue::Null);
+    if has_id && !(id.is_null() || id.is_string() || id.is_number()) {
+        return Some(json_rpc_error(
+            JsonValue::Null,
+            -32600,
+            "invalid request id",
+        ));
+    }
+    let Some(method) = object.get("method").and_then(JsonValue::as_str) else {
+        return Some(json_rpc_error(JsonValue::Null, -32600, "invalid request"));
+    };
+    if object
+        .get("params")
+        .is_some_and(|params| !params.is_object() && !params.is_array())
+    {
+        return has_id.then(|| json_rpc_error(id, -32602, "invalid params"));
+    }
+
+    let result: std::result::Result<JsonValue, (i64, String)> = match method {
         "initialize" => Ok(json!({
             "protocolVersion": "2025-06-18",
             "capabilities": { "tools": {} },
@@ -1607,14 +1892,25 @@ fn handle_single_rpc(message: JsonValue, state: &ServerState) -> Option<JsonValu
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_descriptors() })),
         "tools/call" => {
-            let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
-            call_tool(params, state)
+            let params = object.get("params").cloned().unwrap_or_else(|| json!({}));
+            match validate_tool_call(&params) {
+                Ok(()) => Ok(call_tool(params, state).unwrap_or_else(|err| {
+                    json!({
+                        "content": [{ "type": "text", "text": err.to_string() }],
+                        "isError": true
+                    })
+                })),
+                Err(err) => Err((-32602, err.to_string())),
+            }
         }
-        _ => Err(anyhow!("method not found: {method}")),
+        _ => Err((-32601, format!("method not found: {method}"))),
     };
+    if !has_id {
+        return None;
+    }
     Some(match result {
         Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-        Err(err) => json_rpc_error(id, -32000, &err.to_string()),
+        Err((code, message)) => json_rpc_error(id, code, &message),
     })
 }
 
@@ -1629,7 +1925,198 @@ fn json_rpc_error(id: JsonValue, code: i64, message: &str) -> JsonValue {
     })
 }
 
+fn validate_tool_call(params: &JsonValue) -> Result<()> {
+    let params = params
+        .as_object()
+        .ok_or_else(|| anyhow!("tools/call params must be an object"))?;
+    let name = params
+        .get("name")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| anyhow!("tools/call params.name must be a string"))?;
+    let empty = serde_json::Map::new();
+    let args = match params.get("arguments") {
+        Some(value) => value
+            .as_object()
+            .ok_or_else(|| anyhow!("tools/call params.arguments must be an object"))?,
+        None => &empty,
+    };
+    for field in params.keys() {
+        if !["name", "arguments"].contains(&field.as_str()) {
+            bail!("unknown tools/call parameter `{field}`");
+        }
+    }
+    let reject_unknown_args = |allowed: &[&str]| -> Result<()> {
+        for field in args.keys() {
+            if !allowed.contains(&field.as_str()) {
+                bail!("unknown argument `{field}` for tool `{name}`");
+            }
+        }
+        Ok(())
+    };
+
+    let require_string = |field: &str| -> Result<()> {
+        match args.get(field) {
+            Some(JsonValue::String(_)) => Ok(()),
+            Some(_) => bail!("`{field}` must be a string"),
+            None => bail!("missing required string argument `{field}`"),
+        }
+    };
+    let optional_string = |field: &str| -> Result<()> {
+        if args.get(field).is_none_or(JsonValue::is_string) {
+            Ok(())
+        } else {
+            bail!("`{field}` must be a string")
+        }
+    };
+    let optional_bool = |field: &str| -> Result<()> {
+        if args.get(field).is_none_or(JsonValue::is_boolean) {
+            Ok(())
+        } else {
+            bail!("`{field}` must be a boolean")
+        }
+    };
+    let optional_i64 = |field: &str| -> Result<()> {
+        if args.get(field).is_none_or(|value| value.as_i64().is_some()) {
+            Ok(())
+        } else {
+            bail!("`{field}` must be an integer")
+        }
+    };
+    let bounded_u64 = |field: &str, minimum: u64, maximum: Option<u64>| -> Result<()> {
+        let Some(value) = args.get(field) else {
+            return Ok(());
+        };
+        let value = value
+            .as_u64()
+            .ok_or_else(|| anyhow!("`{field}` must be a non-negative integer"))?;
+        if value < minimum || maximum.is_some_and(|maximum| value > maximum) {
+            bail!("`{field}` is outside the allowed range")
+        }
+        Ok(())
+    };
+    let enum_string = |field: &str, allowed: &[&str]| -> Result<()> {
+        let Some(value) = args.get(field) else {
+            return Ok(());
+        };
+        let value = value
+            .as_str()
+            .ok_or_else(|| anyhow!("`{field}` must be a string"))?;
+        if !allowed.contains(&value) {
+            bail!("`{field}` must be one of {}", allowed.join(", "))
+        }
+        Ok(())
+    };
+    let string_array = |field: &str| -> Result<()> {
+        let Some(value) = args.get(field) else {
+            return Ok(());
+        };
+        let values = value
+            .as_array()
+            .ok_or_else(|| anyhow!("`{field}` must be an array of strings"))?;
+        if values.iter().any(|value| !value.is_string()) {
+            bail!("`{field}` must be an array of strings")
+        }
+        Ok(())
+    };
+    let integer_array = |field: &str| -> Result<()> {
+        let Some(value) = args.get(field) else {
+            bail!("missing required array argument `{field}`");
+        };
+        let values = value
+            .as_array()
+            .ok_or_else(|| anyhow!("`{field}` must be an array of integers"))?;
+        if values.iter().any(|value| value.as_i64().is_none()) {
+            bail!("`{field}` must be an array of integers")
+        }
+        Ok(())
+    };
+
+    match name {
+        "search" => {
+            reject_unknown_args(&[
+                "query",
+                "k",
+                "types",
+                "date_from",
+                "date_to",
+                "doc_scope",
+                "mode",
+                "include_old",
+                "current_only",
+                "include_snippet",
+                "sort_by",
+                "seed_text",
+                "similar_to_chunk_id",
+                "format",
+            ])?;
+            require_string("query")?;
+            bounded_u64("k", 1, Some(MAX_K as u64))?;
+            string_array("types")?;
+            for field in ["date_from", "date_to", "doc_scope", "seed_text"] {
+                optional_string(field)?;
+            }
+            enum_string("mode", &["hybrid", "vector", "keyword"])?;
+            enum_string("sort_by", &["relevance", "recency"])?;
+            for field in ["include_old", "current_only", "include_snippet"] {
+                optional_bool(field)?;
+            }
+            optional_i64("similar_to_chunk_id")?;
+            enum_string("format", &["json"])?;
+        }
+        "get_asset" => {
+            reject_unknown_args(&["asset_ref"])?;
+            require_string("asset_ref")?;
+        }
+        "get_doc_anchors" => {
+            reject_unknown_args(&["doc_id"])?;
+            require_string("doc_id")?;
+        }
+        "get_chunks" => {
+            reject_unknown_args(&[
+                "chunk_ids",
+                "before",
+                "after",
+                "max_chars",
+                "cursor",
+                "format",
+            ])?;
+            integer_array("chunk_ids")?;
+            let chunk_id_count = args
+                .get("chunk_ids")
+                .and_then(JsonValue::as_array)
+                .map_or(0, Vec::len);
+            if !(1..=100).contains(&chunk_id_count) {
+                bail!("`chunk_ids` must contain between 1 and 100 integers");
+            }
+            bounded_u64("before", 0, Some(20))?;
+            bounded_u64("after", 0, Some(20))?;
+            bounded_u64("max_chars", 1, Some(200_000))?;
+            optional_string("cursor")?;
+            enum_string("format", &["json"])?;
+        }
+        "get_definition" => {
+            reject_unknown_args(&["term", "context_doc_id", "max_defs", "format"])?;
+            require_string("term")?;
+            optional_string("context_doc_id")?;
+            bounded_u64("max_defs", 1, Some(20))?;
+            enum_string("format", &["json"])?;
+        }
+        "stats" => {
+            reject_unknown_args(&["format"])?;
+            enum_string("format", &["json"])?;
+        }
+        "fetch" => {
+            reject_unknown_args(&["uri"])?;
+            require_string("uri")?;
+        }
+        _ => bail!("unknown tool `{name}`"),
+    }
+    Ok(())
+}
+
 fn call_tool(params: JsonValue, state: &ServerState) -> Result<JsonValue> {
+    let _corpus_lock = config::corpus_read_lock()?;
+    state.ensure_corpus_generation_unchanged()?;
     let name = params
         .get("name")
         .and_then(|v| v.as_str())
@@ -1755,8 +2242,7 @@ const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first; hits are chunk po
 /// cached MCP `initialize` instructions by `server_instructions`, so the
 /// agent can offer to run `ato-mcp update`.
 fn resolve_startup_update_notice() -> Option<UpdateAvailability> {
-    let client = source::http_probe_client().ok()?;
-    let manifest_url = resolve_latest_corpus_manifest_url_with(&client).ok()?;
+    let manifest_url = resolve_latest_corpus_manifest_url_probe().ok()?;
     check_for_update_availability(&manifest_url).ok().flatten()
 }
 
@@ -1786,7 +2272,7 @@ fn server_instructions(update_notice: Option<&UpdateAvailability>) -> String {
     };
     match update_notice {
         Some(notice) => format!(
-            "{body}\n\nA newer ATO corpus index is available ({}). Ask whether to run `ato-mcp update` now or continue with the installed corpus; restart the MCP host/backend after updating.",
+            "{body}\n\nAn updated ATO corpus generation is available (index {}). Ask whether to run `ato-mcp update` now or continue with the installed corpus; restart the MCP host/backend after updating.",
             notice.available_index_version
         ),
         None => body,
@@ -1802,7 +2288,7 @@ fn tool_descriptors() -> JsonValue {
     json!([
         {
             "name": "search",
-            "description": "Search the local ATO corpus. Returns slim `hits` with chunk_id plus `title_hits`; fetch hit bodies with get_chunks. Use doc_scope for a doc_id or prefix like `PAC/%`. `seed_text` or `similar_to_chunk_id` runs vector-only related search.",
+            "description": "Search the ATO corpus. Returns `hits` plus `title_hits`; read bodies with get_chunks. `types` accepts codes from `stats.types` (`JUD` for cases). Hybrid suits natural-language queries; keyword ranks matching terms. `doc_scope` accepts an ID/prefix. Seed inputs run vector-only related search.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1848,14 +2334,15 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_chunks",
-            "description": "Fetch chunk bodies by chunk_id, with optional before/after neighbours. Text may contain `[doc:X]` (in-corpus) and `[fetch:URI]` (external) markers; `[asset:X]` for images.",
+            "description": "Fetch chunk bodies by chunk_id, with optional before/after neighbours. Continue truncated results with the cursor from meta.next_call. Text may contain `[doc:X]` (in-corpus) and `[fetch:URI]` (external) markers; `[asset:X]` for images.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "chunk_ids": {"type": "array", "items": {"type": "integer"}},
+                    "chunk_ids": {"type": "array", "items": {"type": "integer"}, "minItems": 1, "maxItems": 100},
                     "before": {"type": "integer", "minimum": 0, "maximum": 20},
                     "after": {"type": "integer", "minimum": 0, "maximum": 20},
-                    "max_chars": {"type": "integer", "minimum": 1},
+                    "max_chars": {"type": "integer", "minimum": 1, "maximum": 200000},
+                    "cursor": {"type": "string"},
                     "format": {"type": "string", "enum": ["json"], "default": "json"}
                 },
                 "required": ["chunk_ids"]
@@ -1902,6 +2389,7 @@ fn tool_descriptors() -> JsonValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ann::*;
     use crate::config::*;
     use crate::db::*;
     use crate::extract::*;
@@ -2180,7 +2668,7 @@ mod tests {
 
     #[test]
     fn html_elements_and_assets_are_queryable() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let (dir, _db) = make_test_db()?;
         let conn = open_write_at(&dir.path().join("live/ato.db"))?;
         let html = r#"<div id="LawContent"><h1 id="top">Example</h1><p>See <a data-doc-id="PAC/19970038/203-55">203-55</a>.</p><span data-asset-ref="ato-image://DOC_HTML/0">[image: Diagram]</span></div>"#;
@@ -2282,20 +2770,17 @@ mod tests {
     }
 
     fn with_data_dir<R>(dir: &std::path::Path, f: impl FnOnce() -> R) -> R {
-        let prev = std::env::var("ATO_MCP_DATA_DIR").ok();
-        std::env::set_var("ATO_MCP_DATA_DIR", dir);
-        let result = f();
-        if let Some(p) = prev {
-            std::env::set_var("ATO_MCP_DATA_DIR", p);
-        } else {
-            std::env::remove_var("ATO_MCP_DATA_DIR");
-        }
-        result
+        let _environment = TestEnvironment::set(&[("ATO_MCP_DATA_DIR", dir.as_os_str())]);
+        f()
+    }
+
+    fn lock_test_db() -> std::sync::MutexGuard<'static, ()> {
+        TEST_DB_LOCK.lock().unwrap_or_else(|err| err.into_inner())
     }
 
     #[test]
     fn read_http_state_accepts_legacy_port_only_file() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let dir = tempdir()?;
         fs::write(
             dir.path().join("http.json"),
@@ -2309,6 +2794,150 @@ mod tests {
             let state = read_http_state()?.expect("state");
             assert_eq!(state.port, 37409);
             assert_eq!(state.url, "http://127.0.0.1:37409/mcp");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn read_http_state_rejects_noncanonical_endpoint() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join("http.json"),
+            r#"{"port":37409,"url":"http://example.test:37409/mcp"}"#,
+        )?;
+        with_data_dir(dir.path(), || -> Result<()> {
+            assert!(read_http_state()?.is_none());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn json_rpc_empty_batch_and_strict_tool_arguments() {
+        let state = ServerState::new();
+        let empty = handle_rpc(json!([]), &state).expect("empty batch response");
+        assert_eq!(empty["error"]["code"], -32600);
+
+        let malformed = handle_rpc(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_chunks",
+                    "arguments": {"chunk_ids": [1], "before": "2"}
+                }
+            }),
+            &state,
+        )
+        .expect("invalid params response");
+        assert_eq!(malformed["error"]["code"], -32602);
+
+        let malformed_cursor = handle_rpc(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_chunks",
+                    "arguments": {"chunk_ids": [1], "cursor": false}
+                }
+            }),
+            &state,
+        )
+        .expect("invalid cursor response");
+        assert_eq!(malformed_cursor["error"]["code"], -32602);
+
+        let unknown_argument = handle_rpc(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "stats",
+                    "arguments": {"unexpected": true}
+                }
+            }),
+            &state,
+        )
+        .expect("unknown argument response");
+        assert_eq!(unknown_argument["error"]["code"], -32602);
+
+        let unknown_param = handle_rpc(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "stats",
+                    "arguments": {},
+                    "unexpected": true
+                }
+            }),
+            &state,
+        )
+        .expect("unknown tools/call parameter response");
+        assert_eq!(unknown_param["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn get_chunks_cursor_round_trips_through_json_rpc() -> Result<()> {
+        let _lock = TEST_DB_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let (dir, _db) = make_test_db()?;
+        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        insert_doc(&conn, "DOC_CURSOR")?;
+        insert_chunk(&conn, 91, "DOC_CURSOR", 0, "abcdefghij")?;
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            let state = ServerState::new();
+            let mut cursor = None;
+            let mut combined = String::new();
+            for id in 1..=4 {
+                let mut arguments = json!({"chunk_ids": [91], "max_chars": 4});
+                if let Some(value) = cursor.take() {
+                    arguments["cursor"] = JsonValue::String(value);
+                }
+                let response = handle_rpc(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "method": "tools/call",
+                        "params": {"name": "get_chunks", "arguments": arguments}
+                    }),
+                    &state,
+                )
+                .expect("get_chunks response");
+                assert!(response.get("error").is_none(), "response: {response}");
+                let text = response["result"]["content"][0]["text"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("missing get_chunks text result"))?;
+                let body: JsonValue = serde_json::from_str(text)?;
+                for chunk in body["chunks"].as_array().into_iter().flatten() {
+                    combined.push_str(chunk["text"].as_str().unwrap_or_default());
+                }
+                let Some(next_call) = body.pointer("/meta/next_call").and_then(JsonValue::as_str)
+                else {
+                    break;
+                };
+                let encoded = next_call
+                    .split_once("cursor=")
+                    .ok_or_else(|| anyhow!("next_call omitted cursor: {next_call}"))?
+                    .1
+                    .strip_suffix(')')
+                    .ok_or_else(|| anyhow!("next_call was not a complete call: {next_call}"))?;
+                cursor = Some(serde_json::from_str(encoded)?);
+            }
+            assert_eq!(combined, "abcdefghij");
+            assert!(cursor.is_none(), "continuation did not terminate");
+            assert_eq!(
+                tool_descriptors()
+                    .as_array()
+                    .and_then(|tools| tools.iter().find(|tool| tool["name"] == "get_chunks"))
+                    .and_then(|tool| tool.pointer("/inputSchema/properties/cursor"))
+                    .and_then(|schema| schema["type"].as_str()),
+                Some("string")
+            );
             Ok(())
         })
     }
@@ -2562,13 +3191,14 @@ mod tests {
 
     #[test]
     fn stage_model_rejects_wrong_non_hf_bundle_size() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let data = tempdir()?;
         let release = tempdir()?;
         let model_bundle = release.path().join("model-bundle.tar.zst");
         let bundle_bytes = write_test_model_bundle(&model_bundle)?;
         let manifest = Manifest {
             schema_version: SUPPORTED_SCHEMA_VERSION as i64,
+            manifest_format_version: None,
             index_version: "wrong-model-size".to_string(),
             created_at: "2026-05-04T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2584,6 +3214,7 @@ mod tests {
                     .to_string(),
                 size: 1,
             },
+            ann: None,
         };
         let context = UrlContext {
             manifest_dir: Some(release.path().to_path_buf()),
@@ -2591,9 +3222,10 @@ mod tests {
         };
         with_data_dir(data.path(), || -> Result<()> {
             let err = stage_model(&manifest, &context, &staging_dir()?).unwrap_err();
+            let message = err.to_string();
             assert!(
-                err.to_string().contains("model bundle size mismatch"),
-                "expected model size validation error, got: {err}"
+                message.contains("artifact") && message.contains("size mismatch"),
+                "expected artifact size validation error, got: {err}"
             );
             Ok(())
         })?;
@@ -2628,7 +3260,7 @@ mod tests {
 
     #[test]
     fn open_read_rejects_unsupported_schema_version() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let (dir, db) = make_test_db()?;
         let conn = open_write_at(&db)?;
         // Force a bogus schema version via raw SQL.
@@ -2647,7 +3279,7 @@ mod tests {
 
     #[test]
     fn open_read_rejects_missing_schema_version_row() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let (dir, db) = make_test_db()?;
         let conn = open_write_at(&db)?;
         // init_db wrote the row; now delete it to simulate a corrupt /
@@ -2668,7 +3300,7 @@ mod tests {
 
     #[test]
     fn vector_search_requires_model_marker_match() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let (dir, db) = make_test_db()?;
         let conn = open_write_at(&db)?;
         set_meta(&conn, "embedding_model_id", EMBEDDING_MODEL_ID)?;
@@ -2676,6 +3308,7 @@ mod tests {
         let model_sha = "expected-model-marker";
         let manifest = Manifest {
             schema_version: SUPPORTED_SCHEMA_VERSION as i64,
+            manifest_format_version: None,
             index_version: "test-marker-readiness".to_string(),
             created_at: "2026-05-04T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2691,6 +3324,7 @@ mod tests {
                     .to_string(),
                 size: 1,
             },
+            ann: None,
         };
 
         with_data_dir(dir.path(), || -> Result<()> {
@@ -2712,6 +3346,80 @@ mod tests {
             Ok(())
         })?;
         Ok(())
+    }
+
+    #[test]
+    fn ann_generation_update_commits_with_one_active_pointer() -> Result<()> {
+        let _lock = lock_test_db();
+        let data = tempdir()?;
+        with_data_dir(data.path(), || -> Result<()> {
+            let staging_root = staging_dir()?.join("generation-promotion-test");
+            fs::create_dir_all(&staging_root)?;
+            let staged_db = staging_root.join("ato.db");
+            let staged_ann = staging_root.join(ANN_FILENAME);
+            fs::write(&staged_db, b"database-generation")?;
+            fs::write(&staged_ann, b"ann-generation")?;
+
+            let model_dir = staging_dir()?.join("generation-model-test");
+            fs::create_dir_all(&model_dir)?;
+            for file in EMBEDDING_MODEL_HF_FILES {
+                fs::write(
+                    model_dir.join(file.output_name),
+                    file.output_name.as_bytes(),
+                )?;
+            }
+            let staged_model = StagedModel {
+                dir: model_dir,
+                marker_value: "model-marker".to_string(),
+            };
+            let mut manifest = sample_manifest(SUPPORTED_SCHEMA_VERSION as i64, "");
+            manifest.manifest_format_version = Some(SUPPORTED_MANIFEST_FORMAT_VERSION);
+            manifest.ann = Some(sample_ann("d"));
+            promote_staged_update(
+                Some(&staged_model),
+                StagedCorpusUpdate {
+                    staging_root,
+                    staged_db,
+                    staged_ann: Some(staged_ann),
+                    stats: UpdateStats::default(),
+                },
+                &manifest,
+            )?;
+
+            let key = active_generation_key()?.expect("generation must be active");
+            assert_eq!(key.len(), 64);
+            assert_eq!(fs::read(db_path()?)?, b"database-generation");
+            assert_eq!(fs::read(ann_path()?)?, b"ann-generation");
+            let installed: Manifest =
+                serde_json::from_slice(&fs::read(installed_manifest_path()?)?)?;
+            assert_eq!(installed, manifest);
+            let running_state = ServerState::default();
+
+            let legacy_root = staging_dir()?.join("legacy-generation-promotion-test");
+            fs::create_dir_all(&legacy_root)?;
+            let legacy_db = legacy_root.join("ato.db");
+            fs::write(&legacy_db, b"legacy-database-generation")?;
+            let legacy_manifest = sample_manifest(SUPPORTED_SCHEMA_VERSION as i64, "");
+            promote_staged_update(
+                None,
+                StagedCorpusUpdate {
+                    staging_root: legacy_root,
+                    staged_db: legacy_db,
+                    staged_ann: None,
+                    stats: UpdateStats::default(),
+                },
+                &legacy_manifest,
+            )?;
+            let legacy_key = active_generation_key()?.expect("legacy generation must be active");
+            assert_ne!(legacy_key, key);
+            assert_eq!(fs::read(db_path()?)?, b"legacy-database-generation");
+            assert!(!ann_path()?.exists());
+            let installed: Manifest =
+                serde_json::from_slice(&fs::read(installed_manifest_path()?)?)?;
+            assert_eq!(installed, legacy_manifest);
+            assert!(running_state.ensure_corpus_generation_unchanged().is_err());
+            Ok(())
+        })
     }
 
     // ----- Cleanup: highlight_snippet fallback paths -----
@@ -2788,6 +3496,7 @@ mod tests {
     fn sample_manifest(schema_version: i64, min_client_version: &str) -> Manifest {
         Manifest {
             schema_version,
+            manifest_format_version: None,
             index_version: "test".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             min_client_version: min_client_version.to_string(),
@@ -2803,14 +3512,51 @@ mod tests {
                     .to_string(),
                 size: 1,
             },
+            ann: None,
         }
+    }
+
+    fn sample_ann(digest_character: &str) -> ManifestAnn {
+        ManifestAnn {
+            format: ANN_FORMAT.to_string(),
+            format_version: ANN_FORMAT_VERSION,
+            library: ANN_LIBRARY.to_string(),
+            library_version: ANN_LIBRARY_VERSION.to_string(),
+            url: ANN_FILENAME.to_string(),
+            sha256: digest_character.repeat(64),
+            size: 1,
+            corpus_id: format!("sha256:{}", digest_character.repeat(64)),
+            embedding_model_id: EMBEDDING_MODEL_ID.to_string(),
+            embedding_dimension: EMBEDDING_DIM as u32,
+            embedding_set_sha256: digest_character.repeat(64),
+            vector_count: 1,
+            seed: ANN_SEED,
+            rng: ANN_RNG.to_string(),
+            trees: ANN_TREES as u32,
+            split_after: ANN_SPLIT_AFTER as u32,
+            id_encoding: ANN_ID_ENCODING.to_string(),
+            metric: ANN_METRIC.to_string(),
+        }
+    }
+
+    #[test]
+    fn manifest_v2_requires_ann_while_legacy_manifest_remains_readable() {
+        let mut manifest = sample_manifest(SUPPORTED_SCHEMA_VERSION as i64, "");
+        assert!(enforce_manifest_compatibility(&manifest).is_ok());
+        manifest.manifest_format_version = Some(SUPPORTED_MANIFEST_FORMAT_VERSION);
+        let error = enforce_manifest_compatibility(&manifest).unwrap_err();
+        assert!(error.to_string().contains("requires an ANN sidecar"));
+        manifest.manifest_format_version = None;
+        manifest.ann = Some(sample_ann("e"));
+        let error = enforce_manifest_compatibility(&manifest).unwrap_err();
+        assert!(error.to_string().contains("legacy manifest format 1"));
     }
 
     // ----- serve startup: probe + server_instructions -----
 
     #[test]
     fn server_instructions_no_db_tells_user_to_run_update() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let data = tempdir()?;
         with_data_dir(data.path(), || {
             let text = server_instructions(None);
@@ -2829,7 +3575,7 @@ mod tests {
 
     #[test]
     fn server_instructions_appends_update_available_notice() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let data = tempdir()?;
         with_data_dir(data.path(), || {
             let notice = UpdateAvailability {
@@ -2837,7 +3583,7 @@ mod tests {
             };
             let text = server_instructions(Some(&notice));
             assert!(
-                text.contains("newer ATO corpus index is available"),
+                text.contains("updated ATO corpus generation is available"),
                 "missing update notice in: {text}"
             );
             assert!(
@@ -2854,7 +3600,7 @@ mod tests {
 
     #[test]
     fn mcp_startup_guidance_stays_compact() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let data = tempdir()?;
         with_data_dir(data.path(), || {
             let static_chars = ATO_MCP_USE_INSTRUCTIONS.chars().count();
@@ -2917,7 +3663,7 @@ mod tests {
 
     #[test]
     fn check_for_update_availability_returns_none_when_no_installed_manifest() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let data = tempdir()?;
         let result = with_data_dir(data.path(), || {
             check_for_update_availability("https://example.invalid/manifest.json")
@@ -2930,53 +3676,45 @@ mod tests {
     }
 
     #[test]
-    fn latest_corpus_manifest_url_skips_binary_only_releases() -> Result<()> {
-        let releases = json!([
-            {
-                "tag_name": "v0.15.1",
-                "assets": [
-                    {
+    fn corpus_manifest_discovery_paginates_past_binary_only_releases() -> Result<()> {
+        let first_page = (0..100)
+            .map(|index| {
+                json!({
+                    "tag_name": format!("v0.15.{index}"),
+                    "assets": [{
                         "name": "ato-mcp-x86_64-unknown-linux-gnu.tar.gz",
-                        "browser_download_url": "https://example.test/v0.15.1/linux.tar.gz"
-                    }
-                ]
-            },
-            {
-                "tag_name": "v0.15.0-rc1",
-                "prerelease": true,
-                "assets": [
-                    {
-                        "name": "manifest.json",
-                        "browser_download_url": "https://example.test/v0.15.0-rc1/manifest.json"
-                    }
-                ]
-            },
-            {
-                "tag_name": "v0.14.7",
-                "assets": [
-                    {
-                        "name": "ato.db.zst",
-                        "browser_download_url": "https://example.test/v0.14.7/ato.db.zst"
-                    },
-                    {
-                        "name": "manifest.json",
-                        "browser_download_url": "https://example.test/v0.14.7/manifest.json"
-                    }
-                ]
-            }
-        ]);
-        assert_eq!(
-            source::latest_corpus_manifest_url_from_releases_json(
-                &serde_json::to_vec(&releases)?
-            )?,
-            "https://example.test/v0.14.7/manifest.json"
-        );
+                        "browser_download_url": format!("https://example.test/{index}/binary.tar.gz")
+                    }]
+                })
+            })
+            .collect::<Vec<_>>();
+        let second_page = vec![json!({
+            "tag_name": "corpus",
+            "assets": [{
+                "name": "manifest.json",
+                "browser_download_url": "https://example.test/corpus/manifest.json"
+            }]
+        })];
+        let pages = [
+            serde_json::to_vec(&first_page)?,
+            serde_json::to_vec(&second_page)?,
+        ];
+        let mut fetched_pages = Vec::new();
+        let manifest = source::resolve_corpus_manifest_url_with(|page| {
+            fetched_pages.push(page);
+            pages
+                .get(page - 1)
+                .cloned()
+                .ok_or_else(|| anyhow!("unexpected release page {page}"))
+        })?;
+        assert_eq!(fetched_pages, vec![1, 2]);
+        assert_eq!(manifest, "https://example.test/corpus/manifest.json");
         Ok(())
     }
 
     #[test]
     fn check_for_update_availability_suppresses_incompatible_schema() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let data = tempdir()?;
         let release = tempdir()?;
         let release_dir = release.path();
@@ -2984,6 +3722,7 @@ mod tests {
 
         let installed = Manifest {
             schema_version: SUPPORTED_SCHEMA_VERSION as i64,
+            manifest_format_version: None,
             index_version: "test-installed".to_string(),
             created_at: "2026-05-04T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2999,6 +3738,7 @@ mod tests {
                     .to_string(),
                 size: 1,
             },
+            ann: None,
         };
         // Published manifest declares a schema this binary can't ingest.
         let published = Manifest {
@@ -3024,13 +3764,14 @@ mod tests {
 
     #[test]
     fn check_for_update_availability_returns_none_when_already_current() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let data = tempdir()?;
         let release = tempdir()?;
         let release_dir = release.path();
         let manifest_path = release_dir.join("manifest.json");
         let manifest = Manifest {
             schema_version: SUPPORTED_SCHEMA_VERSION as i64,
+            manifest_format_version: None,
             index_version: "test-probe-current".to_string(),
             created_at: "2026-05-04T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -3046,6 +3787,7 @@ mod tests {
                     .to_string(),
                 size: 1,
             },
+            ann: None,
         };
         fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
 
@@ -3069,7 +3811,7 @@ mod tests {
 
     #[test]
     fn schema_init_writes_v10_metadata() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let (_dir, db) = make_test_db()?;
         let conn = open_write_at(&db)?;
         let value =
@@ -3081,7 +3823,7 @@ mod tests {
 
     #[test]
     fn open_read_rejects_unsupported_schema_corpus() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let (dir, db) = make_test_db()?;
         let conn = open_write_at(&db)?;
         // Stamp an unsupported schema version. The user-facing error must
@@ -3157,6 +3899,14 @@ mod tests {
                 "missing legislation prefix {expected}; params={params:?}"
             );
         }
+    }
+
+    #[test]
+    fn fts_query_uses_or_term_semantics() {
+        assert_eq!(
+            fts_query("a Body research-development evidence"),
+            "\"Body\" OR \"research-development\" OR \"evidence\""
+        );
     }
 
     #[test]
@@ -3301,7 +4051,7 @@ mod tests {
 
     #[test]
     fn collect_title_hits_excludes_withdrawn_by_default() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let (dir, _db) = make_test_db()?;
         let conn = open_write_at(&dir.path().join("live/ato.db"))?;
         // Two docs sharing a query keyword in their titles. One is withdrawn.
@@ -3366,7 +4116,7 @@ mod tests {
 
     #[test]
     fn collect_title_hits_prefers_direct_doc_id_hits() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let (dir, _db) = make_test_db()?;
         let conn = open_write_at(&dir.path().join("live/ato.db"))?;
         insert_doc_full(
@@ -3424,7 +4174,7 @@ mod tests {
 
     #[test]
     fn get_definition_returns_matching_entry_only() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let (dir, _db) = make_test_db()?;
         let conn = open_write_at(&dir.path().join("live/ato.db"))?;
         insert_doc_full(
@@ -3473,7 +4223,7 @@ mod tests {
 
     #[test]
     fn get_definition_ignores_non_legislation_sources() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let (dir, _db) = make_test_db()?;
         let conn = open_write_at(&dir.path().join("live/ato.db"))?;
         insert_doc_full(
@@ -3541,31 +4291,24 @@ mod tests {
 
     #[test]
     fn get_definition_falls_back_to_configured_ordinary_dictionary() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let (dir, _db) = make_test_db()?;
         let dictionary_path = dir.path().join("ordinary.tsv");
         fs::write(
             &dictionary_path,
             "car\tcar\tnoun\ta road vehicle powered by an engine\n",
         )?;
-        let prev = std::env::var_os(ORDINARY_DICTIONARY_PATH_ENV);
-        std::env::set_var(ORDINARY_DICTIONARY_PATH_ENV, &dictionary_path);
-
-        let result = with_data_dir(dir.path(), || -> Result<String> {
-            get_definition(
-                "car",
-                GetDefinitionOptions {
-                    context_doc_id: None,
-                    max_defs: 5,
-                },
-            )
-        });
-
-        if let Some(value) = prev {
-            std::env::set_var(ORDINARY_DICTIONARY_PATH_ENV, value);
-        } else {
-            std::env::remove_var(ORDINARY_DICTIONARY_PATH_ENV);
-        }
+        let _environment = TestEnvironment::set(&[
+            ("ATO_MCP_DATA_DIR", dir.path().as_os_str()),
+            (ORDINARY_DICTIONARY_PATH_ENV, dictionary_path.as_os_str()),
+        ]);
+        let result = get_definition(
+            "car",
+            GetDefinitionOptions {
+                context_doc_id: None,
+                max_defs: 5,
+            },
+        );
         let parsed: serde_json::Value = serde_json::from_str(&result?)?;
         assert_eq!(parsed["statutory_definition_found"], json!(false));
         assert_eq!(parsed["ordinary_meaning"]["kind"], json!("ordinary"));
@@ -3619,8 +4362,162 @@ mod tests {
     }
 
     #[test]
+    fn lexical_search_keeps_best_bm25_match_first() -> Result<()> {
+        let _lock = lock_test_db();
+        let (_dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
+        for (doc_id, chunk_id, text) in [
+            ("DOC_RELEVANT", 1_i64, "common distinctive"),
+            ("DOC_COMMON_A", 2_i64, "common"),
+            ("DOC_COMMON_B", 3_i64, "common"),
+        ] {
+            insert_doc(&conn, doc_id)?;
+            insert_chunk(&conn, chunk_id, doc_id, 0, text)?;
+            conn.execute(
+                "INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)",
+                params![chunk_id, text],
+            )?;
+        }
+
+        let hits = lexical_search(&conn, "common distinctive", &SqlFilter::default(), 10)?;
+        assert_eq!(hits.len(), 3, "OR semantics should retain partial matches");
+        assert_eq!(hits[0].chunk_id, 1);
+        assert!(hits[0].score > hits[1].score);
+        Ok(())
+    }
+
+    #[test]
+    fn keyword_search_matches_mixed_judgment_title_and_body_terms() -> Result<()> {
+        let _lock = lock_test_db();
+        let (dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
+        let doc_id = "JUD/2025ATC10-742/00001";
+        let title = "Body by Michael Pty Ltd v Industry Innovation and Science Australia";
+        insert_doc_full(&conn, doc_id, Some("2025-01-24"), None, None, None)?;
+        conn.execute(
+            "UPDATE documents SET type = 'JUD', title = ? WHERE doc_id = ?",
+            params![title, doc_id],
+        )?;
+        conn.execute(
+            "INSERT INTO title_fts(doc_id, title, headings) VALUES (?, ?, '')",
+            params![doc_id, title],
+        )?;
+        let citation_chunk =
+            "Body by Michael Pty Ltd v Industry Innovation and Science Australia [2025] ARTA 44";
+        let evidence_chunk = "The absence of documentary evidence may create evidentiary difficulty, but any such absence is not of itself determinative.";
+        for (chunk_id, ord, text) in [
+            (10_i64, 0_i64, citation_chunk),
+            (11_i64, 1_i64, evidence_chunk),
+        ] {
+            insert_chunk(&conn, chunk_id, doc_id, ord, text)?;
+            conn.execute(
+                "INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)",
+                params![chunk_id, text],
+            )?;
+        }
+
+        insert_doc_full(
+            &conn,
+            "RUL/DECOY/00001",
+            Some("2025-01-24"),
+            None,
+            None,
+            None,
+        )?;
+        conn.execute(
+            "UPDATE documents SET type = 'RUL', title = ? WHERE doc_id = 'RUL/DECOY/00001'",
+            params![title],
+        )?;
+        insert_chunk(
+            &conn,
+            12,
+            "RUL/DECOY/00001",
+            0,
+            "Body Michael Industry Innovation Science Australia 2025 ARTA 44 absence documentary evidence not determinative",
+        )?;
+        conn.execute(
+            "INSERT INTO chunks_fts(rowid, text) VALUES (12, ?)",
+            params!["Body Michael Industry Innovation Science Australia 2025 ARTA 44 absence documentary evidence not determinative"],
+        )?;
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            let types = vec!["JUD".to_string()];
+            let json_str = search(
+                "Body by Michael Industry Innovation Science Australia 2025 ARTA 44 absence documentary evidence not determinative",
+                SearchOptions {
+                    k: 10,
+                    types: Some(&types),
+                    date_from: None,
+                    date_to: None,
+                    doc_scope: None,
+                    mode: SearchMode::Keyword,
+                    sort_by: SortBy::Relevance,
+                    include_old: false,
+                    current_only: true,
+                    max_per_doc: DEFAULT_MAX_PER_DOC,
+                    include_snippet: true,
+                    similar_to_chunk_id: None,
+                    seed_text: None,
+                },
+                None,
+            )?;
+            let parsed: JsonValue = serde_json::from_str(&json_str)?;
+            let hits = parsed["hits"].as_array().expect("hits array");
+            assert!(hits.iter().any(|hit| hit["doc_id"] == doc_id));
+            assert!(hits.iter().all(|hit| hit["type"] == "JUD"));
+            let title_hits = parsed["title_hits"].as_array().expect("title_hits array");
+            assert!(title_hits.iter().any(|hit| hit["doc_id"] == doc_id));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn search_rejects_unknown_exact_doc_type() -> Result<()> {
+        let _lock = lock_test_db();
+        let (dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
+        insert_doc(&conn, "JUD/TEST/00001")?;
+        conn.execute(
+            "UPDATE documents SET type = 'JUD' WHERE doc_id = 'JUD/TEST/00001'",
+            [],
+        )?;
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            let types = vec!["case".to_string()];
+            let err = search(
+                "documentary evidence",
+                SearchOptions {
+                    k: 10,
+                    types: Some(&types),
+                    date_from: None,
+                    date_to: None,
+                    doc_scope: None,
+                    mode: SearchMode::Keyword,
+                    sort_by: SortBy::Relevance,
+                    include_old: false,
+                    current_only: true,
+                    max_per_doc: DEFAULT_MAX_PER_DOC,
+                    include_snippet: true,
+                    similar_to_chunk_id: None,
+                    seed_text: None,
+                },
+                None,
+            )
+            .expect_err("unknown exact type should fail");
+            let message = err.to_string();
+            assert!(message.contains("case"));
+            assert!(message.contains("stats.types"));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
     fn test_search_hit_carries_navigation_flags() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let (dir, _db) = make_test_db()?;
         let conn = open_write_at(&dir.path().join("live/ato.db"))?;
         // Doc with has_in_doc_links=1; one chunk so search returns it.
@@ -3670,7 +4567,7 @@ mod tests {
 
     #[test]
     fn test_get_doc_anchors_returns_three_kinds() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let (dir, _db) = make_test_db()?;
         let conn = open_write_at(&dir.path().join("live/ato.db"))?;
         insert_doc_with_nav_flags(&conn, "DOC_ANCHORS", 1, 1, 1)?;
@@ -3728,7 +4625,7 @@ mod tests {
 
     #[test]
     fn get_doc_anchors_resolves_in_doc_chunks_from_stored_html() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let (dir, _db) = make_test_db()?;
         let conn = open_write_at(&dir.path().join("live/ato.db"))?;
         insert_doc_full(
@@ -3777,7 +4674,7 @@ mod tests {
 
     #[test]
     fn test_get_doc_anchors_pit_to_date() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let (dir, _db) = make_test_db()?;
         let conn = open_write_at(&dir.path().join("live/ato.db"))?;
         insert_doc_with_nav_flags(&conn, "DOC_PIT", 0, 0, 1)?;
@@ -3824,7 +4721,7 @@ mod tests {
 
     #[test]
     fn ensure_model_rejects_incomplete_bundle_before_marker() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let data = tempdir()?;
         let release = tempdir()?;
         let release_dir = release.path();
@@ -3839,6 +4736,7 @@ mod tests {
         let model_bundle_bytes = fs::read(&model_bundle)?;
         let manifest = Manifest {
             schema_version: SUPPORTED_SCHEMA_VERSION as i64,
+            manifest_format_version: None,
             index_version: "test-incomplete-model-bundle".to_string(),
             created_at: "2026-05-04T00:00:00Z".to_string(),
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -3854,6 +4752,7 @@ mod tests {
                     .to_string(),
                 size: 1,
             },
+            ann: None,
         };
         let context = UrlContext {
             manifest_dir: Some(release_dir.to_path_buf()),
@@ -3877,6 +4776,84 @@ mod tests {
             Ok(())
         })?;
         Ok(())
+    }
+
+    #[test]
+    fn stage_model_rejects_insecure_or_unapproved_remote_sources() -> Result<()> {
+        let _lock = lock_test_db();
+        let data = tempdir()?;
+        with_data_dir(data.path(), || -> Result<()> {
+            for (url, expected) in [
+                ("http://github.com/model.tar.zst", "must use HTTPS"),
+                (
+                    "https://example.com/model.tar.zst",
+                    "unapproved acquisition hostname",
+                ),
+                (
+                    "https://127.0.0.1/model.tar.zst",
+                    "unapproved acquisition hostname",
+                ),
+            ] {
+                let mut manifest = sample_manifest(SUPPORTED_SCHEMA_VERSION as i64, "");
+                manifest.model = ModelInfo {
+                    id: EMBEDDING_MODEL_ID.to_string(),
+                    sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                        .to_string(),
+                    size: 1,
+                    url: url.to_string(),
+                };
+                let context = UrlContext {
+                    manifest_dir: None,
+                    manifest_base_url: None,
+                };
+                let error = stage_model(
+                    &manifest,
+                    &context,
+                    &data.path().join("remote-model-staging"),
+                )
+                .unwrap_err();
+                assert!(
+                    error.to_string().contains(expected),
+                    "expected `{expected}` for {url}, got: {error:#}"
+                );
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn stage_model_rejects_local_artifacts_outside_manifest_directory() -> Result<()> {
+        let _lock = lock_test_db();
+        let data = tempdir()?;
+        let release = tempdir()?;
+        let outside = tempdir()?;
+        let artifact = outside.path().join("model-bundle.tar.zst");
+        fs::write(&artifact, b"x")?;
+        let mut manifest = sample_manifest(SUPPORTED_SCHEMA_VERSION as i64, "");
+        manifest.model = ModelInfo {
+            id: EMBEDDING_MODEL_ID.to_string(),
+            sha256: sha256_hex(b"x"),
+            size: 1,
+            url: artifact.display().to_string(),
+        };
+        let context = UrlContext {
+            manifest_dir: Some(release.path().to_path_buf()),
+            manifest_base_url: None,
+        };
+
+        with_data_dir(data.path(), || -> Result<()> {
+            let error = stage_model(
+                &manifest,
+                &context,
+                &data.path().join("local-model-staging"),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("model artifact escaped"),
+                "unexpected error: {error:#}"
+            );
+            Ok(())
+        })
     }
 
     // ===== Slim Search Surface ============================================
@@ -3983,7 +4960,7 @@ mod tests {
 
     #[test]
     fn test_get_doc_anchors_includes_cited_by() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let (dir, _db) = make_test_db()?;
         let conn = open_write_at(&dir.path().join("live/ato.db"))?;
         // Three docs cite TARGET. Two are 2024 dated (modern); one 2010.
@@ -4040,7 +5017,7 @@ mod tests {
 
     #[test]
     fn test_get_doc_anchors_cited_by_truncates_with_total() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let (dir, _db) = make_test_db()?;
         let conn = open_write_at(&dir.path().join("live/ato.db"))?;
         insert_doc(&conn, "POPULAR")?;
@@ -4073,7 +5050,7 @@ mod tests {
 
     #[test]
     fn test_load_chunk_embedding_roundtrip() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let (dir, _db) = make_test_db()?;
         let conn = open_write_at(&dir.path().join("live/ato.db"))?;
         insert_doc(&conn, "EMB")?;
@@ -4094,7 +5071,7 @@ mod tests {
 
     #[test]
     fn test_load_chunk_embedding_missing_chunk_errors() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let (dir, _db) = make_test_db()?;
         let conn = open_write_at(&dir.path().join("live/ato.db"))?;
         let err = load_chunk_embedding(&conn, 99999).unwrap_err();
@@ -4108,7 +5085,7 @@ mod tests {
 
     #[test]
     fn test_derive_citations_extracts_doc_markers() -> Result<()> {
-        let _lock = TEST_DB_LOCK.lock().unwrap();
+        let _lock = lock_test_db();
         let (dir, _db) = make_test_db()?;
         let conn = open_write_at(&dir.path().join("live/ato.db"))?;
         insert_doc(&conn, "SRC")?;

@@ -1,21 +1,39 @@
 # Maintainer Runbook
 
-End users install the Rust binary and never run any of the publication
-commands. This file is for corpus publication only.
+End users install a released Rust binary and use `ato-mcp update`. Corpus
+publication runs only from the maintainer checkout and requires GPU-backed
+embeddings.
 
-## What Runs Where
+## Release contracts
 
-- Rust binary: end-user CLI, updater, MCP server, search/fetch tools,
-  **and** the entire maintainer pipeline (scrape, extract, chunk,
-  embed, pack generation, GitHub release upload).
-- GitHub Actions: cheap CI, cross-platform Rust binary release assets,
-  and an optional self-hosted GPU corpus release workflow.
+Binary tags are immutable `vX.Y.Z` tags. The manual binary workflow checks out
+the supplied tag, requires an exact tagged checkout, and requires `X.Y.Z` to
+match the Cargo package version. It publishes these verified archives plus
+`SHA256SUMS`:
 
-The corpus build must use GPU-backed embeddings. If there is no suitable
-GitHub GPU runner, keep the build local. Do not silently fall back to a CPU
-or keyword-only release build.
+- `ato-mcp-x86_64-unknown-linux-gnu.tar.gz` (built for glibc 2.17)
+- `ato-mcp-aarch64-apple-darwin.tar.gz`
+- `ato-mcp-x86_64-pc-windows-msvc.zip`
 
-## Weekly Local Release
+Corpus discovery is asset-based and paginated. The updater reads GitHub releases
+in API order, 100 at a time, ignores drafts and prereleases, and selects the
+first release containing an asset named exactly `manifest.json`. Manifest
+format 2 requires `model`,
+`db`, and `ann`. The database descriptor identifies `ato.db.zst` by
+URL, SHA-256, and size. The ANN descriptor binds `ato.ann` to the exact model,
+dimension, corpus identity, ordered embedding-set digest, construction
+parameters, sidecar format, size, and SHA-256.
+
+The publication invariant is database first, ANN sidecar second, manifest
+last. Upload and verify `ato.db.zst` and then `ato.ann` before making the
+manifest discoverable. Upload
+`manifest.json.minisig`, when used, before `manifest.json`. The self-hosted GPU
+workflow resolves the current latest binary release and adds the corpus assets
+to that release.
+
+## Weekly corpus release
+
+Build the maintainer binary with CUDA and run the steady-state script:
 
 ```bash
 cd /path/to/ato-mcp
@@ -29,123 +47,106 @@ ATO_MCP_GH_REPO=gunba/ato-mcp \
 scripts/maintainer-sync.sh
 ```
 
-`scripts/maintainer-sync.sh` will:
+The script refreshes the source index, skips an unchanged incremental run,
+builds a fresh `ato.db` and `ato.ann`, packages `ato.db.zst`, and delegates publication to
+`scripts/publish-release.sh`. `ATO_MCP_MODE` accepts `incremental`, `catch_up`,
+or `full`; a full run always rebuilds. Set `ATO_MCP_FORCE_REBUILD=1` for a
+schema-only or model-only publication.
 
-1. Refresh `ato_pages` in the requested mode (incremental, catch_up, full),
-   then always run the incremental What's New refresh as the final
-   pre-build source step.
-2. Build `release/<tag>/ato.db`, packs, and `manifest.json` via
-   `ato-mcp build --profile`.
-3. Build embeddings from `ATO_MCP_MODEL_DIR` and write the pinned Hugging
-   Face Granite embedding source into the manifest, unless `ATO_MCP_MODEL_URL`
-   points at an approved mirror.
-4. Upload the corpus assets via `ato-mcp publish-release`.
-5. Mark the release latest.
+The build requires `tokenizer.json`, `onnx/model_fp16.onnx`, and
+`onnx/model_fp16.onnx_data` under `ATO_MCP_MODEL_DIR`. Fix CUDA or
+`CUDAExecutionProvider` failures rather than publishing a degraded corpus.
+Set `ATO_MCP_CUDA_LIB_PATH` when the runtime libraries are outside the normal
+loader path.
 
-Weekly release runs should use `ATO_MCP_MODE=incremental`. The full-tree
-`catch_up` mode is for proving genuinely missing canonical IDs after a
-long outage; it is not an empty-shell retry queue. Empty shells are pages the
-ATO served without extractable body content and should be treated as
-diagnostics unless a live document URL is known to have gained content.
+For an approved model mirror, set `ATO_MCP_MODEL_URL`. A Hugging Face value must
+use `hf://repo@revision`. Other URLs also require
+`ATO_MCP_MODEL_SHA256` and positive `ATO_MCP_MODEL_SIZE`. Manifest signing uses
+`ATO_MCP_SIGN_KEY` and requires `minisign` on `PATH`.
 
-The script skips rebuilds when the refreshed `index.jsonl` hash is unchanged,
-except in `ATO_MCP_MODE=full`. Set `ATO_MCP_FORCE_REBUILD=1` for schema or
-model-only publications. Before rebuilding, the script validates that
-`release/.latest` is a current-model base release the running binary can
-parse. If the pointer is missing, it scans local corpus release directories
-and, when possible, materializes a compatible published corpus release from
-its manifest and pack assets without running the embedding model. If no base
-release exists but an interrupted output directory has a matching checkpoint,
-the script resumes that checkpoint, even if the date-derived release tag has
-rolled over. After a successful publication, `release/.latest` points at the
-whole release directory so the next incremental run passes it as
-`--base-release-dir`; the builder copies the previous DB/packs, re-cleans
-source docs to compare source-derived content hashes, and only re-embeds
-documents whose cleaned content changed or whose doc_id is new. Build logs
-include stage timing, embedding token throughput, padding efficiency, and
-source-doc progress.
+## Manual corpus publication
 
-The script requires `nvidia-smi`/CUDA to be available so the Rust
-binary's bundled `ort` runtime can use the CUDA execution provider. If
-CUDA is unavailable, fix the environment instead of publishing a
-degraded corpus.
-
-Manifest signing with `--sign-key` requires the `minisign` CLI on `PATH`.
-
-## Optional GPU Workflow
-
-`.github/workflows/corpus-release-gpu.yml` targets:
-
-```yaml
-runs-on: [self-hosted, linux, x64, gpu]
-```
-
-It fails before scraping if `nvidia-smi` or ONNX Runtime's
-`CUDAExecutionProvider` is missing. It is manual-only by default to avoid
-hosted GPU spend.
-
-## Binary Release Assets
-
-`.github/workflows/release-binaries.yml` builds and uploads:
-
-- `ato-mcp-x86_64-unknown-linux-gnu.tar.gz`
-- `ato-mcp-aarch64-apple-darwin.tar.gz`
-- `ato-mcp-x86_64-pc-windows-msvc.zip`
-
-Run it by pushing a `v*` tag or via `workflow_dispatch`.
-
-## Manual Corpus Publication
-
-After a local `ato-mcp build`:
+After a successful local `ato-mcp build`:
 
 ```bash
-jq '.packs | length' release/manifest.json
-scripts/publish-release.sh v0.3.0 gunba/ato-mcp
+scripts/publish-release.sh vX.Y.Z gunba/ato-mcp
 ```
 
-Set `ATO_MCP_MODEL_URL` only when publishing against an approved model mirror.
-For non-Hugging Face mirrors, also set `ATO_MCP_MODEL_SHA256` and
-`ATO_MCP_MODEL_SIZE`. By default the manifest points at pinned Hugging Face
-Granite embedding files.
-This uploads manifest and packs to GitHub Releases; it does not upload the
-model to GitHub or duplicate the corpus into an offline bundle by default.
-Do not publish DB-derived repacks.
+The script packages the canonical database without mutating it and invokes the
+Rust publisher. The publisher verifies and uploads `ato.db.zst`, `ato.ann`, the
+optional signature, and finally `manifest.json`, stopping before discovery if
+any earlier artifact fails. The script then promotes the release to latest.
 
-For an explicit air-gapped install package:
+## Offline bundle
+
+Create an air-gapped data bundle only from the current database artifact
+format:
 
 ```bash
-scripts/make-offline-bundle.sh release/ato-mcp-offline-v0.3.0.tar.zst
+ATO_MCP_RELEASE_DIR="$PWD/release" \
+ATO_MCP_MODEL_DIR="$PWD/models/granite-embedding-small-r2" \
+scripts/make-offline-bundle.sh release/ato-mcp-offline-bundle.tar.zst
 ```
 
-The offline bundle script runs the Rust installer against a local mirror of
-the manifest, packs, and model bundle, then packages the resulting data
-directory. Do not build offline bundles by copying `release/ato.db` directly.
+The release directory must contain `manifest.json` and the matching
+`ato.db.zst` and `ato.ann`. The script localizes the database, ANN, and model
+URLs, verifies their digests and sizes, installs through `ato-mcp update
+--manifest-url`, and archives the resulting data directory. Extract the archive
+into the platform default data directory, or into another stable directory that
+will always be supplied as `ATO_MCP_DATA_DIR`.
 
-## Health Checks
+## Systemd operations
+
+The end-user update service runs `update`, tries to restart the optional backend
+service, and runs `stats` against the refreshed data. Install the update and
+serve units together when automatic refresh is desired. A custom data directory
+must be set identically in both units with a systemd environment override.
+
+The maintainer GPU workflow is manual and targets a self-hosted Linux x64 runner.
+It checks `nvidia-smi` before building with the `cuda` feature. The local
+maintainer timer provides the same release path without hosted GPU spend.
+
+## Verification
 
 ```bash
-ato-mcp stats
-ato-mcp doctor
 cargo test --locked
+cargo clippy --all-targets --all-features --locked -- -D warnings
+bash -n scripts/*.sh
+ATO_MCP_DATA_DIR=/stable/test/data scripts/smoke.sh
 ```
 
-Watch for:
+Before announcing a corpus release, verify:
 
-- Zero new rows for several weekly incremental runs while the live What's New
-  feed has changed.
-- Growing failed rows in `ato_pages/index.jsonl`.
-- `ato-mcp doctor` failures after update.
-- Missing `CUDAExecutionProvider` before a release build.
+```bash
+gh release view vX.Y.Z --repo gunba/ato-mcp \
+  --json assets --jq '.assets[].name'
+ato-mcp stats
+ato-mcp search "research and development tax incentive" --k 1
+```
 
-### CLI Search
+The release must contain matching `ato.db.zst`, `ato.ann`, and `manifest.json` assets, and
+`manifest.json` must be the last publication step.
 
-`ato-mcp search "..."` from the CLI runs the same `search()` code path the
-MCP server does. CLI latency benchmarks therefore reflect production
-hybrid search behaviour.
+## ANN implementation contract
 
-## Do Not
+The sidecar uses pinned `arroy 0.6.4` with its full-precision cosine forest on
+LMDB. Arroy is maintained by Meilisearch, supports query-time RoaringBitmap
+candidate filters, accepts a seeded build, and reads through LMDB's memory map
+on Linux, macOS, and Windows. It avoids USearch's C++ runtime/ABI surface and
+the native-endian, pointer-width persistence in `hnsw_rs`. The build fixes the
+ChaCha12 algorithm and crate version, seed, tree/split parameters, insertion
+order, and Rayon thread count; CI builds and verifies the embedded contract,
+candidate ordering, and filtered-result behavior on all three release platforms.
 
-- Do not hand-edit `index.jsonl`.
-- Do not delete published packs referenced by a manifest.
-- Do not publish a corpus built without GPU-backed embeddings.
-- Do not paste or print local tokens in logs or release notes.
+SQLite signed-int8 embeddings remain authoritative. ANN discovers candidates;
+runtime search exact-reranks them with `dot_i8`, uses stable chunk-ID ties, and
+falls back to an exact eligible scan whenever deterministic widening cannot
+fill the requested candidate pool. The installed-corpus benchmark defaults to
+1,000 candidates and validates at least 0.99 recall@50 before publication.
+
+Format-2 installs are assembled under `generations/<install-id>/` with the
+database placed first, ANN sidecar second, model files next, and installed
+manifest last. A durable atomic replacement of `active-generation` is the only
+activation step. A crash before it leaves the previous generation active; a
+crash after it leaves the new complete generation active. Incomplete staging
+and inactive generations are cleaned on later successful updates.

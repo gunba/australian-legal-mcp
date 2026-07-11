@@ -3,34 +3,62 @@
 
 use crate::db::{canonical_url, decompress_text, get_meta, open_read, table_exists};
 use crate::semantic::{dot_i8, encode_query_embedding};
-use crate::source::load_installed_manifest;
+use crate::source::{load_installed_manifest, verify_ann_db_binding};
 use crate::{
-    embedding_model_installed_matches, SearchMode, ServerState, SortBy, DEFAULT_EXCLUDED_TYPES, EMBEDDING_DIM, EMBEDDING_MODEL_ID, HARD_MAX_PER_DOC, LEGISLATION_TYPE_PREFIXES,
-    MAX_K, OLD_CONTENT_CUTOFF, SNIPPET_CHARS, TITLE_HITS_K,
+    embedding_model_installed_matches, SearchMode, ServerState, SortBy, DEFAULT_EXCLUDED_TYPES,
+    EMBEDDING_DIM, EMBEDDING_MODEL_ID, HARD_MAX_PER_DOC, LEGISLATION_TYPE_PREFIXES, MAX_K,
+    OLD_CONTENT_CUTOFF, SNIPPET_CHARS, TITLE_HITS_K,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
 use rusqlite::types::Value;
-use rusqlite::{params_from_iter, Connection};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::{json, Value as JsonValue};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 use url::Url;
 
 pub(crate) fn fts_query(query: &str) -> String {
-    // [MT-08] FTS query construction quotes >=2-char terms and preserves hyphenated phrases.
+    fts_terms(query).join(" OR ")
+}
+
+const MAX_FTS_INPUT_CHARS: usize = 4_096;
+const MAX_FTS_TERMS: usize = 16;
+const FTS_STOPWORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "is", "it", "of", "on",
+    "or", "that", "the", "this", "to", "was", "were", "with",
+];
+
+fn fts_terms(query: &str) -> Vec<String> {
     let re = Regex::new(r"[A-Za-z0-9']+(?:-[A-Za-z0-9']+)*").expect("valid regex");
-    let tokens: Vec<String> = re
-        .find_iter(query)
-        .map(|m| m.as_str())
-        .filter(|t| t.len() >= 2)
-        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
-        .collect();
-    if tokens.is_empty() {
-        "\"\"".to_string()
+    let bounded = query.chars().take(MAX_FTS_INPUT_CHARS).collect::<String>();
+    let mut seen = HashSet::new();
+    re.find_iter(&bounded)
+        .map(|m| m.as_str().to_string())
+        .filter(|term| {
+            let normalized = term.to_ascii_lowercase();
+            term.len() >= 2
+                && !FTS_STOPWORDS.contains(&normalized.as_str())
+                && seen.insert(normalized)
+        })
+        .take(MAX_FTS_TERMS)
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect()
+}
+
+fn fts_broad_query(query: &str) -> Option<String> {
+    let terms = fts_terms(query);
+    if terms.len() > 1 {
+        Some(fts_query(query))
     } else {
-        tokens.join(" ")
+        None
     }
+}
+
+fn fts_strict_query(query: &str) -> String {
+    fts_terms(query).join(" ")
 }
 
 pub(crate) fn glob_to_like(pattern: &str) -> String {
@@ -128,6 +156,34 @@ pub(crate) fn build_doc_filter(
     }
 }
 
+fn validate_doc_types(conn: &Connection, types: Option<&[String]>) -> Result<()> {
+    let Some(types) = types else {
+        return Ok(());
+    };
+
+    let mut seen = HashSet::new();
+    let mut unknown = Vec::new();
+    let mut stmt =
+        conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM documents WHERE type = ? LIMIT 1)")?;
+    for doc_type in types {
+        if doc_type.contains('*') || !seen.insert(doc_type.as_str()) {
+            continue;
+        }
+        let exists = stmt.query_row([doc_type.as_str()], |row| row.get::<_, i64>(0))? != 0;
+        if !exists {
+            unknown.push(doc_type.as_str());
+        }
+    }
+
+    if !unknown.is_empty() {
+        bail!(
+            "unknown exact document type(s): {}. Use `stats.types` to discover corpus type codes, or pass a `*` glob",
+            unknown.join(", ")
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct Hit {
     // [MT-04] Search-family hits stay slim; bodies materialize through follow-up tools.
@@ -169,6 +225,43 @@ pub(crate) struct Hit {
 pub(crate) struct VectorHit {
     pub(crate) chunk_id: i64,
     pub(crate) score: f64,
+}
+
+#[derive(Debug, Clone)]
+struct HeapHit(VectorHit);
+
+impl PartialEq for HeapHit {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.chunk_id == other.0.chunk_id && self.0.score.to_bits() == other.0.score.to_bits()
+    }
+}
+
+impl Eq for HeapHit {}
+
+impl PartialOrd for HeapHit {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapHit {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap exposes the greatest item. Reverse score ordering so the
+        // least-relevant retained hit is the root; larger IDs lose score ties.
+        other
+            .0
+            .score
+            .total_cmp(&self.0.score)
+            .then_with(|| self.0.chunk_id.cmp(&other.0.chunk_id))
+    }
+}
+
+fn rank_hits(hits: &mut [VectorHit]) {
+    hits.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+    });
 }
 
 pub(crate) struct SearchOptions<'a> {
@@ -269,11 +362,9 @@ pub(crate) fn dedup_per_doc(
     let mut docs: Vec<(String, f64, Vec<VectorHit>)> = Vec::new();
     for (_idx, (doc_id, mut items)) in buckets {
         items.sort_by(|a, b| {
-            a.1.cmp(&b.1).then_with(|| {
-                b.0.score
-                    .partial_cmp(&a.0.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            a.1.cmp(&b.1)
+                .then_with(|| b.0.score.total_cmp(&a.0.score))
+                .then_with(|| a.0.chunk_id.cmp(&b.0.chunk_id))
         });
         let doc_score = items
             .iter()
@@ -283,7 +374,7 @@ pub(crate) fn dedup_per_doc(
         let chunks: Vec<VectorHit> = items.into_iter().map(|(h, _)| h).collect();
         docs.push((doc_id, doc_score, chunks));
     }
-    docs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    docs.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     // Single pass: take up to `cap` chunks from each doc in score order
     // until we hit `k`. We do not back-fill beyond the cap — the user
@@ -308,7 +399,12 @@ pub(crate) fn search(
     opts: SearchOptions<'_>,
     server_state: Option<&ServerState>,
 ) -> Result<String> {
+    let _corpus_lock = crate::config::corpus_read_lock()?;
+    if let Some(state) = server_state {
+        state.ensure_corpus_generation_unchanged()?;
+    }
     let conn = open_read()?;
+    validate_doc_types(&conn, opts.types)?;
     let k = opts.k.clamp(1, MAX_K);
     let max_per_doc = opts.max_per_doc.clamp(1, HARD_MAX_PER_DOC);
     let filter = build_doc_filter(
@@ -398,18 +494,20 @@ pub(crate) fn search(
     let candidate_meta = load_candidate_meta(&conn, &ranked_hits)?;
     let deduped = dedup_per_doc(ranked_hits, &candidate_meta, frontier, max_per_doc);
 
-    let mut records = Vec::new();
-    for ranked_hit in deduped.into_iter() {
-        if let Some(hit) = load_hit(&conn, ranked_hit.chunk_id, query, opts.include_snippet)? {
-            // First-stage scores drive `deduped` ordering; we just iterate in
-            // that order. Internal scores never reach the agent — results are
-            // presented sorted by relevance.
-            records.push(hit);
-        }
-    }
+    let ranked_ids = deduped.iter().map(|hit| hit.chunk_id).collect::<Vec<_>>();
+    let mut hydrated = load_hits(&conn, &ranked_ids, query, opts.include_snippet)?;
+    let mut records = ranked_ids
+        .into_iter()
+        .filter_map(|chunk_id| hydrated.remove(&chunk_id))
+        .collect::<Vec<_>>();
     if matches!(opts.sort_by, SortBy::Recency) {
         // [MT-06] Recency sort materializes a widened frontier, then sorts by date descending.
-        records.sort_by(|a, b| b.date.cmp(&a.date));
+        records.sort_by(|a, b| {
+            b.date
+                .cmp(&a.date)
+                .then_with(|| a.doc_id.cmp(&b.doc_id))
+                .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+        });
         records.truncate(k);
     }
     // [MT-03] JSON metadata preserves query/filter state in next_call when k can grow.
@@ -553,6 +651,9 @@ pub(crate) fn search_next_call(query: &str, k: usize, opts: &SearchOptions<'_>) 
     if !opts.current_only {
         args.push("current_only=false".to_string());
     }
+    if !opts.include_snippet {
+        args.push("include_snippet=false".to_string());
+    }
     // Seed-driven searches: preserve the seed so paging re-runs the same
     // semantic query rather than falling back to a plain `query` search.
     if let Some(seed_id) = opts.similar_to_chunk_id {
@@ -570,7 +671,10 @@ pub(crate) fn mcp_string(value: &str) -> String {
 /// Load a chunk's stored int8 embedding from `chunk_embeddings`. Used by
 /// `similar_to_chunk_id` to bypass query encoding and run vector search
 /// directly against the seed chunk's vector.
-pub(crate) fn load_chunk_embedding(conn: &Connection, chunk_id: i64) -> Result<[i8; EMBEDDING_DIM]> {
+pub(crate) fn load_chunk_embedding(
+    conn: &Connection,
+    chunk_id: i64,
+) -> Result<[i8; EMBEDDING_DIM]> {
     let blob: Vec<u8> = conn
         .query_row(
             "SELECT embedding FROM chunk_embeddings WHERE chunk_id = ?",
@@ -593,6 +697,32 @@ pub(crate) fn load_chunk_embedding(conn: &Connection, chunk_id: i64) -> Result<[
 }
 
 pub(crate) fn ensure_vector_search_ready(conn: &Connection) -> Result<()> {
+    static READINESS: OnceLock<Mutex<HashMap<String, Result<(), String>>>> = OnceLock::new();
+    let installed = load_installed_manifest()?;
+    let ann_generation = installed
+        .as_ref()
+        .and_then(|manifest| manifest.ann.as_ref())
+        .map(|ann| format!("{}:{}", ann.corpus_id, ann.sha256))
+        .unwrap_or_else(|| "legacy-exact".to_string());
+    let corpus_id = format!(
+        "{}:{}:{}",
+        get_meta(conn, "index_version")?.unwrap_or_default(),
+        get_meta(conn, "embedding_model_id")?.unwrap_or_default(),
+        ann_generation,
+    );
+    let cache = READINESS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .map_err(|_| anyhow!("semantic readiness cache lock poisoned"))?;
+    if let Some(result) = cache.get(&corpus_id) {
+        return result.clone().map_err(|message| anyhow!(message));
+    }
+    let result = check_vector_search_ready(conn).map_err(|error| error.to_string());
+    cache.insert(corpus_id, result.clone());
+    result.map_err(|message| anyhow!(message))
+}
+
+fn check_vector_search_ready(conn: &Connection) -> Result<()> {
     // [MT-09] Hybrid/vector modes require the current semantic corpus model.
     let model_id = get_meta(conn, "embedding_model_id")?.ok_or_else(|| {
         anyhow!("semantic search unavailable: missing embedding_model_id metadata")
@@ -625,10 +755,142 @@ pub(crate) fn ensure_vector_search_ready(conn: &Connection) -> Result<()> {
     if embeddings == 0 {
         bail!("semantic search unavailable: installed corpus has no chunk embeddings");
     }
+    if let Some(ann) = installed.ann.as_ref() {
+        verify_ann_db_binding(conn, ann)?;
+        crate::ann::verify_sidecar(&crate::config::ann_path()?, ann).map_err(|error| {
+            anyhow!(
+                "semantic search unavailable: required ANN sidecar is not ready: {error}; run `ato-mcp update`"
+            )
+        })?;
+    }
     Ok(())
 }
 
 pub(crate) fn vector_search(
+    conn: &Connection,
+    query_embedding: &[i8; EMBEDDING_DIM],
+    filter: &SqlFilter,
+    limit: usize,
+) -> Result<Vec<VectorHit>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let installed = load_installed_manifest()?.ok_or_else(|| {
+        anyhow!("semantic search unavailable: installed manifest missing; run `ato-mcp update`")
+    })?;
+    let Some(ann) = installed.ann.as_ref() else {
+        return exact_vector_search(conn, query_embedding, filter, limit);
+    };
+
+    let eligible = eligible_ann_items(conn, filter)?;
+    if eligible.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Exact scanning is faster and guarantees the true top-K for narrow
+    // filters. Broad filters use ANN, then exact-rerank its candidates.
+    const EXACT_FILTER_THRESHOLD: u64 = 10_000;
+    if eligible.len() <= EXACT_FILTER_THRESHOLD {
+        return exact_vector_search(conn, query_embedding, filter, limit);
+    }
+
+    let wanted = limit
+        .saturating_mul(20)
+        .max(512)
+        .min(eligible.len() as usize);
+    let trees = ann.trees as usize;
+    let maximum_search_k = (eligible.len() as usize)
+        .saturating_mul(trees)
+        .min(2_000_000)
+        .max(wanted);
+    let mut search_k = wanted.saturating_mul(trees).saturating_mul(4).max(wanted);
+    let candidate_ids = loop {
+        let ids = crate::ann::search_sidecar(
+            &crate::config::ann_path()?,
+            ann,
+            query_embedding,
+            &eligible,
+            wanted,
+            search_k.min(maximum_search_k),
+        )?;
+        if ids.len() == wanted {
+            break ids;
+        }
+        if search_k >= maximum_search_k {
+            // Filtering is never allowed to silently underfill. Once ANN has
+            // reached its deterministic work ceiling, scan the eligible set.
+            return exact_vector_search(conn, query_embedding, filter, limit);
+        }
+        search_k = search_k.saturating_mul(2).min(maximum_search_k);
+    };
+    exact_rerank_candidates(conn, query_embedding, &candidate_ids, limit)
+}
+
+fn eligible_ann_items(conn: &Connection, filter: &SqlFilter) -> Result<roaring::RoaringBitmap> {
+    let where_filter = if filter.sql.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", filter.sql)
+    };
+    let sql = format!(
+        r#"
+        SELECT e.chunk_id
+        FROM chunk_embeddings e
+        JOIN chunks c ON c.chunk_id = e.chunk_id
+        JOIN documents d ON d.doc_id = c.doc_id
+        {where_filter}
+        ORDER BY e.chunk_id ASC
+        "#
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(filter.params.clone()), |row| {
+        row.get::<_, i64>("chunk_id")
+    })?;
+    let mut eligible = roaring::RoaringBitmap::new();
+    for row in rows {
+        let chunk_id = row?;
+        let item_id = u32::try_from(chunk_id).map_err(|_| {
+            anyhow!("installed ANN corpus contains out-of-range chunk_id {chunk_id}")
+        })?;
+        if !eligible.insert(item_id) {
+            bail!("installed ANN corpus contains duplicate chunk_id {chunk_id}");
+        }
+    }
+    Ok(eligible)
+}
+
+fn exact_rerank_candidates(
+    conn: &Connection,
+    query_embedding: &[i8; EMBEDDING_DIM],
+    candidate_ids: &[u32],
+    limit: usize,
+) -> Result<Vec<VectorHit>> {
+    let mut stmt =
+        conn.prepare_cached("SELECT embedding FROM chunk_embeddings WHERE chunk_id = ?1")?;
+    let mut seen = HashSet::with_capacity(candidate_ids.len());
+    let mut hits = BinaryHeap::with_capacity(limit + 1);
+    for item_id in candidate_ids {
+        let chunk_id = i64::from(*item_id);
+        if !seen.insert(chunk_id) {
+            bail!("ANN sidecar returned duplicate chunk_id {chunk_id}");
+        }
+        let embedding = stmt
+            .query_row(params![chunk_id], |row| row.get::<_, Vec<u8>>(0))
+            .optional()?
+            .ok_or_else(|| anyhow!("ANN sidecar returned unknown chunk_id {chunk_id}"))?;
+        hits.push(HeapHit(VectorHit {
+            chunk_id,
+            score: dot_i8(query_embedding, &embedding)?,
+        }));
+        if hits.len() > limit {
+            hits.pop();
+        }
+    }
+    let mut hits = hits.into_iter().map(|hit| hit.0).collect::<Vec<_>>();
+    rank_hits(&mut hits);
+    Ok(hits)
+}
+
+fn exact_vector_search(
     conn: &Connection,
     query_embedding: &[i8; EMBEDDING_DIM],
     filter: &SqlFilter,
@@ -650,31 +912,49 @@ pub(crate) fn vector_search(
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(filter.params.clone()), |row| {
-        Ok((
-            row.get::<_, i64>("chunk_id")?,
-            row.get::<_, Vec<u8>>("embedding")?,
-        ))
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
     })?;
-    let mut hits = Vec::new();
+    let mut hits = BinaryHeap::with_capacity(limit + 1);
     for row in rows {
         let (chunk_id, embedding) = row?;
-        hits.push(VectorHit {
+        hits.push(HeapHit(VectorHit {
             chunk_id,
             score: dot_i8(query_embedding, &embedding)?,
-        });
+        }));
+        if hits.len() > limit {
+            hits.pop();
+        }
     }
-    hits.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    hits.truncate(limit);
+    let mut hits = hits.into_iter().map(|hit| hit.0).collect::<Vec<_>>();
+    rank_hits(&mut hits);
     Ok(hits)
 }
 
 pub(crate) fn lexical_search(
     conn: &Connection,
     query: &str,
+    filter: &SqlFilter,
+    limit: usize,
+) -> Result<Vec<VectorHit>> {
+    let strict_query = fts_strict_query(query);
+    if strict_query.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut hits = lexical_search_stage(conn, &strict_query, filter, limit)?;
+    if hits.len() < limit {
+        if let Some(broad_query) = fts_broad_query(query) {
+            let broad = lexical_search_stage(conn, &broad_query, filter, limit)?;
+            let mut seen = hits.iter().map(|hit| hit.chunk_id).collect::<HashSet<_>>();
+            hits.extend(broad.into_iter().filter(|hit| seen.insert(hit.chunk_id)));
+            hits.truncate(limit);
+        }
+    }
+    Ok(hits)
+}
+
+fn lexical_search_stage(
+    conn: &Connection,
+    fts_query: &str,
     filter: &SqlFilter,
     limit: usize,
 ) -> Result<Vec<VectorHit>> {
@@ -685,30 +965,28 @@ pub(crate) fn lexical_search(
     };
     let sql = format!(
         r#"
-        SELECT f.rowid AS chunk_id, bm25(chunks_fts) AS score
+        SELECT f.rowid AS chunk_id, -bm25(chunks_fts) AS score
         FROM chunks_fts f
         JOIN chunks c ON c.chunk_id = f.rowid
         JOIN documents d ON d.doc_id = c.doc_id
         WHERE chunks_fts MATCH ? {where_filter}
-        ORDER BY score ASC
+        ORDER BY score DESC, chunk_id ASC
         LIMIT ?
         "#
     );
-    let mut params_vec = vec![Value::Text(fts_query(query))];
+    let mut params_vec = vec![Value::Text(fts_query.to_string())];
     params_vec.extend(filter.params.clone());
     params_vec.push(Value::Integer(limit as i64));
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows = match stmt.query_map(params_from_iter(params_vec), |row| {
-        Ok(VectorHit {
-            chunk_id: row.get::<_, i64>("chunk_id")?,
-            score: row.get::<_, f64>("score")?,
-        })
-    }) {
-        Ok(rows) => rows.collect::<rusqlite::Result<Vec<_>>>()?,
-        Err(rusqlite::Error::SqliteFailure(_, _)) => Vec::new(),
-        Err(err) => return Err(err.into()),
-    };
+    let rows = stmt
+        .query_map(params_from_iter(params_vec), |row| {
+            Ok(VectorHit {
+                chunk_id: row.get::<_, i64>("chunk_id")?,
+                score: row.get::<_, f64>("score")?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
 
@@ -732,11 +1010,7 @@ pub(crate) fn rrf_fuse(vector_hits: &[VectorHit], lexical_hits: &[VectorHit]) ->
         .into_iter()
         .map(|(chunk_id, score)| VectorHit { chunk_id, score })
         .collect::<Vec<_>>();
-    out.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    rank_hits(&mut out);
     out
 }
 
@@ -746,64 +1020,97 @@ pub(crate) fn rrf_fuse(vector_hits: &[VectorHit], lexical_hits: &[VectorHit]) ->
 // (get_chunks, get_definition, get_doc_anchors, get_asset, stats) run fully
 // concurrently.
 
-pub(crate) fn load_hit(
+fn load_hits(
     conn: &Connection,
-    chunk_id: i64,
+    chunk_ids: &[i64],
     query: &str,
     include_snippet: bool,
-) -> Result<Option<Hit>> {
-    let mut stmt = conn.prepare(
+) -> Result<HashMap<i64, Hit>> {
+    if chunk_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = vec!["?"; chunk_ids.len()].join(",");
+    let text_column = if include_snippet { "c.text" } else { "NULL" };
+    let sql = format!(
         r#"
-        SELECT c.chunk_id, c.doc_id, c.anchor, c.text,
+        SELECT c.chunk_id, c.doc_id, c.anchor, {text_column} AS text,
                d.type, d.title, d.date,
                d.withdrawn_date, d.superseded_by, d.replaces,
                d.has_in_doc_links, d.has_related_docs, d.has_history
-        FROM chunks c
-        JOIN documents d ON d.doc_id = c.doc_id
-        WHERE c.chunk_id = ?
-        "#,
-    )?;
-    let mut rows = stmt.query([chunk_id])?;
-    let Some(row) = rows.next()? else {
-        return Ok(None);
-    };
-    let doc_id: String = row.get("doc_id")?;
-    let raw_text = decompress_text(row.get("text")?)?;
-    let text = crate::retrieval::annotate_doc_refs(&raw_text, &doc_id)?;
-    let chunk_id: i64 = row.get("chunk_id")?;
-    Ok(Some(Hit {
-        doc_id: doc_id.clone(),
-        title: row.get("title")?,
-        doc_type: row.get("type")?,
-        date: row.get("date")?,
-        anchor: row.get("anchor")?,
-        snippet: if include_snippet {
-            Some(highlight_snippet(&text, query, SNIPPET_CHARS))
-        } else {
-            None
-        },
-        canonical_url: canonical_url(&doc_id),
-        chunk_id: Some(chunk_id),
-        next_call: Some(format!("get_chunks(chunk_ids=[{chunk_id}])")),
-        withdrawn_date: row.get("withdrawn_date")?,
-        superseded_by: row.get("superseded_by")?,
-        replaces: row.get("replaces")?,
-        has_in_doc_links: row
-            .get::<_, i64>("has_in_doc_links")
-            .ok()
-            .filter(|v| *v != 0)
-            .map(|_| true),
-        has_related_docs: row
-            .get::<_, i64>("has_related_docs")
-            .ok()
-            .filter(|v| *v != 0)
-            .map(|_| true),
-        has_history: row
-            .get::<_, i64>("has_history")
-            .ok()
-            .filter(|v| *v != 0)
-            .map(|_| true),
-    }))
+        FROM chunks c JOIN documents d ON d.doc_id = c.doc_id
+        WHERE c.chunk_id IN ({placeholders})
+        "#
+    );
+    let params = chunk_ids
+        .iter()
+        .copied()
+        .map(Value::Integer)
+        .collect::<Vec<_>>();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(params), |row| {
+        Ok((
+            row.get::<_, i64>("chunk_id")?,
+            row.get::<_, String>("doc_id")?,
+            row.get::<_, Option<String>>("anchor")?,
+            row.get::<_, Option<Vec<u8>>>("text")?,
+            row.get::<_, String>("type")?,
+            row.get::<_, String>("title")?,
+            row.get::<_, Option<String>>("date")?,
+            row.get::<_, Option<String>>("withdrawn_date")?,
+            row.get::<_, Option<String>>("superseded_by")?,
+            row.get::<_, Option<String>>("replaces")?,
+            row.get::<_, i64>("has_in_doc_links")?,
+            row.get::<_, i64>("has_related_docs")?,
+            row.get::<_, i64>("has_history")?,
+        ))
+    })?;
+    let mut hits = HashMap::with_capacity(chunk_ids.len());
+    for row in rows {
+        let (
+            chunk_id,
+            doc_id,
+            anchor,
+            text_blob,
+            doc_type,
+            title,
+            date,
+            withdrawn_date,
+            superseded_by,
+            replaces,
+            has_in_doc_links,
+            has_related_docs,
+            has_history,
+        ) = row?;
+        let snippet = match text_blob {
+            Some(blob) => {
+                let raw_text = decompress_text(blob)?;
+                let text = crate::retrieval::annotate_doc_refs(&raw_text, &doc_id)?;
+                Some(highlight_snippet(&text, query, SNIPPET_CHARS))
+            }
+            None => None,
+        };
+        hits.insert(
+            chunk_id,
+            Hit {
+                doc_id: doc_id.clone(),
+                title,
+                doc_type,
+                date,
+                anchor,
+                snippet,
+                canonical_url: canonical_url(&doc_id),
+                chunk_id: Some(chunk_id),
+                next_call: Some(format!("get_chunks(chunk_ids=[{chunk_id}])")),
+                withdrawn_date,
+                superseded_by,
+                replaces,
+                has_in_doc_links: (has_in_doc_links != 0).then_some(true),
+                has_related_docs: (has_related_docs != 0).then_some(true),
+                has_history: (has_history != 0).then_some(true),
+            },
+        );
+    }
+    Ok(hits)
 }
 
 /// Tokenize a query into the same lowercase word forms used by [`fts_query`]
@@ -1028,7 +1335,11 @@ pub(crate) fn direct_title_hits(
     Ok(hits)
 }
 
-pub(crate) fn load_title_hit(conn: &Connection, doc_id: &str, filter: &SqlFilter) -> Result<Option<Hit>> {
+pub(crate) fn load_title_hit(
+    conn: &Connection,
+    doc_id: &str,
+    filter: &SqlFilter,
+) -> Result<Option<Hit>> {
     let where_filter = if filter.sql.is_empty() {
         String::new()
     } else {
@@ -1098,7 +1409,39 @@ pub(crate) fn collect_title_hits(
     // [MT-14] Title hits rank title_fts independently and reuse the chunk
     // query's document filter.
     let k = k.clamp(1, 100);
-    let direct_hits = direct_title_hits(conn, query, k, filter)?;
+    let mut hits = direct_title_hits(conn, query, k, filter)?;
+    let strict_query = fts_strict_query(query);
+    if strict_query.is_empty() {
+        return Ok(hits);
+    }
+    let mut seen = hits
+        .iter()
+        .map(|hit| hit.doc_id.clone())
+        .collect::<HashSet<_>>();
+    hits.extend(
+        query_title_fts(conn, &strict_query, filter, k)?
+            .into_iter()
+            .filter(|hit| seen.insert(hit.doc_id.clone())),
+    );
+    if hits.len() < k {
+        if let Some(broad_query) = fts_broad_query(query) {
+            hits.extend(
+                query_title_fts(conn, &broad_query, filter, k)?
+                    .into_iter()
+                    .filter(|hit| seen.insert(hit.doc_id.clone())),
+            );
+        }
+    }
+    hits.truncate(k);
+    Ok(hits)
+}
+
+fn query_title_fts(
+    conn: &Connection,
+    title_query: &str,
+    filter: &SqlFilter,
+    limit: usize,
+) -> Result<Vec<Hit>> {
     let where_filter = if filter.sql.is_empty() {
         String::new()
     } else {
@@ -1117,52 +1460,181 @@ pub(crate) fn collect_title_hits(
         LIMIT ?
         "#
     );
-    let mut params_vec = vec![Value::Text(fts_query(query))];
+    let mut params_vec = vec![Value::Text(title_query.to_string())];
     params_vec.extend(filter.params.clone());
-    params_vec.push(Value::Integer(k as i64 + 1));
+    params_vec.push(Value::Integer(limit as i64));
 
     let mut stmt = conn.prepare(&sql)?;
-    let mut rows = match stmt.query_map(params_from_iter(params_vec), |row| {
-        let doc_id: String = row.get("doc_id")?;
-        let title: String = row.get("title")?;
-        Ok(Hit {
-            canonical_url: canonical_url(&doc_id),
-            doc_id: doc_id.clone(),
-            title: title.clone(),
-            doc_type: row.get("type")?,
-            date: row.get("date")?,
-            anchor: None,
-            snippet: Some(title),
-            chunk_id: None,
-            next_call: None,
-            withdrawn_date: row.get("withdrawn_date")?,
-            superseded_by: row.get("superseded_by")?,
-            replaces: row.get("replaces")?,
-            has_in_doc_links: row
-                .get::<_, i64>("has_in_doc_links")
-                .ok()
-                .filter(|v| *v != 0)
-                .map(|_| true),
-            has_related_docs: row
-                .get::<_, i64>("has_related_docs")
-                .ok()
-                .filter(|v| *v != 0)
-                .map(|_| true),
-            has_history: row
-                .get::<_, i64>("has_history")
-                .ok()
-                .filter(|v| *v != 0)
-                .map(|_| true),
-        })
-    }) {
-        Ok(rows) => rows.collect::<rusqlite::Result<Vec<_>>>()?,
-        Err(rusqlite::Error::SqliteFailure(_, _)) => Vec::new(),
-        Err(err) => return Err(err.into()),
-    };
-    let direct_doc_ids: HashSet<String> =
-        direct_hits.iter().map(|hit| hit.doc_id.clone()).collect();
-    rows.retain(|hit| !direct_doc_ids.contains(&hit.doc_id));
-    rows.splice(0..0, direct_hits);
-    rows.truncate(k);
+    let rows = stmt
+        .query_map(params_from_iter(params_vec), |row| {
+            let doc_id: String = row.get("doc_id")?;
+            let title: String = row.get("title")?;
+            Ok(Hit {
+                canonical_url: canonical_url(&doc_id),
+                doc_id: doc_id.clone(),
+                title: title.clone(),
+                doc_type: row.get("type")?,
+                date: row.get("date")?,
+                anchor: None,
+                snippet: Some(title),
+                chunk_id: None,
+                next_call: None,
+                withdrawn_date: row.get("withdrawn_date")?,
+                superseded_by: row.get("superseded_by")?,
+                replaces: row.get("replaces")?,
+                has_in_doc_links: row
+                    .get::<_, i64>("has_in_doc_links")
+                    .ok()
+                    .filter(|v| *v != 0)
+                    .map(|_| true),
+                has_related_docs: row
+                    .get::<_, i64>("has_related_docs")
+                    .ok()
+                    .filter(|v| *v != 0)
+                    .map(|_| true),
+                has_history: row
+                    .get::<_, i64>("has_history")
+                    .ok()
+                    .filter(|v| *v != 0)
+                    .map(|_| true),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fts_terms_are_bounded_deduplicated_and_drop_stopwords() {
+        let repeated = std::iter::repeat_n("the Tax tax", 40)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(fts_query(&repeated), "\"Tax\"");
+        let many = (0..100)
+            .map(|n| format!("term{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(fts_terms(&many).len(), MAX_FTS_TERMS);
+    }
+
+    #[test]
+    fn fts_broadening_is_a_distinct_second_stage() {
+        assert_eq!(
+            fts_strict_query("capital gains tax"),
+            "\"capital\" \"gains\" \"tax\""
+        );
+        assert_eq!(
+            fts_broad_query("capital gains tax").as_deref(),
+            Some("\"capital\" OR \"gains\" OR \"tax\"")
+        );
+    }
+
+    #[test]
+    fn bounded_heap_retains_deterministic_top_k() {
+        let mut heap = BinaryHeap::new();
+        for hit in [
+            VectorHit {
+                chunk_id: 9,
+                score: 1.0,
+            },
+            VectorHit {
+                chunk_id: 3,
+                score: 1.0,
+            },
+            VectorHit {
+                chunk_id: 5,
+                score: 2.0,
+            },
+            VectorHit {
+                chunk_id: 1,
+                score: 0.5,
+            },
+        ] {
+            heap.push(HeapHit(hit));
+            if heap.len() > 3 {
+                heap.pop();
+            }
+        }
+        let mut hits = heap.into_iter().map(|hit| hit.0).collect::<Vec<_>>();
+        rank_hits(&mut hits);
+        assert_eq!(
+            hits.iter().map(|hit| hit.chunk_id).collect::<Vec<_>>(),
+            vec![5, 3, 9]
+        );
+    }
+
+    #[test]
+    fn hybrid_ties_use_chunk_id_order() {
+        let vector = vec![
+            VectorHit {
+                chunk_id: 2,
+                score: 1.0,
+            },
+            VectorHit {
+                chunk_id: 1,
+                score: 1.0,
+            },
+        ];
+        let lexical = vec![
+            VectorHit {
+                chunk_id: 1,
+                score: 1.0,
+            },
+            VectorHit {
+                chunk_id: 2,
+                score: 1.0,
+            },
+        ];
+        let fused = rrf_fuse(&vector, &lexical);
+        assert_eq!(
+            fused.iter().map(|hit| hit.chunk_id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn ann_candidate_rerank_uses_authoritative_scores_and_stable_ties() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE chunk_embeddings(chunk_id INTEGER PRIMARY KEY, embedding BLOB NOT NULL);",
+        )?;
+        let embedding = vec![1u8; EMBEDDING_DIM];
+        conn.execute(
+            "INSERT INTO chunk_embeddings(chunk_id, embedding) VALUES (9, ?1)",
+            params![&embedding],
+        )?;
+        conn.execute(
+            "INSERT INTO chunk_embeddings(chunk_id, embedding) VALUES (3, ?1)",
+            params![&embedding],
+        )?;
+        let hits = exact_rerank_candidates(&conn, &[1i8; EMBEDDING_DIM], &[9, 3], 2)?;
+        assert_eq!(
+            hits.iter().map(|hit| hit.chunk_id).collect::<Vec<_>>(),
+            vec![3, 9]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn search_continuation_preserves_metadata_only_hydration() {
+        let opts = SearchOptions {
+            k: 5,
+            types: None,
+            date_from: None,
+            date_to: None,
+            doc_scope: None,
+            mode: SearchMode::Keyword,
+            sort_by: SortBy::Relevance,
+            include_old: false,
+            current_only: true,
+            max_per_doc: 1,
+            include_snippet: false,
+            similar_to_chunk_id: None,
+            seed_text: None,
+        };
+        assert!(search_next_call("tax", 10, &opts).contains("include_snippet=false"));
+    }
 }

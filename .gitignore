@@ -10,6 +10,7 @@ target/
 .codex/agent-proofs-AGENTS-snippet.md
 .DS_Store
 /tmp/
+/Temp/
 # ML model weights and build outputs — too large for git.
 models/
 release/
