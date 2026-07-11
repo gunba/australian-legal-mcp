@@ -1,6 +1,6 @@
 {
   "name": "ato-mcp",
-  "version": "0.16.1",
+  "version": "0.16.2",
   "private": true,
   "description": "Local search and retrieval over the Australian Taxation Office legal corpus.",
   "license": "MIT",

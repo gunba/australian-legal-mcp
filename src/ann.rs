@@ -663,12 +663,11 @@ mod tests {
             .transpose()
             .context("ATO_MCP_BENCH_CANDIDATES must be an integer")?
             .unwrap_or(1_000);
-        let search_k = std::env::var("ATO_MCP_BENCH_SEARCH_K")
+        let requested_search_k = std::env::var("ATO_MCP_BENCH_SEARCH_K")
             .ok()
             .map(|value| value.parse::<usize>())
             .transpose()
-            .context("ATO_MCP_BENCH_SEARCH_K must be an integer")?
-            .unwrap_or(64_000);
+            .context("ATO_MCP_BENCH_SEARCH_K must be an integer")?;
         let minimum_recall = std::env::var("ATO_MCP_BENCH_MIN_RECALL")
             .ok()
             .map(|value| value.parse::<f64>())
@@ -679,6 +678,13 @@ mod tests {
         let source_sha =
             crate::db::get_meta(&conn, "source_index_sha256")?.unwrap_or_else(|| "0".repeat(64));
         let identity = compute_identity(&conn, &source_sha)?;
+        let search_k = requested_search_k.unwrap_or_else(|| {
+            crate::search::initial_ann_search_k(
+                identity.vector_count as usize,
+                candidate_count,
+                ANN_TREES,
+            )
+        });
         let started = std::time::Instant::now();
         let output_path = Path::new(&output);
         let info = if output_path.is_file() {

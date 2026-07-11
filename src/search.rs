@@ -766,6 +766,19 @@ fn check_vector_search_ready(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn initial_ann_search_k(eligible_len: usize, wanted: usize, trees: usize) -> usize {
+    let maximum = eligible_len
+        .saturating_mul(trees)
+        .min(2_000_000)
+        .max(wanted);
+    let structural = wanted.saturating_mul(trees).saturating_mul(4);
+    // Keep broad-corpus recall stable as the corpus grows. ANN still avoids
+    // scoring and transferring every SQLite embedding, while exact reranking
+    // preserves authoritative scores for the returned candidate set.
+    let recall_floor = eligible_len.saturating_mul(3).div_ceil(4);
+    structural.max(recall_floor).max(wanted).min(maximum)
+}
+
 pub(crate) fn vector_search(
     conn: &Connection,
     query_embedding: &[i8; EMBEDDING_DIM],
@@ -802,7 +815,7 @@ pub(crate) fn vector_search(
         .saturating_mul(trees)
         .min(2_000_000)
         .max(wanted);
-    let mut search_k = wanted.saturating_mul(trees).saturating_mul(4).max(wanted);
+    let mut search_k = initial_ann_search_k(eligible.len() as usize, wanted, trees);
     let candidate_ids = loop {
         let ids = crate::ann::search_sidecar(
             &crate::config::ann_path()?,
@@ -1530,6 +1543,14 @@ mod tests {
             fts_broad_query("capital gains tax").as_deref(),
             Some("\"capital\" OR \"gains\" OR \"tax\"")
         );
+    }
+
+    #[test]
+    fn ann_search_budget_scales_for_recall_and_stays_bounded() {
+        assert_eq!(initial_ann_search_k(600_140, 1_000, 16), 450_105);
+        assert_eq!(initial_ann_search_k(10_001, 512, 16), 32_768);
+        assert_eq!(initial_ann_search_k(10, 10, 16), 160);
+        assert_eq!(initial_ann_search_k(4_000_000, 1_000, 16), 2_000_000);
     }
 
     #[test]
