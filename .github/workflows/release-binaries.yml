@@ -77,11 +77,14 @@ jobs:
           use-cache: false
       - name: Install pinned Linux compatibility builder
         if: matrix.zig
-        run: cargo install cargo-zigbuild --version 0.20.1 --locked
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libtime-piece-perl make
+          cargo install cargo-zigbuild --version 0.23.0 --locked
       - name: Build Linux for glibc 2.17
         if: matrix.zig
         run: >-
-          cargo zigbuild --release --locked
+          cargo zigbuild --release --locked --features vendored-openssl
           --target x86_64-unknown-linux-gnu.2.17
       - name: Build native target
         if: ${{ !matrix.zig }}
@@ -107,7 +110,9 @@ jobs:
         if: matrix.archive == 'tar'
         shell: bash
         run: |
-          install -Dm755 "${{ matrix.binary }}" package/ato-mcp
+          mkdir -p package
+          cp "${{ matrix.binary }}" package/ato-mcp
+          chmod 755 package/ato-mcp
           cp README.md LICENSE package/
           package/ato-mcp --version | grep -F "${RELEASE_TAG#v}"
           COPYFILE_DISABLE=1 tar -C package -czf "${{ matrix.asset }}" .

@@ -60,10 +60,13 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 # ATO outbound requests use reqwest+native-tls so the runtime stays on the
 # platform TLS stack.
+# Release-only portability feature: statically link vendored OpenSSL when
+openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
 
 [features]
 default = []
 cuda = ["ort/cuda"]
+vendored-openssl = ["dep:openssl-sys"]
 
 [target.'cfg(windows)'.dependencies]
 ort = { version = "2.0.0-rc.12", default-features = false, features = [

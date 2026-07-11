@@ -15,6 +15,10 @@ match the Cargo package version. It publishes these verified archives plus
 - `ato-mcp-aarch64-apple-darwin.tar.gz`
 - `ato-mcp-x86_64-pc-windows-msvc.zip`
 
+The Linux archive enables the release-only `vendored-openssl` feature so it
+does not depend on the runner's OpenSSL ABI. Its Zig build requires `make`,
+Perl, and the `Time::Piece` module; the workflow installs those prerequisites.
+
 Corpus discovery is asset-based and paginated. The updater reads GitHub releases
 in API order, 100 at a time, ignores drafts and prereleases, and selects the
 first release containing an asset named exactly `manifest.json`. Manifest
