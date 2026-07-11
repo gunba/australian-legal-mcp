@@ -50,7 +50,7 @@ pub(crate) fn sidecar_relative_path(source_id: &SourceId) -> PathBuf {
     PathBuf::from(ANN_DIRECTORY).join(format!("{source_id}.ann"))
 }
 
-fn sidecar_url(source_id: &SourceId) -> String {
+pub(crate) fn sidecar_url(source_id: &SourceId) -> String {
     format!("{ANN_DIRECTORY}/{source_id}.ann")
 }
 

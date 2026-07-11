@@ -4034,9 +4034,7 @@ mod tests {
             format_version: ANN_FORMAT_VERSION,
             library: ANN_LIBRARY.to_string(),
             library_version: ANN_LIBRARY_VERSION.to_string(),
-            url: sidecar_relative_path(&source_id)
-                .to_string_lossy()
-                .into_owned(),
+            url: crate::ann::sidecar_url(&source_id),
             sha256: digest_character.repeat(64),
             size: 1,
             corpus_id: format!("sha256:{}", digest_character.repeat(64)),
