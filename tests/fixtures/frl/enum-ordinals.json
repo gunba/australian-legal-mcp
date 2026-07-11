@@ -1,0 +1,34 @@
+{
+  "title": {
+    "id": "A0099",
+    "name": "Ordinal Instrument",
+    "makingDate": "2024-01-01T00:00:00",
+    "collection": 1,
+    "subCollection": 0,
+    "isPrincipal": true,
+    "isInForce": false,
+    "status": 2
+  },
+  "rendition": {
+    "titleId": "A0099",
+    "start": "2024-01-01T00:00:00",
+    "retrospectiveStart": "2024-01-01T00:00:00",
+    "rectificationVersionNumber": 0,
+    "type": 0,
+    "uniqueTypeNumber": 0,
+    "volumeNumber": 0,
+    "format": 3,
+    "compilationNumber": "1",
+    "registerId": "FA0099",
+    "versionType": 1,
+    "extension": ".epub",
+    "mimeType": "application/epub+zip",
+    "fileName": "A0099.epub",
+    "bytes": null,
+    "pageCount": null,
+    "sizeInBytes": 123,
+    "isAuthorised": true,
+    "name": null,
+    "contents": null
+  }
+}

@@ -32,11 +32,11 @@ jobs:
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           test "$(git describe --tags --exact-match)" = "$RELEASE_TAG"
           version=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "ato-mcp") | .version')
+            | jq -r '.packages[] | select(.name == "australian-legal-mcp") | .version')
           test "v$version" = "$RELEASE_TAG"
 
   build:
-    name: build ${{ matrix.asset }}
+    name: build ${{ matrix.target }}
     needs: validate
     strategy:
       fail-fast: false
@@ -44,22 +44,22 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            asset: ato-mcp-x86_64-unknown-linux-gnu.tar.gz
-            binary: target/x86_64-unknown-linux-gnu/release/ato-mcp
+            binary: target/x86_64-unknown-linux-gnu/release/legal-mcp
             archive: tar
+            extension: tar.gz
             zig: true
             ort_version: 1.24.4
           - os: macos-14
             target: aarch64-apple-darwin
-            asset: ato-mcp-aarch64-apple-darwin.tar.gz
-            binary: target/aarch64-apple-darwin/release/ato-mcp
+            binary: target/aarch64-apple-darwin/release/legal-mcp
             archive: tar
+            extension: tar.gz
             zig: false
           - os: windows-2022
             target: x86_64-pc-windows-msvc
-            asset: ato-mcp-x86_64-pc-windows-msvc.zip
-            binary: target/x86_64-pc-windows-msvc/release/ato-mcp.exe
+            binary: target/x86_64-pc-windows-msvc/release/legal-mcp.exe
             archive: zip
+            extension: zip
             zig: false
             ort_version: 1.24.4
     runs-on: ${{ matrix.os }}
@@ -76,6 +76,12 @@ jobs:
         with:
           version: 0.13.0
           use-cache: false
+      - name: Define archive name
+        id: archive
+        shell: bash
+        run: |
+          echo "name=legal-mcp-${RELEASE_TAG#v}-${{ matrix.target }}.${{ matrix.extension }}" \
+            >> "$GITHUB_OUTPUT"
       - name: Install pinned Linux compatibility builder
         if: matrix.zig
         run: |
@@ -126,39 +132,40 @@ jobs:
         shell: bash
         run: |
           mkdir -p package
-          cp "${{ matrix.binary }}" package/ato-mcp
-          chmod 755 package/ato-mcp
+          cp "${{ matrix.binary }}" package/legal-mcp
+          chmod 755 package/legal-mcp
           cp README.md LICENSE package/
           if [[ "$RUNNER_OS" == "Linux" ]]; then
             ort="onnxruntime-linux-x64-${{ matrix.ort_version }}"
             cp -L "$ort/lib/libonnxruntime.so" package/libonnxruntime.so
             cp "$ort/LICENSE" package/ONNXRUNTIME-LICENSE
           fi
-          package/ato-mcp --version | grep -F "${RELEASE_TAG#v}"
-          COPYFILE_DISABLE=1 tar -C package -czf "${{ matrix.asset }}" .
+          package/legal-mcp --version | grep -F "${RELEASE_TAG#v}"
+          COPYFILE_DISABLE=1 tar -C package -czf \
+            "${{ steps.archive.outputs.name }}" .
           mkdir verify
-          tar -C verify -xzf "${{ matrix.asset }}"
-          verify/ato-mcp --version | grep -F "${RELEASE_TAG#v}"
+          tar -C verify -xzf "${{ steps.archive.outputs.name }}"
+          verify/legal-mcp --version | grep -F "${RELEASE_TAG#v}"
       - name: Package and verify zip
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path package
-          Copy-Item "${{ matrix.binary }}" package/ato-mcp.exe
+          Copy-Item "${{ matrix.binary }}" package/legal-mcp.exe
           $ort = "${{ matrix.ort_version }}"
           $dll = "onnxruntime/onnxruntime-win-x64-$ort/lib/onnxruntime.dll"
           Copy-Item $dll package/
           Copy-Item README.md, LICENSE package/
           $version = $env:RELEASE_TAG.Substring(1)
-          & package/ato-mcp.exe --version | Select-String $version
+          & package/legal-mcp.exe --version | Select-String $version
           Compress-Archive -Path package/* `
-            -DestinationPath "${{ matrix.asset }}"
-          Expand-Archive "${{ matrix.asset }}" verify
-          & verify/ato-mcp.exe --version | Select-String $version
+            -DestinationPath "${{ steps.archive.outputs.name }}"
+          Expand-Archive "${{ steps.archive.outputs.name }}" verify
+          & verify/legal-mcp.exe --version | Select-String $version
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
+          name: ${{ steps.archive.outputs.name }}
+          path: ${{ steps.archive.outputs.name }}
           if-no-files-found: error
 
   publish:
@@ -180,6 +187,6 @@ jobs:
             || gh release create "$RELEASE_TAG" --repo "$REPO" \
               --title "$RELEASE_TAG" --generate-notes
           find artifacts -maxdepth 2 -type f -exec cp {} . \;
-          sha256sum ato-mcp-* > SHA256SUMS
-          gh release upload "$RELEASE_TAG" ato-mcp-* SHA256SUMS \
+          sha256sum legal-mcp-* > SHA256SUMS
+          gh release upload "$RELEASE_TAG" legal-mcp-* SHA256SUMS \
             --repo "$REPO" --clobber

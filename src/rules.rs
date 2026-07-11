@@ -1,16 +1,13 @@
-//! Source-derived metadata rules engine: classifies each doc by shape
-//! (Taxation Ruling, Court Case, Act section, EM, ...) and runs a
-//! template-specific extractor for (title, date). Port of the Python
-//! src/ato_mcp/indexer/rules.py.
+//! Source-derived metadata rules engine: classifies each document by legal
+//! form (Taxation Ruling, Court Case, Act section, EM, ...) and applies the
+//! corresponding positional title and date extractor.
 
 // =====================================================================
 // Rules engine — template-based metadata classifier
 //
-// Port of src/ato_mcp/indexer/rules.py (deleted in v0.8.0). Classifies
-// each doc into one of ~10 structural templates (Taxation Ruling, Court
-// Case, Act, EM, ...) and runs a positional extractor for each. Output
-// is a (title, date) pair the build pipeline writes into the documents
-// row.
+// Classifies each document into a structural template (Taxation Ruling,
+// Court Case, Act, EM, ...) and applies its positional extractor. The build
+// pipeline writes the resulting title and date into the document row.
 // =====================================================================
 
 #[derive(Debug, Clone, Default)]
@@ -117,7 +114,7 @@ pub(crate) fn ruling_series_alt() -> &'static str {
     S.get_or_init(|| RULING_SERIES_LIST.join("|"))
 }
 
-pub(crate) const UNSLASHED_LEGACY_LIST: &[&str] = &["IT", "MT", "CRP"];
+pub(crate) const UNSLASHED_RULING_PREFIXES: &[&str] = &["IT", "MT", "CRP"];
 
 pub(crate) fn re_ruling_citation() -> &'static regex::Regex {
     static R: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -135,7 +132,7 @@ pub(crate) fn re_ruling_unslashed() -> &'static regex::Regex {
     R.get_or_init(|| {
         regex::Regex::new(&format!(
             r"^({})\s+\d{{1,5}}(?:\s|$|[—\-])",
-            UNSLASHED_LEGACY_LIST.join("|")
+            UNSLASHED_RULING_PREFIXES.join("|")
         ))
         .unwrap()
     })

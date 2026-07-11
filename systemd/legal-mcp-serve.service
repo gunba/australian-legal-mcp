@@ -1,0 +1,13 @@
+[Unit]
+Description=Australian Legal MCP server (HTTP daemon)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/australian-legal-mcp/environment
+ExecStart=%h/.local/bin/legal-mcp serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

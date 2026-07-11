@@ -1,73 +1,56 @@
-//! Corpus build orchestrator: walks ato_pages/index.jsonl, runs cleaning +
-//! chunker + rules-engine + embedder pipeline in-process, writes documents/
-//! chunks/embeddings/anchors/definitions/citations and emits manifest.json.
-//! Plus checkpoint resume and `bundle_localize_manifest` for offline bundles.
+//! Corpus build orchestrator: ingests the ATO source inventory and normalized
+//! Federal Register documents, runs source-specific extraction plus shared
+//! chunking and embedding, and emits a source-qualified corpus manifest.
+//! Includes checkpoint resume and offline-bundle manifest localization.
 
-use crate::chunker::{chunk_html, Chunk, CHUNKER_FORMAT_VERSION, EMBED_MAX_TOKENS};
-use crate::db::{compress_text, init_db, open_write_at, set_meta};
+use crate::chunker::{
+    chunk_html_with_token_count, Chunk, CHUNKER_FORMAT_VERSION, EMBED_MAX_TOKENS,
+};
+use crate::db::{compress_text, init_db, open_write_at, set_corpus_meta, set_source_meta};
 use crate::extract::{
     anchors_node_text, extract_anchors, extract_compose_title, extract_currency,
-    extract_definitions, extract_em_front_matter, extract_leading_headings, metadata_content_hash,
-    metadata_doc_id_for, metadata_extract_pub_date, metadata_parse_docid, rewrite_images_html,
-    AnchorRef, CurrencyInfo, DefinitionChunk, ExtractedAsset,
+    extract_definitions, extract_em_front_matter, extract_leading_headings, metadata_doc_id_for,
+    metadata_extract_pub_date, metadata_parse_docid, rewrite_images_html, AnchorRef, CurrencyInfo,
+    DefinitionChunk, ExtractedAsset,
 };
-use crate::html::{clean_ato_html, normalise_named_anchors, rewrite_links_html, strip_attributes};
+use crate::frl::load_normalized_documents;
+use crate::html::{
+    canonical_ato_native_id, clean_ato_html, normalise_named_anchors, rewrite_links_html,
+    strip_attributes,
+};
+use crate::pipeline::{finalise_source_ann, ingest_source};
 use crate::retrieval::derive_citations;
 use crate::rules::{derive_metadata, RuleInputs};
 use crate::semantic::{SemanticEncodeStats, SemanticModelPaths};
-use crate::source::{
-    collect_prefix_breakdown, compute_documents_by_type, verify_semantic_install, Manifest,
-    ManifestDb, ModelInfo,
-};
+use crate::source::{verify_semantic_install, Manifest, ManifestDb, ModelInfo};
+use legal_model::{DocumentId, SourceId};
 
-// BuildCheckpoint carries minimal per-doc records purely for resume tracking.
-// The original pack-based fields are kept as opaque JSON to stay
-// forward-compatible with any pre-v0.13 partial checkpoints sitting on disk.
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DocRef {
-    pub(crate) doc_id: String,
-    #[serde(default)]
+    pub(crate) document_id: DocumentId,
     pub(crate) content_hash: String,
-    #[serde(default)]
-    pub(crate) pack_sha8: String,
-    #[serde(default)]
-    pub(crate) offset: u64,
-    #[serde(default)]
-    pub(crate) length: u64,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PackInfo {
-    #[serde(default)]
-    pub(crate) sha8: String,
-    #[serde(default)]
-    pub(crate) sha256: String,
-    #[serde(default)]
-    pub(crate) size: u64,
-    #[serde(default)]
-    pub(crate) url: String,
 }
 use crate::{
     ServerState, EMBEDDING_DIM, EMBEDDING_INPUT_MAX_TOKENS, EMBEDDING_MODEL_FINGERPRINT,
     EMBEDDING_MODEL_HF_SIZE, EMBEDDING_MODEL_HF_URL, EMBEDDING_MODEL_ID, SUPPORTED_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub(crate) const BUILD_EMBED_BATCH_SIZE: usize = 32;
 pub(crate) const BUILD_EMBED_PENDING_FLUSH_CHUNKS: usize = 4096;
-pub(crate) const BUILD_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+pub(crate) const BUILD_CHECKPOINT_SCHEMA_VERSION: u32 = 3;
+pub(crate) const ATO_SOURCE_ID: &str = "ato";
 
-// ----- Build orchestrator (port of src/ato_mcp/indexer/build.py) -----
+// ----- Deterministic corpus build orchestrator -----
 //
 // Walks pages_dir/index.jsonl, runs each doc through the cleaning + chunker
 // + rules-engine metadata classifier + embedder pipeline in-process, writes
@@ -106,7 +89,6 @@ pub(crate) struct BuildProfile {
     pub(crate) embedding_padded_tokens: usize,
     pub(crate) embedding_max_batch: usize,
     pub(crate) embedding_max_seq_len: usize,
-    pub(crate) pack: Duration,
     pub(crate) checkpoint: Duration,
     pub(crate) finalise: Duration,
 }
@@ -130,11 +112,11 @@ impl BuildProfile {
         if !self.enabled {
             return;
         }
-        // [IB-19] --profile reports stage timing plus embedding batch,
+        // --profile reports stage timing plus embedding batch,
         // token, padding, and model-throughput counters for build tuning.
         let total = self.elapsed().as_secs_f64().max(0.000_001);
         eprintln!(
-            "ato-mcp build profile: docs={} chunks={} html_mb={:.1} total_s={:.2} docs_per_s={:.2}",
+            "legal-mcp build profile: docs={} chunks={} html_mb={:.1} total_s={:.2} docs_per_s={:.2}",
             self.docs,
             self.chunks,
             self.html_bytes as f64 / (1024.0 * 1024.0),
@@ -150,7 +132,6 @@ impl BuildProfile {
             ("sqlite", self.sqlite),
             ("assets", self.assets),
             ("embedding", self.embedding),
-            ("pack", self.pack),
             ("checkpoint", self.checkpoint),
             ("finalise", self.finalise),
         ];
@@ -200,7 +181,7 @@ pub(crate) fn maybe_report_build_progress(
     if processed > 0 && processed.is_multiple_of(1000) {
         let elapsed = started_at.elapsed().as_secs_f64().max(0.000_001);
         eprintln!(
-            "ato-mcp build: processed {processed} source docs ({:.1}/s, rebuilt {rebuilt}, reused {reused})",
+            "legal-mcp build: processed {processed} source docs ({:.1}/s, rebuilt {rebuilt}, reused {reused})",
             processed as f64 / elapsed
         );
     }
@@ -223,7 +204,7 @@ pub(crate) fn encode_build_embeddings_adaptive(
         Err(err) if inputs.len() > 1 && is_batch_allocation_failure(&err) => {
             let mid = inputs.len() / 2;
             eprintln!(
-                "ato-mcp build: embedding batch of {} exceeded GPU memory; retrying as {} + {}",
+                "legal-mcp build: embedding batch of {} exceeded GPU memory; retrying as {} + {}",
                 inputs.len(),
                 mid,
                 inputs.len() - mid
@@ -250,10 +231,50 @@ pub(crate) fn flush_pending_build_embeddings(
         return Ok(());
     }
     let started = std::time::Instant::now();
-    let mut order: Vec<usize> = (0..pending.len()).collect();
-    order.sort_by_key(|&idx| pending[idx].text.len());
-    for batch in order.chunks(BUILD_EMBED_BATCH_SIZE) {
-        let inputs: Vec<String> = batch.iter().map(|&idx| pending[idx].text.clone()).collect();
+    let mut text_by_sha256 = BTreeMap::<String, String>::new();
+    let mut pending_hashes = Vec::with_capacity(pending.len());
+    for item in pending.iter() {
+        let text_sha256 = format!("{:x}", Sha256::digest(item.text.as_bytes()));
+        match text_by_sha256.entry(text_sha256.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(item.text.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &item.text => {
+                bail!("distinct chunk texts produced the same SHA-256 digest");
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
+        pending_hashes.push((item.chunk_id, text_sha256));
+    }
+
+    let mut vectors = HashMap::<String, Vec<u8>>::new();
+    let mut missing = Vec::<(String, String)>::new();
+    let mut select = conn.prepare(
+        "SELECT embedding FROM embedding_cache WHERE model_id = ?1 AND text_sha256 = ?2",
+    )?;
+    for (text_sha256, text) in text_by_sha256 {
+        let cached = select
+            .query_row(rusqlite::params![EMBEDDING_MODEL_ID, &text_sha256], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .optional()?;
+        if let Some(cached) = cached {
+            if cached.len() != EMBEDDING_DIM {
+                bail!("cached embedding has invalid dimensions");
+            }
+            vectors.insert(text_sha256, cached);
+        } else {
+            missing.push((text_sha256, text));
+        }
+    }
+    drop(select);
+    missing.sort_by_key(|(_, text)| text.len());
+
+    for batch in missing.chunks(BUILD_EMBED_BATCH_SIZE) {
+        let inputs = batch
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect::<Vec<_>>();
         let (embeddings, stats) = encode_build_embeddings_adaptive(state, &inputs)?;
         profile.embedding_tokenize += stats.tokenize;
         profile.embedding_prepare += stats.prepare;
@@ -273,18 +294,31 @@ pub(crate) fn flush_pending_build_embeddings(
             );
         }
         let write_started = std::time::Instant::now();
-        for (&idx, emb) in batch.iter().zip(embeddings.iter()) {
-            let item = &pending[idx];
-            let bytes: &[u8] =
-                unsafe { std::slice::from_raw_parts(emb.as_ptr() as *const u8, emb.len()) };
+        for ((text_sha256, _), emb) in batch.iter().zip(embeddings.iter()) {
+            let bytes = emb.iter().map(|value| *value as u8).collect::<Vec<_>>();
             conn.execute(
-                "INSERT INTO chunk_embeddings (chunk_id, embedding) VALUES (?1, ?2)",
-                rusqlite::params![item.chunk_id, bytes],
+                "INSERT INTO embedding_cache(model_id, text_sha256, embedding)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![EMBEDDING_MODEL_ID, text_sha256, &bytes],
             )
-            .context("INSERT chunk_embeddings")?;
+            .context("INSERT embedding_cache")?;
+            vectors.insert(text_sha256.clone(), bytes);
         }
         profile.embedding_write += write_started.elapsed();
     }
+
+    let write_started = std::time::Instant::now();
+    for (chunk_id, text_sha256) in pending_hashes {
+        let embedding = vectors
+            .get(&text_sha256)
+            .ok_or_else(|| anyhow!("missing cached embedding for chunk text {text_sha256}"))?;
+        conn.execute(
+            "INSERT INTO chunk_embeddings (chunk_id, embedding) VALUES (?1, ?2)",
+            rusqlite::params![chunk_id, embedding],
+        )
+        .context("INSERT chunk_embeddings")?;
+    }
+    profile.embedding_write += write_started.elapsed();
     pending.clear();
     profile.embedding += started.elapsed();
     Ok(())
@@ -293,9 +327,8 @@ pub(crate) fn flush_pending_build_embeddings(
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BuildCheckpoint {
-    // [IB-13] Checkpoints persist source/model/chunker gates plus committed
-    // doc refs, packs, and base-release verification state.
     pub(crate) schema_version: u32,
+    pub(crate) source_id: SourceId,
     pub(crate) source_index_sha256: String,
     pub(crate) zstd_level: i32,
     pub(crate) embedding_model_id: String,
@@ -304,13 +337,6 @@ pub(crate) struct BuildCheckpoint {
     pub(crate) embedding_input_max_tokens: usize,
     pub(crate) chunker_format_version: u32,
     pub(crate) documents: Vec<DocRef>,
-    pub(crate) packs: Vec<PackInfo>,
-    #[serde(default)]
-    pub(crate) base_documents: Vec<DocRef>,
-    #[serde(default)]
-    pub(crate) base_source_hash_by_doc_id: HashMap<String, String>,
-    #[serde(default)]
-    pub(crate) verified_source_doc_ids: Vec<String>,
 }
 
 pub(crate) fn build_checkpoint_path(out_dir: &Path) -> PathBuf {
@@ -319,6 +345,7 @@ pub(crate) fn build_checkpoint_path(out_dir: &Path) -> PathBuf {
 
 pub(crate) fn load_build_checkpoint(
     out_dir: &Path,
+    source_id: &SourceId,
     source_index_sha256: &str,
     zstd_level: i32,
 ) -> Result<Option<BuildCheckpoint>> {
@@ -333,6 +360,13 @@ pub(crate) fn load_build_checkpoint(
         bail!(
             "unsupported build checkpoint schema {} in {}",
             checkpoint.schema_version,
+            path.display()
+        );
+    }
+    if &checkpoint.source_id != source_id {
+        bail!(
+            "build checkpoint source `{}` differs from requested `{source_id}`; remove {} to start a fresh build",
+            checkpoint.source_id,
             path.display()
         );
     }
@@ -394,21 +428,16 @@ pub(crate) fn load_build_checkpoint(
 
 pub(crate) struct SaveBuildCheckpointArgs<'a> {
     pub(crate) out_dir: &'a Path,
+    pub(crate) source_id: &'a SourceId,
     pub(crate) source_index_sha256: &'a str,
     pub(crate) zstd_level: i32,
     pub(crate) documents: &'a [DocRef],
-    pub(crate) packs: &'a [PackInfo],
-    pub(crate) base_documents: &'a [DocRef],
-    pub(crate) base_source_hash_by_doc_id: &'a HashMap<String, String>,
-    pub(crate) verified_source_doc_ids: &'a HashSet<String>,
 }
 
 pub(crate) fn save_build_checkpoint(args: SaveBuildCheckpointArgs<'_>) -> Result<()> {
-    let mut verified_source_doc_ids: Vec<String> =
-        args.verified_source_doc_ids.iter().cloned().collect();
-    verified_source_doc_ids.sort();
     let checkpoint = BuildCheckpoint {
         schema_version: BUILD_CHECKPOINT_SCHEMA_VERSION,
+        source_id: args.source_id.clone(),
         source_index_sha256: args.source_index_sha256.to_string(),
         zstd_level: args.zstd_level,
         embedding_model_id: EMBEDDING_MODEL_ID.to_string(),
@@ -417,51 +446,211 @@ pub(crate) fn save_build_checkpoint(args: SaveBuildCheckpointArgs<'_>) -> Result
         embedding_input_max_tokens: EMBEDDING_INPUT_MAX_TOKENS,
         chunker_format_version: CHUNKER_FORMAT_VERSION,
         documents: args.documents.to_vec(),
-        packs: args.packs.to_vec(),
-        base_documents: args.base_documents.to_vec(),
-        base_source_hash_by_doc_id: args.base_source_hash_by_doc_id.clone(),
-        verified_source_doc_ids,
     };
     let path = build_checkpoint_path(args.out_dir);
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(&checkpoint)?)
-        .with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, &path)
-        .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
-    Ok(())
+    atomic_write(&path, &serde_json::to_vec_pretty(&checkpoint)?)
+        .with_context(|| format!("writing {}", path.display()))
 }
 
-pub(crate) fn committed_build_doc_count(conn: &Connection) -> Result<usize> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM documents WHERE pack_sha8 <> 'PENDING'",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(count as usize)
+pub(crate) fn committed_build_doc_count(conn: &Connection, documents: &[DocRef]) -> Result<usize> {
+    let mut stored =
+        conn.prepare("SELECT content_hash FROM documents WHERE source_id = ?1 AND native_id = ?2")?;
+    let mut count = 0;
+    for document in documents {
+        let content_hash = stored
+            .query_row(
+                rusqlite::params![
+                    document.document_id.source.as_str(),
+                    document.document_id.native_id
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        count += usize::from(content_hash.as_deref() == Some(document.content_hash.as_str()));
+    }
+    Ok(count)
 }
 
-pub(crate) fn pending_build_doc_count(conn: &Connection) -> Result<usize> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM documents WHERE pack_sha8 = 'PENDING'",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(count as usize)
-}
-
-pub(crate) fn remove_build_doc(conn: &Connection, doc_id: &str) -> Result<()> {
+pub(crate) fn remove_build_doc(conn: &Connection, source_id: &str, native_id: &str) -> Result<()> {
     conn.execute(
-        "DELETE FROM chunks_fts WHERE rowid IN (SELECT chunk_id FROM chunks WHERE doc_id = ?1)",
-        [doc_id],
+        "DELETE FROM chunks_fts WHERE rowid IN (
+            SELECT chunk_id FROM chunks WHERE source_id = ?1 AND native_id = ?2
+        )",
+        rusqlite::params![source_id, native_id],
     )?;
-    conn.execute("DELETE FROM title_fts WHERE doc_id = ?1", [doc_id])?;
-    conn.execute("DELETE FROM citations WHERE target_doc_id = ?1", [doc_id])?;
-    conn.execute("DELETE FROM documents WHERE doc_id = ?1", [doc_id])?;
+    conn.execute(
+        "DELETE FROM title_fts WHERE source_id = ?1 AND native_id = ?2",
+        rusqlite::params![source_id, native_id],
+    )?;
+    conn.execute(
+        "DELETE FROM citations WHERE target_source_id = ?1 AND target_native_id = ?2",
+        rusqlite::params![source_id, native_id],
+    )?;
+    conn.execute(
+        "DELETE FROM documents WHERE source_id = ?1 AND native_id = ?2",
+        rusqlite::params![source_id, native_id],
+    )?;
     Ok(())
+}
+
+pub(crate) fn remove_absent_build_docs(
+    conn: &Connection,
+    source_id: &str,
+    inventory: &HashSet<DocumentId>,
+) -> Result<usize> {
+    let mut select =
+        conn.prepare("SELECT native_id FROM documents WHERE source_id = ?1 ORDER BY native_id")?;
+    let existing = select
+        .query_map([source_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let inventory_native_ids = inventory
+        .iter()
+        .filter(|document_id| document_id.source.as_str() == source_id)
+        .map(|document_id| document_id.native_id.as_str())
+        .collect::<HashSet<_>>();
+    let absent = existing
+        .into_iter()
+        .filter(|native_id| !inventory_native_ids.contains(native_id.as_str()))
+        .collect::<Vec<_>>();
+    for native_id in &absent {
+        remove_build_doc(conn, source_id, native_id)?;
+    }
+    Ok(absent.len())
+}
+
+fn compute_source_documents_by_type(
+    conn: &Connection,
+    source_id: &str,
+) -> Result<BTreeMap<String, i64>> {
+    let mut types = BTreeMap::new();
+    let mut statement = conn.prepare(
+        "SELECT type, COUNT(*) AS count
+         FROM documents
+         WHERE source_id = ?1
+         GROUP BY type
+         ORDER BY count DESC, type ASC",
+    )?;
+    let rows = statement.query_map([source_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (document_type, count) = row?;
+        types.insert(document_type, count);
+    }
+    Ok(types)
+}
+
+fn source_description_from_title(title: &str) -> String {
+    title
+        .split_once(" \u{2014} ")
+        .map_or(title, |(description, _)| description)
+        .trim()
+        .to_string()
+}
+
+fn collect_source_prefix_breakdown(conn: &Connection, source_id: &str) -> Result<Vec<JsonValue>> {
+    let mut statement = conn.prepare(
+        r#"
+        WITH ranked AS (
+          SELECT
+            CASE
+              WHEN INSTR(native_id, '/') > 0
+                THEN UPPER(SUBSTR(native_id, 1, INSTR(native_id, '/') - 1))
+              ELSE UPPER(native_id)
+            END AS prefix,
+            title,
+            native_id
+          FROM documents
+          WHERE source_id = ?1
+        ),
+        windowed AS (
+          SELECT
+            prefix,
+            title,
+            native_id,
+            COUNT(*) OVER (PARTITION BY prefix) AS document_count,
+            ROW_NUMBER() OVER (
+              PARTITION BY prefix
+              ORDER BY
+                CASE WHEN title LIKE prefix || ' %' THEN 1 ELSE 0 END,
+                native_id
+            ) AS row_number
+          FROM ranked
+        )
+        SELECT prefix, document_count, title
+        FROM windowed
+        WHERE row_number = 1
+        ORDER BY document_count DESC, prefix ASC
+        "#,
+    )?;
+    let rows = statement.query_map([source_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let mut entries = Vec::new();
+    for row in rows {
+        let (prefix, document_count, title) = row?;
+        entries.push(json!({
+            "prefix": prefix,
+            "doc_count": document_count,
+            "description": title.map(|value| source_description_from_title(&value)),
+        }));
+    }
+    Ok(entries)
+}
+
+fn ato_document_id(canonical_id: &str) -> Result<DocumentId> {
+    DocumentId::new(
+        ATO_SOURCE_ID.parse()?,
+        canonical_ato_native_id(&metadata_doc_id_for(canonical_id)),
+    )
+    .map_err(Into::into)
+}
+
+fn ato_canonical_url(native_id: &str) -> String {
+    format!("https://www.ato.gov.au/law/view/document?docid={native_id}")
+}
+
+fn query_parameter(value: &str, name: &str) -> Option<String> {
+    let parsed = url::Url::parse(value).ok().or_else(|| {
+        let path = if value.starts_with('/') {
+            value.to_string()
+        } else {
+            format!("/{value}")
+        };
+        url::Url::parse(&format!("https://www.ato.gov.au{path}")).ok()
+    })?;
+    parsed
+        .query_pairs()
+        .find(|(key, value)| key.eq_ignore_ascii_case(name) && !value.trim().is_empty())
+        .map(|(_, value)| value.into_owned())
+}
+
+fn ato_upstream_version(record: &JsonValue, canonical_id: &str) -> Option<String> {
+    for field in ["upstream_version", "version", "pit"] {
+        if let Some(value) = record
+            .get(field)
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(value.to_string());
+        }
+    }
+    record
+        .get("href")
+        .and_then(JsonValue::as_str)
+        .and_then(|href| query_parameter(href, "pit"))
+        .or_else(|| query_parameter(canonical_id, "pit"))
 }
 
 pub(crate) struct BuildSourceFingerprint<'a> {
-    pub(crate) doc_id: &'a str,
+    pub(crate) document_id: &'a DocumentId,
+    pub(crate) canonical_url: &'a str,
+    pub(crate) upstream_version: &'a Option<String>,
     pub(crate) doc_type: &'a str,
     pub(crate) title: &'a str,
     pub(crate) date: &'a Option<String>,
@@ -489,7 +678,10 @@ pub(crate) fn source_fingerprint_hash(value: &JsonValue) -> Result<String> {
 
 pub(crate) fn build_source_fingerprint_value(input: BuildSourceFingerprint<'_>) -> JsonValue {
     json!({
-        "doc_id": input.doc_id,
+        "source_id": input.document_id.source.as_str(),
+        "native_id": &input.document_id.native_id,
+        "canonical_url": input.canonical_url,
+        "upstream_version": input.upstream_version,
         "type": input.doc_type,
         "title": input.title,
         "date": input.date,
@@ -503,7 +695,13 @@ pub(crate) fn build_source_fingerprint_value(input: BuildSourceFingerprint<'_>) 
         "anchors": input.anchor_refs.iter().map(|r| json!({
             "kind": &r.kind,
             "label": &r.label,
-            "target_doc_id": &r.target_doc_id,
+            "target_source_id": (r.kind == "in_doc" || r.target_doc_id.is_some())
+                .then(|| input.document_id.source.as_str()),
+            "target_native_id": if r.kind == "in_doc" {
+                Some(input.document_id.native_id.as_str())
+            } else {
+                r.target_doc_id.as_deref()
+            },
             "target_pit": &r.target_pit,
         })).collect::<Vec<_>>(),
         "definitions": input.definitions,
@@ -513,7 +711,7 @@ pub(crate) fn build_source_fingerprint_value(input: BuildSourceFingerprint<'_>) 
             "text": &chunk.text,
         })).collect::<Vec<_>>(),
         "assets": input.assets.iter().map(|asset| json!({
-            "asset_ref": &asset.asset_ref,
+            "asset_id": &asset.asset_id,
             "media_type": &asset.media_type,
             "alt": &asset.alt,
             "title": &asset.title,
@@ -525,32 +723,144 @@ pub(crate) fn build_source_fingerprint_value(input: BuildSourceFingerprint<'_>) 
 
 pub(crate) struct BuildCorpusArgs<'a> {
     pub(crate) pages_dir: &'a Path,
+    pub(crate) frl_workspace: &'a Path,
     pub(crate) db_path: &'a Path,
     pub(crate) model_dir: &'a Path,
+    pub(crate) embedding_cache_db: Option<&'a Path>,
     pub(crate) out_dir: &'a Path,
     pub(crate) zstd_level: i32,
-    pub(crate) limit: Option<usize>,
     pub(crate) profile_enabled: bool,
 }
 
-pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
+fn load_authoritative_ato_records(index_path: &Path) -> Result<Vec<JsonValue>> {
     use std::io::BufRead as _;
 
+    let file = File::open(index_path)
+        .with_context(|| format!("opening source index {}", index_path.display()))?;
+    let mut latest = BTreeMap::<String, Option<JsonValue>>::new();
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: JsonValue = serde_json::from_str(&line).context("parsing index.jsonl line")?;
+        let canonical_id = record
+            .get("canonical_id")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("index record missing canonical_id"))?
+            .to_owned();
+        let inventory_key = ato_document_id(&canonical_id)?.native_id;
+        let has_payload = record
+            .get("payload_path")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|path| !path.is_empty())
+            && record.get("size").and_then(JsonValue::as_u64).is_some()
+            && record
+                .get("sha256")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|digest| digest.len() == 64);
+        let status = record.get("status").and_then(JsonValue::as_str);
+        if has_payload && status == Some("success") {
+            latest.insert(inventory_key, Some(record));
+        } else if matches!(status, Some("confirmed_404" | "confirmed_stub")) {
+            latest.insert(inventory_key, None);
+        } else {
+            latest.entry(inventory_key).or_insert(None);
+        }
+    }
+    Ok(latest.into_values().flatten().collect())
+}
+
+fn seed_embedding_cache(
+    target: &Connection,
+    target_path: &Path,
+    seed_path: &Path,
+) -> Result<usize> {
+    let metadata = fs::symlink_metadata(seed_path)
+        .with_context(|| format!("reading embedding cache seed {}", seed_path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("embedding cache seed must be a real SQLite file");
+    }
+    let seed_path = seed_path.canonicalize()?;
+    let target_path = target_path.canonicalize()?;
+    if seed_path == target_path {
+        bail!("embedding cache seed must differ from the fresh target database");
+    }
+    let seed = Connection::open_with_flags(
+        &seed_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    crate::db::enforce_db_schema_version(&seed)?;
+    let model_id = seed
+        .query_row(
+            "SELECT value FROM corpus_meta WHERE key = 'embedding_model_id'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("embedding cache seed has no completed model binding"))?;
+    if model_id != EMBEDDING_MODEL_ID {
+        bail!("embedding cache seed model `{model_id}` does not match `{EMBEDDING_MODEL_ID}`");
+    }
+    let invalid: i64 = seed.query_row(
+        "SELECT COUNT(*) FROM embedding_cache
+         WHERE model_id = ?1 AND length(embedding) != ?2",
+        rusqlite::params![EMBEDDING_MODEL_ID, EMBEDDING_DIM as i64],
+        |row| row.get(0),
+    )?;
+    if invalid != 0 {
+        bail!("embedding cache seed contains {invalid} invalid vectors");
+    }
+    drop(seed);
+
+    let seed_utf8 = seed_path
+        .to_str()
+        .ok_or_else(|| anyhow!("embedding cache seed path is not UTF-8"))?;
+    let before: i64 =
+        target.query_row("SELECT COUNT(*) FROM embedding_cache", [], |row| row.get(0))?;
+    target.execute("ATTACH DATABASE ?1 AS embedding_seed", [seed_utf8])?;
+    let copy_result = target.execute(
+        "INSERT OR IGNORE INTO main.embedding_cache(model_id, text_sha256, embedding)
+         SELECT model_id, text_sha256, embedding
+         FROM embedding_seed.embedding_cache
+         WHERE model_id = ?1",
+        [EMBEDDING_MODEL_ID],
+    );
+    let detach_result = target.execute_batch("DETACH DATABASE embedding_seed;");
+    copy_result?;
+    detach_result?;
+    let after: i64 =
+        target.query_row("SELECT COUNT(*) FROM embedding_cache", [], |row| row.get(0))?;
+    usize::try_from(after.saturating_sub(before)).context("embedding cache seed count overflow")
+}
+
+pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
     let BuildCorpusArgs {
         pages_dir,
+        frl_workspace,
         db_path,
         model_dir,
+        embedding_cache_db,
         out_dir,
         zstd_level,
-        limit,
         profile_enabled,
     } = args;
 
     let pages_root = pages_dir
         .canonicalize()
         .with_context(|| format!("canonicalizing pages_dir {}", pages_dir.display()))?;
+    let frl_root = frl_workspace
+        .canonicalize()
+        .with_context(|| format!("canonicalizing FRL workspace {}", frl_workspace.display()))?;
+    if pages_root == frl_root {
+        bail!("ATO and FRL source workspaces must be distinct directories");
+    }
+    let _workspace_locks = [
+        crate::source_update::lock_workspace_shared(&pages_root)?,
+        crate::source_update::lock_workspace_shared(&frl_root)?,
+    ];
 
-    // [IB-17] Maintainer builds require a local pinned Granite model
+    // Maintainer builds require a local pinned Granite model
     // checkout; hosted model metadata is owned by publish/release.
     let semantic_model_paths = SemanticModelPaths::from_model_dir(model_dir)?;
     let index_path = pages_root.join("index.jsonl");
@@ -561,104 +871,93 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         );
     }
     let source_index_sha256 = sha256_file(&index_path)?;
-    let index_file =
-        File::open(&index_path).with_context(|| format!("opening {}", index_path.display()))?;
-    let reader = std::io::BufReader::new(index_file);
+    let source_records = load_authoritative_ato_records(&index_path)?;
 
     fs::create_dir_all(out_dir)
         .with_context(|| format!("creating out_dir {}", out_dir.display()))?;
-    fs::create_dir_all(out_dir.join("packs"))?;
-
-    let checkpoint = load_build_checkpoint(out_dir, &source_index_sha256, zstd_level)?;
-    let checkpoint_loaded = checkpoint.is_some();
-    let mut base_doc_refs: HashMap<String, DocRef> = HashMap::new();
-    let mut base_documents: Vec<DocRef> = Vec::new();
-    let mut base_source_hash_by_doc_id: HashMap<String, String> = HashMap::new();
-    let mut source_doc_ids: HashSet<String> = HashSet::new();
-    let mut base_seeded = false;
-    let (mut documents, packs) = match checkpoint {
-        Some(checkpoint) => {
-            eprintln!(
-                "ato-mcp build: resuming from checkpoint ({} docs, {} packs)",
-                checkpoint.documents.len(),
-                checkpoint.packs.len()
-            );
-            if !checkpoint.base_documents.is_empty() {
-                base_documents = checkpoint.base_documents;
-                base_doc_refs = base_documents
-                    .iter()
-                    .map(|doc| (doc.doc_id.clone(), doc.clone()))
-                    .collect();
-                base_source_hash_by_doc_id = checkpoint.base_source_hash_by_doc_id;
-                source_doc_ids = checkpoint.verified_source_doc_ids.into_iter().collect();
-                base_seeded = true;
-            }
-            (checkpoint.documents, checkpoint.packs)
-        }
-        None => {
-            fs::remove_file(out_dir.join("manifest.json")).ok();
-            fs::remove_file(out_dir.join("update.json")).ok();
-            (Vec::new(), Vec::new())
-        }
-    };
-    let conn = open_write_at(db_path)
-        .with_context(|| format!("opening sqlite at {}", db_path.display()))?;
-    init_db(&conn)?;
-    let committed_docs = committed_build_doc_count(&conn)?;
-    let pending_docs = pending_build_doc_count(&conn)?;
-    if pending_docs > 0 {
+    let manifest_path = out_dir.join("manifest.json");
+    if manifest_path.exists() {
         bail!(
-            "build DB has {pending_docs} uncheckpointed PENDING documents at {}; remove the release dir to start fresh",
+            "refusing to mutate completed corpus output {}; choose a fresh output directory",
+            out_dir.display()
+        );
+    }
+
+    let source_id: SourceId = ATO_SOURCE_ID.parse()?;
+    let checkpoint = load_build_checkpoint(out_dir, &source_id, &source_index_sha256, zstd_level)?;
+    if checkpoint.is_none() && db_path.exists() {
+        bail!(
+            "refusing to reuse uncheckpointed corpus database {}; choose a fresh output directory",
             db_path.display()
         );
     }
+    let mut documents = match checkpoint {
+        Some(checkpoint) => {
+            eprintln!(
+                "legal-mcp build: resuming source {} from checkpoint ({} docs)",
+                checkpoint.source_id,
+                checkpoint.documents.len()
+            );
+            checkpoint.documents
+        }
+        None => {
+            fs::remove_file(out_dir.join("update.json")).ok();
+            Vec::new()
+        }
+    };
+    let mut conn = open_write_at(db_path)
+        .with_context(|| format!("opening sqlite at {}", db_path.display()))?;
+    init_db(&conn)?;
+    if let Some(seed_path) = embedding_cache_db {
+        let imported = seed_embedding_cache(&conn, db_path, seed_path)?;
+        eprintln!("legal-mcp build: imported {imported} reusable embeddings");
+    }
+    let source_display_name = &crate::legal_source::source_registry()
+        .source(&source_id)?
+        .descriptor()
+        .display_name;
+    conn.execute(
+        "INSERT INTO sources(source_id, display_name) VALUES (?1, ?2)
+         ON CONFLICT(source_id) DO UPDATE SET display_name = excluded.display_name",
+        rusqlite::params![source_id.as_str(), source_display_name],
+    )?;
+    let committed_docs = committed_build_doc_count(&conn, &documents)?;
     if committed_docs != documents.len() {
         bail!(
-            "build checkpoint has {} documents but DB has {committed_docs}; remove {} to start fresh",
+            "build checkpoint has {} documents but only {committed_docs} are committed in the DB; remove {} to start fresh",
             documents.len(),
             build_checkpoint_path(out_dir).display()
         );
     }
-    // [IB-14] Resume skips only checkpoint-committed docs (or verified source
-    // doc_ids for a base-seeded checkpoint); PENDING rows abort above.
-    let checkpoint_doc_ids: HashSet<String> = if checkpoint_loaded && base_seeded {
-        source_doc_ids.clone()
-    } else if checkpoint_loaded {
-        documents.iter().map(|doc| doc.doc_id.clone()).collect()
-    } else {
-        HashSet::new()
-    };
+    let checkpoint_document_ids: HashSet<DocumentId> = documents
+        .iter()
+        .map(|doc| doc.document_id.clone())
+        .collect();
+    if checkpoint_document_ids.len() != documents.len()
+        || checkpoint_document_ids
+            .iter()
+            .any(|document_id| document_id.source != source_id)
+    {
+        bail!(
+            "build checkpoint contains duplicate or foreign-source document identities; remove {} to start fresh",
+            build_checkpoint_path(out_dir).display()
+        );
+    }
 
     let mut profile = BuildProfile::new(profile_enabled);
-    // [IB-16] Corpus build runs as a single Rust process with adaptive
+    // Corpus build runs as a single Rust process with adaptive
     // embedding batches and no separate worker-pool build path.
     let state = ServerState::with_model_paths(semantic_model_paths);
-    let mut processed: usize = if checkpoint_loaded && base_seeded {
-        source_doc_ids.len()
-    } else {
-        checkpoint_doc_ids.len()
-    };
+    let mut processed = checkpoint_document_ids.len();
     let mut skipped_no_payload: usize = 0;
-    let mut skipped_duplicate_doc_ids: usize = 0;
-    let mut reused_base_docs: usize = 0;
-    let mut changed_base_docs: usize = 0;
-    let mut removed_base_docs: usize = 0;
+    let mut skipped_duplicate_documents: usize = 0;
+    let mut source_inventory: HashSet<DocumentId> = HashSet::new();
     let mut tx = conn.unchecked_transaction()?;
     let progress_started = std::time::Instant::now();
 
     let mut pending_embeddings: Vec<PendingBuildEmbedding> =
         Vec::with_capacity(BUILD_EMBED_BATCH_SIZE);
-    for line_res in reader.lines() {
-        if let Some(n) = limit {
-            if processed >= n {
-                break;
-            }
-        }
-        let line = line_res?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let record: JsonValue = serde_json::from_str(&line).context("parsing index.jsonl line")?;
+    for record in source_records {
         let canonical_id = record
             .get("canonical_id")
             .and_then(|v| v.as_str())
@@ -671,33 +970,20 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
             skipped_no_payload += 1;
             continue;
         }
-        let payload_path = confined_payload_path(&pages_root, payload_path_raw)?;
-        let doc_id = metadata_doc_id_for(canonical_id);
-        let checkpoint_verified = checkpoint_doc_ids.contains(&doc_id);
-        if !source_doc_ids.insert(doc_id.clone()) {
-            if checkpoint_verified {
-                processed += 1;
-                maybe_report_build_progress(
-                    processed,
-                    profile.docs,
-                    reused_base_docs,
-                    progress_started,
-                );
-                continue;
-            }
-            skipped_duplicate_doc_ids += 1;
+        let document_id = ato_document_id(canonical_id)?;
+        if !source_inventory.insert(document_id.clone()) {
+            skipped_duplicate_documents += 1;
             continue;
         }
-        if checkpoint_verified {
+        if checkpoint_document_ids.contains(&document_id) {
             processed += 1;
-            maybe_report_build_progress(
-                processed,
-                profile.docs,
-                reused_base_docs,
-                progress_started,
-            );
+            maybe_report_build_progress(processed, profile.docs, 0, progress_started);
             continue;
         }
+        let payload_path = confined_payload_path(&pages_root, payload_path_raw)?;
+        let native_id = document_id.native_id.clone();
+        let canonical_url = ato_canonical_url(&native_id);
+        let upstream_version = ato_upstream_version(&record, canonical_id);
 
         let started = std::time::Instant::now();
         let expected_size = record
@@ -723,8 +1009,11 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         // Cleaning pipeline.
         let started = std::time::Instant::now();
         let cleaned = clean_ato_html(&html);
-        let (rewritten_html, assets) =
-            rewrite_images_html(&cleaned.html, Some(&doc_id), Some(payload_path.as_path()));
+        let (rewritten_html, assets) = rewrite_images_html(
+            &cleaned.html,
+            Some(&native_id),
+            Some(payload_path.as_path()),
+        );
         let normalised = normalise_named_anchors(&rewritten_html);
         let with_links = rewrite_links_html(&normalised);
         let final_html = strip_attributes(&with_links);
@@ -747,7 +1036,8 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         let mut heading_levels: Vec<u32> = Vec::new();
         {
             let frag = scraper::Html::parse_fragment(&final_html);
-            let h_sel = scraper::Selector::parse("h1, h2, h3, h4, h5, h6").unwrap();
+            let h_sel = scraper::Selector::parse("h1, h2, h3, h4, h5, h6")
+                .map_err(|error| anyhow!("parsing heading selector: {error:?}"))?;
             for h in frag.select(&h_sel) {
                 let text = anchors_node_text(h);
                 if text.is_empty() {
@@ -775,7 +1065,7 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         let (fm_refs, fm_phrase) = extract_em_front_matter(&cleaned.html);
 
         let rule_inputs = RuleInputs {
-            doc_id: doc_id.clone(),
+            doc_id: native_id.clone(),
             title: Some(raw_title.clone()),
             headings,
             heading_levels,
@@ -792,20 +1082,23 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
 
         // Chunker.
         let started = std::time::Instant::now();
-        let chunks = chunk_html(&final_html, Some(&title), EMBED_MAX_TOKENS);
+        let chunks =
+            chunk_html_with_token_count(&final_html, Some(&title), EMBED_MAX_TOKENS, |text| {
+                state.count_embedding_tokens(text)
+            })?;
         profile.chunking += started.elapsed();
         profile.chunks += chunks.len();
 
         // Anchor refs (used for navigation flags + doc_anchors table).
         let started = std::time::Instant::now();
-        let anchor_refs = extract_anchors(&final_html, &doc_id);
+        let anchor_refs = extract_anchors(&final_html, &native_id);
         let has_in_doc_links = anchor_refs.iter().any(|r| r.kind == "in_doc");
         let has_related_docs = anchor_refs.iter().any(|r| r.kind == "sister");
         let has_history = anchor_refs.iter().any(|r| r.kind == "history");
         profile.references += started.elapsed();
 
-        // Definitions are source-derived and needed before the base-release
-        // reuse decision, but their DB rows are inserted after the document row.
+        // Definitions participate in the source fingerprint and are inserted
+        // after their source-qualified document row.
         let started = std::time::Instant::now();
         let def_chunks: Vec<DefinitionChunk> = chunks
             .iter()
@@ -815,15 +1108,16 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
                 text: c.text.clone(),
             })
             .collect();
-        let defs = extract_definitions(&doc_id, &title, &doc_type, &def_chunks);
+        let defs = extract_definitions(&native_id, &title, &doc_type, &def_chunks);
         let definition_records: Vec<JsonValue> = defs
             .iter()
             .map(|d| {
                 json!({
+                    "source_id": source_id.as_str(),
                     "definition_id": d.definition_id.clone(),
                     "term": d.term.clone(),
                     "norm_term": d.norm_term.clone(),
-                    "doc_id": d.doc_id.clone(),
+                    "native_id": native_id.clone(),
                     "source_title": d.source_title.clone(),
                     "source_type": d.source_type.clone(),
                     "scope": d.scope.clone(),
@@ -837,7 +1131,9 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
 
         let source_hash =
             source_fingerprint_hash(&build_source_fingerprint_value(BuildSourceFingerprint {
-                doc_id: &doc_id,
+                document_id: &document_id,
+                canonical_url: &canonical_url,
+                upstream_version: &upstream_version,
                 doc_type: &doc_type,
                 title: &title,
                 date: &derived_date,
@@ -851,37 +1147,21 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
                 chunks: &chunks,
                 assets: &assets,
             }))?;
-        let content_hash = metadata_content_hash(&cleaned.text);
-        if base_doc_refs.contains_key(&doc_id) {
-            let base_source_hash = base_source_hash_by_doc_id
-                .get(&doc_id)
-                .ok_or_else(|| anyhow!("base release missing source fingerprint for {doc_id}"))?;
-            if base_source_hash == &source_hash {
-                reused_base_docs += 1;
-                processed += 1;
-                maybe_report_build_progress(
-                    processed,
-                    profile.docs,
-                    reused_base_docs,
-                    progress_started,
-                );
-                continue;
-            }
-            remove_build_doc(&tx, &doc_id)
-                .with_context(|| format!("removing changed base doc {doc_id}"))?;
-            documents.retain(|doc| doc.doc_id != doc_id);
-            changed_base_docs += 1;
-        }
+        remove_build_doc(&tx, source_id.as_str(), &native_id)
+            .with_context(|| format!("replacing source document {document_id}"))?;
 
-        let now = chrono::Utc::now().to_rfc3339();
-        // `pack_sha8` remains a compact deterministic provenance token for
-        // legacy readers even though schema 10 ships one database artifact.
-        let provenance_sha8 = source_hash[..8].to_string();
+        let downloaded_at = record
+            .get("downloaded_at")
+            .and_then(JsonValue::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
 
         // Collect headings once: stored on documents.headings for install-time
         // FTS5 rebuild, and re-used below to populate title_fts.headings.
         let headings_frag = scraper::Html::parse_fragment(&final_html);
-        let h_sel = scraper::Selector::parse("h1, h2, h3, h4, h5, h6").unwrap();
+        let h_sel = scraper::Selector::parse("h1, h2, h3, h4, h5, h6")
+            .map_err(|error| anyhow!("parsing heading selector: {error:?}"))?;
         let headings_concat: Vec<String> = headings_frag
             .select(&h_sel)
             .map(anchors_node_text)
@@ -892,18 +1172,20 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         let started = std::time::Instant::now();
         tx.execute(
             "INSERT INTO documents
-                (doc_id, type, title, date, downloaded_at, content_hash, pack_sha8,
-                 html, withdrawn_date, superseded_by, replaces,
+                (source_id, native_id, type, title, date, canonical_url, upstream_version,
+                 downloaded_at, content_hash, html, withdrawn_date, superseded_by, replaces,
                  has_in_doc_links, has_related_docs, has_history, headings)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             rusqlite::params![
-                doc_id,
-                doc_type,
-                title,
-                derived_date,
-                now,
-                content_hash,
-                provenance_sha8.clone(),
+                source_id.as_str(),
+                &native_id,
+                &doc_type,
+                &title,
+                &derived_date,
+                &canonical_url,
+                &upstream_version,
+                downloaded_at,
+                &source_hash,
                 compress_text(&final_html)?,
                 currency.withdrawn_date.clone(),
                 currency.superseded_by.clone(),
@@ -924,10 +1206,16 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
                     .context("zstd-compressing chunk text")?;
             let chunk_id: i64 = tx
                 .query_row(
-                    "INSERT INTO chunks (doc_id, ord, anchor, text)
-                 VALUES (?1, ?2, ?3, ?4)
+                    "INSERT INTO chunks (source_id, native_id, ord, anchor, text)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  RETURNING chunk_id",
-                    rusqlite::params![doc_id, chunk.ord, chunk.anchor, zstd_text],
+                    rusqlite::params![
+                        source_id.as_str(),
+                        &native_id,
+                        chunk.ord,
+                        chunk.anchor,
+                        zstd_text
+                    ],
                     |row| row.get(0),
                 )
                 .context("INSERT chunks")?;
@@ -939,8 +1227,8 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
             )
             .with_context(|| {
                 format!(
-                    "INSERT chunks_fts doc_id={} chunk_id={} ord={}",
-                    doc_id, chunk_id, chunk.ord
+                    "INSERT chunks_fts document={} chunk_id={} ord={}",
+                    document_id, chunk_id, chunk.ord
                 )
             })?;
 
@@ -949,13 +1237,13 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
 
         // title_fts: re-use the headings collected before the documents INSERT.
         tx.execute(
-            "INSERT INTO title_fts (doc_id, title, headings) VALUES (?1, ?2, ?3)",
-            rusqlite::params![doc_id, title, headings_text],
+            "INSERT INTO title_fts (source_id, native_id, title, headings)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![source_id.as_str(), &native_id, &title, headings_text],
         )
         .context("INSERT title_fts")?;
 
         // doc_anchors.
-        let mut anchor_records: Vec<JsonValue> = Vec::new();
         for (anchor_ord, r) in (0_i64..).zip(anchor_refs.iter()) {
             let target_chunk_id: Option<i64> = if r.kind == "in_doc" {
                 if let Some(name) = r.target_anchor.as_deref() {
@@ -972,25 +1260,26 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
             } else {
                 None
             };
-            anchor_records.push(json!({
-                "ord": anchor_ord,
-                "kind": r.kind.clone(),
-                "label": r.label.clone(),
-                "target_chunk_id": target_chunk_id,
-                "target_doc_id": r.target_doc_id.clone(),
-                "target_pit": r.target_pit.clone(),
-            }));
+            let target_native_id = if r.kind == "in_doc" {
+                Some(native_id.as_str())
+            } else {
+                r.target_doc_id.as_deref()
+            };
+            let target_source_id = target_native_id.map(|_| source_id.as_str());
             tx.execute(
                 "INSERT INTO doc_anchors
-                    (doc_id, ord, kind, label, target_chunk_id, target_doc_id, target_pit)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    (source_id, native_id, ord, kind, label, target_chunk_id,
+                     target_source_id, target_native_id, target_pit)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 rusqlite::params![
-                    doc_id,
+                    source_id.as_str(),
+                    &native_id,
                     anchor_ord,
                     r.kind,
                     r.label,
                     target_chunk_id,
-                    r.target_doc_id,
+                    target_source_id,
+                    target_native_id,
                     r.target_pit,
                 ],
             )
@@ -1002,15 +1291,16 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         let started = std::time::Instant::now();
         for d in &defs {
             tx.execute(
-                "INSERT OR REPLACE INTO definitions
-                    (definition_id, term, norm_term, doc_id, source_title,
+                "INSERT INTO definitions
+                    (source_id, definition_id, term, norm_term, native_id, source_title,
                      source_type, scope, anchor, ord, body)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![
+                    source_id.as_str(),
                     d.definition_id,
                     d.term,
                     d.norm_term,
-                    d.doc_id,
+                    &native_id,
                     d.source_title,
                     d.source_type,
                     d.scope,
@@ -1027,12 +1317,13 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         let started = std::time::Instant::now();
         for asset in &assets {
             tx.execute(
-                "INSERT OR REPLACE INTO document_assets
-                    (asset_ref, doc_id, media_type, alt, title, sha256, data)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO document_assets
+                    (source_id, asset_id, native_id, media_type, alt, title, sha256, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 rusqlite::params![
-                    asset.asset_ref,
-                    doc_id,
+                    source_id.as_str(),
+                    asset.asset_id,
+                    &native_id,
                     asset.media_type,
                     asset.alt,
                     asset.title,
@@ -1045,11 +1336,8 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         profile.assets += started.elapsed();
 
         documents.push(DocRef {
-            doc_id: doc_id.clone(),
+            document_id: document_id.clone(),
             content_hash: source_hash,
-            pack_sha8: provenance_sha8,
-            offset: 0,
-            length: 0,
         });
 
         for (chunk_id, text) in doc_pending_embeddings {
@@ -1063,13 +1351,10 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
             tx.commit()?;
             save_build_checkpoint(SaveBuildCheckpointArgs {
                 out_dir,
+                source_id: &source_id,
                 source_index_sha256: &source_index_sha256,
                 zstd_level,
                 documents: &documents,
-                packs: &packs,
-                base_documents: &base_documents,
-                base_source_hash_by_doc_id: &base_source_hash_by_doc_id,
-                verified_source_doc_ids: &source_doc_ids,
             })?;
             profile.checkpoint += started.elapsed();
             tx = conn.unchecked_transaction()?;
@@ -1077,64 +1362,43 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
 
         processed += 1;
         profile.docs += 1;
-        maybe_report_build_progress(processed, profile.docs, reused_base_docs, progress_started);
+        maybe_report_build_progress(processed, profile.docs, 0, progress_started);
     }
 
-    if base_seeded {
-        let removed_doc_ids: Vec<String> = documents
-            .iter()
-            .filter(|doc| {
-                base_doc_refs.contains_key(&doc.doc_id) && !source_doc_ids.contains(&doc.doc_id)
-            })
-            .map(|doc| doc.doc_id.clone())
-            .collect();
-        for doc_id in &removed_doc_ids {
-            remove_build_doc(&tx, doc_id)
-                .with_context(|| format!("removing doc absent from source index {doc_id}"))?;
-        }
-        removed_base_docs = removed_doc_ids.len();
-        if removed_base_docs > 0 {
-            documents.retain(|doc| !removed_doc_ids.contains(&doc.doc_id));
-        }
-    }
+    let removed_documents = remove_absent_build_docs(&tx, source_id.as_str(), &source_inventory)?;
+    documents.retain(|doc| source_inventory.contains(&doc.document_id));
 
     flush_pending_build_embeddings(&state, &tx, &mut pending_embeddings, &mut profile)?;
     tx.commit()?;
     let started = std::time::Instant::now();
     save_build_checkpoint(SaveBuildCheckpointArgs {
         out_dir,
+        source_id: &source_id,
         source_index_sha256: &source_index_sha256,
         zstd_level,
         documents: &documents,
-        packs: &packs,
-        base_documents: &base_documents,
-        base_source_hash_by_doc_id: &base_source_hash_by_doc_id,
-        verified_source_doc_ids: &source_doc_ids,
     })?;
     profile.checkpoint += started.elapsed();
     if skipped_no_payload > 0 {
-        eprintln!("ato-mcp build: skipped {skipped_no_payload} index records without payload_path");
-    }
-    if skipped_duplicate_doc_ids > 0 {
         eprintln!(
-            "ato-mcp build: skipped {skipped_duplicate_doc_ids} duplicate doc_id index records"
+            "legal-mcp build: skipped {skipped_no_payload} index records without payload_path"
         );
     }
-    if reused_base_docs > 0 {
-        eprintln!("ato-mcp build: reused {reused_base_docs} unchanged docs from base release");
+    if skipped_duplicate_documents > 0 {
+        eprintln!(
+            "legal-mcp build: skipped {skipped_duplicate_documents} duplicate source document records"
+        );
     }
-    if changed_base_docs > 0 {
-        eprintln!("ato-mcp build: rebuilt {changed_base_docs} changed docs from base release");
-    }
-    if removed_base_docs > 0 {
-        eprintln!("ato-mcp build: removed {removed_base_docs} base docs absent from source index");
+    if removed_documents > 0 {
+        eprintln!(
+            "legal-mcp build: removed {removed_documents} ATO documents absent from the source inventory"
+        );
     }
 
     let started = std::time::Instant::now();
     let created_at = chrono::Utc::now().to_rfc3339();
     let mut manifest = Manifest {
-        schema_version: SUPPORTED_SCHEMA_VERSION as i64,
-        manifest_format_version: Some(crate::SUPPORTED_MANIFEST_FORMAT_VERSION),
+        schema_version: SUPPORTED_SCHEMA_VERSION,
         index_version: chrono::Utc::now().format("%Y.%m.%d").to_string(),
         created_at,
         min_client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1145,28 +1409,31 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
             url: EMBEDDING_MODEL_HF_URL.to_string(),
         },
         // package-corpus fills in the real db sha256/size/url after stripping
-        // FTS5 and zstd-compressing the canonical ato.db.
+        // FTS5 and zstd-compressing the canonical legal.db.
         db: ManifestDb {
-            url: "ato.db.zst".to_string(),
+            url: "legal.db.zst".to_string(),
             sha256: String::new(),
             size: 0,
         },
-        ann: None,
+        ann: BTreeMap::new(),
     };
 
     let final_tx = conn.unchecked_transaction()?;
-    set_meta(&final_tx, "index_version", &manifest.index_version)?;
-    set_meta(&final_tx, "embedding_model_id", &manifest.model.id)?;
-    set_meta(&final_tx, "last_update_at", &manifest.created_at)?;
-    set_meta(&final_tx, "source_index_sha256", &source_index_sha256)?;
-    eprintln!("ato-mcp build: deriving citations…");
-    // [IB-20] Build finalisation derives citations from stored [doc:X]
-    // markers before manifest/update metadata is written.
-    derive_citations(&final_tx)?;
+    set_corpus_meta(&final_tx, "index_version", &manifest.index_version)?;
+    set_corpus_meta(&final_tx, "embedding_model_id", &manifest.model.id)?;
+    set_corpus_meta(&final_tx, "last_update_at", &manifest.created_at)?;
+    set_source_meta(
+        &final_tx,
+        source_id.as_str(),
+        "source_index_sha256",
+        &source_index_sha256,
+    )?;
+    eprintln!("legal-mcp build: deriving citations…");
+    derive_citations(&final_tx, &source_id)?;
     // Precompute the corpus-shape values runtime stats() returns so MCP
     // `initialize` becomes a meta key/value read (sub-ms) instead of a
     // multi-table COUNT(*) + GROUP BY scan (5-10s cold on a multi-GB DB).
-    // The corpus is read-only for the server lifetime — `ato-mcp update`
+    // The corpus is read-only for the server lifetime — `legal-mcp update`
     // requires a restart — so caching at build time is safe.
     let documents_count: i64 =
         final_tx.query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))?;
@@ -1175,57 +1442,133 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         final_tx.query_row("SELECT COUNT(*) FROM chunk_embeddings", [], |r| r.get(0))?;
     let definitions_count: i64 =
         final_tx.query_row("SELECT COUNT(*) FROM definitions", [], |r| r.get(0))?;
-    set_meta(&final_tx, "documents_count", &documents_count.to_string())?;
-    set_meta(&final_tx, "chunks_count", &chunks_count.to_string())?;
-    set_meta(
+    set_corpus_meta(&final_tx, "documents_count", &documents_count.to_string())?;
+    set_corpus_meta(&final_tx, "chunks_count", &chunks_count.to_string())?;
+    set_corpus_meta(
         &final_tx,
         "chunk_embeddings_count",
         &chunk_embeddings_count.to_string(),
     )?;
-    set_meta(
+    set_corpus_meta(
         &final_tx,
         "definitions_count",
         &definitions_count.to_string(),
     )?;
-    let documents_by_type = compute_documents_by_type(&final_tx)?;
-    set_meta(
+
+    let source_documents_count: i64 = final_tx.query_row(
+        "SELECT COUNT(*) FROM documents WHERE source_id = ?1",
+        [source_id.as_str()],
+        |row| row.get(0),
+    )?;
+    let source_chunks_count: i64 = final_tx.query_row(
+        "SELECT COUNT(*) FROM chunks WHERE source_id = ?1",
+        [source_id.as_str()],
+        |row| row.get(0),
+    )?;
+    let source_chunk_embeddings_count: i64 = final_tx.query_row(
+        "SELECT COUNT(*)
+         FROM chunk_embeddings AS embedding
+         JOIN chunks AS chunk ON chunk.chunk_id = embedding.chunk_id
+         WHERE chunk.source_id = ?1",
+        [source_id.as_str()],
+        |row| row.get(0),
+    )?;
+    let source_definitions_count: i64 = final_tx.query_row(
+        "SELECT COUNT(*) FROM definitions WHERE source_id = ?1",
+        [source_id.as_str()],
+        |row| row.get(0),
+    )?;
+    for (key, value) in [
+        ("documents_count", source_documents_count),
+        ("chunks_count", source_chunks_count),
+        ("chunk_embeddings_count", source_chunk_embeddings_count),
+        ("definitions_count", source_definitions_count),
+    ] {
+        set_source_meta(&final_tx, source_id.as_str(), key, &value.to_string())?;
+    }
+    let documents_by_type = compute_source_documents_by_type(&final_tx, source_id.as_str())?;
+    set_source_meta(
         &final_tx,
+        source_id.as_str(),
         "documents_by_type_json",
         &serde_json::to_string(&documents_by_type)?,
     )?;
-    let prefix_breakdown = collect_prefix_breakdown(&final_tx)?;
-    set_meta(
+    let prefix_breakdown = collect_source_prefix_breakdown(&final_tx, source_id.as_str())?;
+    set_source_meta(
         &final_tx,
+        source_id.as_str(),
         "prefix_breakdown_json",
         &serde_json::to_string(&prefix_breakdown)?,
     )?;
-    let ann_identity = crate::ann::compute_identity(&final_tx, &source_index_sha256)?;
-    set_meta(&final_tx, "corpus_id", &ann_identity.corpus_id)?;
-    set_meta(
+    let ann_identity = crate::ann::compute_identity(&final_tx, &source_id, &source_index_sha256)?;
+    set_source_meta(
         &final_tx,
+        source_id.as_str(),
+        "corpus_id",
+        &ann_identity.corpus_id,
+    )?;
+    set_source_meta(
+        &final_tx,
+        source_id.as_str(),
         "embedding_set_sha256",
         &ann_identity.embedding_set_sha256,
     )?;
-    verify_semantic_install(&final_tx, &manifest)?;
     final_tx.commit()?;
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
 
-    eprintln!("ato-mcp build: constructing deterministic ANN sidecar…");
-    manifest.ann = Some(crate::ann::build_sidecar(
+    eprintln!("legal-mcp build: ingesting normalized Federal Register documents…");
+    let frl_source: SourceId = crate::frl::FRL_SOURCE_ID.parse()?;
+    let frl_descriptor = crate::legal_source::source_registry()
+        .source(&frl_source)?
+        .descriptor()
+        .clone();
+    let frl_documents = load_normalized_documents(&frl_root)?;
+    let frl_report = ingest_source(
+        &mut conn,
+        &frl_source,
+        &frl_descriptor,
+        frl_documents,
+        &state,
+    )?;
+    eprintln!(
+        "legal-mcp build: FRL ingested {} documents ({} changed, {} removed, {} embeddings encoded, {} reused)",
+        frl_report.inserted_documents + frl_report.unchanged_documents,
+        frl_report.changed_documents,
+        frl_report.deleted_documents,
+        frl_report.encoded_texts,
+        frl_report.reused_embeddings,
+    );
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+
+    // Source ingestion owns source-local state. The completed generation owns
+    // the one corpus-wide timestamp and version recorded in its manifest.
+    let binding_tx = conn.unchecked_transaction()?;
+    set_corpus_meta(&binding_tx, "index_version", &manifest.index_version)?;
+    set_corpus_meta(&binding_tx, "embedding_model_id", &manifest.model.id)?;
+    set_corpus_meta(&binding_tx, "last_update_at", &manifest.created_at)?;
+    binding_tx.commit()?;
+
+    eprintln!("legal-mcp build: constructing deterministic ANN sidecar…");
+    let ann = crate::ann::build_sidecar(
         &conn,
-        &out_dir.join(crate::ann::ANN_FILENAME),
+        &source_id,
+        out_dir,
         &source_index_sha256,
         &ann_identity,
-    )?);
+    )?;
+    manifest.ann.insert(source_id, ann);
+    let frl_ann = finalise_source_ann(&conn, &frl_source, out_dir)?;
+    manifest.ann.insert(frl_source, frl_ann);
+    crate::source::verify_corpus_manifest_binding(&conn, &manifest)?;
+    verify_semantic_install(&conn, &manifest)?;
 
-    let manifest_path = out_dir.join("manifest.json");
     atomic_write(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)?;
-    eprintln!("ato-mcp build: wrote {}", manifest_path.display());
+    eprintln!("legal-mcp build: wrote {}", manifest_path.display());
     profile.finalise += started.elapsed();
     profile.print();
 
     eprintln!(
-        "ato-mcp build: done - {processed} docs written to {}",
+        "legal-mcp build: done - {processed} docs written to {}",
         db_path.display()
     );
     Ok(())
@@ -1307,7 +1650,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     crate::config::atomic_write(path, bytes)
 }
 
-/// Strip FTS5 indexes from a copy of the canonical ato.db, VACUUM, and
+/// Strip FTS5 indexes from a copy of the canonical legal.db, VACUUM, and
 /// zstd-compress to produce a shippable artifact. The input file is never
 /// mutated. Returns {path, sha256, size} for embedding into manifest.json.
 pub(crate) fn package_corpus(db_path: &Path, out: &Path, level: i32) -> Result<JsonValue> {
@@ -1387,7 +1730,7 @@ pub(crate) fn package_corpus(db_path: &Path, out: &Path, level: i32) -> Result<J
 }
 
 /// Update a manifest.json in-place so its `db` field points at the freshly
-/// packaged ato.db.zst. The URL is set to the bare filename; the publish
+/// packaged legal.db.zst. The URL is set to the bare filename; the publish
 /// pipeline rewrites it to a GitHub release URL later. `manifest.schema_version`
 /// is bumped to the current supported version.
 pub(crate) fn update_manifest_with_db(
@@ -1444,92 +1787,21 @@ pub(crate) fn update_manifest_with_db(
     Ok(())
 }
 
-pub(crate) fn bundle_localize_manifest(
-    manifest_path: &Path,
-    packs_dir: &Path,
-    model_bundle: &Path,
-) -> Result<()> {
-    let mut manifest: JsonValue = serde_json::from_str(&fs::read_to_string(manifest_path)?)
-        .with_context(|| format!("parsing {}", manifest_path.display()))?;
-
-    if let Some(packs) = manifest.get_mut("packs").and_then(|v| v.as_array_mut()) {
-        for pack in packs {
-            let url = pack
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let filename = std::path::Path::new(&url)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or(&url)
-                .to_string();
-            let pack_path = packs_dir.join(&filename);
-            if !pack_path.exists() {
-                bail!("manifest references missing pack: {}", filename);
-            }
-            pack["url"] = JsonValue::String(format!("packs/{filename}"));
-            pack["sha256"] = JsonValue::String(sha256_file(&pack_path)?);
-            pack["size"] =
-                JsonValue::Number(serde_json::Number::from(fs::metadata(&pack_path)?.len()));
-        }
-    }
-
-    if let Some(ann) = manifest.get_mut("ann") {
-        let url = ann
-            .get("url")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let filename = Path::new(url)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow!("manifest ANN URL has no UTF-8 filename"))?;
-        let path = packs_dir.join(filename);
-        if !path.is_file() {
-            bail!("manifest references missing ANN sidecar: {filename}");
-        }
-        ann["url"] = JsonValue::String(filename.to_string());
-        ann["sha256"] = JsonValue::String(sha256_file(&path)?);
-        ann["size"] = JsonValue::Number(serde_json::Number::from(fs::metadata(path)?.len()));
-    }
-
-    let model_filename = model_bundle
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow!("model bundle has no filename"))?;
-    if let Some(model) = manifest.get_mut("model") {
-        model["url"] = JsonValue::String(model_filename.to_string());
-        model["sha256"] = JsonValue::String(sha256_file(model_bundle)?);
-        model["size"] =
-            JsonValue::Number(serde_json::Number::from(fs::metadata(model_bundle)?.len()));
-    }
-
-    let _: Manifest = serde_json::from_value(manifest.clone())
-        .with_context(|| format!("validating {}", manifest_path.display()))?;
-    atomic_write(manifest_path, &serde_json::to_vec_pretty(&manifest)?)?;
-
-    eprintln!(
-        "bundle-localize-manifest: rewrote {}",
-        manifest_path.display(),
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod security_tests {
     use super::*;
 
     #[test]
-    fn build_payloads_are_canonically_confined() {
-        let root = tempfile::tempdir().unwrap();
+    fn build_payloads_are_canonically_confined() -> Result<()> {
+        let root = tempfile::tempdir()?;
         let payloads = root.path().join("payloads");
-        fs::create_dir(&payloads).unwrap();
+        fs::create_dir(&payloads)?;
         let payload = payloads.join("doc.html");
-        fs::write(&payload, "doc").unwrap();
-        let canonical_root = root.path().canonicalize().unwrap();
+        fs::write(&payload, "doc")?;
+        let canonical_root = root.path().canonicalize()?;
         assert_eq!(
-            confined_payload_path(&canonical_root, "payloads/doc.html").unwrap(),
-            payload.canonicalize().unwrap()
+            confined_payload_path(&canonical_root, "payloads/doc.html")?,
+            payload.canonicalize()?
         );
         for raw in [
             "../secret",
@@ -1547,17 +1819,231 @@ mod security_tests {
 
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(&payload, payloads.join("linked.html")).unwrap();
+            std::os::unix::fs::symlink(&payload, payloads.join("linked.html"))?;
             assert!(confined_payload_path(&canonical_root, "payloads/linked.html").is_err());
         }
+        Ok(())
     }
 
     #[test]
-    fn atomic_write_replaces_only_with_complete_bytes() {
-        let root = tempfile::tempdir().unwrap();
+    fn atomic_write_replaces_only_with_complete_bytes() -> Result<()> {
+        let root = tempfile::tempdir()?;
         let path = root.path().join("manifest.json");
-        fs::write(&path, b"old").unwrap();
-        atomic_write(&path, b"new complete value").unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"new complete value");
+        fs::write(&path, b"old")?;
+        atomic_write(&path, b"new complete value")?;
+        assert_eq!(fs::read(&path)?, b"new complete value");
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_document_refs_are_structurally_source_qualified() -> Result<()> {
+        let document_id = DocumentId::new("ato".parse()?, "TR/2026/1")?;
+        let encoded = serde_json::to_value(DocRef {
+            document_id: document_id.clone(),
+            content_hash: "sha256:abc".to_string(),
+        })?;
+        assert_eq!(encoded["document_id"]["source"], "ato");
+        assert_eq!(encoded["document_id"]["native_id"], "TR/2026/1");
+        assert_eq!(
+            serde_json::from_value::<DocRef>(encoded)?.document_id,
+            document_id
+        );
+        assert!(serde_json::from_value::<DocRef>(serde_json::json!({
+            "doc_id": "TR/2026/1",
+            "content_hash": "sha256:abc"
+        }))
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn ato_inventory_uses_latest_usable_payload_and_authoritative_removals() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let index = root.path().join("index.jsonl");
+        let records = [
+            json!({"canonical_id":"/law/view/document?docid=a", "status":"success", "payload_path":"one.html", "size":1, "sha256":"1".repeat(64)}),
+            json!({"canonical_id":"/law/view/document?docid=A", "status":"failed", "payload_path":null}),
+            json!({"canonical_id":"B", "status":"success", "payload_path":"gone.html", "size":1, "sha256":"2".repeat(64)}),
+            json!({"canonical_id":"B", "status":"confirmed_404", "payload_path":null}),
+            json!({"canonical_id":"C", "status":"failed", "payload_path":null}),
+            json!({"canonical_id":"C", "status":"success", "payload_path":"current.html", "size":1, "sha256":"3".repeat(64)}),
+            json!({"canonical_id":"/law/view/document?docid=A#A", "status":"success", "payload_path":"two.html", "size":1, "sha256":"4".repeat(64)}),
+        ];
+        fs::write(
+            &index,
+            records
+                .iter()
+                .map(serde_json::to_string)
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .join("\n"),
+        )?;
+        let authoritative = load_authoritative_ato_records(&index)?;
+        assert_eq!(authoritative.len(), 2);
+        assert_eq!(
+            authoritative[0]["canonical_id"],
+            "/law/view/document?docid=A#A"
+        );
+        assert_eq!(authoritative[0]["payload_path"], "two.html");
+        assert_eq!(authoritative[1]["canonical_id"], "C");
+        assert_eq!(authoritative[1]["payload_path"], "current.html");
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_build_can_seed_only_model_bound_embedding_cache_rows() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let seed_path = root.path().join("seed.db");
+        let target_path = root.path().join("target.db");
+        let seed = open_write_at(&seed_path)?;
+        init_db(&seed)?;
+        set_corpus_meta(&seed, "embedding_model_id", EMBEDDING_MODEL_ID)?;
+        seed.execute(
+            "INSERT INTO embedding_cache(model_id, text_sha256, embedding)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                EMBEDDING_MODEL_ID,
+                "1".repeat(64),
+                vec![1_u8; EMBEDDING_DIM]
+            ],
+        )?;
+        drop(seed);
+
+        let target = open_write_at(&target_path)?;
+        init_db(&target)?;
+        assert_eq!(seed_embedding_cache(&target, &target_path, &seed_path)?, 1);
+        assert_eq!(seed_embedding_cache(&target, &target_path, &seed_path)?, 0);
+        assert_eq!(
+            target.query_row("SELECT COUNT(*) FROM embedding_cache", [], |row| {
+                row.get::<_, i64>(0)
+            })?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ato_provenance_is_authoritative_and_versioned_when_available() {
+        let native_id = "TXR/TR2026-001/NAT/ATO/00001";
+        assert_eq!(
+            ato_canonical_url(native_id),
+            "https://www.ato.gov.au/law/view/document?docid=TXR/TR2026-001/NAT/ATO/00001"
+        );
+        let record = serde_json::json!({
+            "href": "/law/view/document?docid=TXR/TR2026-001/NAT/ATO/00001&PiT=20260701000001"
+        });
+        assert_eq!(
+            ato_upstream_version(&record, native_id).as_deref(),
+            Some("20260701000001")
+        );
+        assert_eq!(
+            ato_upstream_version(
+                &serde_json::json!({"upstream_version": "edition-4"}),
+                native_id
+            )
+            .as_deref(),
+            Some("edition-4")
+        );
+    }
+
+    fn source_scoped_deletion_connection() -> Result<Connection> {
+        let conn = Connection::open_in_memory()?;
+        init_db(&conn)?;
+        conn.execute_batch(
+            r#"
+            INSERT INTO sources(source_id, display_name) VALUES
+                ('ato', 'Australian Taxation Office'),
+                ('frl', 'Federal Register of Legislation');
+            INSERT INTO documents(
+                source_id, native_id, type, title, canonical_url, downloaded_at,
+                content_hash, html
+            ) VALUES
+                ('ato', 'shared', 'ruling', 'ATO shared', 'https://ato.example/shared',
+                 '2026-07-11T00:00:00Z', 'ato-hash', X'00'),
+                ('frl', 'shared', 'act', 'FRL shared', 'https://frl.example/shared',
+                 '2026-07-11T00:00:00Z', 'frl-hash', X'00');
+            INSERT INTO chunks(chunk_id, source_id, native_id, ord, text) VALUES
+                (1, 'ato', 'shared', 0, X'00'),
+                (2, 'frl', 'shared', 0, X'00');
+            INSERT INTO chunks_fts(rowid, text) VALUES
+                (1, 'ATO chunk'),
+                (2, 'FRL chunk');
+            INSERT INTO title_fts(source_id, native_id, title, headings) VALUES
+                ('ato', 'shared', 'ATO shared', ''),
+                ('frl', 'shared', 'FRL shared', '');
+            INSERT INTO citations(
+                source_chunk_id, source_id, source_native_id,
+                target_source_id, target_native_id
+            ) VALUES
+                (1, 'ato', 'shared', 'frl', 'shared'),
+                (2, 'frl', 'shared', 'ato', 'shared');
+            "#,
+        )?;
+        Ok(conn)
+    }
+
+    #[test]
+    fn remove_build_doc_cleans_fts_and_cascades_only_one_source() -> Result<()> {
+        let conn = source_scoped_deletion_connection()?;
+        remove_build_doc(&conn, "ato", "shared")?;
+
+        let ato_documents: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM documents WHERE source_id = 'ato'",
+            [],
+            |row| row.get(0),
+        )?;
+        let frl_documents: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM documents WHERE source_id = 'frl'",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut chunks_fts_statement =
+            conn.prepare("SELECT rowid FROM chunks_fts ORDER BY rowid")?;
+        let remaining_chunk_fts: Vec<i64> = chunks_fts_statement
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut title_statement =
+            conn.prepare("SELECT source_id FROM title_fts ORDER BY source_id")?;
+        let title_sources: Vec<String> = title_statement
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let citations: i64 =
+            conn.query_row("SELECT COUNT(*) FROM citations", [], |row| row.get(0))?;
+
+        assert_eq!(ato_documents, 0);
+        assert_eq!(frl_documents, 1);
+        assert_eq!(remaining_chunk_fts, vec![2]);
+        assert_eq!(title_sources, vec!["frl"]);
+        assert_eq!(citations, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn source_inventory_difference_deletes_absent_rows_without_cross_source_effects() -> Result<()>
+    {
+        let conn = source_scoped_deletion_connection()?;
+        conn.execute(
+            "INSERT INTO documents(
+                source_id, native_id, type, title, canonical_url, downloaded_at,
+                content_hash, html
+             ) VALUES ('ato', 'keep', 'ruling', 'Keep', 'https://ato.example/keep',
+                       '2026-07-11T00:00:00Z', 'keep-hash', X'00')",
+            [],
+        )?;
+        let inventory = HashSet::from([DocumentId::new("ato".parse()?, "keep")?]);
+
+        assert_eq!(remove_absent_build_docs(&conn, "ato", &inventory)?, 1);
+        let mut remaining_statement = conn
+            .prepare("SELECT source_id, native_id FROM documents ORDER BY source_id, native_id")?;
+        let remaining: Vec<(String, String)> = remaining_statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert_eq!(
+            remaining,
+            vec![
+                ("ato".to_string(), "keep".to_string()),
+                ("frl".to_string(), "shared".to_string()),
+            ]
+        );
+        Ok(())
     }
 }

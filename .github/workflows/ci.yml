@@ -51,13 +51,7 @@ jobs:
       - name: Dependency advisories and policy
         run: |
           cargo audit
-          cat > "$RUNNER_TEMP/deny.toml" <<'EOF'
-          [advisories]
-          ignore = [
-            { id = "RUSTSEC-2024-0436", reason = "tokenizers transitive" },
-          ]
-          EOF
-          cargo deny --config "$RUNNER_TEMP/deny.toml" check advisories
+          cargo deny check advisories
       - name: Shell syntax
         run: bash -n scripts/*.sh
       - name: Metadata and npm allowlist contracts
@@ -71,6 +65,16 @@ jobs:
           plugin = json.loads(plugin_path.read_text())
           market_path = pathlib.Path(".claude-plugin/marketplace.json")
           marketplace = json.loads(market_path.read_text())
+          mcp = json.loads(pathlib.Path(".mcp.json").read_text())
+          assert cargo["package"]["name"] == "australian-legal-mcp"
+          assert {target["name"] for target in cargo.get("bin", [])} == {"legal-mcp"}
+          assert package["name"] == "australian-legal-mcp"
+          assert plugin["name"] == "australian-legal-mcp"
+          assert marketplace["name"] == "australian-legal-mcp"
+          assert marketplace["plugins"][0]["name"] == "australian-legal-mcp"
+          assert mcp["mcpServers"] == {
+              "australian-legal": {"command": "legal-mcp", "args": ["mcp"]}
+          }
           versions = {
               cargo["package"]["version"],
               package["version"],
@@ -78,6 +82,11 @@ jobs:
               marketplace["plugins"][0]["version"],
           }
           assert len(versions) == 1, f"manifest versions differ: {versions}"
+          expected_skills = [
+              "skills/australian-legal-mcp/SKILL.md",
+              "skills/setup-australian-legal-mcp/SKILL.md",
+          ]
+          assert package["pi"]["skills"] == expected_skills
           report = pathlib.Path(os.environ["RUNNER_TEMP"], "npm-pack.json")
           packed = json.loads(report.read_text())[0]["files"]
           names = {entry["path"] for entry in packed}
@@ -90,22 +99,32 @@ jobs:
               if name not in allowed and not name.startswith(roots)
           }
           assert not unexpected, unexpected
-          assert "skills/ato-mcp-server/SKILL.md" in names
-          assert "skills/setup-ato-mcp/SKILL.md" in names
+          for skill in expected_skills:
+              assert skill in names
           PY
       - name: Build package and exercise stdio
+        timeout-minutes: 5
+        shell: bash
         run: |
           cargo build --release --locked
-          install -Dm755 target/release/ato-mcp \
-            "$RUNNER_TEMP/package/ato-mcp"
+          version=$(jq -r .version package.json)
+          target=$(rustc -vV | sed -n 's/^host: //p')
+          executable=legal-mcp
+          binary=target/release/legal-mcp
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            executable=legal-mcp.exe
+            binary=target/release/legal-mcp.exe
+          fi
+          mkdir -p "$RUNNER_TEMP/package"
+          cp "$binary" "$RUNNER_TEMP/package/$executable"
+          chmod 755 "$RUNNER_TEMP/package/$executable"
           cp README.md LICENSE "$RUNNER_TEMP/package/"
-          tar -C "$RUNNER_TEMP/package" -czf \
-            "$RUNNER_TEMP/ato-mcp.tar.gz" .
+          archive="$RUNNER_TEMP/legal-mcp-$version-$target.tar.gz"
+          tar -C "$RUNNER_TEMP/package" -czf "$archive" .
           mkdir "$RUNNER_TEMP/unpacked"
-          tar -C "$RUNNER_TEMP/unpacked" -xzf \
-            "$RUNNER_TEMP/ato-mcp.tar.gz"
-          "$RUNNER_TEMP/unpacked/ato-mcp" --version
-          export ATO_MCP_DATA_DIR="$RUNNER_TEMP/data"
+          tar -C "$RUNNER_TEMP/unpacked" -xzf "$archive"
+          "$RUNNER_TEMP/unpacked/$executable" --version
+          export LEGAL_MCP_DATA_DIR="$RUNNER_TEMP/data"
           request=$(jq -nc '{
             jsonrpc:"2.0", id:1, method:"initialize",
             params:{
@@ -113,8 +132,8 @@ jobs:
               clientInfo:{name:"ci", version:"1"}
             }
           }')
-          printf '%s\n' "$request" | timeout 30 \
-            "$RUNNER_TEMP/unpacked/ato-mcp" mcp \
+          printf '%s\n' "$request" | \
+            "$RUNNER_TEMP/unpacked/$executable" mcp \
             > "$RUNNER_TEMP/stdio.jsonl"
-          jq -e '.result.serverInfo.name == "ato-mcp"' \
+          jq -e '.result.serverInfo.name == "australian-legal-mcp"' \
             "$RUNNER_TEMP/stdio.jsonl"

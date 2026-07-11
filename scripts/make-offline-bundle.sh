@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# Build a complete ato-mcp data directory for a stable, air-gapped install.
+# Build a complete Australian Legal MCP data directory for an air-gapped install.
 #
 # Usage:
 #   scripts/make-offline-bundle.sh [output.tar.zst]
 #
-# The release directory must contain the current schema manifest.json and its
-# single manifest.db artifact, ato.db.zst. The resulting archive is extracted
-# into a stable directory and that directory is supplied as ATO_MCP_DATA_DIR to
-# every future ato-mcp command.
+# The release directory must contain the current schema manifest.json, its
+# legal.db.zst artifact, and every ann/<source>.ann sidecar. The archive is
+# extracted into a stable directory supplied as LEGAL_MCP_DATA_DIR to every
+# future legal-mcp command.
 set -euo pipefail
 
-REPO_DIR="${ATO_MCP_REPO_DIR:-$(pwd)}"
-RELEASE_DIR="${ATO_MCP_RELEASE_DIR:-$REPO_DIR/release}"
-BIN="${ATO_MCP_BIN:-$REPO_DIR/target/release/ato-mcp}"
-MODEL_DIR="${ATO_MCP_MODEL_DIR:-$REPO_DIR/models/granite-embedding-small-r2}"
-OUT="${1:-$RELEASE_DIR/ato-mcp-offline-bundle.tar.zst}"
+REPO_DIR="${LEGAL_MCP_REPO_DIR:-$(pwd)}"
+RELEASE_DIR="${LEGAL_MCP_RELEASE_DIR:-$REPO_DIR/release}"
+BIN="${LEGAL_MCP_BIN:-$REPO_DIR/target/release/legal-mcp}"
+MODEL_DIR="${LEGAL_MCP_MODEL_DIR:-$REPO_DIR/models/granite-embedding-small-r2}"
+OUT="${1:-$RELEASE_DIR/legal-mcp-offline-bundle.tar.zst}"
 
 for command in python3 tar zstd; do
 	command -v "$command" >/dev/null 2>&1 || {
@@ -22,7 +22,7 @@ for command in python3 tar zstd; do
 		exit 1
 	}
 done
-for file in "$RELEASE_DIR/manifest.json" "$RELEASE_DIR/ato.db.zst" "$BIN"; do
+for file in "$RELEASE_DIR/manifest.json" "$RELEASE_DIR/legal.db.zst" "$BIN"; do
 	[ -e "$file" ] || {
 		echo "missing: $file" >&2
 		exit 1
@@ -40,17 +40,9 @@ trap 'rm -rf "$WORKDIR"' EXIT
 MIRROR="$WORKDIR/release"
 DATA_DIR="$WORKDIR/data"
 mkdir -p "$MIRROR" "$DATA_DIR"
-cp "$RELEASE_DIR/manifest.json" "$RELEASE_DIR/ato.db.zst" "$MIRROR/"
-if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("ann") else 1)' \
-	"$RELEASE_DIR/manifest.json"; then
-	[ -f "$RELEASE_DIR/ato.ann" ] || {
-		echo "manifest requires missing $RELEASE_DIR/ato.ann" >&2
-		exit 1
-	}
-	cp "$RELEASE_DIR/ato.ann" "$MIRROR/"
-fi
+cp "$RELEASE_DIR/manifest.json" "$RELEASE_DIR/legal.db.zst" "$MIRROR/"
 
-MODEL_BUNDLE="${ATO_MCP_MODEL_BUNDLE:-}"
+MODEL_BUNDLE="${LEGAL_MCP_MODEL_BUNDLE:-}"
 if [ -z "$MODEL_BUNDLE" ] && [ -f "$RELEASE_DIR/semantic-model-bundle.tar.zst" ]; then
 	MODEL_BUNDLE="$RELEASE_DIR/semantic-model-bundle.tar.zst"
 fi
@@ -77,12 +69,12 @@ else
 		-C "$MODEL_STAGE" -cf - . | zstd -T0 -3 -o "$MIRROR/semantic-model-bundle.tar.zst"
 fi
 
-python3 - "$MIRROR/manifest.json" "$MIRROR/ato.db.zst" "$MIRROR/semantic-model-bundle.tar.zst" "$MIRROR/ato.ann" <<'PY'
-import hashlib, json, pathlib, sys
-manifest_path, db_path, model_path, ann_path = map(pathlib.Path, sys.argv[1:])
+python3 - "$MIRROR/manifest.json" "$MIRROR/legal.db.zst" "$MIRROR/semantic-model-bundle.tar.zst" "$RELEASE_DIR" "$MIRROR" <<'PY'
+import hashlib, json, pathlib, shutil, sys
+manifest_path, db_path, model_path, release_dir, mirror = map(pathlib.Path, sys.argv[1:])
 manifest = json.loads(manifest_path.read_text())
-required = {"schema_version", "index_version", "created_at", "min_client_version", "model", "db"}
-if not required.issubset(manifest) or set(manifest) - required - {"ann"}:
+required = {"schema_version", "index_version", "created_at", "min_client_version", "model", "db", "ann"}
+if set(manifest) != required:
     raise SystemExit("manifest has an unsupported contract")
 def describe(path):
     h = hashlib.sha256()
@@ -92,24 +84,29 @@ def describe(path):
     return h.hexdigest(), path.stat().st_size
 db_sha, db_size = describe(db_path)
 if manifest["db"].get("sha256") != db_sha or manifest["db"].get("size") != db_size:
-    raise SystemExit("manifest.db does not match ato.db.zst")
+    raise SystemExit("manifest.db does not match legal.db.zst")
 manifest["db"]["url"] = db_path.name
-if ann := manifest.get("ann"):
+for source, ann in sorted(manifest["ann"].items()):
+    relative = pathlib.PurePosixPath("ann") / f"{source}.ann"
+    ann_path = release_dir / relative
     if not ann_path.is_file():
-        raise SystemExit("manifest requires a missing ANN sidecar")
+        raise SystemExit(f"manifest requires missing {ann_path}")
     ann_sha, ann_size = describe(ann_path)
     if ann.get("sha256") != ann_sha or ann.get("size") != ann_size:
-        raise SystemExit("manifest.ann does not match ato.ann")
-    ann["url"] = ann_path.name
+        raise SystemExit(f"manifest ANN does not match {ann_path}")
+    destination = mirror / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ann_path, destination)
+    ann["url"] = str(relative)
 model_sha, model_size = describe(model_path)
 manifest["model"].update(url=model_path.name, sha256=model_sha, size=model_size)
 manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 PY
 
-ATO_MCP_DATA_DIR="$DATA_DIR" "$BIN" update --manifest-url "$MIRROR/manifest.json"
-ATO_MCP_DATA_DIR="$DATA_DIR" "$BIN" stats >/dev/null
+LEGAL_MCP_DATA_DIR="$DATA_DIR" "$BIN" update --manifest-url "$MIRROR/manifest.json"
+LEGAL_MCP_DATA_DIR="$DATA_DIR" "$BIN" stats >/dev/null
 rm -f "$DATA_DIR/LOCK"
-find "$DATA_DIR" -type f \( -name 'ato.db-shm' -o -name 'ato.db-wal' \) -delete
+find "$DATA_DIR" -type f \( -name 'legal.db-shm' -o -name 'legal.db-wal' \) -delete
 rm -rf "$DATA_DIR/backups" "$DATA_DIR/staging"
 
 tar --sort=name --mtime='2026-01-01 UTC' --owner=0 --group=0 --numeric-owner \

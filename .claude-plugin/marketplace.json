@@ -1,19 +1,19 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
-  "name": "ato-mcp",
-  "description": "Local marketplace for the ato-mcp plugin.",
+  "name": "australian-legal-mcp",
+  "description": "Local marketplace for the australian-legal-mcp plugin.",
   "owner": {
     "name": "gunba",
-    "url": "https://github.com/gunba/ato-mcp"
+    "url": "https://github.com/gunba/australian-legal-mcp"
   },
   "plugins": [
     {
-      "name": "ato-mcp",
-      "version": "0.16.2",
-      "description": "Local search and retrieval over the Australian Taxation Office legal corpus.",
+      "name": "australian-legal-mcp",
+      "version": "0.17.0",
+      "description": "Local search and retrieval across Australian legal sources.",
       "source": "./",
       "category": "research",
-      "homepage": "https://github.com/gunba/ato-mcp"
+      "homepage": "https://github.com/gunba/australian-legal-mcp"
     }
   ]
 }

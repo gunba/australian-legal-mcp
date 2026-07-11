@@ -1,0 +1,62 @@
+[
+  [
+    {
+      "titleId": "A0001",
+      "start": "2024-01-01T00:00:00",
+      "retrospectiveStart": "2024-01-01T00:00:00",
+      "end": null,
+      "retrospectiveEnd": null,
+      "isCurrent": true,
+      "isLatest": true,
+      "name": "Title A0001",
+      "status": "InForce",
+      "registerId": "FA0001",
+      "registeredAt": "2024-01-10T00:00:00",
+      "compilationNumber": "1"
+    },
+    {
+      "titleId": "A0002",
+      "start": "2024-01-01T00:00:00",
+      "retrospectiveStart": "2024-01-01T00:00:00",
+      "end": null,
+      "retrospectiveEnd": null,
+      "isCurrent": true,
+      "isLatest": true,
+      "name": "Title A0002",
+      "status": "InForce",
+      "registerId": "FA0002",
+      "registeredAt": "2024-01-10T00:00:00",
+      "compilationNumber": "1"
+    }
+  ],
+  [
+    {
+      "titleId": "A0002",
+      "start": "2024-01-01T00:00:00",
+      "retrospectiveStart": "2024-01-01T00:00:00",
+      "end": null,
+      "retrospectiveEnd": null,
+      "isCurrent": true,
+      "isLatest": true,
+      "name": "Title A0002",
+      "status": "InForce",
+      "registerId": "FA0002",
+      "registeredAt": "2024-01-10T00:00:00",
+      "compilationNumber": "1"
+    },
+    {
+      "titleId": "A0003",
+      "start": "2024-01-01T00:00:00",
+      "retrospectiveStart": "2024-01-01T00:00:00",
+      "end": null,
+      "retrospectiveEnd": null,
+      "isCurrent": true,
+      "isLatest": true,
+      "name": "Title A0003",
+      "status": "InForce",
+      "registerId": "FA0003",
+      "registeredAt": "2024-01-10T00:00:00",
+      "compilationNumber": "1"
+    }
+  ]
+]

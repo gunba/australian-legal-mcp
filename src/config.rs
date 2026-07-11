@@ -1,6 +1,7 @@
 //! Paths, file locks, and plugin-side `.mcp.json` discovery under the user's
 //! data dir.
 
+use crate::legal_source::SourceId;
 use crate::APP_NAME;
 use anyhow::{anyhow, Context, Result};
 use fs2::FileExt;
@@ -13,14 +14,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use url::Url;
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const MCP_SERVER_CONFIG_NAME: &str = "australian-legal";
+pub(crate) const LEGAL_DB_FILENAME: &str = "legal.db";
 
 pub(crate) fn data_dir() -> Result<PathBuf> {
-    if let Some(value) = std::env::var_os("ATO_MCP_DATA_DIR") {
+    if let Some(value) = std::env::var_os("LEGAL_MCP_DATA_DIR") {
         let value = value
             .to_str()
-            .ok_or_else(|| anyhow!("ATO_MCP_DATA_DIR must contain valid Unicode"))?;
+            .ok_or_else(|| anyhow!("LEGAL_MCP_DATA_DIR must contain valid Unicode"))?;
         if value.trim().is_empty() {
-            return Err(anyhow!("ATO_MCP_DATA_DIR must not be empty or whitespace"));
+            return Err(anyhow!(
+                "LEGAL_MCP_DATA_DIR must not be empty or whitespace"
+            ));
         }
         let path = PathBuf::from(value);
         fs::create_dir_all(&path)?;
@@ -34,7 +39,11 @@ pub(crate) fn data_dir() -> Result<PathBuf> {
 }
 
 fn validate_generation_key(key: &str) -> Result<()> {
-    if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if key.len() != 64
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         return Err(anyhow!("active corpus generation key is malformed"));
     }
     Ok(())
@@ -56,14 +65,11 @@ pub(crate) fn active_generation_key() -> Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
     }
-    let key = fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?
-        .trim()
-        .to_ascii_lowercase();
+    let key = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     validate_generation_key(&key)?;
     if !generation_dir(&key)?.is_dir() {
         return Err(anyhow!(
-            "active corpus generation {key} is missing; run `ato-mcp update`"
+            "active corpus generation {key} is missing; run `legal-mcp update`"
         ));
     }
     Ok(Some(key))
@@ -82,12 +88,9 @@ pub(crate) fn activate_generation(key: &str) -> Result<()> {
 }
 
 pub(crate) fn live_dir() -> Result<PathBuf> {
-    if let Some(key) = active_generation_key()? {
-        return generation_dir(&key);
-    }
-    let path = data_dir()?.join("live");
-    fs::create_dir_all(&path)?;
-    Ok(path)
+    let key = active_generation_key()?
+        .ok_or_else(|| anyhow!("no active legal corpus generation; run `legal-mcp update`"))?;
+    generation_dir(&key)
 }
 
 pub(crate) fn staging_dir() -> Result<PathBuf> {
@@ -97,18 +100,15 @@ pub(crate) fn staging_dir() -> Result<PathBuf> {
 }
 
 pub(crate) fn db_path() -> Result<PathBuf> {
-    Ok(live_dir()?.join("ato.db"))
+    Ok(live_dir()?.join(LEGAL_DB_FILENAME))
 }
 
-pub(crate) fn ann_path() -> Result<PathBuf> {
-    Ok(live_dir()?.join(crate::ann::ANN_FILENAME))
+pub(crate) fn ann_path(source_id: &SourceId) -> Result<PathBuf> {
+    Ok(live_dir()?.join(crate::ann::sidecar_relative_path(source_id)))
 }
 
 pub(crate) fn installed_manifest_path() -> Result<PathBuf> {
-    if let Some(key) = active_generation_key()? {
-        return Ok(generation_dir(&key)?.join("installed_manifest.json"));
-    }
-    Ok(data_dir()?.join("installed_manifest.json"))
+    Ok(live_dir()?.join("installed_manifest.json"))
 }
 
 pub(crate) fn lock_path() -> Result<PathBuf> {
@@ -147,7 +147,7 @@ pub(crate) fn lock_file() -> Result<File> {
         .read(true)
         .write(true)
         .open(path)?;
-    // [UM-02] Single-writer guard around update/install: cross-platform
+    // Single-writer guard around update/install: cross-platform
     // advisory lock via fs2::FileExt on the app LOCK file.
     file.lock_exclusive()?;
     Ok(file)
@@ -220,12 +220,11 @@ fn plugin_mcp_json_from_manifests(
     let plugins = installed_plugins
         .get("plugins")
         .and_then(|v| v.as_object())?;
-    // Entries are keyed like `ato-mcp@<marketplace>`; the value is an array of
-    // install records. Take the newest install of any entry whose key starts
-    // with `ato-mcp@`.
+    // Entries are keyed like `australian-legal-mcp@<marketplace>`; the value is
+    // an array of install records. Take the newest install for this plugin.
     let mut newest: Option<(String, String, PathBuf)> = None;
     for (key, installs) in plugins {
-        let Some(marketplace) = key.strip_prefix("ato-mcp@") else {
+        let Some(marketplace) = key.strip_prefix("australian-legal-mcp@") else {
             continue;
         };
         let Some(records) = installs.as_array() else {
@@ -342,30 +341,22 @@ fn parse_url_port(url: &str) -> Option<u16> {
     (parsed.as_str() == server_url(port)).then_some(port)
 }
 
-fn ato_mcp_entry(value: &JsonValue) -> Option<&JsonValue> {
+fn mcp_server_entry(value: &JsonValue) -> Option<&JsonValue> {
     value
         .get("mcpServers")
-        .and_then(|servers| servers.get("ato"))
-        .or_else(|| value.get("ato"))
+        .and_then(|servers| servers.get(MCP_SERVER_CONFIG_NAME))
 }
 
-fn ato_mcp_entry_mut(value: &mut JsonValue) -> Option<&mut JsonValue> {
-    if value
-        .get("mcpServers")
-        .and_then(|servers| servers.get("ato"))
-        .is_some()
-    {
-        return value
-            .get_mut("mcpServers")
-            .and_then(|servers| servers.get_mut("ato"));
-    }
-    value.get_mut("ato")
+fn mcp_server_entry_mut(value: &mut JsonValue) -> Option<&mut JsonValue> {
+    value
+        .get_mut("mcpServers")
+        .and_then(|servers| servers.get_mut(MCP_SERVER_CONFIG_NAME))
 }
 
-/// Update the `ato` MCP server entry in the plugin's `.mcp.json` to point at
-/// the given URL. Used when `ato-mcp serve` had to pick a new port and the
-/// plugin's existing URL is stale. Returns `true` when the file was actually
-/// changed.
+/// Update the `australian-legal` server entry in the plugin's `.mcp.json` to
+/// point at the given URL. Used when `legal-mcp serve` had to pick a new
+/// port and the plugin's existing URL is stale. Returns `true` when the file
+/// was actually changed.
 pub(crate) fn update_plugin_mcp_json_url(path: &std::path::Path, new_url: &str) -> Result<bool> {
     parse_url_port(new_url).ok_or_else(|| {
         anyhow!("MCP endpoint must be a canonical loopback URL like http://127.0.0.1:<port>/mcp")
@@ -373,8 +364,8 @@ pub(crate) fn update_plugin_mcp_json_url(path: &std::path::Path, new_url: &str) 
     let raw = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut value: JsonValue =
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
-    let entry = ato_mcp_entry_mut(&mut value)
-        .ok_or_else(|| anyhow!("{} has no `ato` entry", path.display()))?;
+    let entry = mcp_server_entry_mut(&mut value)
+        .ok_or_else(|| anyhow!("{} has no `{MCP_SERVER_CONFIG_NAME}` entry", path.display()))?;
     if entry.get("command").is_some() {
         return Ok(false);
     }
@@ -402,7 +393,7 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("ato-mcp-state");
+            .unwrap_or("australian-legal-mcp-state");
         let temp = parent.join(format!(
             ".{file_name}.{}.{}.tmp",
             std::process::id(),
@@ -481,7 +472,7 @@ fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Pick the port `ato-mcp serve` should bind. Precedence:
+/// Pick the port `legal-mcp serve` should bind. Precedence:
 ///   1. `--port` flag, if the caller supplied one.
 ///   2. The port in the plugin's installed `.mcp.json` (if it's bindable —
 ///      i.e. not the `:0` sentinel and not already in use).
@@ -512,7 +503,7 @@ pub(crate) fn resolve_serve_port(cli_override: Option<u16>) -> Result<PortChoice
         fs::read_to_string(&mcp_json).with_context(|| format!("reading {}", mcp_json.display()))?;
     let value: JsonValue =
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", mcp_json.display()))?;
-    let entry = ato_mcp_entry(&value);
+    let entry = mcp_server_entry(&value);
     if entry.and_then(|v| v.get("command")).is_some() {
         return Ok(PortChoice::Cli(pick_free_port()?));
     }
@@ -564,12 +555,44 @@ mod tests {
     fn data_dir_rejects_empty_or_whitespace_override() {
         for value in ["", " ", "\t\n"] {
             let _environment =
-                crate::TestEnvironment::set(&[("ATO_MCP_DATA_DIR", std::ffi::OsStr::new(value))]);
+                crate::TestEnvironment::set(&[("LEGAL_MCP_DATA_DIR", std::ffi::OsStr::new(value))]);
             let error = data_dir().unwrap_err();
             assert!(error
                 .to_string()
                 .contains("must not be empty or whitespace"));
         }
+    }
+
+    #[test]
+    fn generation_paths_require_one_strict_active_generation() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let _environment =
+            crate::TestEnvironment::set(&[("LEGAL_MCP_DATA_DIR", root.path().as_os_str())]);
+
+        assert!(live_dir().is_err());
+        assert!(!root.path().join("live").exists());
+
+        fs::write(root.path().join("active-generation"), "A".repeat(64))?;
+        assert!(active_generation_key().is_err());
+        fs::remove_file(root.path().join("active-generation"))?;
+
+        let key = "a".repeat(64);
+        let generation = generation_dir(&key)?;
+        fs::create_dir_all(&generation)?;
+        activate_generation(&key)?;
+
+        let source_id: SourceId = "ato".parse().expect("valid test source id");
+        assert_eq!(live_dir()?, generation);
+        assert_eq!(db_path()?, generation.join(LEGAL_DB_FILENAME));
+        assert_eq!(
+            ann_path(&source_id)?,
+            generation.join("ann").join("ato.ann")
+        );
+        assert_eq!(
+            installed_manifest_path()?,
+            generation.join("installed_manifest.json")
+        );
+        Ok(())
     }
 
     #[test]
@@ -592,7 +615,7 @@ mod tests {
     #[test]
     fn update_plugin_mcp_json_url_ignores_command_entry() {
         let root = std::env::temp_dir().join(format!(
-            "ato-mcp-config-test-{}-command-entry",
+            "australian-legal-mcp-config-test-{}-command-entry",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&root);
@@ -602,8 +625,8 @@ mod tests {
             &path,
             r#"{
   "mcpServers": {
-    "ato": {
-      "command": "ato-mcp",
+    "australian-legal": {
+      "command": "legal-mcp",
       "args": ["mcp"],
       "url": "http://127.0.0.1:9/mcp"
     }
@@ -616,7 +639,7 @@ mod tests {
         assert!(!update_plugin_mcp_json_url(&path, "http://127.0.0.1:12345/mcp").unwrap());
         let value: JsonValue = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
-            value["mcpServers"]["ato"]["url"].as_str(),
+            value["mcpServers"]["australian-legal"]["url"].as_str(),
             Some("http://127.0.0.1:9/mcp")
         );
 
@@ -626,7 +649,7 @@ mod tests {
     #[test]
     fn directory_marketplace_mcp_json_wins_over_cache_install() {
         let root = std::env::temp_dir().join(format!(
-            "ato-mcp-config-test-{}-directory",
+            "australian-legal-mcp-config-test-{}-directory",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&root);
@@ -639,14 +662,14 @@ mod tests {
 
         let installed = serde_json::json!({
             "plugins": {
-                "ato-mcp@ato-mcp": [{
+                "australian-legal-mcp@australian-legal-mcp": [{
                     "installPath": cache_dir,
                     "lastUpdated": "2026-05-24T10:42:04Z"
                 }]
             }
         });
         let known = serde_json::json!({
-            "ato-mcp": {
+            "australian-legal-mcp": {
                 "source": {
                     "source": "directory",
                     "path": source_dir
@@ -663,8 +686,10 @@ mod tests {
 
     #[test]
     fn plugin_mcp_json_falls_back_to_cache_install() {
-        let root =
-            std::env::temp_dir().join(format!("ato-mcp-config-test-{}-cache", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "australian-legal-mcp-config-test-{}-cache",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&root);
         let cache_dir = root.join("cache");
         fs::create_dir_all(&cache_dir).unwrap();
@@ -672,7 +697,7 @@ mod tests {
 
         let installed = serde_json::json!({
             "plugins": {
-                "ato-mcp@ato-mcp": [{
+                "australian-legal-mcp@australian-legal-mcp": [{
                     "installPath": cache_dir,
                     "lastUpdated": "2026-05-24T10:42:04Z"
                 }]

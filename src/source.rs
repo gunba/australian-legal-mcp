@@ -1,14 +1,13 @@
-//! Source acquisition (scraper) + stats + manifest/update/release.
-//!
-//! TODO: this file accumulated several distinct concerns during the v0.11
-//! refactor — split into scraper.rs, stats.rs, and manifest.rs in a follow-up.
+//! ATO acquisition, corpus statistics, manifest validation, updates and
+//! immutable generation promotion.
 
 use crate::config::{
-    activate_generation, data_dir, generation_dir, generations_dir, installed_manifest_path,
-    live_dir, lock_file, staging_dir,
+    activate_generation, active_generation_key, data_dir, generation_dir, generations_dir,
+    installed_manifest_path, live_dir, lock_file, staging_dir, LEGAL_DB_FILENAME,
 };
-use crate::db::{get_meta, open_read, open_write_at, set_meta, table_exists};
+use crate::db::{get_corpus_meta, get_source_meta, open_read, open_write_at};
 use crate::extract::anchors_node_text;
+use crate::legal_source::{source_registry, SourceId};
 use crate::search::ensure_vector_search_ready;
 use crate::semantic::EMBEDDING_MODEL_HF_FILES;
 use crate::{
@@ -18,14 +17,13 @@ use crate::{
     OLD_CONTENT_CUTOFF, SUPPORTED_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::Utc;
 use reqwest::blocking::{Client, Response};
 use reqwest::redirect::Policy;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{BufReader, Cursor, Read, Seek, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
@@ -33,8 +31,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_DECOMPRESSED_DB_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_ATO_HTML_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 5;
+#[cfg(test)]
+pub(crate) const LEGAL_DB_ARCHIVE_FILENAME: &str = "legal.db.zst";
 
 fn approved_https_host(host: &str) -> bool {
     const ROOTS: &[&str] = &[
@@ -140,16 +141,20 @@ fn resolved_source(
     value: &str,
     context: &UrlContext,
 ) -> Result<std::result::Result<PathBuf, url::Url>> {
+    let direct_local = local_path_from_urlish(value);
     let resolved = resolve_manifest_asset(value, context);
-    if let Some(path) = local_path_from_urlish(&resolved) {
+    if let Some(path) = direct_local.or_else(|| local_path_from_urlish(&resolved)) {
+        let root = context.manifest_dir.as_ref().ok_or_else(|| {
+            anyhow!("a remote manifest cannot reference a local artifact: {value}")
+        })?;
         let canonical = path
             .canonicalize()
             .with_context(|| format!("canonicalizing {}", path.display()))?;
-        if let Some(root) = &context.manifest_dir {
-            let root = root.canonicalize()?;
-            if !canonical.starts_with(&root) {
-                bail!("manifest asset escaped {}", root.display());
-            }
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("canonicalizing manifest root {}", root.display()))?;
+        if !canonical.starts_with(&root) {
+            bail!("manifest asset escaped {}", root.display());
         }
         if !canonical.is_file() {
             bail!(
@@ -285,7 +290,7 @@ pub(crate) fn download_approved_https_to_file(
     Ok(copied)
 }
 
-// ----- What's New scraper (port of src/ato_mcp/scraper/whats_new.py) -----
+// ----- ATO What's New feed ingestion -----
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WhatsNewEntry {
@@ -323,7 +328,10 @@ pub(crate) fn normalize_doc_href(href: &str) -> String {
         }
     }
     if let Some(id) = docid {
-        return format!("/law/view/document?docid={id}");
+        return format!(
+            "/law/view/document?docid={}",
+            crate::html::canonical_ato_native_id(&id)
+        );
     }
     if let Some(q) = parsed.query() {
         if !q.is_empty() {
@@ -396,58 +404,88 @@ pub(crate) fn parse_whats_new(html: &str, base_url: &str) -> Result<Vec<WhatsNew
 
 pub(crate) fn stats() -> Result<String> {
     let conn = open_read()?;
-    // Prefer counts persisted at build time (sub-ms `meta` reads) over live
-    // COUNT(*) scans, which take 5-10s on a cold multi-GB corpus. Old
-    // corpora without these keys fall through to the scan path so they
-    // keep working at the previous speed.
-    let docs = match read_count_meta(&conn, "documents_count")? {
-        Some(n) => n,
-        None => count_table(&conn, "documents")?,
-    };
-    let chunks = match read_count_meta(&conn, "chunks_count")? {
-        Some(n) => n,
-        None => count_table(&conn, "chunks")?,
-    };
-    let embeddings = match read_count_meta(&conn, "chunk_embeddings_count")? {
-        Some(n) => n,
-        None => {
-            if table_exists(&conn, "chunk_embeddings")? {
-                count_table(&conn, "chunk_embeddings")?
-            } else {
-                0
+    let installed_manifest = load_installed_manifest()?;
+    let docs = read_corpus_count_meta(&conn, "documents_count")?
+        .unwrap_or(count_table(&conn, "documents")?);
+    let chunks =
+        read_corpus_count_meta(&conn, "chunks_count")?.unwrap_or(count_table(&conn, "chunks")?);
+    let embeddings = read_corpus_count_meta(&conn, "chunk_embeddings_count")?
+        .unwrap_or(count_table(&conn, "chunk_embeddings")?);
+    let definitions = read_corpus_count_meta(&conn, "definitions_count")?
+        .unwrap_or(count_table(&conn, "definitions")?);
+
+    let registry = source_registry();
+    let registered_sources = registered_source_ids();
+    let database_sources = database_source_ids(&conn)?;
+    if database_sources != registered_sources {
+        bail!(
+            "installed database source set does not match this binary: registered={registered_sources:?}, database={database_sources:?}"
+        );
+    }
+    let descriptors = registry.descriptors();
+    let default_source = registry.resolve(None)?;
+    let mut source_stats = BTreeMap::new();
+    let mut default_types = None;
+    let mut default_prefix_breakdown = None;
+    let mut semantic_search_ready = true;
+    for descriptor in &descriptors {
+        let source_id = descriptor.id.as_str();
+        let source_docs = read_source_count_meta(&conn, source_id, "documents_count")?
+            .unwrap_or(count_source_table(&conn, source_id, "documents")?);
+        let source_chunks = read_source_count_meta(&conn, source_id, "chunks_count")?
+            .unwrap_or(count_source_table(&conn, source_id, "chunks")?);
+        let source_embeddings = read_source_count_meta(&conn, source_id, "chunk_embeddings_count")?
+            .unwrap_or(count_source_table(&conn, source_id, "chunk_embeddings")?);
+        let source_definitions = read_source_count_meta(&conn, source_id, "definitions_count")?
+            .unwrap_or(count_source_table(&conn, source_id, "definitions")?);
+        let types = match get_source_meta(&conn, source_id, "documents_by_type_json")? {
+            Some(cached) => {
+                serde_json::from_str::<BTreeMap<String, i64>>(&cached).with_context(|| {
+                    format!("parsing cached document types for source `{source_id}`")
+                })?
             }
+            None => compute_documents_by_type(&conn, source_id)?,
+        };
+        let prefix_breakdown = match get_source_meta(&conn, source_id, "prefix_breakdown_json")? {
+            Some(cached) => serde_json::from_str::<Vec<JsonValue>>(&cached).with_context(|| {
+                format!("parsing cached prefix breakdown for source `{source_id}`")
+            })?,
+            None => collect_prefix_breakdown(&conn, source_id)?,
+        };
+        if descriptor.id == default_source {
+            default_types = Some(types.clone());
+            default_prefix_breakdown = Some(prefix_breakdown.clone());
         }
-    };
-    let definitions = match read_count_meta(&conn, "definitions_count")? {
-        Some(n) => n,
-        None => {
-            if table_exists(&conn, "definitions")? {
-                count_table(&conn, "definitions")?
-            } else {
-                0
-            }
-        }
-    };
-    let types = match get_meta(&conn, "documents_by_type_json")? {
-        Some(json) => serde_json::from_str::<BTreeMap<String, i64>>(&json)
-            .context("parsing cached documents_by_type_json")?,
-        None => compute_documents_by_type(&conn)?,
-    };
-    // [SW-05] prefix_breakdown is corpus-derived: doc_id-prefix counts plus a
-    // sample title per prefix as the description. Replaces the hand-maintained
-    // prefix-to-doc-type map; agents read this to discover the canonical
-    // ``doc_scope="<PREFIX>/*"`` filter idiom for every prefix in the corpus.
-    let prefix_breakdown = match get_meta(&conn, "prefix_breakdown_json")? {
-        Some(json) => serde_json::from_str::<Vec<JsonValue>>(&json)
-            .context("parsing cached prefix_breakdown_json")?,
-        None => collect_prefix_breakdown(&conn)?,
-    };
-    let semantic_search_ready = ensure_vector_search_ready(&conn).is_ok();
+        let source_semantic_search_ready =
+            ensure_vector_search_ready(&conn, &descriptor.id).is_ok();
+        semantic_search_ready &= source_semantic_search_ready;
+        source_stats.insert(
+            source_id.to_string(),
+            json!({
+                "source_id": source_id,
+                "display_name": descriptor.display_name,
+                "corpus_id": get_source_meta(&conn, source_id, "corpus_id")?,
+                "semantic_search_ready": source_semantic_search_ready,
+                "documents": source_docs,
+                "chunks": source_chunks,
+                "chunk_embeddings": source_embeddings,
+                "definitions": source_definitions,
+                "ann": installed_manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.ann.get(&descriptor.id)),
+                "types": types,
+                "prefix_breakdown": prefix_breakdown,
+            }),
+        );
+    }
     let payload = json!({
         "data_dir": data_dir()?.display().to_string(),
-        "index_version": get_meta(&conn, "index_version")?,
-        "last_update_at": get_meta(&conn, "last_update_at")?,
-        "embedding_model_id": get_meta(&conn, "embedding_model_id")?,
+        "index_version": get_corpus_meta(&conn, "index_version")?,
+        "last_update_at": get_corpus_meta(&conn, "last_update_at")?,
+        "sources": descriptors,
+        "source_stats": source_stats,
+        "default_source": default_source.as_str(),
+        "embedding_model_id": get_corpus_meta(&conn, "embedding_model_id")?,
         "semantic_search_ready": semantic_search_ready,
         "search_modes": ["hybrid", "vector", "keyword"],
         "default_search_mode": "hybrid",
@@ -455,8 +493,9 @@ pub(crate) fn stats() -> Result<String> {
         "chunks": chunks,
         "chunk_embeddings": embeddings,
         "definitions": definitions,
-        "types": types,
-        "prefix_breakdown": prefix_breakdown,
+        "types": default_types.ok_or_else(|| anyhow!("default source is not registered"))?,
+        "prefix_breakdown": default_prefix_breakdown
+            .ok_or_else(|| anyhow!("default source is not registered"))?,
         "default_search_policy": {
             "excluded_types": DEFAULT_EXCLUDED_TYPES,
             "excluded_type_labels": [EDITED_PRIVATE_ADVICE_LABEL],
@@ -465,12 +504,33 @@ pub(crate) fn stats() -> Result<String> {
             "old_content_exception_type_labels": [LEGISLATION_TYPE],
         },
     });
-    // [OF-06] JSON outputs use serde_json pretty rendering before return/write.
+    // JSON outputs use serde_json pretty rendering before return/write.
     Ok(serde_json::to_string_pretty(&payload)?)
 }
 
-fn read_count_meta(conn: &Connection, key: &str) -> Result<Option<i64>> {
-    Ok(get_meta(conn, key)?.and_then(|s| s.trim().parse::<i64>().ok()))
+fn parse_count_meta(value: Option<String>, label: &str) -> Result<Option<i64>> {
+    value
+        .map(|raw| -> Result<i64> {
+            let count = raw
+                .parse::<i64>()
+                .with_context(|| format!("parsing {label} count `{raw}`"))?;
+            if count < 0 {
+                bail!("{label} count must not be negative");
+            }
+            Ok(count)
+        })
+        .transpose()
+}
+
+fn read_corpus_count_meta(conn: &Connection, key: &str) -> Result<Option<i64>> {
+    parse_count_meta(get_corpus_meta(conn, key)?, key)
+}
+
+fn read_source_count_meta(conn: &Connection, source_id: &str, key: &str) -> Result<Option<i64>> {
+    parse_count_meta(
+        get_source_meta(conn, source_id, key)?,
+        &format!("source `{source_id}` {key}"),
+    )
 }
 
 fn count_table(conn: &Connection, table: &str) -> Result<i64> {
@@ -480,11 +540,19 @@ fn count_table(conn: &Connection, table: &str) -> Result<i64> {
         .with_context(|| format!("counting rows in {table}"))
 }
 
-pub(crate) fn compute_documents_by_type(conn: &Connection) -> Result<BTreeMap<String, i64>> {
+pub(crate) fn compute_documents_by_type(
+    conn: &Connection,
+    source_id: &str,
+) -> Result<BTreeMap<String, i64>> {
     let mut types = BTreeMap::new();
-    let mut stmt =
-        conn.prepare("SELECT type, COUNT(*) AS n FROM documents GROUP BY type ORDER BY n DESC")?;
-    let rows = stmt.query_map([], |row| {
+    let mut stmt = conn.prepare(
+        "SELECT type, COUNT(*) AS n
+         FROM documents
+         WHERE source_id = ?1
+         GROUP BY type
+         ORDER BY n DESC, type ASC",
+    )?;
+    let rows = stmt.query_map([source_id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
     for row in rows {
@@ -494,6 +562,29 @@ pub(crate) fn compute_documents_by_type(conn: &Connection) -> Result<BTreeMap<St
     Ok(types)
 }
 
+fn count_source_table(conn: &Connection, source_id: &str, table: &str) -> Result<i64> {
+    if table == "chunk_embeddings" {
+        return conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM chunk_embeddings AS embedding
+                 INNER JOIN chunks AS chunk ON chunk.chunk_id = embedding.chunk_id
+                 WHERE chunk.source_id = ?1",
+                [source_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into);
+    }
+    let sql = match table {
+        "documents" => "SELECT COUNT(*) FROM documents WHERE source_id = ?1",
+        "chunks" => "SELECT COUNT(*) FROM chunks WHERE source_id = ?1",
+        "definitions" => "SELECT COUNT(*) FROM definitions WHERE source_id = ?1",
+        _ => bail!("unsupported source-count table `{table}`"),
+    };
+    conn.query_row(sql, [source_id], |row| row.get(0))
+        .map_err(Into::into)
+}
+
 /// Per-prefix corpus breakdown — doc_id-prefix counts plus a sample-title
 /// description. Replaces the hand-maintained prefix-to-doc-type yaml: the only
 /// signal we trust is the corpus itself.
@@ -501,7 +592,10 @@ pub(crate) fn compute_documents_by_type(conn: &Connection) -> Result<BTreeMap<St
 /// The description is the leading segment of the first sample title (the part
 /// before ` — ` when present, otherwise the full title), since titles for many
 /// ATO doc types don't carry a doc-type label at all (cases, sections, etc.).
-pub(crate) fn collect_prefix_breakdown(conn: &rusqlite::Connection) -> Result<Vec<JsonValue>> {
+pub(crate) fn collect_prefix_breakdown(
+    conn: &rusqlite::Connection,
+    source_id: &str,
+) -> Result<Vec<JsonValue>> {
     // Single-pass window function: partition by docid prefix, compute count
     // + pick one representative title per prefix. Replaces N+1 selects that
     // each ran an UPPER(title) LIKE sort over thousands of rows — that
@@ -517,25 +611,26 @@ pub(crate) fn collect_prefix_breakdown(conn: &rusqlite::Connection) -> Result<Ve
         WITH ranked AS (
           SELECT
             CASE
-              WHEN INSTR(doc_id, '/') > 0
-                THEN UPPER(SUBSTR(doc_id, 1, INSTR(doc_id, '/') - 1))
-              ELSE UPPER(doc_id)
+              WHEN INSTR(native_id, '/') > 0
+                THEN UPPER(SUBSTR(native_id, 1, INSTR(native_id, '/') - 1))
+              ELSE UPPER(native_id)
             END AS prefix,
             title,
-            doc_id
+            native_id
           FROM documents
+          WHERE source_id = ?1
         ),
         windowed AS (
           SELECT
             prefix,
             title,
-            doc_id,
+            native_id,
             COUNT(*) OVER (PARTITION BY prefix) AS doc_count,
             ROW_NUMBER() OVER (
               PARTITION BY prefix
               ORDER BY
                 CASE WHEN title LIKE prefix || ' %' THEN 1 ELSE 0 END,
-                doc_id
+                native_id
             ) AS rn
           FROM ranked
         )
@@ -545,7 +640,7 @@ pub(crate) fn collect_prefix_breakdown(conn: &rusqlite::Connection) -> Result<Ve
         ORDER BY doc_count DESC, prefix ASC
         "#,
     )?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map([source_id], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, i64>(1)?,
@@ -565,6 +660,28 @@ pub(crate) fn collect_prefix_breakdown(conn: &rusqlite::Connection) -> Result<Ve
     Ok(entries)
 }
 
+fn registered_source_ids() -> BTreeSet<SourceId> {
+    source_registry()
+        .descriptors()
+        .into_iter()
+        .map(|descriptor| descriptor.id)
+        .collect()
+}
+
+fn database_source_ids(conn: &Connection) -> Result<BTreeSet<SourceId>> {
+    let mut stmt = conn.prepare("SELECT source_id FROM sources ORDER BY source_id")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut source_ids = BTreeSet::new();
+    for row in rows {
+        let raw = row?;
+        let source_id = raw
+            .parse::<SourceId>()
+            .with_context(|| format!("database contains invalid source id `{raw}`"))?;
+        source_ids.insert(source_id);
+    }
+    Ok(source_ids)
+}
+
 /// Take the part before the first ` — ` em-dash separator if present, else the
 /// full title. ATO ruling titles use that separator to delimit the citation;
 /// for other doc types the title is already the cleanest description we have.
@@ -579,16 +696,13 @@ pub(crate) fn description_from_title(title: &str) -> String {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Manifest {
-    pub(crate) schema_version: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) manifest_format_version: Option<u32>,
+    pub(crate) schema_version: u32,
     pub(crate) index_version: String,
     pub(crate) created_at: String,
     pub(crate) min_client_version: String,
     pub(crate) model: ModelInfo,
     pub(crate) db: ManifestDb,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) ann: Option<crate::ann::ManifestAnn>,
+    pub(crate) ann: BTreeMap<SourceId, crate::ann::ManifestAnn>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -614,68 +728,142 @@ pub(crate) struct UpdateStats {
 }
 
 pub(crate) fn apply_update(manifest_url: &str) -> Result<UpdateStats> {
-    // [UM-01] apply_update holds the app LOCK around all install/update mutation.
+    // apply_update holds the app LOCK around all install/update mutation.
     let lock = lock_file()?;
     let result = apply_update_locked(manifest_url);
     lock.unlock()?;
     result
 }
 
-/// Reject a manifest whose `schema_version` is not the current release
-/// format, or whose `min_client_version` is newer than the currently-running
-/// binary.
-// [CC-03] update and the serve-startup probe both gate on
-// enforce_manifest_compatibility. Update surfaces the upgrade-the-binary error;
-// the probe silently suppresses the incompatible case.
-pub(crate) fn enforce_manifest_compatibility(manifest: &Manifest) -> Result<()> {
-    let schema_version = manifest.schema_version;
-    if schema_version < 0 {
-        bail!("manifest schema_version is negative ({schema_version}); manifest is malformed");
-    }
-    let schema_version = schema_version as u32;
-    if schema_version != SUPPORTED_SCHEMA_VERSION {
+pub(crate) fn validate_manifest(manifest: &Manifest) -> Result<()> {
+    if manifest.schema_version != SUPPORTED_SCHEMA_VERSION {
         bail!(
-            "manifest schema_version {schema_version} is not supported by this binary (expects {SUPPORTED_SCHEMA_VERSION}); install a matching ato-mcp release"
+            "manifest schema_version {} is not supported by this binary (expects {SUPPORTED_SCHEMA_VERSION}); install a matching australian-legal-mcp release",
+            manifest.schema_version
         );
     }
-    let min = manifest.min_client_version.trim();
-    if !min.is_empty() {
-        let current = env!("CARGO_PKG_VERSION");
-        if cmp_dotted_version(min, current).is_gt() {
-            bail!(
-                "manifest requires ato-mcp >= {min}, but this binary is {current}; please upgrade the ato-mcp binary"
-            );
-        }
+    if manifest.index_version.trim() != manifest.index_version
+        || manifest.index_version.is_empty()
+        || manifest.index_version.chars().any(char::is_control)
+    {
+        bail!("manifest index_version is malformed");
+    }
+    chrono::DateTime::parse_from_rfc3339(&manifest.created_at)
+        .context("manifest created_at must be RFC 3339")?;
+    let min = parse_release_version(&manifest.min_client_version, "manifest min_client_version")?;
+    let current = parse_release_version(env!("CARGO_PKG_VERSION"), "binary version")?;
+    if min > current {
+        bail!(
+            "manifest requires australian-legal-mcp >= {}, but this binary is {}; please upgrade the legal-mcp binary",
+            manifest.min_client_version,
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+    if manifest.model.id != EMBEDDING_MODEL_ID {
+        bail!(
+            "manifest model `{}` does not match required model `{EMBEDDING_MODEL_ID}`",
+            manifest.model.id
+        );
     }
     validate_manifest_model_source(&manifest.model)?;
-    let manifest_format = manifest.manifest_format_version.unwrap_or(1);
-    match manifest_format {
-        1 if manifest.ann.is_some() => {
-            bail!("legacy manifest format 1 cannot declare an ANN sidecar")
-        }
-        1 => {}
-        crate::SUPPORTED_MANIFEST_FORMAT_VERSION if manifest.ann.is_none() => bail!(
-            "manifest format {} requires an ANN sidecar",
-            crate::SUPPORTED_MANIFEST_FORMAT_VERSION
-        ),
-        crate::SUPPORTED_MANIFEST_FORMAT_VERSION => {}
-        other => bail!(
-            "manifest format {other} is not supported by this binary (expects 1 or {})",
-            crate::SUPPORTED_MANIFEST_FORMAT_VERSION
-        ),
+    validate_artifact_locator(&manifest.db.url, "database artifact")?;
+    if manifest.db.size == 0 || !is_lower_sha256(&manifest.db.sha256) {
+        bail!("manifest database artifact metadata is malformed");
     }
-    if let Some(ann) = manifest.ann.as_ref() {
-        crate::ann::validate_manifest_ann(ann)?;
+    let expected_sources = registered_source_ids();
+    let manifest_sources = manifest.ann.keys().cloned().collect::<BTreeSet<_>>();
+    if manifest_sources != expected_sources {
+        bail!(
+            "manifest source set does not match this binary: registered={expected_sources:?}, manifest={manifest_sources:?}"
+        );
+    }
+    let mut artifact_urls = BTreeSet::from([manifest.db.url.clone()]);
+    for (source_id, ann) in &manifest.ann {
+        crate::ann::validate_manifest_ann(source_id, ann)?;
+        validate_artifact_locator(&ann.url, &format!("ANN artifact for source `{source_id}`"))?;
+        if !artifact_urls.insert(ann.url.clone()) {
+            bail!("manifest artifacts must have distinct URLs");
+        }
         if ann.embedding_model_id != manifest.model.id {
-            bail!("ANN sidecar model does not match manifest model");
+            bail!("ANN sidecar model for source `{source_id}` does not match manifest model");
         }
     }
     Ok(())
 }
 
+fn validate_artifact_locator(value: &str, label: &str) -> Result<()> {
+    if value.trim() != value || value.is_empty() || value.chars().any(char::is_control) {
+        bail!("manifest {label} URL is malformed");
+    }
+    if let Ok(url) = url::Url::parse(value) {
+        if url.scheme() != "https"
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
+            bail!("manifest {label} URL must be an uncredentialed HTTPS URL");
+        }
+        return Ok(());
+    }
+    let path = Path::new(value);
+    if path.is_absolute()
+        || value.contains('\\')
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("manifest {label} path must be a confined relative path");
+    }
+    Ok(())
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn parse_release_version(value: &str, label: &str) -> Result<Vec<u32>> {
+    if value.is_empty() || value.trim() != value {
+        bail!("{label} is malformed");
+    }
+    let (core, suffix) = value
+        .split_once('-')
+        .map_or((value, None), |(core, suffix)| (core, Some(suffix)));
+    if suffix.is_some_and(|suffix| {
+        suffix.is_empty()
+            || !suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    }) {
+        bail!("{label} is malformed");
+    }
+    let fields = core.split('.').collect::<Vec<_>>();
+    if fields.len() != 3 {
+        bail!("{label} must contain major.minor.patch");
+    }
+    fields
+        .into_iter()
+        .map(|field| {
+            if field.is_empty()
+                || !field.bytes().all(|byte| byte.is_ascii_digit())
+                || (field.len() > 1 && field.starts_with('0'))
+            {
+                bail!("{label} is malformed");
+            }
+            field
+                .parse::<u32>()
+                .with_context(|| format!("{label} component is too large"))
+        })
+        .collect()
+}
+
 /// Compare two dotted version strings (`a.b.c[-suffix]`) by their numeric
 /// components only. Returns `Ordering::Less/Equal/Greater` for the first
 /// arg relative to the second. Pre-release suffixes are ignored.
+#[cfg(test)]
 pub(crate) fn cmp_dotted_version(a: &str, b: &str) -> std::cmp::Ordering {
     fn parts(v: &str) -> Vec<u32> {
         let core = v.split('-').next().unwrap_or("");
@@ -704,7 +892,11 @@ pub(crate) fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
     let manifest_bytes = secure_fetch_bytes(manifest_url, &manifest_context, MAX_MANIFEST_BYTES)
         .with_context(|| format!("fetching manifest from {manifest_url}"))?;
     let new_manifest: Manifest = serde_json::from_slice(&manifest_bytes)?;
-    enforce_manifest_compatibility(&new_manifest)?;
+    validate_manifest(&new_manifest)?;
+    if !new_manifest.model.url.starts_with("hf://") {
+        let _ = resolved_source(&new_manifest.model.url, &manifest_context)
+            .context("validating semantic model artifact source")?;
+    }
     let update_root = staging.join("update-apply");
     if update_root.exists() {
         fs::remove_dir_all(&update_root)?;
@@ -748,7 +940,7 @@ pub(crate) fn remove_path_if_exists(path: &Path) -> Result<()> {
 pub(crate) struct StagedCorpusUpdate {
     pub(crate) staging_root: PathBuf,
     pub(crate) staged_db: PathBuf,
-    pub(crate) staged_ann: Option<PathBuf>,
+    pub(crate) staged_ann: BTreeMap<SourceId, PathBuf>,
     pub(crate) stats: UpdateStats,
 }
 
@@ -765,40 +957,60 @@ fn promote_generation(
     staged_corpus: StagedCorpusUpdate,
     manifest: &Manifest,
 ) -> Result<()> {
-    let mut generation_hasher = Sha256::new();
-    generation_hasher.update(b"ato-mcp-installed-generation-v1\0");
-    generation_hasher.update(manifest.db.sha256.as_bytes());
-    if let Some(ann) = manifest.ann.as_ref() {
-        let corpus_hash = ann
-            .corpus_id
-            .strip_prefix("sha256:")
-            .ok_or_else(|| anyhow!("ANN corpus_id is malformed"))?;
-        generation_hasher.update(corpus_hash.as_bytes());
-        generation_hasher.update(ann.sha256.as_bytes());
-    } else {
-        generation_hasher.update(b"legacy-exact");
+    validate_manifest(manifest)?;
+    let manifest_sources = manifest.ann.keys().cloned().collect::<BTreeSet<_>>();
+    let staged_sources = staged_corpus
+        .staged_ann
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if staged_sources != manifest_sources {
+        bail!(
+            "staged ANN source set does not match manifest: manifest={manifest_sources:?}, staged={staged_sources:?}"
+        );
     }
-    generation_hasher.update(Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true));
-    generation_hasher.update(std::process::id().to_le_bytes());
-    let key = format!("{:x}", generation_hasher.finalize());
+    if !staged_corpus.staged_db.is_file() {
+        bail!(
+            "staged legal database is missing: {}",
+            staged_corpus.staged_db.display()
+        );
+    }
+    for (source_id, path) in &staged_corpus.staged_ann {
+        if !path.is_file() {
+            bail!("staged ANN sidecar for source `{source_id}` is missing");
+        }
+    }
+    let key = generation_key(manifest);
     let final_dir = generation_dir(&key)?;
 
     cleanup_incomplete_generations()?;
+    if final_dir.exists() {
+        if active_generation_key()?.as_deref() == Some(key.as_str()) {
+            remove_path_if_exists(&staged_corpus.staging_root)?;
+            return Ok(());
+        }
+        bail!(
+            "immutable corpus generation collision at {}; refusing to overwrite it",
+            final_dir.display()
+        );
+    }
     let installing = generations_dir()?.join(format!(".{key}.installing"));
     remove_path_if_exists(&installing)?;
     fs::create_dir_all(&installing)?;
+    let mut committed_final = false;
     let result = (|| -> Result<()> {
-        fs::rename(&staged_corpus.staged_db, installing.join("ato.db"))
+        fs::rename(&staged_corpus.staged_db, installing.join(LEGAL_DB_FILENAME))
             .context("placing database in corpus generation")?;
-        match (manifest.ann.as_ref(), staged_corpus.staged_ann.as_ref()) {
-            (Some(_), Some(staged_ann)) => {
-                fs::rename(staged_ann, installing.join(crate::ann::ANN_FILENAME))
-                    .context("placing ANN sidecar in corpus generation")?;
-            }
-            (Some(_), None) => bail!("ANN-required update did not stage a sidecar"),
-            (None, Some(_)) => bail!("legacy update unexpectedly staged an ANN sidecar"),
-            (None, None) => {}
+        let ann_dir = installing.join(crate::ann::ANN_DIRECTORY);
+        fs::create_dir_all(&ann_dir)?;
+        for (source_id, staged_ann) in &staged_corpus.staged_ann {
+            let destination = installing.join(crate::ann::sidecar_relative_path(source_id));
+            fs::rename(staged_ann, &destination).with_context(|| {
+                format!("placing ANN sidecar for source `{source_id}` in corpus generation")
+            })?;
         }
+        #[cfg(unix)]
+        File::open(&ann_dir)?.sync_all()?;
 
         if let Some(model) = staged_model {
             for file in EMBEDDING_MODEL_HF_FILES {
@@ -824,10 +1036,19 @@ fn promote_generation(
         File::open(&installing)?.sync_all()?;
         fs::rename(&installing, &final_dir)
             .with_context(|| format!("committing corpus generation {}", final_dir.display()))?;
+        committed_final = true;
         sync_parent(&final_dir)?;
         activate_generation(&key)
     })();
     if let Err(error) = result {
+        if committed_final && active_generation_key()?.as_deref() != Some(key.as_str()) {
+            remove_path_if_exists(&final_dir).with_context(|| {
+                format!(
+                    "rolling back unactivated generation {}",
+                    final_dir.display()
+                )
+            })?;
+        }
         let cleanup = remove_path_if_exists(&installing);
         if let Err(cleanup_error) = cleanup {
             return Err(error).context(format!(
@@ -839,9 +1060,35 @@ fn promote_generation(
     }
     let _ = fs::remove_dir_all(&staged_corpus.staging_root);
     if let Err(error) = cleanup_inactive_generations(&key) {
-        eprintln!("ato-mcp update: warning: inactive generation cleanup failed: {error}");
+        eprintln!("legal-mcp update: warning: inactive generation cleanup failed: {error}");
     }
     Ok(())
+}
+
+fn generation_key(manifest: &Manifest) -> String {
+    fn field(hasher: &mut Sha256, value: &str) {
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"australian-legal-mcp-installed-generation-v1\0");
+    field(&mut hasher, &manifest.schema_version.to_string());
+    field(&mut hasher, &manifest.index_version);
+    field(&mut hasher, &manifest.db.sha256);
+    field(&mut hasher, &manifest.db.size.to_string());
+    field(&mut hasher, &manifest.model.id);
+    field(&mut hasher, &manifest.model.sha256);
+    field(&mut hasher, &manifest.model.size.to_string());
+    for (source_id, ann) in &manifest.ann {
+        field(&mut hasher, source_id.as_str());
+        field(&mut hasher, &ann.corpus_id);
+        field(&mut hasher, &ann.embedding_set_sha256);
+        field(&mut hasher, &ann.vector_count.to_string());
+        field(&mut hasher, &ann.sha256);
+        field(&mut hasher, &ann.size.to_string());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn cleanup_incomplete_generations() -> Result<()> {
@@ -872,9 +1119,6 @@ fn cleanup_inactive_generations(active_key: &str) -> Result<()> {
         // an inactive generation is harmless and retried after the next update.
         let _ = fs::remove_dir_all(entry.path());
     }
-    let root = data_dir()?;
-    let _ = fs::remove_dir_all(root.join("live"));
-    let _ = fs::remove_file(root.join("installed_manifest.json"));
     Ok(())
 }
 
@@ -913,17 +1157,14 @@ pub(crate) fn stage_live_db_from_db_artifact(
     manifest_bytes: u64,
     staging_root: &Path,
 ) -> Result<StagedCorpusUpdate> {
+    validate_manifest(manifest)?;
     let db_info = &manifest.db;
 
     if staging_root.exists() {
         fs::remove_dir_all(staging_root)?;
     }
     fs::create_dir_all(staging_root)?;
-    let staged_db = staging_root.join("ato.db");
-
-    if db_info.size == 0 || db_info.sha256.len() != 64 {
-        bail!("manifest DB artifact has invalid integrity metadata");
-    }
+    let staged_db = staging_root.join(LEGAL_DB_FILENAME);
 
     // Stream archive acquisition to a temporary file while enforcing its
     // declared byte count and digest. This keeps memory bounded independent
@@ -938,15 +1179,22 @@ pub(crate) fn stage_live_db_from_db_artifact(
     let downloaded = copy_exact_hashed(input.as_mut(), &mut archive, db_info.size, &db_info.sha256)
         .with_context(|| format!("verifying {}", db_info.url))?;
     archive.as_file().sync_all()?;
-    let mut bytes_downloaded = manifest_bytes + downloaded;
+    let mut bytes_downloaded = manifest_bytes
+        .checked_add(downloaded)
+        .ok_or_else(|| anyhow!("update byte count overflow"))?;
 
     archive.as_file_mut().rewind()?;
     let mut decoded = tempfile::NamedTempFile::new_in(staging_root)?;
     {
         let mut decoder = zstd::stream::read::Decoder::new(BufReader::new(archive.as_file_mut()))
             .context("opening corpus zstd stream")?;
-        std::io::copy(&mut decoder, &mut decoded)
-            .with_context(|| format!("decompressing into {}", staged_db.display()))?;
+        copy_bounded(
+            &mut decoder,
+            &mut decoded,
+            MAX_DECOMPRESSED_DB_BYTES,
+            "decompressed legal database",
+        )
+        .with_context(|| format!("decompressing into {}", staged_db.display()))?;
     }
     decoded.as_file().sync_all()?;
     if decoded.as_file().metadata()?.len() == 0 {
@@ -982,27 +1230,31 @@ pub(crate) fn stage_live_db_from_db_artifact(
             tokenize = 'porter unicode61 remove_diacritics 2'
         );
         CREATE VIRTUAL TABLE IF NOT EXISTS title_fts USING fts5(
-            doc_id UNINDEXED, title, headings,
+            source_id UNINDEXED,
+            native_id UNINDEXED,
+            title,
+            headings,
             tokenize = 'porter unicode61 remove_diacritics 2'
         );
         DELETE FROM chunks_fts;
         DELETE FROM title_fts;
         INSERT INTO chunks_fts(rowid, text)
             SELECT chunk_id, zstd_decompress(text) FROM chunks;
-        INSERT INTO title_fts(doc_id, title, headings)
-            SELECT doc_id, title, headings FROM documents;
+        INSERT INTO title_fts(source_id, native_id, title, headings)
+            SELECT source_id, native_id, title, headings FROM documents;
         "#,
     )
     .context("rebuilding FTS5 indexes on staged DB")?;
 
-    set_meta(&conn, "index_version", &manifest.index_version)?;
-    set_meta(&conn, "embedding_model_id", &manifest.model.id)?;
-    set_meta(&conn, "last_update_at", &Utc::now().to_rfc3339())?;
-
+    verify_corpus_manifest_binding(&conn, manifest)?;
     verify_semantic_install(&conn, manifest)?;
-    let integrity: String = conn.query_row("PRAGMA integrity_check;", [], |row| row.get(0))?;
-    if integrity != "ok" {
-        bail!("staged corpus failed SQLite integrity_check: {integrity}");
+    let integrity = {
+        let mut stmt = conn.prepare("PRAGMA integrity_check;")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    if integrity.len() != 1 || integrity[0] != "ok" {
+        bail!("staged corpus failed SQLite integrity_check: {integrity:?}");
     }
     let foreign_key_errors: i64 =
         conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
@@ -1012,28 +1264,33 @@ pub(crate) fn stage_live_db_from_db_artifact(
         bail!("staged corpus has {foreign_key_errors} foreign-key integrity errors");
     }
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
-    let staged_ann = if let Some(ann_info) = manifest.ann.as_ref() {
-        verify_ann_db_binding(&conn, ann_info)?;
-        verify_ann_db_content(&conn, ann_info)?;
-        let staged_ann = staging_root.join(crate::ann::ANN_FILENAME);
+    let mut staged_ann = BTreeMap::new();
+    for (source_id, ann_info) in &manifest.ann {
+        let staged_path = staging_root.join(crate::ann::sidecar_relative_path(source_id));
+        if let Some(parent) = staged_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let mut input: Box<dyn Read> = match resolved_source(&ann_info.url, context)? {
             Ok(path) => {
                 Box::new(File::open(&path).with_context(|| format!("opening {}", path.display()))?)
             }
             Err(url) => Box::new(secure_get(url, Duration::from_secs(60 * 60))?),
         };
-        let downloaded =
-            crate::ann::copy_verified(input.as_mut(), &staged_ann, ann_info.size, &ann_info.sha256)
-                .with_context(|| format!("verifying {}", ann_info.url))?;
+        let downloaded = crate::ann::copy_verified(
+            input.as_mut(),
+            &staged_path,
+            ann_info.size,
+            &ann_info.sha256,
+        )
+        .with_context(|| format!("verifying ANN sidecar for source `{source_id}`"))?;
         bytes_downloaded = bytes_downloaded
             .checked_add(downloaded)
             .ok_or_else(|| anyhow!("update byte count overflow"))?;
-        crate::ann::verify_sidecar(&staged_ann, ann_info)?;
-        Some(staged_ann)
-    } else {
-        None
-    };
+        crate::ann::verify_sidecar(&staged_path, source_id, ann_info)?;
+        staged_ann.insert(source_id.clone(), staged_path);
+    }
     drop(conn);
+    File::open(&staged_db)?.sync_all()?;
 
     Ok(StagedCorpusUpdate {
         staging_root: staging_root.to_path_buf(),
@@ -1043,59 +1300,124 @@ pub(crate) fn stage_live_db_from_db_artifact(
     })
 }
 
-pub(crate) fn verify_ann_db_binding(
-    conn: &Connection,
-    info: &crate::ann::ManifestAnn,
-) -> Result<()> {
-    let corpus_id = get_meta(conn, "corpus_id")?
-        .ok_or_else(|| anyhow!("ANN-required corpus is missing corpus_id metadata"))?;
-    let embedding_set_sha256 = get_meta(conn, "embedding_set_sha256")?
-        .ok_or_else(|| anyhow!("ANN-required corpus is missing embedding_set_sha256 metadata"))?;
-    if corpus_id != info.corpus_id
-        || embedding_set_sha256 != info.embedding_set_sha256
-        || u64::try_from(chunk_embedding_count(conn)?).ok() != Some(info.vector_count)
-    {
-        bail!("ANN sidecar metadata does not match the staged corpus database");
+fn copy_bounded(
+    reader: &mut dyn Read,
+    writer: &mut dyn Write,
+    limit: u64,
+    label: &str,
+) -> Result<u64> {
+    let mut total = 0u64;
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(total);
+        }
+        total = total
+            .checked_add(count as u64)
+            .ok_or_else(|| anyhow!("{label} byte count overflow"))?;
+        if total > limit {
+            bail!("{label} exceeded {limit} byte limit");
+        }
+        writer.write_all(&buffer[..count])?;
+    }
+}
+
+fn required_corpus_meta(conn: &Connection, key: &str) -> Result<String> {
+    get_corpus_meta(conn, key)?
+        .ok_or_else(|| anyhow!("staged database is missing corpus_meta.{key}"))
+}
+
+fn required_source_meta(conn: &Connection, source_id: &SourceId, key: &str) -> Result<String> {
+    get_source_meta(conn, source_id.as_str(), key)?
+        .ok_or_else(|| anyhow!("staged database is missing source_meta[`{source_id}`].{key}"))
+}
+
+pub(crate) fn verify_corpus_manifest_binding(conn: &Connection, manifest: &Manifest) -> Result<()> {
+    let expected = [
+        ("schema_version", manifest.schema_version.to_string()),
+        ("index_version", manifest.index_version.clone()),
+        ("embedding_model_id", manifest.model.id.clone()),
+        ("last_update_at", manifest.created_at.clone()),
+    ];
+    for (key, expected_value) in expected {
+        let actual = required_corpus_meta(conn, key)?;
+        if actual != expected_value {
+            bail!(
+                "staged database corpus_meta.{key} does not match manifest: expected `{expected_value}`, got `{actual}`"
+            );
+        }
     }
     Ok(())
 }
 
-fn verify_ann_db_content(conn: &Connection, info: &crate::ann::ManifestAnn) -> Result<()> {
-    let source_index_sha256 = get_meta(conn, "source_index_sha256")?
-        .ok_or_else(|| anyhow!("ANN-required corpus is missing source_index_sha256 metadata"))?;
-    let actual = crate::ann::compute_identity(conn, &source_index_sha256)?;
-    if actual.corpus_id != info.corpus_id
+pub(crate) fn verify_ann_db_binding(
+    conn: &Connection,
+    source_id: &SourceId,
+    info: &crate::ann::ManifestAnn,
+) -> Result<()> {
+    let corpus_id = required_source_meta(conn, source_id, "corpus_id")?;
+    let embedding_set_sha256 = required_source_meta(conn, source_id, "embedding_set_sha256")?;
+    if corpus_id != info.corpus_id
+        || embedding_set_sha256 != info.embedding_set_sha256
+        || u64::try_from(chunk_embedding_count(conn, source_id)?).ok() != Some(info.vector_count)
+    {
+        bail!("ANN sidecar metadata for source `{source_id}` does not match the staged database");
+    }
+    Ok(())
+}
+
+fn verify_ann_db_content(
+    conn: &Connection,
+    source_id: &SourceId,
+    info: &crate::ann::ManifestAnn,
+) -> Result<()> {
+    let source_index_sha256 = required_source_meta(conn, source_id, "source_index_sha256")?;
+    let actual = crate::ann::compute_identity(conn, source_id, &source_index_sha256)?;
+    if actual.source_id != *source_id
+        || actual.corpus_id != info.corpus_id
         || actual.embedding_set_sha256 != info.embedding_set_sha256
         || actual.vector_count != info.vector_count
     {
-        bail!("ANN sidecar embedding digest does not match the staged corpus database");
+        bail!("ANN sidecar embedding digest for source `{source_id}` does not match the staged database");
     }
     Ok(())
 }
 
 pub(crate) fn verify_semantic_install(conn: &Connection, manifest: &Manifest) -> Result<()> {
     if manifest.model.id != EMBEDDING_MODEL_ID {
-        return Ok(());
+        bail!("semantic corpus uses an unsupported embedding model");
     }
-    let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?;
-    let embeddings = chunk_embedding_count(conn)?;
-    if embeddings != chunks {
+    let database_sources = database_source_ids(conn)?;
+    let manifest_sources = manifest.ann.keys().cloned().collect::<BTreeSet<_>>();
+    let registered_sources = registered_source_ids();
+    if database_sources != registered_sources || manifest_sources != registered_sources {
         bail!(
-            "semantic corpus install incomplete: chunk_embeddings={embeddings}, chunks={chunks}; rebuild the release packs with embedding_b64"
+            "semantic corpus source sets differ: registered={registered_sources:?}, manifest={manifest_sources:?}, database={database_sources:?}"
         );
+    }
+    for (source_id, ann_info) in &manifest.ann {
+        let documents = count_source_table(conn, source_id.as_str(), "documents")?;
+        let chunks = count_source_table(conn, source_id.as_str(), "chunks")?;
+        let embeddings = chunk_embedding_count(conn, source_id)?;
+        if documents == 0
+            || chunks == 0
+            || embeddings != chunks
+            || u64::try_from(embeddings).ok() != Some(ann_info.vector_count)
+        {
+            bail!(
+                "semantic corpus for source `{source_id}` is incomplete: documents={documents}, chunks={chunks}, chunk_embeddings={embeddings}, ann_vectors={}",
+                ann_info.vector_count
+            );
+        }
+        verify_ann_db_binding(conn, source_id, ann_info)?;
+        verify_ann_db_content(conn, source_id, ann_info)?;
     }
     Ok(())
 }
 
-pub(crate) fn chunk_embedding_count(conn: &Connection) -> Result<i64> {
-    if table_exists(conn, "chunk_embeddings")? {
-        conn.query_row("SELECT COUNT(*) FROM chunk_embeddings", [], |row| {
-            row.get(0)
-        })
-        .map_err(Into::into)
-    } else {
-        Ok(0)
-    }
+pub(crate) fn chunk_embedding_count(conn: &Connection, source_id: &SourceId) -> Result<i64> {
+    count_source_table(conn, source_id.as_str(), "chunk_embeddings")
 }
 
 pub(crate) fn load_installed_manifest() -> Result<Option<Manifest>> {
@@ -1103,13 +1425,17 @@ pub(crate) fn load_installed_manifest() -> Result<Option<Manifest>> {
     if !path.exists() {
         return Ok(None);
     }
-    Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+    let manifest: Manifest = serde_json::from_slice(&fs::read(&path)?)
+        .with_context(|| format!("parsing installed manifest {}", path.display()))?;
+    validate_manifest(&manifest)
+        .with_context(|| format!("validating installed manifest {}", path.display()))?;
+    Ok(Some(manifest))
 }
 
 /// Notice surfaced to the agent via `server_instructions` when the
 /// published corpus is newer than the installed one. Carries the published
 /// `index_version` so the agent can mention it to the user when suggesting
-/// `ato-mcp update`.
+/// `legal-mcp update`.
 pub(crate) struct UpdateAvailability {
     pub(crate) available_index_version: String,
 }
@@ -1181,7 +1507,7 @@ where
             break;
         }
     }
-    bail!("no published ato-mcp release with manifest.json was found")
+    bail!("no published australian-legal-mcp release with manifest.json was found")
 }
 
 fn resolve_corpus_manifest_url_with_budget(budget: Duration) -> Result<String> {
@@ -1212,11 +1538,14 @@ pub(crate) fn resolve_latest_corpus_manifest_url_probe() -> Result<String> {
 /// corpus. Every other case collapses to `Ok(None)` — no error path that
 /// could stall serve startup. A published index that requires a newer binary
 /// also returns `None` rather than emitting an "update available" notice the
-/// user could not act on; the next manual `ato-mcp update` will surface the
+/// user could not act on; the next manual `legal-mcp update` will surface the
 /// real upgrade-the-binary error.
 pub(crate) fn check_for_update_availability(
     manifest_url: &str,
 ) -> Result<Option<UpdateAvailability>> {
+    if active_generation_key()?.is_none() {
+        return Ok(None);
+    }
     let Some(installed) = load_installed_manifest()? else {
         return Ok(None);
     };
@@ -1229,20 +1558,17 @@ pub(crate) fn check_for_update_availability(
         Ok(m) => m,
         Err(_) => return Ok(None),
     };
-    if enforce_manifest_compatibility(&manifest).is_err() {
+    if validate_manifest(&manifest).is_err() {
         return Ok(None);
     }
-    let installed_ann = installed
-        .ann
-        .as_ref()
-        .map(|ann| (&ann.corpus_id, &ann.sha256));
-    let published_ann = manifest
-        .ann
-        .as_ref()
-        .map(|ann| (&ann.corpus_id, &ann.sha256));
     if installed.index_version == manifest.index_version
+        && installed.schema_version == manifest.schema_version
+        && installed.model.id == manifest.model.id
+        && installed.model.sha256 == manifest.model.sha256
+        && installed.model.size == manifest.model.size
         && installed.db.sha256 == manifest.db.sha256
-        && installed_ann == published_ann
+        && installed.db.size == manifest.db.size
+        && installed.ann == manifest.ann
     {
         return Ok(None);
     }
@@ -1251,7 +1577,7 @@ pub(crate) fn check_for_update_availability(
     }))
 }
 
-// ----- tree-crawl (port of src/ato_mcp/scraper/tree_crawler.py + snapshot.py) -----
+// ----- ATO browse-tree crawl and source snapshot -----
 
 pub(crate) const SCRAPER_EXCLUDED_TITLES: &[&str] = &[
     "Archived document types",
@@ -1334,7 +1660,7 @@ pub(crate) fn canonical_id_from(data_url: Option<&str>, href: Option<&str>) -> O
     Some(data_url.to_string())
 }
 
-// [SS-02] fetch_nodes_blocking hits the ATO browse-content JSON API through a
+// fetch_nodes_blocking hits the ATO browse-content JSON API through a
 // reqwest blocking client; the response payload is expected to be a JSON list.
 pub(crate) fn fetch_nodes_blocking(
     _client: &reqwest::blocking::Client,
@@ -1387,7 +1713,7 @@ pub(crate) fn tree_crawl(
         .timeout(Duration::from_secs_f64(timeout_seconds))
         .build()?;
 
-    // [SS-03] Maintainer ATO API pacing is serialized through this mutex so
+    // Maintainer ATO API pacing is serialized through this mutex so
     // tree-crawl/link-download do not issue simultaneous outgoing requests.
     // Tree crawler can issue thousands per run.
     let last_request = std::sync::Mutex::new(
@@ -1549,7 +1875,7 @@ pub(crate) fn tree_crawl(
     Ok(())
 }
 
-// ----- snapshot-reduce (port of src/ato_mcp/scraper/reducer.py) -----
+// ----- Deterministic ATO snapshot reduction -----
 
 #[derive(Debug, Default)]
 pub(crate) struct CanonicalEntry {
@@ -1595,7 +1921,7 @@ pub(crate) fn snapshot_reduce(nodes_path: &Path, output_dir: Option<&Path>) -> R
 
     // node uid → (parent_uid, data_url)
     let mut node_meta: HashMap<u64, (Option<u64>, Option<String>)> = HashMap::new();
-    // [SS-07] Reduction dedupes canonical IDs, chooses a representative
+    // Reduction dedupes canonical IDs, chooses a representative
     // source path, and carries excluded-title descendants into skip output.
     let mut folder_records: HashMap<String, FolderRecord> = HashMap::new();
     let mut folder_children: HashMap<Option<String>, HashSet<String>> = HashMap::new();
@@ -1879,7 +2205,7 @@ pub(crate) fn snapshot_reduce(nodes_path: &Path, output_dir: Option<&Path>) -> R
     Ok(())
 }
 
-// ----- link-download (port of src/ato_mcp/scraper/downloader.py) -----
+// ----- Rate-limited ATO source document download -----
 
 pub(crate) struct LinkDownloadArgs {
     pub(crate) deduped_links: PathBuf,
@@ -1889,6 +2215,97 @@ pub(crate) struct LinkDownloadArgs {
     pub(crate) max_workers: usize,
     pub(crate) timeout_seconds: f64,
     pub(crate) force: bool,
+    pub(crate) workspace_lock_held: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LinkDownloadReport {
+    pub(crate) completed: usize,
+    pub(crate) errors: usize,
+    pub(crate) skipped: usize,
+}
+
+struct LinkRefreshFailure {
+    status: &'static str,
+    error: String,
+    http_status: Option<u16>,
+    attempted_at: String,
+    href: Option<String>,
+}
+
+fn record_link_refresh_failure(
+    index: &mut std::collections::HashMap<String, JsonValue>,
+    canonical_id: &str,
+    out_dir: &Path,
+    failure: LinkRefreshFailure,
+) -> JsonValue {
+    let record = if let Some(existing) = index.get(canonical_id).filter(|record| {
+        record.get("status").and_then(JsonValue::as_str) == Some("success")
+            && indexed_payload_path(out_dir, record)
+                .is_some_and(|path| payload_matches_record(&path, record))
+    }) {
+        let mut record = existing.clone();
+        if let Some(object) = record.as_object_mut() {
+            object.insert("refresh_status".to_string(), json!(failure.status));
+            object.insert("refresh_error".to_string(), json!(failure.error));
+            object.insert(
+                "refresh_http_status".to_string(),
+                json!(failure.http_status),
+            );
+            object.insert(
+                "refresh_attempted_at".to_string(),
+                json!(failure.attempted_at),
+            );
+            object.insert("refresh_href".to_string(), json!(failure.href));
+        }
+        record
+    } else {
+        json!({
+            "canonical_id": canonical_id,
+            "href": failure.href,
+            "status": failure.status,
+            "payload_path": null,
+            "error": failure.error,
+            "http_status": failure.http_status,
+            "downloaded_at": failure.attempted_at,
+        })
+    };
+    index.insert(canonical_id.to_string(), record.clone());
+    record
+}
+
+fn merge_resume_index_record(
+    index: &mut std::collections::HashMap<String, JsonValue>,
+    canonical_id: &str,
+    record: JsonValue,
+) {
+    let status = record.get("status").and_then(JsonValue::as_str);
+    if matches!(status, Some("failed" | "missing_content")) {
+        if let Some(mut preserved) = index
+            .get(canonical_id)
+            .filter(|existing| {
+                existing.get("status").and_then(JsonValue::as_str) == Some("success")
+            })
+            .cloned()
+        {
+            if let Some(object) = preserved.as_object_mut() {
+                object.insert("refresh_status".to_string(), json!(status));
+                for (source, target) in [
+                    ("error", "refresh_error"),
+                    ("http_status", "refresh_http_status"),
+                    ("downloaded_at", "refresh_attempted_at"),
+                    ("href", "refresh_href"),
+                ] {
+                    if let Some(value) = record.get(source) {
+                        object.insert(target.to_string(), value.clone());
+                    }
+                }
+            }
+            index.insert(canonical_id.to_string(), preserved);
+            return;
+        }
+    }
+    index.insert(canonical_id.to_string(), record);
 }
 
 pub(crate) fn slug_for(text: &str, fallback: &str) -> String {
@@ -1907,7 +2324,7 @@ pub(crate) fn slug_for(text: &str, fallback: &str) -> String {
 pub(crate) fn build_payload_path(out_dir: &Path, link: &JsonValue) -> Result<PathBuf> {
     let payload_dir = out_dir.join("payloads");
     let mut dir = payload_dir.clone();
-    // [SS-06] Catch-up/download payload paths inherit representative_path
+    // Catch-up/download payload paths inherit representative_path
     // from reduced source links.
     if let Some(seg) = link.get("representative_path").and_then(|v| v.as_array()) {
         for s in seg.iter().filter_map(|v| v.as_str()) {
@@ -1965,6 +2382,54 @@ fn payload_matches_record(path: &Path, record: &JsonValue) -> bool {
         && sha256_path(path).is_ok_and(|actual| actual == expected_sha)
 }
 
+fn indexed_payload_path(out_dir: &Path, record: &JsonValue) -> Option<PathBuf> {
+    let raw = Path::new(record.get("payload_path")?.as_str()?);
+    if raw.is_absolute()
+        || raw
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let canonical = out_dir.join(raw).canonicalize().ok()?;
+    canonical.starts_with(out_dir).then_some(canonical)
+}
+
+fn immutable_payload_path(base_path: &Path, sha256: &str) -> Result<PathBuf> {
+    if sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("payload SHA-256 is malformed");
+    }
+    let parent = base_path
+        .parent()
+        .ok_or_else(|| anyhow!("payload path has no parent"))?;
+    Ok(parent.join(format!("{sha256}.html")))
+}
+
+fn persist_immutable_payload(payload_root: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    prepare_payload_parent(payload_root, path)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!("immutable payload path is unsafe: {}", path.display());
+            }
+            if metadata.len() != bytes.len() as u64
+                || sha256_path(path)? != format!("{:x}", Sha256::digest(bytes))
+            {
+                bail!("immutable payload collision at {}", path.display());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            atomic_write(path, bytes)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
 pub(crate) fn extract_law_contents(html: &str) -> Option<String> {
     use scraper::{Html, Selector};
     let doc = Html::parse_document(html);
@@ -1982,12 +2447,19 @@ pub(crate) fn extract_law_contents(html: &str) -> Option<String> {
     Some(format!(r#"<div id="lawContents">{inner}</div>"#))
 }
 
-pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
+pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<LinkDownloadReport> {
     use std::io::BufRead as _;
     use std::sync::{Arc, Mutex};
 
+    let download_started_at = chrono::Utc::now().to_rfc3339();
+
     fs::create_dir_all(&args.out_dir)?;
     let out_dir = args.out_dir.canonicalize()?;
+    let _workspace_lock = if args.workspace_lock_held {
+        None
+    } else {
+        Some(crate::source_update::lock_workspace_exclusive(&out_dir)?)
+    };
     let payload_dir = out_dir.join("payloads");
     if fs::symlink_metadata(&payload_dir).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         bail!(
@@ -2042,7 +2514,8 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
                 Err(error) => return Err(error).context("parsing resume index"),
             };
             if let Some(cid) = rec.get("canonical_id").and_then(|v| v.as_str()) {
-                index.insert(cid.to_string(), rec);
+                let cid = cid.to_string();
+                merge_resume_index_record(&mut index, &cid, rec);
             }
         }
     }
@@ -2052,12 +2525,11 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
             let Some(canonical_id) = link.get("canonical_id").and_then(JsonValue::as_str) else {
                 return false;
             };
-            let Ok(path) = build_payload_path(&out_dir, link) else {
-                return false;
-            };
             index.get(canonical_id).is_some_and(|record| {
                 record.get("status").and_then(JsonValue::as_str) == Some("success")
-                    && payload_matches_record(&path, record)
+                    && record.get("refresh_status").is_none()
+                    && indexed_payload_path(&out_dir, record)
+                        .is_some_and(|path| payload_matches_record(&path, record))
             })
         })
         .count();
@@ -2073,7 +2545,7 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
     ));
     let request_delay = args.request_delay_seconds;
 
-    // [SS-08] Link-download fans out over worker threads with a shared queue,
+    // Link-download fans out over worker threads with a shared queue,
     // shared client, shared index writer, and shared request-delay lock.
     let work_queue: Arc<Mutex<Vec<JsonValue>>> = Arc::new(Mutex::new(links));
     let stats_completed = Arc::new(std::sync::atomic::AtomicUsize::new(initial_completed));
@@ -2124,7 +2596,9 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
                         let idx = index.lock().unwrap();
                         idx.get(&canonical_id).is_some_and(|record| {
                             record.get("status").and_then(JsonValue::as_str) == Some("success")
-                                && payload_matches_record(&payload_path, record)
+                                && record.get("refresh_status").is_none()
+                                && indexed_payload_path(&out_dir, record)
+                                    .is_some_and(|path| payload_matches_record(&path, record))
                         })
                     };
                     if already_done {
@@ -2179,19 +2653,21 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
                         eprintln!("link-download w{worker_id}: failed {canonical_id}: {e}");
                         stats_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let now = chrono::Utc::now().to_rfc3339();
-                        let rec = json!({
-                            "canonical_id": canonical_id,
-                            "href": href,
-                            "status": "failed",
-                            "payload_path": null,
-                            "error": e.to_string(),
-                            "http_status": null,
-                            "downloaded_at": now,
-                        });
                         {
                             use std::io::Write as _;
                             let mut idx = index.lock().unwrap();
-                            idx.insert(canonical_id.clone(), rec.clone());
+                            let rec = record_link_refresh_failure(
+                                &mut idx,
+                                &canonical_id,
+                                &out_dir,
+                                LinkRefreshFailure {
+                                    status: "failed",
+                                    error: e.to_string(),
+                                    http_status: None,
+                                    attempted_at: now,
+                                    href: href.clone(),
+                                },
+                            );
                             let mut w = index_writer.lock().unwrap();
                             writeln!(w, "{}", serde_json::to_string(&rec)?)?;
                             w.sync_data()?;
@@ -2208,19 +2684,21 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
                         );
                         stats_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let now = chrono::Utc::now().to_rfc3339();
-                        let rec = json!({
-                            "canonical_id": canonical_id,
-                            "href": href,
-                            "status": "missing_content",
-                            "payload_path": null,
-                            "error": "lawContents div not found",
-                            "http_status": http_status,
-                            "downloaded_at": now,
-                        });
                         {
                             use std::io::Write as _;
                             let mut idx = index.lock().unwrap();
-                            idx.insert(canonical_id.clone(), rec.clone());
+                            let rec = record_link_refresh_failure(
+                                &mut idx,
+                                &canonical_id,
+                                &out_dir,
+                                LinkRefreshFailure {
+                                    status: "missing_content",
+                                    error: "lawContents div not found".to_string(),
+                                    http_status: Some(http_status),
+                                    attempted_at: now,
+                                    href: href.clone(),
+                                },
+                            );
                             let mut w = index_writer.lock().unwrap();
                             writeln!(w, "{}", serde_json::to_string(&rec)?)?;
                             w.sync_data()?;
@@ -2229,10 +2707,10 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
                     }
                 };
 
-                prepare_payload_parent(&payload_dir, &payload_path)?;
-                atomic_write(&payload_path, snippet.as_bytes())?;
-                let payload_sha = sha256_path(&payload_path)?;
-                let payload_size = fs::metadata(&payload_path)?.len();
+                let payload_sha = format!("{:x}", Sha256::digest(snippet.as_bytes()));
+                let payload_path = immutable_payload_path(&payload_path, &payload_sha)?;
+                persist_immutable_payload(&payload_dir, &payload_path, snippet.as_bytes())?;
+                let payload_size = snippet.len() as u64;
 
                 let rel = payload_path
                     .strip_prefix(&out_dir)
@@ -2273,10 +2751,20 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
         }));
     }
 
+    let mut worker_errors = Vec::new();
     for handle in handles {
-        handle
-            .join()
-            .map_err(|_| anyhow!("link-download worker panicked"))??;
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => worker_errors.push(error.to_string()),
+            Err(_) => worker_errors.push("worker panicked".to_string()),
+        }
+    }
+    drop(index_writer);
+    if !worker_errors.is_empty() {
+        bail!(
+            "link-download workers failed after all workers stopped: {}",
+            worker_errors.join("; ")
+        );
     }
 
     // Atomic rewrite of index.jsonl with sorted entries.
@@ -2293,13 +2781,18 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
     sync_parent(&index_path)?;
 
     // metadata.json.
-    let now = chrono::Utc::now().to_rfc3339();
+    let download_completed_at = chrono::Utc::now().to_rfc3339();
+    let report = LinkDownloadReport {
+        completed: stats_completed.load(std::sync::atomic::Ordering::Relaxed),
+        errors: stats_errors.load(std::sync::atomic::Ordering::Relaxed),
+        skipped: stats_skipped.load(std::sync::atomic::Ordering::Relaxed),
+    };
     let metadata = json!({
         "links_file": args.deduped_links.to_string_lossy(),
-        "download_started_at": now,
-        "download_completed_at": now,
+        "download_started_at": download_started_at,
+        "download_completed_at": download_completed_at,
         "total_links": total,
-        "completed_links": stats_completed.load(std::sync::atomic::Ordering::Relaxed),
+        "completed_links": report.completed,
     });
     atomic_write(
         &out_dir.join("metadata.json"),
@@ -2308,23 +2801,23 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<()> {
 
     eprintln!(
         "link-download: done — {} success, {} errors, {} skipped (out_dir={})",
-        stats_completed.load(std::sync::atomic::Ordering::Relaxed),
-        stats_errors.load(std::sync::atomic::Ordering::Relaxed),
-        stats_skipped.load(std::sync::atomic::Ordering::Relaxed),
+        report.completed,
+        report.errors,
+        report.skipped,
         args.out_dir.display(),
     );
-    Ok(())
+    Ok(report)
 }
 
-// ----- scrape-diff (port of pipeline.py incremental + catch_up diff steps) -----
+// ----- Incremental and catch-up ATO snapshot diff -----
 
 pub(crate) fn representative_path_from_docid(
     canonical_id: &str,
     title: &str,
     heading: Option<&str>,
 ) -> Vec<String> {
-    // Mirrors src/ato_mcp/indexer/metadata.py:representative_path_from_docid.
-    // Falls back to ['Other'] when nothing better can be determined.
+    // Derive a stable representative path from the document id, heading, and
+    // title; fall back to `Other` when no category can be identified.
     use scraper as _;
     if let Some(category) = doc_id_top_category(canonical_id) {
         let mut out = vec![category.to_string()];
@@ -2343,11 +2836,9 @@ pub(crate) fn representative_path_from_docid(
 
 pub(crate) fn doc_id_top_category(canonical_id: &str) -> Option<&'static str> {
     // Best-effort extraction of the top-level category from a canonical_id
-    // like /law/view/document?docid=CRP%2FCRP19%2FCR. The full Python
-    // version walks docid prefixes against a 200-row mapping table; this
-    // covers the dozen most common buckets the maintainer pipeline cares
-    // about. Anything unrecognised falls through to "Other" so the
-    // downloader still has a folder to write to.
+    // such as /law/view/document?docid=CRP%2FCRP19%2FCR. The common document
+    // prefixes used by the maintainer pipeline map to stable buckets; anything
+    // unrecognised falls through to `Other` so downloads always have a folder.
     let lower = canonical_id.to_ascii_lowercase();
     if lower.contains("docid=cm") || lower.contains("docid=tr") || lower.contains("docid=tr%2f") {
         return Some("Public_rulings");
@@ -2385,9 +2876,9 @@ pub(crate) fn doc_id_top_category(canonical_id: &str) -> Option<&'static str> {
 
 pub(crate) fn load_canonical_ids(index_path: &Path) -> Result<std::collections::HashSet<String>> {
     use std::io::BufRead as _;
-    let mut out = std::collections::HashSet::new();
+    let mut states = BTreeMap::new();
     if !index_path.exists() {
-        return Ok(out);
+        return Ok(std::collections::HashSet::new());
     }
     let f = File::open(index_path)?;
     let reader = std::io::BufReader::new(f);
@@ -2398,14 +2889,22 @@ pub(crate) fn load_canonical_ids(index_path: &Path) -> Result<std::collections::
             continue;
         }
         let rec: JsonValue = serde_json::from_str(trimmed)?;
-        if let Some(cid) = rec.get("canonical_id").and_then(|v| v.as_str()) {
+        if let Some(cid) = rec.get("canonical_id").and_then(|value| value.as_str()) {
             let normalised = normalize_doc_href(cid);
-            if !normalised.is_empty() {
-                out.insert(normalised);
+            if normalised.is_empty() {
+                continue;
             }
+            let complete = matches!(
+                rec.get("status").and_then(JsonValue::as_str),
+                Some("success" | "confirmed_404" | "confirmed_stub")
+            ) && rec.get("refresh_status").is_none();
+            states.insert(normalised, complete);
         }
     }
-    Ok(out)
+    Ok(states
+        .into_iter()
+        .filter_map(|(canonical_id, complete)| complete.then_some(canonical_id))
+        .collect())
 }
 
 pub(crate) fn scrape_diff(
@@ -2616,6 +3115,250 @@ mod security_tests {
     }
 
     #[test]
+    fn remote_manifests_cannot_resolve_local_artifacts() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let artifact = root.path().join("legal.db.zst");
+        fs::write(&artifact, b"artifact")?;
+        let context = UrlContext {
+            manifest_dir: None,
+            manifest_base_url: Some("https://github.com/example/release".to_string()),
+        };
+        for value in [
+            artifact.display().to_string(),
+            url::Url::from_file_path(&artifact)
+                .expect("absolute artifact path")
+                .to_string(),
+        ] {
+            let error = resolved_source(&value, &context).unwrap_err();
+            assert!(error.to_string().contains("remote manifest"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn decompression_output_is_bounded() -> Result<()> {
+        let compressed = zstd::stream::encode_all(Cursor::new(b"bounded output"), 1)?;
+        let mut reader = zstd::stream::read::Decoder::new(Cursor::new(compressed))?;
+        let error = copy_bounded(&mut reader, &mut Vec::new(), 4, "test output").unwrap_err();
+        assert!(error.to_string().contains("exceeded 4 byte limit"));
+        Ok(())
+    }
+
+    fn sample_manifest() -> Manifest {
+        let source_id: SourceId = "ato".parse().expect("valid source id");
+        let frl_source_id: SourceId = "frl".parse().expect("valid source id");
+        let ann = crate::ann::ManifestAnn {
+            source_id: source_id.clone(),
+            format: crate::ann::ANN_FORMAT.to_string(),
+            format_version: crate::ann::ANN_FORMAT_VERSION,
+            library: crate::ann::ANN_LIBRARY.to_string(),
+            library_version: crate::ann::ANN_LIBRARY_VERSION.to_string(),
+            url: "ann/ato.ann".to_string(),
+            sha256: "1".repeat(64),
+            size: 1,
+            corpus_id: format!("sha256:{}", "2".repeat(64)),
+            embedding_model_id: EMBEDDING_MODEL_ID.to_string(),
+            embedding_dimension: crate::EMBEDDING_DIM as u32,
+            embedding_set_sha256: "3".repeat(64),
+            vector_count: 1,
+            seed: crate::ann::ANN_SEED,
+            rng: crate::ann::ANN_RNG.to_string(),
+            trees: crate::ann::ANN_TREES as u32,
+            split_after: crate::ann::ANN_SPLIT_AFTER as u32,
+            id_encoding: crate::ann::ANN_ID_ENCODING.to_string(),
+            metric: crate::ann::ANN_METRIC.to_string(),
+        };
+        let mut frl_ann = ann.clone();
+        frl_ann.source_id = frl_source_id.clone();
+        frl_ann.url = "ann/frl.ann".to_string();
+        frl_ann.sha256 = "6".repeat(64);
+        frl_ann.corpus_id = format!("sha256:{}", "7".repeat(64));
+        frl_ann.embedding_set_sha256 = "8".repeat(64);
+        Manifest {
+            schema_version: SUPPORTED_SCHEMA_VERSION,
+            index_version: "2026.07.11".to_string(),
+            created_at: "2026-07-11T00:00:00Z".to_string(),
+            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
+            model: ModelInfo {
+                id: EMBEDDING_MODEL_ID.to_string(),
+                sha256: "4".repeat(64),
+                size: 1,
+                url: "model-bundle.tar.zst".to_string(),
+            },
+            db: ManifestDb {
+                url: LEGAL_DB_ARCHIVE_FILENAME.to_string(),
+                sha256: "5".repeat(64),
+                size: 1,
+            },
+            ann: BTreeMap::from([(source_id, ann), (frl_source_id, frl_ann)]),
+        }
+    }
+
+    #[test]
+    fn final_manifest_requires_exact_registered_source_map() -> Result<()> {
+        let manifest = sample_manifest();
+        validate_manifest(&manifest)?;
+
+        let mut missing = manifest.clone();
+        missing.ann.clear();
+        assert!(validate_manifest(&missing).is_err());
+
+        let mut mismatched = manifest.clone();
+        mismatched
+            .ann
+            .get_mut(&"ato".parse::<SourceId>().expect("valid source id"))
+            .expect("ATO manifest entry")
+            .source_id = "frl".parse().expect("valid source id");
+        assert!(validate_manifest(&mismatched).is_err());
+
+        let mut encoded = serde_json::to_value(&manifest)?;
+        encoded
+            .as_object_mut()
+            .expect("manifest object")
+            .insert("unexpected".to_string(), json!(2));
+        assert!(serde_json::from_value::<Manifest>(encoded).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn final_manifest_accepts_remote_artifacts_but_rejects_duplicate_urls() -> Result<()> {
+        let mut manifest = sample_manifest();
+        manifest.db.url = "https://downloads.example/legal.db.zst".to_string();
+        for (source, ann) in &mut manifest.ann {
+            ann.url = format!("https://downloads.example/{source}.ann");
+        }
+        validate_manifest(&manifest)?;
+
+        let duplicate = manifest.db.url.clone();
+        manifest
+            .ann
+            .get_mut(&"ato".parse::<SourceId>()?)
+            .expect("ATO manifest entry")
+            .url = duplicate;
+        assert!(validate_manifest(&manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("distinct URLs"));
+
+        let mut escaping = sample_manifest();
+        escaping.db.url = "../legal.db.zst".to_string();
+        assert!(validate_manifest(&escaping).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn generation_promotion_is_atomic_and_requires_every_source() -> Result<()> {
+        let data = tempfile::tempdir()?;
+        let _environment =
+            crate::TestEnvironment::set(&[("LEGAL_MCP_DATA_DIR", data.path().as_os_str())]);
+        let previous_key = "f".repeat(64);
+        fs::create_dir_all(generation_dir(&previous_key)?)?;
+        activate_generation(&previous_key)?;
+
+        let manifest = sample_manifest();
+        let expected_key = generation_key(&manifest);
+        let model_dir = data.path().join("staged-model");
+        fs::create_dir_all(&model_dir)?;
+        for file in EMBEDDING_MODEL_HF_FILES {
+            fs::write(model_dir.join(file.output_name), b"model")?;
+        }
+        let staged_model = StagedModel {
+            dir: model_dir,
+            marker_value: "verified-model".to_string(),
+        };
+
+        let incomplete_root = data.path().join("incomplete-generation");
+        fs::create_dir_all(&incomplete_root)?;
+        let incomplete_db = incomplete_root.join(LEGAL_DB_FILENAME);
+        fs::write(&incomplete_db, b"database")?;
+        let error = promote_staged_update(
+            Some(&staged_model),
+            StagedCorpusUpdate {
+                staging_root: incomplete_root,
+                staged_db: incomplete_db,
+                staged_ann: BTreeMap::new(),
+                stats: UpdateStats::default(),
+            },
+            &manifest,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("source set"));
+        assert_eq!(
+            active_generation_key()?.as_deref(),
+            Some(previous_key.as_str())
+        );
+        assert!(!generation_dir(&expected_key)?.exists());
+
+        let complete_root = data.path().join("complete-generation");
+        fs::create_dir_all(&complete_root)?;
+        let staged_db = complete_root.join(LEGAL_DB_FILENAME);
+        fs::write(&staged_db, b"database")?;
+        let mut staged_sidecars = BTreeMap::new();
+        for source_id in manifest.ann.keys() {
+            let staged_ann = complete_root.join(crate::ann::sidecar_relative_path(source_id));
+            fs::create_dir_all(staged_ann.parent().expect("ANN parent"))?;
+            fs::write(&staged_ann, format!("{source_id}-sidecar"))?;
+            staged_sidecars.insert(source_id.clone(), staged_ann);
+        }
+        let colliding_generation = generation_dir(&expected_key)?;
+        fs::create_dir_all(&colliding_generation)?;
+        fs::write(colliding_generation.join("sentinel"), b"immutable")?;
+        let collision_error = match promote_staged_update(
+            Some(&staged_model),
+            StagedCorpusUpdate {
+                staging_root: complete_root.clone(),
+                staged_db: staged_db.clone(),
+                staged_ann: staged_sidecars.clone(),
+                stats: UpdateStats::default(),
+            },
+            &manifest,
+        ) {
+            Ok(()) => panic!("an inactive immutable generation was overwritten"),
+            Err(error) => error,
+        };
+        assert!(collision_error.to_string().contains("collision"));
+        assert_eq!(
+            fs::read(colliding_generation.join("sentinel"))?,
+            b"immutable"
+        );
+        assert_eq!(
+            active_generation_key()?.as_deref(),
+            Some(previous_key.as_str())
+        );
+        fs::remove_dir_all(&colliding_generation)?;
+        promote_staged_update(
+            Some(&staged_model),
+            StagedCorpusUpdate {
+                staging_root: complete_root,
+                staged_db,
+                staged_ann: staged_sidecars,
+                stats: UpdateStats::default(),
+            },
+            &manifest,
+        )?;
+
+        assert_eq!(
+            active_generation_key()?.as_deref(),
+            Some(expected_key.as_str())
+        );
+        let generation = generation_dir(&expected_key)?;
+        assert_eq!(fs::read(generation.join(LEGAL_DB_FILENAME))?, b"database");
+        for source_id in manifest.ann.keys() {
+            assert_eq!(
+                fs::read(generation.join(crate::ann::sidecar_relative_path(source_id)))?,
+                format!("{source_id}-sidecar").into_bytes()
+            );
+        }
+        let installed: Manifest =
+            serde_json::from_slice(&fs::read(generation.join("installed_manifest.json"))?)?;
+        assert_eq!(installed, manifest);
+        assert!(!generations_dir()?
+            .join(format!(".{expected_key}.installing"))
+            .exists());
+        Ok(())
+    }
+
+    #[test]
     fn payload_paths_remain_beneath_payload_root() {
         let root = tempfile::tempdir().unwrap();
         let link = json!({
@@ -2625,6 +3368,100 @@ mod security_tests {
         let path = build_payload_path(root.path(), &link).unwrap();
         assert!(path.starts_with(root.path().join("payloads")));
         assert!(!path.to_string_lossy().contains(".."));
+    }
+
+    #[test]
+    fn incremental_diff_retries_nonterminal_acquisition_records() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let index = root.path().join("index.jsonl");
+        fs::write(
+            &index,
+            [
+                json!({"canonical_id": "/law/view/document?docid=JUD/GOOD/00001", "status": "success"}),
+                json!({"canonical_id": "/law/view/document?docid=JUD/GONE/00001", "status": "confirmed_404"}),
+                json!({"canonical_id": "/law/view/document?docid=JUD/RETRY/00001", "status": "failed"}),
+                json!({"canonical_id": "/law/view/document?docid=JUD/MISSING/00001", "status": "missing_content"}),
+                json!({"canonical_id": "/law/view/document?docid=JUD/STALE/00001", "status": "success", "refresh_status": "failed"}),
+                json!({"canonical_id": "/law/view/document?docid=JUD/FLAP/00001", "status": "success"}),
+                json!({"canonical_id": "/law/view/document?docid=JUD/FLAP/00001", "status": "failed"}),
+            ]
+            .into_iter()
+            .map(|record| serde_json::to_string(&record))
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .join("\n"),
+        )?;
+
+        let complete = load_canonical_ids(&index)?;
+        assert!(complete.contains("/law/view/document?docid=JUD/GOOD/00001"));
+        assert!(complete.contains("/law/view/document?docid=JUD/GONE/00001"));
+        assert!(!complete.contains("/law/view/document?docid=JUD/RETRY/00001"));
+        assert!(!complete.contains("/law/view/document?docid=JUD/MISSING/00001"));
+        assert!(!complete.contains("/law/view/document?docid=JUD/STALE/00001"));
+        assert!(!complete.contains("/law/view/document?docid=JUD/FLAP/00001"));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_refresh_preserves_last_verified_payload_for_builds() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let payload = root.path().join("document.html");
+        fs::write(&payload, b"verified source")?;
+        let canonical_id = "/law/view/document?docid=JUD/KEEP/00001";
+        let mut index = std::collections::HashMap::from([(
+            canonical_id.to_string(),
+            json!({
+                "canonical_id": canonical_id,
+                "status": "success",
+                "payload_path": "document.html",
+                "size": fs::metadata(&payload)?.len(),
+                "sha256": sha256_path(&payload)?,
+            }),
+        )]);
+        let record = record_link_refresh_failure(
+            &mut index,
+            canonical_id,
+            root.path(),
+            LinkRefreshFailure {
+                status: "failed",
+                error: "transient".to_string(),
+                http_status: None,
+                attempted_at: "2026-07-12T00:00:00Z".to_string(),
+                href: Some(canonical_id.to_string()),
+            },
+        );
+        assert_eq!(record["status"], "success");
+        assert_eq!(record["payload_path"], "document.html");
+        assert_eq!(record["refresh_status"], "failed");
+        assert!(payload_matches_record(&payload, &record));
+
+        let mut reloaded = std::collections::HashMap::from([(
+            canonical_id.to_string(),
+            index[canonical_id].clone(),
+        )]);
+        reloaded
+            .get_mut(canonical_id)
+            .and_then(JsonValue::as_object_mut)
+            .expect("object")
+            .remove("refresh_status");
+        merge_resume_index_record(
+            &mut reloaded,
+            canonical_id,
+            json!({
+                "canonical_id": canonical_id,
+                "status": "missing_content",
+                "error": "transient parse failure",
+            }),
+        );
+        assert_eq!(reloaded[canonical_id]["status"], "success");
+        assert_eq!(reloaded[canonical_id]["refresh_status"], "missing_content");
+
+        let replacement = b"new verified source";
+        let replacement_sha = format!("{:x}", Sha256::digest(replacement));
+        let replacement_path = immutable_payload_path(&payload, &replacement_sha)?;
+        persist_immutable_payload(root.path(), &replacement_path, replacement)?;
+        assert_eq!(fs::read(&payload)?, b"verified source");
+        assert_eq!(fs::read(&replacement_path)?, replacement);
+        Ok(())
     }
 
     #[test]

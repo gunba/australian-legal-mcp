@@ -1,0 +1,46 @@
+[
+  [
+    {
+      "id": "A0001",
+      "name": "One Act",
+      "makingDate": "2024-01-01T00:00:00",
+      "collection": "Act",
+      "subCollection": null,
+      "isPrincipal": true,
+      "isInForce": true,
+      "status": "InForce"
+    },
+    {
+      "id": "A0002",
+      "name": "Two Act",
+      "makingDate": "2024-01-01T00:00:00",
+      "collection": "Act",
+      "subCollection": null,
+      "isPrincipal": true,
+      "isInForce": true,
+      "status": "InForce"
+    }
+  ],
+  [
+    {
+      "id": "A0002",
+      "name": "Two Act",
+      "makingDate": "2024-01-01T00:00:00",
+      "collection": "Act",
+      "subCollection": null,
+      "isPrincipal": true,
+      "isInForce": true,
+      "status": "InForce"
+    },
+    {
+      "id": "A0003",
+      "name": "Three Act",
+      "makingDate": "2024-01-01T00:00:00",
+      "collection": "Act",
+      "subCollection": null,
+      "isPrincipal": true,
+      "isInForce": true,
+      "status": "InForce"
+    }
+  ]
+]

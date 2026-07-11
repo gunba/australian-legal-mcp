@@ -1,15 +1,18 @@
-//! Hybrid BM25 + vector search, candidate dedup, RRF fusion, snippet
-//! rendering, and title hits. Port of the runtime search path.
+//! Hybrid BM25 + vector search with candidate deduplication, RRF fusion,
+//! bounded snippet rendering, and direct title hits.
 
-use crate::db::{canonical_url, decompress_text, get_meta, open_read, table_exists};
+use crate::config::{active_generation_key, ann_path};
+use crate::db::{decompress_text, get_corpus_meta, get_source_meta, open_read, table_exists};
+use crate::legal_source::source_registry;
 use crate::semantic::{dot_i8, encode_query_embedding};
-use crate::source::{load_installed_manifest, verify_ann_db_binding};
+use crate::source::load_installed_manifest;
 use crate::{
     embedding_model_installed_matches, SearchMode, ServerState, SortBy, DEFAULT_EXCLUDED_TYPES,
     EMBEDDING_DIM, EMBEDDING_MODEL_ID, HARD_MAX_PER_DOC, LEGISLATION_TYPE_PREFIXES, MAX_K,
     OLD_CONTENT_CUTOFF, SNIPPET_CHARS, TITLE_HITS_K,
 };
 use anyhow::{anyhow, bail, Context, Result};
+use legal_model::{ChunkRef, DocumentId, SourceId};
 use regex::Regex;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
@@ -17,8 +20,8 @@ use serde::Serialize;
 use serde_json::{json, Value as JsonValue};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
-use url::Url;
 
 pub(crate) fn fts_query(query: &str) -> String {
     fts_terms(query).join(" OR ")
@@ -62,7 +65,7 @@ fn fts_strict_query(query: &str) -> String {
 }
 
 pub(crate) fn glob_to_like(pattern: &str) -> String {
-    // [MT-13] Accept both '*' and '%' as wildcards (the prefix idiom the
+    // Accept both '*' and '%' as wildcards (the prefix idiom the
     // MCP tool descriptor advertises is `PAC/%`); escape '_' and '\' so they
     // match literally. ATO doc_ids never contain '%', so collapsing both
     // wildcard glyphs onto SQL LIKE '%' is safe.
@@ -80,24 +83,36 @@ pub(crate) fn glob_to_like(pattern: &str) -> String {
     out
 }
 
-#[derive(Default)]
 pub(crate) struct SqlFilter {
+    pub(crate) source: SourceId,
     pub(crate) sql: String,
     pub(crate) params: Vec<Value>,
 }
 
-pub(crate) fn build_doc_filter(
-    alias: &str,
-    types: Option<&[String]>,
-    date_from: Option<&str>,
-    date_to: Option<&str>,
-    doc_scope: Option<&str>,
-    include_old: bool,
-    current_only: bool,
-) -> SqlFilter {
-    // [MT-10] Default search policy excludes EPA and old non-legislation unless overridden.
-    let mut clauses = Vec::new();
-    let mut params_out = Vec::new();
+pub(crate) struct DocumentFilterSpec<'a> {
+    pub(crate) source_id: &'a SourceId,
+    pub(crate) types: Option<&'a [String]>,
+    pub(crate) date_from: Option<&'a str>,
+    pub(crate) date_to: Option<&'a str>,
+    pub(crate) doc_scope: Option<&'a str>,
+    pub(crate) include_old: bool,
+    pub(crate) current_only: bool,
+}
+
+pub(crate) fn build_doc_filter(alias: &str, spec: DocumentFilterSpec<'_>) -> SqlFilter {
+    let DocumentFilterSpec {
+        source_id,
+        types,
+        date_from,
+        date_to,
+        doc_scope,
+        include_old,
+        current_only,
+    } = spec;
+    // ATO owns its edited-private-advice and old-content defaults. Other
+    // sources must not inherit ATO document codes or date policy.
+    let mut clauses = vec![format!("{alias}.source_id = ?")];
+    let mut params_out = vec![Value::Text(source_id.as_str().to_string())];
 
     if let Some(types) = types {
         if !types.is_empty() {
@@ -113,7 +128,7 @@ pub(crate) fn build_doc_filter(
             }
             clauses.push(format!("({})", ors.join(" OR ")));
         }
-    } else if !DEFAULT_EXCLUDED_TYPES.is_empty() {
+    } else if source_id.as_str() == "ato" && !DEFAULT_EXCLUDED_TYPES.is_empty() {
         let placeholders = vec!["?"; DEFAULT_EXCLUDED_TYPES.len()].join(",");
         clauses.push(format!("{alias}.type NOT IN ({placeholders})"));
         for t in DEFAULT_EXCLUDED_TYPES {
@@ -130,10 +145,10 @@ pub(crate) fn build_doc_filter(
         params_out.push(Value::Text(date_to.to_string()));
     }
     if let Some(doc_scope) = doc_scope {
-        clauses.push(format!("{alias}.doc_id LIKE ? ESCAPE '\\'"));
+        clauses.push(format!("{alias}.native_id LIKE ? ESCAPE '\\'"));
         params_out.push(Value::Text(glob_to_like(doc_scope)));
     }
-    if !include_old && date_from.is_none() {
+    if source_id.as_str() == "ato" && !include_old && date_from.is_none() {
         let placeholders = vec!["?"; LEGISLATION_TYPE_PREFIXES.len()].join(",");
         clauses.push(format!(
             "({alias}.date IS NULL OR {alias}.date >= ? OR {alias}.type IN ({placeholders}))"
@@ -151,25 +166,34 @@ pub(crate) fn build_doc_filter(
     }
 
     SqlFilter {
+        source: source_id.clone(),
         sql: clauses.join(" AND "),
         params: params_out,
     }
 }
 
-fn validate_doc_types(conn: &Connection, types: Option<&[String]>) -> Result<()> {
+fn validate_doc_types(
+    conn: &Connection,
+    source_id: &SourceId,
+    types: Option<&[String]>,
+) -> Result<()> {
     let Some(types) = types else {
         return Ok(());
     };
 
     let mut seen = HashSet::new();
     let mut unknown = Vec::new();
-    let mut stmt =
-        conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM documents WHERE type = ? LIMIT 1)")?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM documents \
+         WHERE source_id = ?1 AND type = ?2 LIMIT 1)",
+    )?;
     for doc_type in types {
         if doc_type.contains('*') || !seen.insert(doc_type.as_str()) {
             continue;
         }
-        let exists = stmt.query_row([doc_type.as_str()], |row| row.get::<_, i64>(0))? != 0;
+        let exists = stmt.query_row(params![source_id.as_str(), doc_type], |row| {
+            row.get::<_, i64>(0)
+        })? != 0;
         if !exists {
             unknown.push(doc_type.as_str());
         }
@@ -186,8 +210,8 @@ fn validate_doc_types(conn: &Connection, types: Option<&[String]>) -> Result<()>
 
 #[derive(Debug, Serialize)]
 pub(crate) struct Hit {
-    // [MT-04] Search-family hits stay slim; bodies materialize through follow-up tools.
-    pub(crate) doc_id: String,
+    // Search-family hits stay slim; bodies materialize through follow-up tools.
+    pub(crate) document: DocumentId,
     pub(crate) title: String,
     #[serde(rename = "type")]
     pub(crate) doc_type: String,
@@ -199,7 +223,7 @@ pub(crate) struct Hit {
     pub(crate) snippet: Option<String>,
     pub(crate) canonical_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) chunk_id: Option<i64>,
+    pub(crate) chunk: Option<ChunkRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) next_call: Option<String>,
     /// W2.2 currency markers — only serialised when set so JSON output for
@@ -207,12 +231,12 @@ pub(crate) struct Hit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) withdrawn_date: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) superseded_by: Option<String>,
+    pub(crate) superseded_by: Option<DocumentId>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) replaces: Option<String>,
+    pub(crate) replaces: Option<DocumentId>,
     /// Navigation hint flags — only serialised when set (so a doc with no
     /// matching anchors keeps the slim hit clean). `Some(true)` tells the
-    /// agent to call `get_doc_anchors(doc_id)` to navigate.
+    /// agent to call `get_doc_anchors(document)` to navigate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) has_in_doc_links: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -265,6 +289,7 @@ fn rank_hits(hits: &mut [VectorHit]) {
 }
 
 pub(crate) struct SearchOptions<'a> {
+    pub(crate) source: SourceId,
     pub(crate) k: usize,
     pub(crate) types: Option<&'a [String]>,
     pub(crate) date_from: Option<&'a str>,
@@ -291,19 +316,19 @@ pub(crate) struct SearchOptions<'a> {
     /// semantic stage. Forces vector-only mode (no BM25 stage). The input
     /// chunk is filtered out of results so the agent never sees their
     /// seed chunk reflected back.
-    pub(crate) similar_to_chunk_id: Option<i64>,
+    pub(crate) similar_to_chunk: Option<ChunkRef>,
     /// When set, this arbitrary text is runtime-embedded and used as the
-    /// query vector — the same mechanism as `similar_to_chunk_id` but for
+    /// query vector — the same mechanism as `similar_to_chunk` but for
     /// text that isn't a corpus chunk (e.g. a chunk returned by
     /// `fetch`). Forces vector-only mode and skips title hits,
-    /// like `similar_to_chunk_id`. `similar_to_chunk_id` wins if both are set.
+    /// like `similar_to_chunk`. `similar_to_chunk` wins if both are set.
     pub(crate) seed_text: Option<&'a str>,
 }
 
 /// Metadata required to rank and dedup candidate chunks across documents.
 #[derive(Debug, Clone)]
 pub(crate) struct CandidateMeta {
-    pub(crate) doc_id: String,
+    pub(crate) document: DocumentId,
     /// True when this chunk's plaintext is short (< 100 chars) and the
     /// chunk sits at the start of the document — typically a stub
     /// preamble that crowds out more useful chunks. We approximate "intro"
@@ -312,7 +337,7 @@ pub(crate) struct CandidateMeta {
     pub(crate) is_intro: bool,
 }
 
-/// Group candidate `(chunk_id, score)` entries by `doc_id`, demote
+/// Group candidate `(chunk_id, score)` entries by typed document identity, demote
 /// intros, and emit at most `max_per_doc` chunks per document until `k`
 /// is reached. Per-document score is the max of the top three chunk
 /// scores within that document. Pure function — no DB access — so it
@@ -331,19 +356,19 @@ pub(crate) fn dedup_per_doc(
     // Bucket per doc, keep insertion order (which matches incoming
     // ranking order so each bucket is already sorted by score desc when
     // the caller did its own sort).
-    let mut buckets: BTreeMap<usize, (String, Vec<(VectorHit, bool)>)> = BTreeMap::new();
-    let mut order: HashMap<String, usize> = HashMap::new();
+    let mut buckets: BTreeMap<usize, (DocumentId, Vec<(VectorHit, bool)>)> = BTreeMap::new();
+    let mut order: HashMap<DocumentId, usize> = HashMap::new();
     let mut next_idx = 0usize;
     for hit in ranked {
         let Some(m) = meta.get(&hit.chunk_id) else {
             continue;
         };
-        let idx = match order.get(&m.doc_id) {
+        let idx = match order.get(&m.document) {
             Some(i) => *i,
             None => {
                 let i = next_idx;
-                order.insert(m.doc_id.clone(), i);
-                buckets.insert(i, (m.doc_id.clone(), Vec::new()));
+                order.insert(m.document.clone(), i);
+                buckets.insert(i, (m.document.clone(), Vec::new()));
                 next_idx += 1;
                 i
             }
@@ -359,8 +384,8 @@ pub(crate) fn dedup_per_doc(
     // so non-intro chunks always come before intro chunks within a doc.
     // Then compute the per-doc score as max of the top 3 chunk scores in
     // that ordered list.
-    let mut docs: Vec<(String, f64, Vec<VectorHit>)> = Vec::new();
-    for (_idx, (doc_id, mut items)) in buckets {
+    let mut docs: Vec<(DocumentId, f64, Vec<VectorHit>)> = Vec::new();
+    for (_idx, (document, mut items)) in buckets {
         items.sort_by(|a, b| {
             a.1.cmp(&b.1)
                 .then_with(|| b.0.score.total_cmp(&a.0.score))
@@ -372,7 +397,7 @@ pub(crate) fn dedup_per_doc(
             .map(|(h, _)| h.score)
             .fold(f64::NEG_INFINITY, f64::max);
         let chunks: Vec<VectorHit> = items.into_iter().map(|(h, _)| h).collect();
-        docs.push((doc_id, doc_score, chunks));
+        docs.push((document, doc_score, chunks));
     }
     docs.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
@@ -382,7 +407,7 @@ pub(crate) fn dedup_per_doc(
     // Callers that need more chunks from the same doc should follow up
     // with `get_chunks`.
     let mut out: Vec<VectorHit> = Vec::with_capacity(k);
-    for (_doc_id, _score, chunks) in &docs {
+    for (_document, _score, chunks) in &docs {
         if out.len() >= k {
             break;
         }
@@ -400,38 +425,62 @@ pub(crate) fn search(
     server_state: Option<&ServerState>,
 ) -> Result<String> {
     let _corpus_lock = crate::config::corpus_read_lock()?;
+    let resolved_source = opts.source.clone();
+    source_registry().source(&resolved_source)?;
+    let generation = active_generation_key()?.ok_or_else(|| {
+        anyhow!("no active corpus generation; install a corpus generation before search")
+    })?;
     if let Some(state) = server_state {
         state.ensure_corpus_generation_unchanged()?;
     }
     let conn = open_read()?;
-    validate_doc_types(&conn, opts.types)?;
+    validate_doc_types(&conn, &resolved_source, opts.types)?;
     let k = opts.k.clamp(1, MAX_K);
     let max_per_doc = opts.max_per_doc.clamp(1, HARD_MAX_PER_DOC);
     let filter = build_doc_filter(
         "d",
-        opts.types,
-        opts.date_from,
-        opts.date_to,
-        opts.doc_scope,
-        opts.include_old,
-        opts.current_only,
+        DocumentFilterSpec {
+            source_id: &resolved_source,
+            types: opts.types,
+            date_from: opts.date_from,
+            date_to: opts.date_to,
+            doc_scope: opts.doc_scope,
+            include_old: opts.include_old,
+            current_only: opts.current_only,
+        },
     );
-    // [MT-02] k is clamped, first-stage recall is widened, then candidates dedupe per document.
+    // k is clamped, first-stage recall is widened, then candidates dedupe per document.
     let internal_limit = std::cmp::max(k * 5, 50);
-    // [MT-16] `similar_to_chunk_id` short-circuits semantic encode: load the seed
+    // `similar_to_chunk` short-circuits semantic encode: load the seed
     // chunk's stored embedding and use it as the query vector. Force
     // vector-only mode (no BM25 stage — no real query text to rank against).
-    let similar_seed: Option<(i64, [i8; EMBEDDING_DIM])> = match opts.similar_to_chunk_id {
-        Some(seed_id) => {
-            ensure_vector_search_ready(&conn)?;
-            Some((seed_id, load_chunk_embedding(&conn, seed_id)?))
+    let similar_seed: Option<(i64, [i8; EMBEDDING_DIM])> = match opts.similar_to_chunk.as_ref() {
+        Some(reference) => {
+            if reference.source != resolved_source {
+                bail!(
+                    "similar_to_chunk source `{}` does not match resolved search source `{resolved_source}`",
+                    reference.source
+                );
+            }
+            if reference.generation != generation {
+                bail!(
+                    "similar_to_chunk generation `{}` does not match active generation `{generation}`",
+                    reference.generation
+                );
+            }
+            let seed_id = i64::try_from(reference.chunk_id)
+                .map_err(|_| anyhow!("similar_to_chunk id exceeds SQLite integer range"))?;
+            Some((
+                seed_id,
+                load_chunk_embedding(&conn, &resolved_source, seed_id)?,
+            ))
         }
         None => None,
     };
     // `seed_text` runtime-embeds arbitrary text as the query vector — the
-    // same seed-driven path as `similar_to_chunk_id`, but for text that
+    // same seed-driven path as `similar_to_chunk`, but for text that
     // isn't a corpus chunk (e.g. a chunk from `fetch`).
-    // `similar_to_chunk_id` wins if both are set.
+    // `similar_to_chunk` wins if both are set.
     let seed_text: Option<&str> = if similar_seed.is_some() {
         None
     } else {
@@ -445,14 +494,21 @@ pub(crate) fn search(
     } else {
         opts.mode
     };
+    let source_ann = if matches!(effective_mode, SearchMode::Hybrid | SearchMode::Vector) {
+        Some(ensure_vector_search_ready(&conn, &resolved_source)?)
+    } else {
+        None
+    };
     let lexical_hits = if matches!(effective_mode, SearchMode::Hybrid | SearchMode::Keyword) {
-        lexical_search(&conn, query, &filter, internal_limit)?
+        lexical_search(&conn, &resolved_source, query, &filter, internal_limit)?
     } else {
         Vec::new()
     };
     let ranked_hits = match effective_mode {
         SearchMode::Hybrid | SearchMode::Vector => {
-            ensure_vector_search_ready(&conn)?;
+            let source_ann = source_ann
+                .as_ref()
+                .ok_or_else(|| anyhow!("vector mode did not prepare source ANN state"))?;
             let query_embedding = if let Some((_, ref seed_vec)) = similar_seed {
                 *seed_vec
             } else {
@@ -464,7 +520,14 @@ pub(crate) fn search(
                     None => encode_query_embedding(embed_input)?,
                 }
             };
-            let vector_hits = vector_search(&conn, &query_embedding, &filter, internal_limit)?;
+            let vector_hits = vector_search(
+                &conn,
+                &resolved_source,
+                source_ann,
+                &query_embedding,
+                &filter,
+                internal_limit,
+            )?;
             // Filter the seed chunk out of its own similar-chunks results.
             let vector_hits = if let Some((seed_id, _)) = similar_seed {
                 vector_hits
@@ -489,35 +552,43 @@ pub(crate) fn search(
         SortBy::Recency => std::cmp::max(k * 5, 50),
     };
 
-    // Batch-load (chunk_id -> doc_id, is_intro) for all candidates so the
+    // Batch-load (chunk_id -> document, is_intro) for all candidates so the
     // dedup pass doesn't have to round-trip per chunk.
-    let candidate_meta = load_candidate_meta(&conn, &ranked_hits)?;
+    let candidate_meta = load_candidate_meta(&conn, &resolved_source, &ranked_hits)?;
     let deduped = dedup_per_doc(ranked_hits, &candidate_meta, frontier, max_per_doc);
 
     let ranked_ids = deduped.iter().map(|hit| hit.chunk_id).collect::<Vec<_>>();
-    let mut hydrated = load_hits(&conn, &ranked_ids, query, opts.include_snippet)?;
+    let mut hydrated = load_hits(
+        &conn,
+        &resolved_source,
+        &generation,
+        &ranked_ids,
+        query,
+        opts.include_snippet,
+    )?;
     let mut records = ranked_ids
         .into_iter()
         .filter_map(|chunk_id| hydrated.remove(&chunk_id))
         .collect::<Vec<_>>();
     if matches!(opts.sort_by, SortBy::Recency) {
-        // [MT-06] Recency sort materializes a widened frontier, then sorts by date descending.
+        // Recency sort materializes a widened frontier, then sorts by date descending.
         records.sort_by(|a, b| {
             b.date
                 .cmp(&a.date)
-                .then_with(|| a.doc_id.cmp(&b.doc_id))
-                .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+                .then_with(|| a.document.cmp(&b.document))
+                .then_with(|| a.chunk.cmp(&b.chunk))
         });
         records.truncate(k);
     }
-    // [MT-03] JSON metadata preserves query/filter state in next_call when k can grow.
+    // JSON metadata preserves query/filter state in next_call when k can grow.
     let next_call = if candidate_count > records.len() && k < MAX_K {
-        Some(search_next_call(query, std::cmp::min(k * 2, MAX_K), &opts))
+        Some(search_next_call(query, std::cmp::min(k * 2, MAX_K), &opts)?)
     } else {
         None
     };
 
     let mut meta = serde_json::Map::new();
+    meta.insert("resolved_source".to_string(), json!(resolved_source));
     if candidate_count > records.len() {
         meta.insert("truncated".to_string(), json!(true));
         if let Some(nc) = next_call {
@@ -528,12 +599,12 @@ pub(crate) fn search(
     // Title-level hits — a parallel algorithm over the separate `title_fts`
     // table, surfaced as a sidebar alongside the chunk `hits`. Reuses the
     // same document filter so chunk and title queries stay consistently
-    // scoped. Skipped for a seed search (`similar_to_chunk_id` / `seed_text`)
+    // scoped. Skipped for a seed search (`similar_to_chunk` / `seed_text`)
     // — there's no real query text to BM25 against; `query` is ignored.
     let title_hits: Vec<Hit> = if is_seed_search {
         Vec::new()
     } else {
-        collect_title_hits(&conn, query, TITLE_HITS_K, &filter)?
+        collect_title_hits(&conn, &resolved_source, query, TITLE_HITS_K, &filter)?
     };
 
     let mut response = serde_json::Map::new();
@@ -553,6 +624,7 @@ pub(crate) fn search_cli(query: &str, opts: SearchOptions<'_>) -> Result<(String
 
 pub(crate) fn load_candidate_meta(
     conn: &Connection,
+    source_id: &SourceId,
     ranked: &[VectorHit],
 ) -> Result<HashMap<i64, CandidateMeta>> {
     if ranked.is_empty() {
@@ -565,37 +637,44 @@ pub(crate) fn load_candidate_meta(
     ids.dedup();
 
     let placeholders = vec!["?"; ids.len()].join(",");
-    // Two-step query: first read (chunk_id, doc_id, ord) for every
+    // Two-step query: first read (chunk_id, native_id, ord) for every
     // candidate cheaply; then decompress the text BLOB only for the
     // small minority sitting at ord == 0 so we can measure the *plain*
     // text length precisely. Heading-path is gone; "intro" now means
     // "leading stub chunk" (ord 0 with short text) which still
     // correctly demotes the typical preamble pattern.
-    let sql =
-        format!("SELECT chunk_id, doc_id, ord FROM chunks WHERE chunk_id IN ({placeholders})");
-    let params_vec: Vec<Value> = ids.into_iter().map(Value::Integer).collect();
+    let sql = format!(
+        "SELECT chunk_id, native_id, ord FROM chunks \
+         WHERE source_id = ? AND chunk_id IN ({placeholders})"
+    );
+    let mut params_vec = vec![Value::Text(source_id.as_str().to_string())];
+    params_vec.extend(ids.into_iter().map(Value::Integer));
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params_vec), |row| {
         let chunk_id: i64 = row.get("chunk_id")?;
-        let doc_id: String = row.get("doc_id")?;
+        let native_id: String = row.get("native_id")?;
         let ord: i64 = row.get("ord")?;
-        Ok((chunk_id, doc_id, ord))
+        Ok((chunk_id, native_id, ord))
     })?;
     let mut leading_chunk_ids: Vec<i64> = Vec::new();
     let mut staged: Vec<(i64, String, i64)> = Vec::new();
     for row in rows {
-        let (chunk_id, doc_id, ord) = row?;
+        let (chunk_id, native_id, ord) = row?;
         if ord == 0 {
             leading_chunk_ids.push(chunk_id);
         }
-        staged.push((chunk_id, doc_id, ord));
+        staged.push((chunk_id, native_id, ord));
     }
 
     let mut intro_set: HashSet<i64> = HashSet::new();
     if !leading_chunk_ids.is_empty() {
         let placeholders2 = vec!["?"; leading_chunk_ids.len()].join(",");
-        let sql2 = format!("SELECT chunk_id, text FROM chunks WHERE chunk_id IN ({placeholders2})");
-        let params_vec2: Vec<Value> = leading_chunk_ids.into_iter().map(Value::Integer).collect();
+        let sql2 = format!(
+            "SELECT chunk_id, text FROM chunks \
+             WHERE source_id = ? AND chunk_id IN ({placeholders2})"
+        );
+        let mut params_vec2 = vec![Value::Text(source_id.as_str().to_string())];
+        params_vec2.extend(leading_chunk_ids.into_iter().map(Value::Integer));
         let mut stmt2 = conn.prepare(&sql2)?;
         let rows2 = stmt2.query_map(params_from_iter(params_vec2), |row| {
             let chunk_id: i64 = row.get("chunk_id")?;
@@ -612,16 +691,26 @@ pub(crate) fn load_candidate_meta(
     }
 
     let mut out = HashMap::new();
-    for (chunk_id, doc_id, _ord) in staged {
+    for (chunk_id, native_id, _ord) in staged {
         let is_intro = intro_set.contains(&chunk_id);
-        out.insert(chunk_id, CandidateMeta { doc_id, is_intro });
+        out.insert(
+            chunk_id,
+            CandidateMeta {
+                document: DocumentId {
+                    source: source_id.clone(),
+                    native_id,
+                },
+                is_intro,
+            },
+        );
     }
     Ok(out)
 }
 
-pub(crate) fn search_next_call(query: &str, k: usize, opts: &SearchOptions<'_>) -> String {
+pub(crate) fn search_next_call(query: &str, k: usize, opts: &SearchOptions<'_>) -> Result<String> {
     let mut args = vec![
         format!("query={}", mcp_string(query)),
+        format!("source={}", mcp_string(opts.source.as_str())),
         format!("k={k}"),
         format!("mode=\"{}\"", opts.mode.as_str()),
     ];
@@ -656,12 +745,15 @@ pub(crate) fn search_next_call(query: &str, k: usize, opts: &SearchOptions<'_>) 
     }
     // Seed-driven searches: preserve the seed so paging re-runs the same
     // semantic query rather than falling back to a plain `query` search.
-    if let Some(seed_id) = opts.similar_to_chunk_id {
-        args.push(format!("similar_to_chunk_id={seed_id}"));
+    if let Some(similar_to_chunk) = opts.similar_to_chunk.as_ref() {
+        args.push(format!(
+            "similar_to_chunk={}",
+            serde_json::to_string(similar_to_chunk)?
+        ));
     } else if let Some(seed) = opts.seed_text {
         args.push(format!("seed_text={}", mcp_string(seed)));
     }
-    format!("search({})", args.join(", "))
+    Ok(format!("search({})", args.join(", ")))
 }
 
 pub(crate) fn mcp_string(value: &str) -> String {
@@ -669,19 +761,24 @@ pub(crate) fn mcp_string(value: &str) -> String {
 }
 
 /// Load a chunk's stored int8 embedding from `chunk_embeddings`. Used by
-/// `similar_to_chunk_id` to bypass query encoding and run vector search
+/// `similar_to` to bypass query encoding and run vector search
 /// directly against the seed chunk's vector.
 pub(crate) fn load_chunk_embedding(
     conn: &Connection,
+    source_id: &SourceId,
     chunk_id: i64,
 ) -> Result<[i8; EMBEDDING_DIM]> {
     let blob: Vec<u8> = conn
         .query_row(
-            "SELECT embedding FROM chunk_embeddings WHERE chunk_id = ?",
-            [chunk_id],
+            "SELECT e.embedding FROM chunk_embeddings AS e \
+             JOIN chunks AS c ON c.chunk_id = e.chunk_id \
+             WHERE c.source_id = ?1 AND e.chunk_id = ?2",
+            params![source_id.as_str(), chunk_id],
             |row| row.get(0),
         )
-        .with_context(|| format!("no stored embedding for chunk_id={chunk_id}"))?;
+        .with_context(|| {
+            format!("no stored embedding for source `{source_id}` chunk_id={chunk_id}")
+        })?;
     if blob.len() != EMBEDDING_DIM {
         bail!(
             "stored embedding for chunk_id={chunk_id} has wrong length: got {}, expected {}",
@@ -696,35 +793,65 @@ pub(crate) fn load_chunk_embedding(
     Ok(out)
 }
 
-pub(crate) fn ensure_vector_search_ready(conn: &Connection) -> Result<()> {
+#[derive(Clone, Debug)]
+pub(crate) struct SourceAnn {
+    info: crate::ann::ManifestAnn,
+    path: PathBuf,
+    model: crate::source::ModelInfo,
+}
+
+fn load_source_ann(source_id: &SourceId) -> Result<SourceAnn> {
+    let installed = load_installed_manifest()?.ok_or_else(|| {
+        anyhow!("semantic search unavailable: installed manifest missing; run `legal-mcp update`")
+    })?;
+    let info = installed.ann.get(source_id).cloned().ok_or_else(|| {
+        anyhow!("semantic search unavailable: manifest has no ANN sidecar for source `{source_id}`")
+    })?;
+    crate::ann::validate_manifest_ann(source_id, &info)?;
+    let path = ann_path(source_id)?;
+    Ok(SourceAnn {
+        info,
+        path,
+        model: installed.model,
+    })
+}
+
+pub(crate) fn ensure_vector_search_ready(
+    conn: &Connection,
+    source_id: &SourceId,
+) -> Result<SourceAnn> {
     static READINESS: OnceLock<Mutex<HashMap<String, Result<(), String>>>> = OnceLock::new();
-    let installed = load_installed_manifest()?;
-    let ann_generation = installed
-        .as_ref()
-        .and_then(|manifest| manifest.ann.as_ref())
-        .map(|ann| format!("{}:{}", ann.corpus_id, ann.sha256))
-        .unwrap_or_else(|| "legacy-exact".to_string());
+    let source_ann = load_source_ann(source_id)?;
     let corpus_id = format!(
-        "{}:{}:{}",
-        get_meta(conn, "index_version")?.unwrap_or_default(),
-        get_meta(conn, "embedding_model_id")?.unwrap_or_default(),
-        ann_generation,
+        "{}:{}:{}:{}:{}",
+        source_id,
+        get_corpus_meta(conn, "index_version")?.unwrap_or_default(),
+        get_corpus_meta(conn, "embedding_model_id")?.unwrap_or_default(),
+        source_ann.info.corpus_id,
+        source_ann.info.sha256,
     );
     let cache = READINESS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache
         .lock()
         .map_err(|_| anyhow!("semantic readiness cache lock poisoned"))?;
     if let Some(result) = cache.get(&corpus_id) {
-        return result.clone().map_err(|message| anyhow!(message));
+        result.clone().map_err(|message| anyhow!(message))?;
+        return Ok(source_ann);
     }
-    let result = check_vector_search_ready(conn).map_err(|error| error.to_string());
+    let result =
+        check_vector_search_ready(conn, source_id, &source_ann).map_err(|error| error.to_string());
     cache.insert(corpus_id, result.clone());
-    result.map_err(|message| anyhow!(message))
+    result.map_err(|message| anyhow!(message))?;
+    Ok(source_ann)
 }
 
-fn check_vector_search_ready(conn: &Connection) -> Result<()> {
-    // [MT-09] Hybrid/vector modes require the current semantic corpus model.
-    let model_id = get_meta(conn, "embedding_model_id")?.ok_or_else(|| {
+fn check_vector_search_ready(
+    conn: &Connection,
+    source_id: &SourceId,
+    source_ann: &SourceAnn,
+) -> Result<()> {
+    // Hybrid/vector modes require the current semantic corpus model.
+    let model_id = get_corpus_meta(conn, "embedding_model_id")?.ok_or_else(|| {
         anyhow!("semantic search unavailable: missing embedding_model_id metadata")
     })?;
     if model_id != EMBEDDING_MODEL_ID {
@@ -732,37 +859,47 @@ fn check_vector_search_ready(conn: &Connection) -> Result<()> {
             "semantic search unavailable: installed corpus uses unsupported embedding model `{model_id}`; install a {EMBEDDING_MODEL_ID} corpus"
         );
     }
-    let installed = load_installed_manifest()?.ok_or_else(|| {
-        anyhow!("semantic search unavailable: installed manifest missing; run `ato-mcp update`")
-    })?;
-    if installed.model.id != model_id {
+    if source_ann.model.id != model_id {
         bail!(
             "semantic search unavailable: installed manifest model `{}` does not match corpus metadata `{model_id}`",
-            installed.model.id
+            source_ann.model.id
         );
     }
-    if !embedding_model_installed_matches(&installed.model)? {
+    if !embedding_model_installed_matches(&source_ann.model)? {
         bail!(
-            "semantic search unavailable: installed semantic model files do not match installed_manifest.json; run `ato-mcp update`"
+            "semantic search unavailable: installed semantic model files do not match installed_manifest.json; run `legal-mcp update`"
         );
     }
     if !table_exists(conn, "chunk_embeddings")? {
-        bail!("semantic search unavailable: installed corpus has no chunk_embeddings table; run `ato-mcp update`");
+        bail!("semantic search unavailable: installed corpus has no chunk_embeddings table; run `legal-mcp update`");
     }
-    let embeddings: i64 = conn.query_row("SELECT COUNT(*) FROM chunk_embeddings", [], |row| {
-        row.get(0)
-    })?;
+    let embeddings: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM chunk_embeddings AS e \
+         JOIN chunks AS c ON c.chunk_id = e.chunk_id \
+         WHERE c.source_id = ?1",
+        [source_id.as_str()],
+        |row| row.get(0),
+    )?;
     if embeddings == 0 {
         bail!("semantic search unavailable: installed corpus has no chunk embeddings");
     }
-    if let Some(ann) = installed.ann.as_ref() {
-        verify_ann_db_binding(conn, ann)?;
-        crate::ann::verify_sidecar(&crate::config::ann_path()?, ann).map_err(|error| {
-            anyhow!(
-                "semantic search unavailable: required ANN sidecar is not ready: {error}; run `ato-mcp update`"
-            )
-        })?;
+    let corpus_id = get_source_meta(conn, source_id.as_str(), "corpus_id")?
+        .ok_or_else(|| anyhow!("source `{source_id}` is missing corpus_id metadata"))?;
+    let embedding_set_sha256 = get_source_meta(conn, source_id.as_str(), "embedding_set_sha256")?
+        .ok_or_else(|| {
+        anyhow!("source `{source_id}` is missing embedding_set_sha256 metadata")
+    })?;
+    if corpus_id != source_ann.info.corpus_id
+        || embedding_set_sha256 != source_ann.info.embedding_set_sha256
+        || u64::try_from(embeddings).ok() != Some(source_ann.info.vector_count)
+    {
+        bail!("ANN sidecar metadata does not match source `{source_id}` in the corpus database");
     }
+    crate::ann::verify_sidecar(&source_ann.path, source_id, &source_ann.info).map_err(|error| {
+        anyhow!(
+            "semantic search unavailable: required ANN sidecar for source `{source_id}` is not ready: {error}; run `legal-mcp update`"
+        )
+    })?;
     Ok(())
 }
 
@@ -781,6 +918,8 @@ pub(crate) fn initial_ann_search_k(eligible_len: usize, wanted: usize, trees: us
 
 pub(crate) fn vector_search(
     conn: &Connection,
+    source_id: &SourceId,
+    source_ann: &SourceAnn,
     query_embedding: &[i8; EMBEDDING_DIM],
     filter: &SqlFilter,
     limit: usize,
@@ -788,14 +927,7 @@ pub(crate) fn vector_search(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let installed = load_installed_manifest()?.ok_or_else(|| {
-        anyhow!("semantic search unavailable: installed manifest missing; run `ato-mcp update`")
-    })?;
-    let Some(ann) = installed.ann.as_ref() else {
-        return exact_vector_search(conn, query_embedding, filter, limit);
-    };
-
-    let eligible = eligible_ann_items(conn, filter)?;
+    let eligible = eligible_ann_items(conn, source_id, filter)?;
     if eligible.is_empty() {
         return Ok(Vec::new());
     }
@@ -803,14 +935,14 @@ pub(crate) fn vector_search(
     // filters. Broad filters use ANN, then exact-rerank its candidates.
     const EXACT_FILTER_THRESHOLD: u64 = 10_000;
     if eligible.len() <= EXACT_FILTER_THRESHOLD {
-        return exact_vector_search(conn, query_embedding, filter, limit);
+        return exact_vector_search(conn, source_id, query_embedding, filter, limit);
     }
 
     let wanted = limit
         .saturating_mul(20)
         .max(512)
         .min(eligible.len() as usize);
-    let trees = ann.trees as usize;
+    let trees = source_ann.info.trees as usize;
     let maximum_search_k = (eligible.len() as usize)
         .saturating_mul(trees)
         .min(2_000_000)
@@ -818,8 +950,9 @@ pub(crate) fn vector_search(
     let mut search_k = initial_ann_search_k(eligible.len() as usize, wanted, trees);
     let candidate_ids = loop {
         let ids = crate::ann::search_sidecar(
-            &crate::config::ann_path()?,
-            ann,
+            &source_ann.path,
+            source_id,
+            &source_ann.info,
             query_embedding,
             &eligible,
             wanted,
@@ -831,14 +964,18 @@ pub(crate) fn vector_search(
         if search_k >= maximum_search_k {
             // Filtering is never allowed to silently underfill. Once ANN has
             // reached its deterministic work ceiling, scan the eligible set.
-            return exact_vector_search(conn, query_embedding, filter, limit);
+            return exact_vector_search(conn, source_id, query_embedding, filter, limit);
         }
         search_k = search_k.saturating_mul(2).min(maximum_search_k);
     };
-    exact_rerank_candidates(conn, query_embedding, &candidate_ids, limit)
+    exact_rerank_candidates(conn, source_id, query_embedding, &candidate_ids, limit)
 }
 
-fn eligible_ann_items(conn: &Connection, filter: &SqlFilter) -> Result<roaring::RoaringBitmap> {
+fn eligible_ann_items(
+    conn: &Connection,
+    source_id: &SourceId,
+    filter: &SqlFilter,
+) -> Result<roaring::RoaringBitmap> {
     let where_filter = if filter.sql.is_empty() {
         String::new()
     } else {
@@ -849,12 +986,14 @@ fn eligible_ann_items(conn: &Connection, filter: &SqlFilter) -> Result<roaring::
         SELECT e.chunk_id
         FROM chunk_embeddings e
         JOIN chunks c ON c.chunk_id = e.chunk_id
-        JOIN documents d ON d.doc_id = c.doc_id
+        JOIN documents d
+          ON d.source_id = c.source_id AND d.native_id = c.native_id
         {where_filter}
         ORDER BY e.chunk_id ASC
         "#
     );
     let mut stmt = conn.prepare(&sql)?;
+    debug_assert_eq!(&filter.source, source_id);
     let rows = stmt.query_map(params_from_iter(filter.params.clone()), |row| {
         row.get::<_, i64>("chunk_id")
     })?;
@@ -873,12 +1012,16 @@ fn eligible_ann_items(conn: &Connection, filter: &SqlFilter) -> Result<roaring::
 
 fn exact_rerank_candidates(
     conn: &Connection,
+    source_id: &SourceId,
     query_embedding: &[i8; EMBEDDING_DIM],
     candidate_ids: &[u32],
     limit: usize,
 ) -> Result<Vec<VectorHit>> {
-    let mut stmt =
-        conn.prepare_cached("SELECT embedding FROM chunk_embeddings WHERE chunk_id = ?1")?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT e.embedding FROM chunk_embeddings AS e \
+         JOIN chunks AS c ON c.chunk_id = e.chunk_id \
+         WHERE c.source_id = ?1 AND e.chunk_id = ?2",
+    )?;
     let mut seen = HashSet::with_capacity(candidate_ids.len());
     let mut hits = BinaryHeap::with_capacity(limit + 1);
     for item_id in candidate_ids {
@@ -887,7 +1030,9 @@ fn exact_rerank_candidates(
             bail!("ANN sidecar returned duplicate chunk_id {chunk_id}");
         }
         let embedding = stmt
-            .query_row(params![chunk_id], |row| row.get::<_, Vec<u8>>(0))
+            .query_row(params![source_id.as_str(), chunk_id], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
             .optional()?
             .ok_or_else(|| anyhow!("ANN sidecar returned unknown chunk_id {chunk_id}"))?;
         hits.push(HeapHit(VectorHit {
@@ -905,6 +1050,7 @@ fn exact_rerank_candidates(
 
 fn exact_vector_search(
     conn: &Connection,
+    source_id: &SourceId,
     query_embedding: &[i8; EMBEDDING_DIM],
     filter: &SqlFilter,
     limit: usize,
@@ -919,11 +1065,13 @@ fn exact_vector_search(
         SELECT e.chunk_id, e.embedding
         FROM chunk_embeddings e
         JOIN chunks c ON c.chunk_id = e.chunk_id
-        JOIN documents d ON d.doc_id = c.doc_id
+        JOIN documents d
+          ON d.source_id = c.source_id AND d.native_id = c.native_id
         {where_filter}
         "#
     );
     let mut stmt = conn.prepare(&sql)?;
+    debug_assert_eq!(&filter.source, source_id);
     let rows = stmt.query_map(params_from_iter(filter.params.clone()), |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
     })?;
@@ -945,6 +1093,7 @@ fn exact_vector_search(
 
 pub(crate) fn lexical_search(
     conn: &Connection,
+    source_id: &SourceId,
     query: &str,
     filter: &SqlFilter,
     limit: usize,
@@ -953,10 +1102,10 @@ pub(crate) fn lexical_search(
     if strict_query.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
-    let mut hits = lexical_search_stage(conn, &strict_query, filter, limit)?;
+    let mut hits = lexical_search_stage(conn, source_id, &strict_query, filter, limit)?;
     if hits.len() < limit {
         if let Some(broad_query) = fts_broad_query(query) {
-            let broad = lexical_search_stage(conn, &broad_query, filter, limit)?;
+            let broad = lexical_search_stage(conn, source_id, &broad_query, filter, limit)?;
             let mut seen = hits.iter().map(|hit| hit.chunk_id).collect::<HashSet<_>>();
             hits.extend(broad.into_iter().filter(|hit| seen.insert(hit.chunk_id)));
             hits.truncate(limit);
@@ -967,6 +1116,7 @@ pub(crate) fn lexical_search(
 
 fn lexical_search_stage(
     conn: &Connection,
+    source_id: &SourceId,
     fts_query: &str,
     filter: &SqlFilter,
     limit: usize,
@@ -981,7 +1131,8 @@ fn lexical_search_stage(
         SELECT f.rowid AS chunk_id, -bm25(chunks_fts) AS score
         FROM chunks_fts f
         JOIN chunks c ON c.chunk_id = f.rowid
-        JOIN documents d ON d.doc_id = c.doc_id
+        JOIN documents d
+          ON d.source_id = c.source_id AND d.native_id = c.native_id
         WHERE chunks_fts MATCH ? {where_filter}
         ORDER BY score DESC, chunk_id ASC
         LIMIT ?
@@ -992,6 +1143,7 @@ fn lexical_search_stage(
     params_vec.push(Value::Integer(limit as i64));
 
     let mut stmt = conn.prepare(&sql)?;
+    debug_assert_eq!(&filter.source, source_id);
     let rows = stmt
         .query_map(params_from_iter(params_vec), |row| {
             Ok(VectorHit {
@@ -1004,7 +1156,7 @@ fn lexical_search_stage(
 }
 
 pub(crate) fn rrf_fuse(vector_hits: &[VectorHit], lexical_hits: &[VectorHit]) -> Vec<VectorHit> {
-    // [MT-05] Hybrid ranking fuses vector and lexical ranks via RRF with K=60.
+    // Hybrid ranking fuses vector and lexical ranks via RRF with K=60.
     const RRF_K: f64 = 60.0;
     let mut scores: HashMap<i64, f64> = HashMap::new();
     for (rank, hit) in vector_hits.iter().enumerate() {
@@ -1027,7 +1179,7 @@ pub(crate) fn rrf_fuse(vector_hits: &[VectorHit], lexical_hits: &[VectorHit]) ->
     out
 }
 
-// [MT-01] HTTP transport keeps one ServerState shared across worker threads.
+// HTTP transport keeps one ServerState shared across worker threads.
 // The semantic runtime is loaded lazily and reused across tool calls. Search-time
 // inference holds the lock for one query embedding; read-only tools
 // (get_chunks, get_definition, get_doc_anchors, get_asset, stats) run fully
@@ -1035,6 +1187,8 @@ pub(crate) fn rrf_fuse(vector_hits: &[VectorHit], lexical_hits: &[VectorHit]) ->
 
 fn load_hits(
     conn: &Connection,
+    source_id: &SourceId,
+    generation: &str,
     chunk_ids: &[i64],
     query: &str,
     include_snippet: bool,
@@ -1046,29 +1200,29 @@ fn load_hits(
     let text_column = if include_snippet { "c.text" } else { "NULL" };
     let sql = format!(
         r#"
-        SELECT c.chunk_id, c.doc_id, c.anchor, {text_column} AS text,
-               d.type, d.title, d.date,
+        SELECT c.chunk_id, c.native_id, c.anchor, {text_column} AS text,
+               d.type, d.title, d.date, d.canonical_url,
                d.withdrawn_date, d.superseded_by, d.replaces,
                d.has_in_doc_links, d.has_related_docs, d.has_history
-        FROM chunks c JOIN documents d ON d.doc_id = c.doc_id
-        WHERE c.chunk_id IN ({placeholders})
+        FROM chunks c
+        JOIN documents d
+          ON d.source_id = c.source_id AND d.native_id = c.native_id
+        WHERE c.source_id = ? AND c.chunk_id IN ({placeholders})
         "#
     );
-    let params = chunk_ids
-        .iter()
-        .copied()
-        .map(Value::Integer)
-        .collect::<Vec<_>>();
+    let mut params = vec![Value::Text(source_id.as_str().to_string())];
+    params.extend(chunk_ids.iter().copied().map(Value::Integer));
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params), |row| {
         Ok((
             row.get::<_, i64>("chunk_id")?,
-            row.get::<_, String>("doc_id")?,
+            row.get::<_, String>("native_id")?,
             row.get::<_, Option<String>>("anchor")?,
             row.get::<_, Option<Vec<u8>>>("text")?,
             row.get::<_, String>("type")?,
             row.get::<_, String>("title")?,
             row.get::<_, Option<String>>("date")?,
+            row.get::<_, String>("canonical_url")?,
             row.get::<_, Option<String>>("withdrawn_date")?,
             row.get::<_, Option<String>>("superseded_by")?,
             row.get::<_, Option<String>>("replaces")?,
@@ -1081,12 +1235,13 @@ fn load_hits(
     for row in rows {
         let (
             chunk_id,
-            doc_id,
+            native_id,
             anchor,
             text_blob,
             doc_type,
             title,
             date,
+            canonical_url,
             withdrawn_date,
             superseded_by,
             replaces,
@@ -1094,29 +1249,47 @@ fn load_hits(
             has_related_docs,
             has_history,
         ) = row?;
+        let document = DocumentId {
+            source: source_id.clone(),
+            native_id,
+        };
         let snippet = match text_blob {
             Some(blob) => {
                 let raw_text = decompress_text(blob)?;
-                let text = crate::retrieval::annotate_doc_refs(&raw_text, &doc_id)?;
+                let text = crate::retrieval::annotate_doc_refs(&raw_text, &document)?;
                 Some(highlight_snippet(&text, query, SNIPPET_CHARS))
             }
             None => None,
         };
+        let chunk = ChunkRef::new(
+            generation,
+            source_id.clone(),
+            u64::try_from(chunk_id).map_err(|_| {
+                anyhow!("stored chunk_id {chunk_id} cannot be represented publicly")
+            })?,
+        )?;
+        let next_call = format!("get_chunks(chunks=[{}])", serde_json::to_string(&chunk)?);
         hits.insert(
             chunk_id,
             Hit {
-                doc_id: doc_id.clone(),
+                document,
                 title,
                 doc_type,
                 date,
                 anchor,
                 snippet,
-                canonical_url: canonical_url(&doc_id),
-                chunk_id: Some(chunk_id),
-                next_call: Some(format!("get_chunks(chunk_ids=[{chunk_id}])")),
+                canonical_url,
+                chunk: Some(chunk),
+                next_call: Some(next_call),
                 withdrawn_date,
-                superseded_by,
-                replaces,
+                superseded_by: superseded_by.map(|native_id| DocumentId {
+                    source: source_id.clone(),
+                    native_id,
+                }),
+                replaces: replaces.map(|native_id| DocumentId {
+                    source: source_id.clone(),
+                    native_id,
+                }),
                 has_in_doc_links: (has_in_doc_links != 0).then_some(true),
                 has_related_docs: (has_related_docs != 0).then_some(true),
                 has_history: (has_history != 0).then_some(true),
@@ -1282,166 +1455,41 @@ pub(crate) fn trim_chars(s: &str, max_chars: usize) -> String {
     s[..end].to_string()
 }
 
-pub(crate) fn ato_doc_id_from_link(value: &str) -> Option<String> {
-    let trimmed = value.trim().trim_matches('<').trim_matches('>');
-    let parsed = Url::parse(trimmed)
-        .or_else(|_| Url::parse("https://www.ato.gov.au").and_then(|base| base.join(trimmed)))
-        .ok()?;
-    if parsed.domain() != Some("www.ato.gov.au") && parsed.domain() != Some("ato.gov.au") {
-        return None;
-    }
-    if parsed.path() != "/law/view/document" {
-        return None;
-    }
-    for (key, value) in parsed.query_pairs() {
-        if key.eq_ignore_ascii_case("docid") || key.eq_ignore_ascii_case("locid") {
-            let doc_id = value.trim().trim_matches('"').to_string();
-            if !doc_id.is_empty() {
-                return Some(doc_id);
-            }
-        }
-    }
-    None
-}
-
-pub(crate) fn direct_doc_id_from_query(query: &str) -> Option<String> {
-    if let Some(doc_id) = ato_doc_id_from_link(query) {
-        return Some(doc_id);
-    }
-    let candidate = query.trim().trim_matches('<').trim_matches('>');
-    if candidate.is_empty()
-        || candidate.contains(char::is_whitespace)
-        || !candidate.contains('/')
-        || !candidate
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '.' | '(' | ')' | '-'))
-    {
-        return None;
-    }
-    Some(candidate.to_string())
-}
-
-pub(crate) fn direct_title_hits(
-    conn: &Connection,
-    query: &str,
-    k: usize,
-    filter: &SqlFilter,
-) -> Result<Vec<Hit>> {
-    let mut doc_ids = Vec::new();
-    if let Some(doc_id) = direct_doc_id_from_query(query) {
-        doc_ids.push(doc_id);
-    }
-
-    let mut hits = Vec::new();
-    let mut seen = HashSet::new();
-    for doc_id in doc_ids {
-        if !seen.insert(doc_id.clone()) {
-            continue;
-        }
-        if let Some(hit) = load_title_hit(conn, &doc_id, filter)? {
-            hits.push(hit);
-        }
-        if hits.len() >= k {
-            break;
-        }
-    }
-    Ok(hits)
-}
-
-pub(crate) fn load_title_hit(
-    conn: &Connection,
-    doc_id: &str,
-    filter: &SqlFilter,
-) -> Result<Option<Hit>> {
-    let where_filter = if filter.sql.is_empty() {
-        String::new()
-    } else {
-        format!(" AND {}", filter.sql)
-    };
-    let sql = format!(
-        r#"
-        SELECT d.doc_id, d.type, d.title, d.date,
-               d.withdrawn_date, d.superseded_by, d.replaces,
-               d.has_in_doc_links, d.has_related_docs, d.has_history
-        FROM documents d
-        WHERE d.doc_id = ? {where_filter}
-        "#
-    );
-    let mut params_vec = vec![Value::Text(doc_id.to_string())];
-    params_vec.extend(filter.params.clone());
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query(params_from_iter(params_vec))?;
-    if let Some(row) = rows.next()? {
-        let doc_id: String = row.get("doc_id")?;
-        let title: String = row.get("title")?;
-        Ok(Some(Hit {
-            canonical_url: canonical_url(&doc_id),
-            doc_id: doc_id.clone(),
-            title: title.clone(),
-            doc_type: row.get("type")?,
-            date: row.get("date")?,
-            anchor: None,
-            snippet: Some(title),
-            chunk_id: None,
-            next_call: None,
-            withdrawn_date: row.get("withdrawn_date")?,
-            superseded_by: row.get("superseded_by")?,
-            replaces: row.get("replaces")?,
-            has_in_doc_links: row
-                .get::<_, i64>("has_in_doc_links")
-                .ok()
-                .filter(|v| *v != 0)
-                .map(|_| true),
-            has_related_docs: row
-                .get::<_, i64>("has_related_docs")
-                .ok()
-                .filter(|v| *v != 0)
-                .map(|_| true),
-            has_history: row
-                .get::<_, i64>("has_history")
-                .ok()
-                .filter(|v| *v != 0)
-                .map(|_| true),
-        }))
-    } else {
-        Ok(None)
-    }
-}
-
-/// Title-level hits for a query: exact doc_id / ATO-link lookups first,
-/// then BM25 over the separate `title_fts` table. A parallel algorithm to
+/// Title-level hits for a query use BM25 over the source-qualified
+/// `title_fts` table. A parallel algorithm to
 /// chunk search — `search` calls this to populate its `title_hits`
 /// sidebar. The caller supplies the connection and the already-built
 /// document filter so chunk and title queries stay consistently scoped.
 pub(crate) fn collect_title_hits(
     conn: &Connection,
+    source_id: &SourceId,
     query: &str,
     k: usize,
     filter: &SqlFilter,
 ) -> Result<Vec<Hit>> {
-    // [MT-14] Title hits rank title_fts independently and reuse the chunk
+    // Title hits rank title_fts independently and reuse the chunk
     // query's document filter.
     let k = k.clamp(1, 100);
-    let mut hits = direct_title_hits(conn, query, k, filter)?;
+    let mut hits = Vec::new();
     let strict_query = fts_strict_query(query);
     if strict_query.is_empty() {
         return Ok(hits);
     }
     let mut seen = hits
         .iter()
-        .map(|hit| hit.doc_id.clone())
+        .map(|hit| hit.document.clone())
         .collect::<HashSet<_>>();
     hits.extend(
-        query_title_fts(conn, &strict_query, filter, k)?
+        query_title_fts(conn, source_id, &strict_query, filter, k)?
             .into_iter()
-            .filter(|hit| seen.insert(hit.doc_id.clone())),
+            .filter(|hit| seen.insert(hit.document.clone())),
     );
     if hits.len() < k {
         if let Some(broad_query) = fts_broad_query(query) {
             hits.extend(
-                query_title_fts(conn, &broad_query, filter, k)?
+                query_title_fts(conn, source_id, &broad_query, filter, k)?
                     .into_iter()
-                    .filter(|hit| seen.insert(hit.doc_id.clone())),
+                    .filter(|hit| seen.insert(hit.document.clone())),
             );
         }
     }
@@ -1451,6 +1499,7 @@ pub(crate) fn collect_title_hits(
 
 fn query_title_fts(
     conn: &Connection,
+    source_id: &SourceId,
     title_query: &str,
     filter: &SqlFilter,
     limit: usize,
@@ -1462,14 +1511,15 @@ fn query_title_fts(
     };
     let sql = format!(
         r#"
-        SELECT t.doc_id AS doc_id, bm25(title_fts) AS score,
-               d.type, d.title, d.date,
+        SELECT t.native_id AS native_id, bm25(title_fts) AS score,
+               d.type, d.title, d.date, d.canonical_url,
                d.withdrawn_date, d.superseded_by, d.replaces,
                d.has_in_doc_links, d.has_related_docs, d.has_history
         FROM title_fts t
-        JOIN documents d ON d.doc_id = t.doc_id
+        JOIN documents d
+          ON d.source_id = t.source_id AND d.native_id = t.native_id
         WHERE title_fts MATCH ? {where_filter}
-        ORDER BY score ASC
+        ORDER BY score ASC, t.source_id ASC, t.native_id ASC
         LIMIT ?
         "#
     );
@@ -1478,23 +1528,37 @@ fn query_title_fts(
     params_vec.push(Value::Integer(limit as i64));
 
     let mut stmt = conn.prepare(&sql)?;
+    debug_assert_eq!(&filter.source, source_id);
     let rows = stmt
         .query_map(params_from_iter(params_vec), |row| {
-            let doc_id: String = row.get("doc_id")?;
+            let native_id: String = row.get("native_id")?;
             let title: String = row.get("title")?;
             Ok(Hit {
-                canonical_url: canonical_url(&doc_id),
-                doc_id: doc_id.clone(),
+                canonical_url: row.get("canonical_url")?,
+                document: DocumentId {
+                    source: source_id.clone(),
+                    native_id,
+                },
                 title: title.clone(),
                 doc_type: row.get("type")?,
                 date: row.get("date")?,
                 anchor: None,
                 snippet: Some(title),
-                chunk_id: None,
+                chunk: None,
                 next_call: None,
                 withdrawn_date: row.get("withdrawn_date")?,
-                superseded_by: row.get("superseded_by")?,
-                replaces: row.get("replaces")?,
+                superseded_by: row
+                    .get::<_, Option<String>>("superseded_by")?
+                    .map(|native_id| DocumentId {
+                        source: source_id.clone(),
+                        native_id,
+                    }),
+                replaces: row
+                    .get::<_, Option<String>>("replaces")?
+                    .map(|native_id| DocumentId {
+                        source: source_id.clone(),
+                        native_id,
+                    }),
                 has_in_doc_links: row
                     .get::<_, i64>("has_in_doc_links")
                     .ok()
@@ -1520,6 +1584,10 @@ fn query_title_fts(
 mod tests {
     use super::*;
 
+    fn source() -> SourceId {
+        "ato".parse().expect("valid source")
+    }
+
     #[test]
     fn fts_terms_are_bounded_deduplicated_and_drop_stopwords() {
         let repeated = std::iter::repeat_n("the Tax tax", 40)
@@ -1543,6 +1611,26 @@ mod tests {
             fts_broad_query("capital gains tax").as_deref(),
             Some("\"capital\" OR \"gains\" OR \"tax\"")
         );
+    }
+
+    #[test]
+    fn document_filter_always_binds_the_resolved_source_first() {
+        let source = source();
+        let filter = build_doc_filter(
+            "d",
+            DocumentFilterSpec {
+                source_id: &source,
+                types: None,
+                date_from: None,
+                date_to: None,
+                doc_scope: None,
+                include_old: true,
+                current_only: false,
+            },
+        );
+        assert_eq!(filter.source, source);
+        assert!(filter.sql.starts_with("d.source_id = ?"));
+        assert_eq!(filter.params[0], Value::Text("ato".to_string()));
     }
 
     #[test]
@@ -1620,7 +1708,13 @@ mod tests {
     fn ann_candidate_rerank_uses_authoritative_scores_and_stable_ties() -> Result<()> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(
-            "CREATE TABLE chunk_embeddings(chunk_id INTEGER PRIMARY KEY, embedding BLOB NOT NULL);",
+            "CREATE TABLE chunks(\
+                 chunk_id INTEGER PRIMARY KEY, source_id TEXT NOT NULL\
+             );\
+             CREATE TABLE chunk_embeddings(\
+                 chunk_id INTEGER PRIMARY KEY, embedding BLOB NOT NULL\
+             );\
+             INSERT INTO chunks VALUES (9, 'ato'), (3, 'ato');",
         )?;
         let embedding = vec![1u8; EMBEDDING_DIM];
         conn.execute(
@@ -1631,7 +1725,7 @@ mod tests {
             "INSERT INTO chunk_embeddings(chunk_id, embedding) VALUES (3, ?1)",
             params![&embedding],
         )?;
-        let hits = exact_rerank_candidates(&conn, &[1i8; EMBEDDING_DIM], &[9, 3], 2)?;
+        let hits = exact_rerank_candidates(&conn, &source(), &[1i8; EMBEDDING_DIM], &[9, 3], 2)?;
         assert_eq!(
             hits.iter().map(|hit| hit.chunk_id).collect::<Vec<_>>(),
             vec![3, 9]
@@ -1642,6 +1736,7 @@ mod tests {
     #[test]
     fn search_continuation_preserves_metadata_only_hydration() {
         let opts = SearchOptions {
+            source: source(),
             k: 5,
             types: None,
             date_from: None,
@@ -1653,9 +1748,11 @@ mod tests {
             current_only: true,
             max_per_doc: 1,
             include_snippet: false,
-            similar_to_chunk_id: None,
+            similar_to_chunk: None,
             seed_text: None,
         };
-        assert!(search_next_call("tax", 10, &opts).contains("include_snippet=false"));
+        let next = search_next_call("tax", 10, &opts).expect("valid continuation");
+        assert!(next.contains("source=\"ato\""));
+        assert!(next.contains("include_snippet=false"));
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! Spawns the release binary against a tempdir data dir, hits the MCP
 //! endpoint with `initialize` and `tools/list`, and asserts the JSON
-//! shape. Readiness is deterministic — we read the `ato-mcp listening
+//! shape. Readiness is deterministic — we read the `legal-mcp listening
 //! on ...` line from stderr before issuing requests.
 
 use std::io::{BufRead, BufReader};
@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use tempfile::tempdir;
 
 fn bin_path() -> &'static str {
-    env!("CARGO_BIN_EXE_ato-mcp")
+    env!("CARGO_BIN_EXE_legal-mcp")
 }
 
 fn pick_free_port() -> Result<u16> {
@@ -61,7 +61,7 @@ fn start_server_once(data_dir: &std::path::Path) -> Result<Server> {
 
     let mut child = Command::new(bin_path())
         .args(["serve", "--port", &port.to_string()])
-        .env("ATO_MCP_DATA_DIR", data_dir)
+        .env("LEGAL_MCP_DATA_DIR", data_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -177,7 +177,7 @@ fn initialize_and_tools_list_over_http() -> Result<()> {
     )?;
     assert_eq!(init["jsonrpc"], "2.0");
     assert_eq!(init["id"], 1);
-    assert_eq!(init["result"]["serverInfo"]["name"], "ato-mcp");
+    assert_eq!(init["result"]["serverInfo"]["name"], "australian-legal-mcp");
     assert!(
         init["result"]["instructions"].is_string(),
         "initialize must surface server instructions: {init:?}"
@@ -191,18 +191,62 @@ fn initialize_and_tools_list_over_http() -> Result<()> {
             "method": "tools/list"
         }),
     )?;
-    let names: Vec<String> = tools["result"]["tools"]
-        .as_array()
-        .expect("tools array")
+    let listed_tools = tools["result"]["tools"].as_array().expect("tools array");
+    let names: Vec<String> = listed_tools
         .iter()
         .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
         .collect();
-    for expected in ["search", "get_chunks", "get_doc_anchors", "fetch", "stats"] {
+    for expected in [
+        "search",
+        "get_chunks",
+        "get_asset",
+        "get_doc_anchors",
+        "get_definition",
+        "stats",
+        "fetch",
+    ] {
         assert!(
             names.iter().any(|n| n == expected),
             "expected `{expected}` in tool list, got {names:?}"
         );
     }
+
+    let schema = |name: &str| {
+        listed_tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .and_then(|tool| tool.get("inputSchema"))
+            .unwrap_or_else(|| panic!("missing schema for {name}"))
+    };
+    assert_eq!(schema("search")["properties"]["source"]["default"], "ato");
+    assert_eq!(
+        schema("search")["properties"]["similar_to_chunk"]["type"],
+        "object"
+    );
+    assert_eq!(
+        schema("get_chunks")["properties"]["chunks"]["items"]["type"],
+        "object"
+    );
+    assert_eq!(schema("get_asset")["properties"]["asset"]["type"], "object");
+    assert_eq!(
+        schema("get_asset")["properties"]["asset"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        schema("get_doc_anchors")["properties"]["document"]["type"],
+        "object"
+    );
+    assert_eq!(
+        schema("get_definition")["properties"]["context_document"]["type"],
+        "object"
+    );
+    assert_eq!(
+        schema("get_definition")["properties"]["source"]["enum"],
+        json!(["ato", "frl"])
+    );
+    assert!(listed_tools
+        .iter()
+        .all(|tool| tool["inputSchema"]["additionalProperties"] == false));
     for removed in [
         "search_titles",
         "get_document",
@@ -281,6 +325,50 @@ fn json_rpc_notifications_batches_and_errors_conform() -> Result<()> {
         assert_eq!(value["error"]["code"], code, "response: {value}");
     }
 
+    for (id, name, arguments) in [
+        (
+            10,
+            "search",
+            json!({"query": "tax", "similar_to_chunk_id": 1}),
+        ),
+        (
+            11,
+            "search",
+            json!({
+                "query": "tax",
+                "similar_to": {
+                    "generation": "test-generation",
+                    "source": "ato",
+                    "chunk_id": 1
+                }
+            }),
+        ),
+        (12, "get_chunks", json!({"chunk_ids": [1]})),
+        (13, "get_asset", json!({"asset_ref": "ato-image://DOC/0"})),
+        (14, "get_doc_anchors", json!({"doc_id": "PAC/1"})),
+        (
+            15,
+            "get_definition",
+            json!({"term": "car", "context_doc_id": "PAC/1"}),
+        ),
+        (16, "fetch", json!({"uri": "ato:PAC/1"})),
+        (17, "fetch", json!({"uri": "legal://ato/PAC/1"})),
+    ] {
+        let response = post(
+            &server.url,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}
+            }),
+        )?;
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "alternate identity shape unexpectedly accepted: {response}"
+        );
+    }
+
     let parse_error = post_raw(&server.url, "{", Some("application/json"))?;
     let parse_error: Value = serde_json::from_str(&parse_error.body)?;
     assert_eq!(parse_error["error"]["code"], -32700);
@@ -315,7 +403,7 @@ fn rejects_non_loopback_bind() -> Result<()> {
     let dir = tempdir()?;
     let output = Command::new(bin_path())
         .args(["serve", "--port", "0", "--bind", "0.0.0.0"])
-        .env("ATO_MCP_DATA_DIR", dir.path())
+        .env("LEGAL_MCP_DATA_DIR", dir.path())
         .output()?;
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("loopback-only"));

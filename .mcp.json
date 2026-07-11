@@ -1,7 +1,7 @@
 {
   "mcpServers": {
-    "ato": {
-      "command": "ato-mcp",
+    "australian-legal": {
+      "command": "legal-mcp",
       "args": ["mcp"]
     }
   }

@@ -4,25 +4,26 @@
 //! the `derive_citations` build helper and `load_cited_by` reader.
 
 use crate::chunker::{chunk_html, EMBED_MAX_TOKENS};
-use crate::config::data_dir;
-use crate::db::{canonical_url, decompress_text, open_read, table_exists};
+use crate::config::{active_generation_key, data_dir};
+use crate::db::{decompress_text, open_read, table_exists};
 use crate::extract::{extract_anchors, normalize_definition_term};
 use crate::html::clean_ato_html;
+use crate::legal_source::source_registry;
 use crate::uri::{parse_doc_uri, DocUri};
 use crate::{
-    fetch_bytes, optional_usize, required_str, UrlContext, ATO_FETCH_TIMEOUT, ATO_USER_AGENT,
-    OEWN_2024_SOURCE, OEWN_2024_URL, ORDINARY_DICTIONARY_PATH_ENV,
-    STATUTORY_DEFINITION_TYPE_PREFIXES,
+    fetch_bytes, UrlContext, ATO_FETCH_TIMEOUT, ATO_USER_AGENT, OEWN_2024_SOURCE, OEWN_2024_URL,
+    ORDINARY_DICTIONARY_PATH_ENV, STATUTORY_DEFINITION_TYPE_PREFIXES,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use chrono::{Datelike, NaiveDate};
+use legal_model::{AssetRef, ChunkRef, DocumentId, SourceId};
 use regex::Regex;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
@@ -32,11 +33,11 @@ use zip::ZipArchive;
 
 pub(crate) const CITED_BY_LIMIT: usize = 100;
 
-/// Cached set of every doc_id in the local corpus. Loaded once per process
-/// from `documents.doc_id` so the `[doc:X]` annotation pass on chunk hydration
-/// stays O(text length) instead of paying a SQL round-trip per marker.
-static CORPUS_DOC_IDS: OnceLock<HashSet<String>> = OnceLock::new();
-static CORPUS_DOC_IDS_INIT: Mutex<()> = Mutex::new(());
+/// Per-source native document-id caches used while annotating canonical
+/// source-qualified document markers. A cache fill always has a validated
+/// `SourceId` predicate; retrieval never scans identities across sources.
+type CorpusDocumentIdCache = HashMap<(String, SourceId), Arc<HashSet<String>>>;
+static CORPUS_DOC_IDS: OnceLock<Mutex<CorpusDocumentIdCache>> = OnceLock::new();
 static ORDINARY_DICTIONARY_INSTALL: Mutex<()> = Mutex::new(());
 static ORDINARY_DICTIONARY_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<OrdinaryDictionaryIndex>>>> =
     OnceLock::new();
@@ -50,29 +51,63 @@ fn doc_marker_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"\[doc:([^\s\]@]+)([^\]]*)\]").expect("valid regex"))
 }
 
-/// Lazily load every doc_id in `documents` into a set. ~150k strings of
-/// ~25 chars ≈ a few MB; amortised across the process lifetime.
-pub(crate) fn corpus_doc_id_set() -> Result<&'static HashSet<String>> {
-    if let Some(set) = CORPUS_DOC_IDS.get() {
-        return Ok(set);
-    }
-    let _guard = CORPUS_DOC_IDS_INIT
+/// Lazily load one source's native document ids. The caller must provide a
+/// typed identity and the registry check prevents syntactically valid but
+/// unregistered sources from reaching SQL.
+pub(crate) fn corpus_doc_id_set(source_id: &SourceId) -> Result<Arc<HashSet<String>>> {
+    validate_source(source_id)?;
+    let generation = active_generation()?;
+    let key = (generation, source_id.clone());
+    let cache = CORPUS_DOC_IDS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
         .lock()
         .map_err(|_| anyhow!("corpus document-id cache lock poisoned"))?;
-    if let Some(set) = CORPUS_DOC_IDS.get() {
-        return Ok(set);
+    if let Some(set) = cache.get(&key) {
+        return Ok(Arc::clone(set));
     }
     let conn = open_read()?;
-    let mut stmt = conn.prepare("SELECT doc_id FROM documents")?;
+    let mut stmt = conn
+        .prepare("SELECT native_id FROM documents WHERE source_id = ?1 ORDER BY native_id ASC")?;
     let mut set = HashSet::new();
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let rows = stmt.query_map([source_id.as_str()], |row| row.get::<_, String>(0))?;
     for row in rows {
         set.insert(row?);
     }
-    CORPUS_DOC_IDS
-        .set(set)
-        .map_err(|_| anyhow!("corpus document-id cache initialized concurrently"))?;
-    Ok(CORPUS_DOC_IDS.get().expect("corpus document-id cache set"))
+    let set = Arc::new(set);
+    cache.insert(key, Arc::clone(&set));
+    Ok(set)
+}
+
+fn validate_source(source_id: &SourceId) -> Result<()> {
+    let resolved = source_registry().resolve(Some(source_id.as_str()))?;
+    if &resolved != source_id {
+        bail!("legal source `{source_id}` did not resolve canonically");
+    }
+    Ok(())
+}
+
+fn active_generation() -> Result<String> {
+    active_generation_key()?.ok_or_else(|| {
+        anyhow!("no active corpus generation; install a corpus generation before retrieval")
+    })
+}
+
+fn validate_chunk_ref(reference: &ChunkRef, generation: &str) -> Result<i64> {
+    validate_source(&reference.source)?;
+    if reference.generation != generation {
+        bail!(
+            "chunk reference belongs to generation `{}`; active generation is `{generation}`",
+            reference.generation
+        );
+    }
+    i64::try_from(reference.chunk_id)
+        .map_err(|_| anyhow!("chunk reference exceeds SQLite integer range"))
+}
+
+fn chunk_ref(generation: &str, source: &SourceId, chunk_id: i64) -> Result<ChunkRef> {
+    let chunk_id = u64::try_from(chunk_id)
+        .map_err(|_| anyhow!("stored chunk_id {chunk_id} cannot be represented publicly"))?;
+    Ok(ChunkRef::new(generation, source.clone(), chunk_id)?)
 }
 
 /// Translate an ATO `[doc:X<tail>]` marker tail (everything captured between
@@ -124,42 +159,78 @@ pub(crate) fn ato_marker_tail_to_query_suffix(tail: &str) -> String {
     }
 }
 
-/// Rewrite `[doc:X<tail>]` markers whose target is not in the local corpus
-/// into `[fetch:ato:X<query>]`. The new marker self-describes the retrieval
+/// Rewrite canonical `[doc:SOURCE:NATIVE_ID<tail>]` markers whose target is
+/// not in the local corpus into `[fetch:SOURCE:NATIVE_ID<query>]`. The marker
+/// carries the one exact source identity used by both retrieval paths:
 /// path:
-///   - `[doc:X]`        → in corpus; use `get_chunks` / `get_doc_anchors`.
-///   - `[fetch:ato:X]`  → external; use the `fetch` tool.
+///   - `[doc:ato:X]`        → in corpus; use `get_chunks` / `get_doc_anchors`.
+///   - `[fetch:ato:X]`      → external; use the `fetch` tool.
 ///
-/// Self-references (target == current doc_id) and markers whose target IS
+/// Self-references (target == current document) and markers whose target is
 /// in the corpus are left as-is. The regex only matches the `[doc:...]`
 /// shape, so already-rewritten `[fetch:...]` markers are inherently
 /// idempotent — they don't match and pass through untouched.
-pub(crate) fn annotate_doc_refs(text: &str, self_doc_id: &str) -> Result<String> {
-    Ok(annotate_doc_refs_with(
-        text,
-        self_doc_id,
-        corpus_doc_id_set()?,
-    ))
+pub(crate) fn annotate_doc_refs(text: &str, self_document: &DocumentId) -> Result<String> {
+    validate_source(&self_document.source)?;
+    let mut sources = BTreeSet::from([self_document.source.clone()]);
+    for captures in doc_marker_regex().captures_iter(text) {
+        let target: DocumentId = captures[1].parse().with_context(|| {
+            format!(
+                "invalid source-qualified document marker `[doc:{}]`",
+                &captures[1]
+            )
+        })?;
+        validate_source(&target.source)?;
+        sources.insert(target.source);
+    }
+    let mut corpus = HashMap::new();
+    for source in sources {
+        corpus.insert(source.clone(), corpus_doc_id_set(&source)?);
+    }
+    annotate_doc_refs_with(text, self_document, &corpus)
 }
 
 /// Pure helper: same as `annotate_doc_refs` but takes the doc-id set
 /// explicitly so unit tests don't need a live DB.
 pub(crate) fn annotate_doc_refs_with(
     text: &str,
-    self_doc_id: &str,
-    corpus: &HashSet<String>,
-) -> String {
+    self_document: &DocumentId,
+    corpus: &HashMap<SourceId, Arc<HashSet<String>>>,
+) -> Result<String> {
     let re = doc_marker_regex();
-    re.replace_all(text, |caps: &regex::Captures<'_>| {
-        let doc_id = &caps[1];
-        let tail = &caps[2];
-        if doc_id == self_doc_id || corpus.contains(doc_id) {
-            return caps[0].to_string();
+    let mut annotated = String::with_capacity(text.len());
+    let mut previous_end = 0;
+    for captures in re.captures_iter(text) {
+        let whole = captures
+            .get(0)
+            .ok_or_else(|| anyhow!("document marker regex omitted its full match"))?;
+        let target: DocumentId = captures[1].parse().with_context(|| {
+            format!(
+                "invalid source-qualified document marker `[doc:{}]`",
+                &captures[1]
+            )
+        })?;
+        validate_source(&target.source)?;
+        annotated.push_str(&text[previous_end..whole.start()]);
+        let tail = &captures[2];
+        let is_local = corpus
+            .get(&target.source)
+            .is_some_and(|ids| ids.contains(&target.native_id));
+        if &target == self_document || is_local {
+            annotated.push_str(&format!("[doc:{target}{tail}]"));
+        } else {
+            let query = ato_marker_tail_to_query_suffix(tail);
+            let base = DocUri::new(target, None, None)?.to_uri_string();
+            let candidate = format!("{base}{query}");
+            let canonical = parse_doc_uri(&candidate)
+                .map(|uri| uri.to_uri_string())
+                .unwrap_or(base);
+            annotated.push_str(&format!("[fetch:{canonical}]"));
         }
-        let query = ato_marker_tail_to_query_suffix(tail);
-        format!("[fetch:ato:{doc_id}{query}]")
-    })
-    .into_owned()
+        previous_end = whole.end();
+    }
+    annotated.push_str(&text[previous_end..]);
+    Ok(annotated)
 }
 
 /// Public entry point for the `fetch` MCP tool. Parses the URI scheme and
@@ -167,10 +238,11 @@ pub(crate) fn annotate_doc_refs_with(
 /// string with the shape `{uri, canonical_url, title, source, chunks}`.
 pub(crate) fn fetch(uri_string: &str) -> Result<String> {
     let uri = parse_doc_uri(uri_string)?;
-    match uri {
-        DocUri::Ato { doc_id, pit, view } => {
-            fetch_ato_doc(&doc_id, pit.as_deref(), view.as_deref())
-        }
+    let (document, pit, view) = uri.into_parts();
+    validate_source(&document.source)?;
+    match document.source.as_str() {
+        "ato" => fetch_ato_doc(&document.native_id, pit.as_deref(), view.as_deref()),
+        source => bail!("live fetch is not available for legal source `{source}`"),
     }
 }
 
@@ -238,40 +310,44 @@ pub(crate) fn fetch_ato_doc(doc_id: &str, pit: Option<&str>, view: Option<&str>)
     // chunks aren't persisted and carry no chunk_id; all of them come
     // back inline in this one response.
     let chunks = chunk_html(&cleaned.html, cleaned.title.as_deref(), EMBED_MAX_TOKENS);
-    let corpus = corpus_doc_id_set()?;
+    let source = SourceId::new("ato")?;
+    validate_source(&source)?;
+    let document = DocumentId::new(source, doc_id)?;
     let chunk_json: Vec<JsonValue> = chunks
         .iter()
-        .map(|c| {
-            json!({
+        .map(|c| -> Result<JsonValue> {
+            Ok(json!({
                 "ord": c.ord,
                 "anchor": c.anchor,
-                "text": annotate_doc_refs_with(&c.text, doc_id, corpus),
-            })
+                "text": annotate_doc_refs(&c.text, &document)?,
+            }))
         })
-        .collect();
-    let canonical_uri = DocUri::Ato {
-        doc_id: doc_id.to_string(),
-        pit: pit.map(str::to_string),
-        view: view.map(str::to_string),
-    }
+        .collect::<Result<Vec<_>>>()?;
+    let canonical_uri = DocUri::new(
+        document.clone(),
+        pit.map(str::to_string),
+        view.map(str::to_string),
+    )?
     .to_uri_string();
     Ok(serde_json::to_string_pretty(&json!({
         "uri": canonical_uri,
         "canonical_url": url.as_str(),
+        "document": document,
         "title": cleaned.title,
-        "source": "live",
+        "source": document.source,
         "chunks": chunk_json,
     }))?)
 }
 
-pub(crate) struct GetDefinitionOptions<'a> {
-    pub(crate) context_doc_id: Option<&'a str>,
+pub(crate) struct GetDefinitionOptions {
+    pub(crate) source: Option<SourceId>,
+    pub(crate) context_document: Option<DocumentId>,
     pub(crate) max_defs: usize,
 }
 
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct DefinitionSource {
-    pub(crate) doc_id: String,
+    pub(crate) document: DocumentId,
     pub(crate) title: String,
     #[serde(rename = "type")]
     pub(crate) source_type: String,
@@ -401,9 +477,9 @@ impl OrdinaryDictionaryIndex {
     }
 }
 
-pub(crate) fn context_prefix(context_doc_id: Option<&str>) -> Option<String> {
-    let doc_id = context_doc_id?;
-    let mut parts = doc_id.split('/');
+pub(crate) fn context_prefix(context_document: Option<&DocumentId>) -> Option<String> {
+    let document = context_document?;
+    let mut parts = document.native_id.split('/');
     let first = parts.next()?;
     let second = parts.next()?;
     if first == "PAC" {
@@ -413,22 +489,45 @@ pub(crate) fn context_prefix(context_doc_id: Option<&str>) -> Option<String> {
     }
 }
 
-pub(crate) fn definition_rank(hit: &DefinitionHit, opts: &GetDefinitionOptions<'_>) -> usize {
+pub(crate) fn definition_rank(hit: &DefinitionHit, opts: &GetDefinitionOptions) -> usize {
     if opts
-        .context_doc_id
-        .is_some_and(|doc_id| hit.source.doc_id == doc_id)
+        .context_document
+        .as_ref()
+        .is_some_and(|document| hit.source.document == *document)
     {
         return 0;
     }
-    if let Some(prefix) = context_prefix(opts.context_doc_id) {
-        if hit.source.doc_id.starts_with(&(prefix + "/")) {
+    if let Some(prefix) = context_prefix(opts.context_document.as_ref()) {
+        if hit.source.document.native_id.starts_with(&(prefix + "/")) {
             return 1;
         }
     }
     2
 }
 
-pub(crate) fn get_definition(term: &str, opts: GetDefinitionOptions<'_>) -> Result<String> {
+pub(crate) fn get_definition(term: &str, opts: GetDefinitionOptions) -> Result<String> {
+    let source_id = match (&opts.source, &opts.context_document) {
+        (Some(source), Some(document)) => {
+            validate_source(source)?;
+            validate_source(&document.source)?;
+            if source != &document.source {
+                bail!(
+                    "definition source `{source}` does not match context document source `{}`",
+                    document.source
+                );
+            }
+            source.clone()
+        }
+        (Some(source), None) => {
+            validate_source(source)?;
+            source.clone()
+        }
+        (None, Some(document)) => {
+            validate_source(&document.source)?;
+            document.source.clone()
+        }
+        (None, None) => source_registry().resolve(None)?,
+    };
     let conn = open_read()?;
     if !table_exists(&conn, "definitions")? {
         let (ordinary, ordinary_error) = ordinary_meaning_or_error(term);
@@ -439,41 +538,48 @@ pub(crate) fn get_definition(term: &str, opts: GetDefinitionOptions<'_>) -> Resu
     let source_placeholders = vec!["?"; STATUTORY_DEFINITION_TYPE_PREFIXES.len()].join(",");
     let sql = format!(
         r#"
-        SELECT definition_id, term, doc_id, source_title, source_type, scope,
-               anchor, body
-        FROM definitions
-        WHERE norm_term = ? AND source_type IN ({source_placeholders})
-        ORDER BY doc_id, ord, term
+        SELECT x.definition_id, x.term, x.native_id, x.source_title,
+               x.source_type, x.scope, x.anchor, x.body, d.canonical_url
+        FROM definitions AS x
+        JOIN documents AS d
+          ON d.source_id = x.source_id AND d.native_id = x.native_id
+        WHERE x.source_id = ? AND x.norm_term = ?
+          AND x.source_type IN ({source_placeholders})
+        ORDER BY x.native_id, x.ord, x.term
         LIMIT 100
         "#
     );
     let mut stmt = conn.prepare(&sql)?;
-    let mut query_params = Vec::with_capacity(1 + STATUTORY_DEFINITION_TYPE_PREFIXES.len());
+    let mut query_params = Vec::with_capacity(2 + STATUTORY_DEFINITION_TYPE_PREFIXES.len());
+    query_params.push(Value::Text(source_id.as_str().to_string()));
     query_params.push(Value::Text(norm));
     for source_type in STATUTORY_DEFINITION_TYPE_PREFIXES {
         query_params.push(Value::Text((*source_type).to_string()));
     }
     let mut hits = stmt
         .query_map(rusqlite::params_from_iter(query_params), |row| {
-            let doc_id: String = row.get("doc_id")?;
+            let native_id: String = row.get("native_id")?;
             Ok(DefinitionHit {
                 definition_id: row.get("definition_id")?,
                 term: row.get("term")?,
                 kind: "statutory".to_string(),
                 body: row.get("body")?,
                 source: DefinitionSource {
-                    canonical_url: canonical_url(&doc_id),
-                    doc_id,
+                    document: DocumentId {
+                        source: source_id.clone(),
+                        native_id,
+                    },
                     title: row.get("source_title")?,
                     source_type: row.get("source_type")?,
                     scope: row.get("scope")?,
                     anchor: row.get("anchor")?,
+                    canonical_url: row.get("canonical_url")?,
                 },
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut seen = HashSet::new();
-    hits.retain(|hit| seen.insert((hit.source.doc_id.clone(), hit.body.clone())));
+    hits.retain(|hit| seen.insert((hit.source.document.clone(), hit.body.clone())));
     hits.sort_by_key(|hit| definition_rank(hit, &opts));
     hits.truncate(max_defs);
     let (ordinary, ordinary_error) = if hits.is_empty() {
@@ -681,35 +787,6 @@ pub(crate) fn format_definition_response(
     }))?)
 }
 
-pub(crate) fn get_chunks_mcp(args: &JsonValue) -> Result<String> {
-    let ids = args
-        .get("chunk_ids")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("missing chunk_ids array"))?;
-    let chunk_ids = ids
-        .iter()
-        .map(|v| {
-            v.as_i64()
-                .ok_or_else(|| anyhow!("chunk_ids must contain integers"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let max_chars = optional_usize(args, "max_chars").unwrap_or(DEFAULT_GET_CHUNKS_MAX_CHARS);
-    let cursor = args
-        .get("cursor")
-        .and_then(JsonValue::as_str)
-        .map(decode_get_chunks_cursor)
-        .transpose()?;
-    get_chunks_from_cursor(
-        &chunk_ids,
-        GetChunksOptions {
-            before: optional_usize(args, "before").unwrap_or(0).min(20),
-            after: optional_usize(args, "after").unwrap_or(0).min(20),
-            max_chars: Some(max_chars),
-        },
-        cursor,
-    )
-}
-
 const MAX_GET_CHUNKS_IDS: usize = 100;
 const DEFAULT_GET_CHUNKS_MAX_CHARS: usize = 50_000;
 const HARD_GET_CHUNKS_MAX_CHARS: usize = 200_000;
@@ -722,9 +799,9 @@ pub(crate) struct GetChunksOptions {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct HydratedChunk {
-    pub(crate) chunk_id: i64,
+    pub(crate) chunk: ChunkRef,
     pub(crate) requested: bool,
-    pub(crate) doc_id: String,
+    pub(crate) document: DocumentId,
     #[serde(rename = "type")]
     pub(crate) doc_type: String,
     pub(crate) title: String,
@@ -740,14 +817,20 @@ pub(crate) struct HydratedChunk {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ChunkPointer {
-    pub(crate) chunk_id: i64,
-    pub(crate) doc_id: String,
+    key: ChunkKey,
+    pub(crate) document: DocumentId,
     pub(crate) ord: i64,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct ChunkKey {
+    source: SourceId,
+    chunk_id: i64,
 }
 
 #[derive(Debug, Clone)]
 struct ChunkRange {
-    doc_id: String,
+    document: DocumentId,
     from_ord: i64,
     to_ord: i64,
     request_order: usize,
@@ -755,18 +838,20 @@ struct ChunkRange {
 
 #[derive(Debug)]
 struct StoredChunk {
+    source: SourceId,
     chunk_id: i64,
-    doc_id: String,
+    native_id: String,
     doc_type: String,
     title: String,
     date: Option<String>,
     anchor: Option<String>,
+    canonical_url: String,
     text_blob: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct GetChunksCursor {
-    chunk_ids: Vec<i64>,
+    chunks: Vec<ChunkRef>,
     before: usize,
     after: usize,
     max_chars: usize,
@@ -785,23 +870,42 @@ fn decode_get_chunks_cursor(value: &str) -> Result<GetChunksCursor> {
     serde_json::from_slice(&bytes).context("invalid get_chunks cursor payload")
 }
 
+pub(crate) fn get_chunks(
+    chunks: Vec<ChunkRef>,
+    opts: GetChunksOptions,
+    cursor: Option<&str>,
+) -> Result<String> {
+    let cursor = cursor.map(decode_get_chunks_cursor).transpose()?;
+    get_chunks_from_cursor(&chunks, opts, cursor)
+}
+
 fn get_chunks_from_cursor(
-    chunk_ids: &[i64],
+    chunks: &[ChunkRef],
     opts: GetChunksOptions,
     cursor: Option<GetChunksCursor>,
 ) -> Result<String> {
-    if chunk_ids.is_empty() {
-        bail!("chunk_ids must contain at least one id");
+    if chunks.is_empty() {
+        bail!("chunks must contain at least one reference");
     }
-    if chunk_ids.len() > MAX_GET_CHUNKS_IDS {
-        bail!("chunk_ids accepts at most {MAX_GET_CHUNKS_IDS} ids per request");
+    if chunks.len() > MAX_GET_CHUNKS_IDS {
+        bail!("chunks accepts at most {MAX_GET_CHUNKS_IDS} references per request");
     }
     let max_chars = opts.max_chars.unwrap_or(DEFAULT_GET_CHUNKS_MAX_CHARS);
     if max_chars == 0 || max_chars > HARD_GET_CHUNKS_MAX_CHARS {
         bail!("max_chars must be between 1 and {HARD_GET_CHUNKS_MAX_CHARS}");
     }
+    let generation = active_generation()?;
+    let requested_keys = chunks
+        .iter()
+        .map(|reference| {
+            Ok(ChunkKey {
+                source: reference.source.clone(),
+                chunk_id: validate_chunk_ref(reference, &generation)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let expected_cursor = GetChunksCursor {
-        chunk_ids: chunk_ids.to_vec(),
+        chunks: chunks.to_vec(),
         before: opts.before,
         after: opts.after,
         max_chars,
@@ -809,41 +913,78 @@ fn get_chunks_from_cursor(
         text_offset: 0,
     };
     let cursor = cursor.unwrap_or_else(|| expected_cursor.clone());
-    if cursor.chunk_ids != expected_cursor.chunk_ids
+    if cursor.chunks != expected_cursor.chunks
         || cursor.before != expected_cursor.before
         || cursor.after != expected_cursor.after
         || cursor.max_chars != expected_cursor.max_chars
     {
-        bail!("get_chunks cursor does not match chunk_ids or retrieval options");
+        bail!("get_chunks cursor does not match chunks or retrieval options");
     }
     let conn = open_read()?;
-    let placeholders = vec!["?"; chunk_ids.len()].join(",");
-    let sql =
-        format!("SELECT chunk_id, doc_id, ord FROM chunks WHERE chunk_id IN ({placeholders})");
-    let params_vec: Vec<Value> = chunk_ids.iter().map(|id| Value::Integer(*id)).collect();
+    let predicates = vec!["(source_id = ? AND chunk_id = ?)"; requested_keys.len()].join(" OR ");
+    let sql = format!("SELECT source_id, chunk_id, native_id, ord FROM chunks WHERE {predicates}");
+    let mut params_vec = Vec::with_capacity(requested_keys.len() * 2);
+    for key in &requested_keys {
+        params_vec.push(Value::Text(key.source.as_str().to_string()));
+        params_vec.push(Value::Integer(key.chunk_id));
+    }
     let mut stmt = conn.prepare(&sql)?;
-    let pointers = stmt
-        .query_map(params_from_iter(params_vec), |row| {
-            Ok(ChunkPointer {
-                chunk_id: row.get("chunk_id")?,
-                doc_id: row.get("doc_id")?,
-                ord: row.get("ord")?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .into_iter()
-        .map(|pointer| (pointer.chunk_id, pointer))
-        .collect::<HashMap<_, _>>();
+    let rows = stmt.query_map(params_from_iter(params_vec), |row| {
+        Ok((
+            row.get::<_, String>("source_id")?,
+            row.get::<_, i64>("chunk_id")?,
+            row.get::<_, String>("native_id")?,
+            row.get::<_, i64>("ord")?,
+        ))
+    })?;
+    let mut pointers = HashMap::new();
+    for row in rows {
+        let (source, chunk_id, native_id, ord) = row?;
+        let source = source
+            .parse::<SourceId>()
+            .with_context(|| format!("invalid stored chunk source `{source}`"))?;
+        validate_source(&source)?;
+        let pointer = ChunkPointer {
+            key: ChunkKey {
+                source: source.clone(),
+                chunk_id,
+            },
+            document: DocumentId { source, native_id },
+            ord,
+        };
+        pointers.insert(pointer.key.clone(), pointer);
+    }
+    if let Some((reference, _)) = chunks
+        .iter()
+        .zip(&requested_keys)
+        .find(|(_, key)| !pointers.contains_key(*key))
+    {
+        bail!("chunk reference `{reference}` was not found in the active generation");
+    }
 
-    let requested_set: HashSet<i64> = chunk_ids.iter().copied().collect();
-    let ranges = merged_chunk_ranges(chunk_ids, &pointers, opts.before, opts.after);
+    let requested_set = requested_keys.iter().cloned().collect::<HashSet<_>>();
+    let mut requested_order = HashMap::new();
+    for (index, key) in requested_keys.iter().cloned().enumerate() {
+        requested_order.entry(key).or_insert(index);
+    }
+    let ranges = chunk_ranges_in_request_order(&requested_keys, &pointers, opts.before, opts.after);
     let mut stored = Vec::new();
     let mut seen = HashSet::new();
     for range in ranges {
         for chunk in
-            load_stored_chunks_by_ord_range(&conn, &range.doc_id, range.from_ord, range.to_ord)?
+            load_stored_chunks_by_ord_range(&conn, &range.document, range.from_ord, range.to_ord)?
         {
-            if seen.insert(chunk.chunk_id) {
+            let key = ChunkKey {
+                source: chunk.source.clone(),
+                chunk_id: chunk.chunk_id,
+            };
+            if requested_order
+                .get(&key)
+                .is_some_and(|order| *order > range.request_order)
+            {
+                continue;
+            }
+            if seen.insert(key) {
                 stored.push(chunk);
             }
         }
@@ -854,11 +995,14 @@ fn get_chunks_from_cursor(
     }
     let mut out = Vec::new();
     let mut returned_chars = 0usize;
-    let corpus = corpus_doc_id_set()?;
     let mut next = None;
     for (index, chunk) in stored.into_iter().enumerate().skip(cursor.item) {
         let raw_text = decompress_text(chunk.text_blob)?;
-        let text = annotate_doc_refs_with(&raw_text, &chunk.doc_id, corpus);
+        let document = DocumentId {
+            source: chunk.source.clone(),
+            native_id: chunk.native_id.clone(),
+        };
+        let text = annotate_doc_refs(&raw_text, &document)?;
         let start = if index == cursor.item {
             cursor.text_offset
         } else {
@@ -876,15 +1020,19 @@ fn get_chunks_from_cursor(
         let take = available.min(remaining);
         let body = text.chars().skip(start).take(take).collect::<String>();
         let complete = take == available;
-        out.push(HydratedChunk {
+        let key = ChunkKey {
+            source: chunk.source.clone(),
             chunk_id: chunk.chunk_id,
-            requested: requested_set.contains(&chunk.chunk_id),
-            doc_id: chunk.doc_id.clone(),
+        };
+        out.push(HydratedChunk {
+            chunk: chunk_ref(&generation, &chunk.source, chunk.chunk_id)?,
+            requested: requested_set.contains(&key),
+            document,
             doc_type: chunk.doc_type.clone(),
             title: chunk.title.clone(),
             date: chunk.date.clone(),
             anchor: chunk.anchor.clone(),
-            canonical_url: canonical_url(&chunk.doc_id),
+            canonical_url: chunk.canonical_url,
             text: body,
             text_start: (start != 0 || !complete).then_some(start),
             text_complete: (start != 0 || !complete).then_some(complete),
@@ -916,10 +1064,7 @@ fn get_chunks_from_cursor(
         }
     }
     let mut response = serde_json::Map::new();
-    response.insert(
-        "requested_chunk_ids".to_string(),
-        serde_json::to_value(chunk_ids)?,
-    );
+    response.insert("requested".to_string(), serde_json::to_value(chunks)?);
     response.insert(
         "context".to_string(),
         json!({
@@ -936,14 +1081,9 @@ fn get_chunks_from_cursor(
 }
 
 fn get_chunks_next_call(cursor: &GetChunksCursor) -> Result<String> {
-    let ids = cursor
-        .chunk_ids
-        .iter()
-        .map(i64::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
+    let chunks = serde_json::to_string(&cursor.chunks)?;
     Ok(format!(
-        "get_chunks(chunk_ids=[{ids}], before={}, after={}, max_chars={}, cursor={})",
+        "get_chunks(chunks={chunks}, before={}, after={}, max_chars={}, cursor={})",
         cursor.before,
         cursor.after,
         cursor.max_chars,
@@ -951,110 +1091,101 @@ fn get_chunks_next_call(cursor: &GetChunksCursor) -> Result<String> {
     ))
 }
 
-fn merged_chunk_ranges(
-    chunk_ids: &[i64],
-    pointers: &HashMap<i64, ChunkPointer>,
+fn chunk_ranges_in_request_order(
+    requested: &[ChunkKey],
+    pointers: &HashMap<ChunkKey, ChunkPointer>,
     before: usize,
     after: usize,
 ) -> Vec<ChunkRange> {
-    let mut by_doc: BTreeMap<String, Vec<ChunkRange>> = BTreeMap::new();
-    for (request_order, chunk_id) in chunk_ids.iter().enumerate() {
-        let Some(pointer) = pointers.get(chunk_id) else {
+    let mut ranges = Vec::new();
+    for (request_order, key) in requested.iter().enumerate() {
+        let Some(pointer) = pointers.get(key) else {
             continue;
         };
-        by_doc
-            .entry(pointer.doc_id.clone())
-            .or_default()
-            .push(ChunkRange {
-                doc_id: pointer.doc_id.clone(),
-                from_ord: pointer.ord.saturating_sub(before as i64),
-                to_ord: pointer.ord.saturating_add(after as i64),
-                request_order,
-            });
+        ranges.push(ChunkRange {
+            document: pointer.document.clone(),
+            from_ord: pointer.ord.saturating_sub(before as i64),
+            to_ord: pointer.ord.saturating_add(after as i64),
+            request_order,
+        });
     }
-    let mut merged: Vec<ChunkRange> = Vec::new();
-    for (_, mut ranges) in by_doc {
-        ranges.sort_by_key(|range| (range.from_ord, range.to_ord));
-        for range in ranges {
-            if let Some(previous) = merged.last_mut().filter(|previous| {
-                previous.doc_id == range.doc_id
-                    && range.from_ord <= previous.to_ord.saturating_add(1)
-            }) {
-                previous.to_ord = previous.to_ord.max(range.to_ord);
-                previous.request_order = previous.request_order.min(range.request_order);
-            } else {
-                merged.push(range);
-            }
-        }
-    }
-    merged.sort_by_key(|range| range.request_order);
-    merged
+    ranges
 }
 
 fn load_stored_chunks_by_ord_range(
     conn: &Connection,
-    doc_id: &str,
+    document: &DocumentId,
     from_ord: i64,
     to_ord: i64,
 ) -> Result<Vec<StoredChunk>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT c.chunk_id, c.doc_id, c.anchor, c.text,
-               d.type, d.title, d.date
+        SELECT c.chunk_id, c.native_id, c.anchor, c.text,
+               d.type, d.title, d.date, d.canonical_url
         FROM chunks c
-        JOIN documents d ON d.doc_id = c.doc_id
-        WHERE c.doc_id = ? AND c.ord BETWEEN ? AND ?
+        JOIN documents d
+          ON d.source_id = c.source_id AND d.native_id = c.native_id
+        WHERE c.source_id = ? AND c.native_id = ? AND c.ord BETWEEN ? AND ?
         ORDER BY c.ord ASC
         "#,
     )?;
-    let rows = stmt.query_map(params![doc_id, from_ord, to_ord], |row| {
-        let doc_id: String = row.get("doc_id")?;
-        Ok((
-            row.get::<_, i64>("chunk_id")?,
-            doc_id,
-            row.get::<_, String>("type")?,
-            row.get::<_, String>("title")?,
-            row.get::<_, Option<String>>("date")?,
-            row.get::<_, Option<String>>("anchor")?,
-            row.get::<_, Vec<u8>>("text")?,
-        ))
-    })?;
+    let rows = stmt.query_map(
+        params![
+            document.source.as_str(),
+            document.native_id,
+            from_ord,
+            to_ord
+        ],
+        |row| {
+            Ok((
+                row.get::<_, i64>("chunk_id")?,
+                row.get::<_, String>("native_id")?,
+                row.get::<_, String>("type")?,
+                row.get::<_, String>("title")?,
+                row.get::<_, Option<String>>("date")?,
+                row.get::<_, Option<String>>("anchor")?,
+                row.get::<_, String>("canonical_url")?,
+                row.get::<_, Vec<u8>>("text")?,
+            ))
+        },
+    )?;
     rows.map(|row| {
-        let (chunk_id, doc_id, doc_type, title, date, anchor, text_blob) = row?;
+        let (chunk_id, native_id, doc_type, title, date, anchor, canonical_url, text_blob) = row?;
         Ok(StoredChunk {
+            source: document.source.clone(),
             chunk_id,
-            doc_id,
+            native_id,
             doc_type,
             title,
             date,
             anchor,
+            canonical_url,
             text_blob,
         })
     })
     .collect()
 }
 
-pub(crate) fn get_asset_mcp(args: &JsonValue) -> Result<JsonValue> {
-    let asset_ref = required_str(args, "asset_ref")?;
-    get_asset(asset_ref)
-}
-
-pub(crate) fn get_asset(asset_ref: &str) -> Result<JsonValue> {
+pub(crate) fn get_asset(asset: AssetRef) -> Result<JsonValue> {
+    validate_source(&asset.source)?;
     let conn = open_read()?;
     let mut stmt = conn.prepare(
         r#"
-        SELECT doc_id, media_type, alt, title, data
+        SELECT native_id, media_type, alt, title, data
         FROM document_assets
-        WHERE asset_ref = ?
+        WHERE source_id = ? AND asset_id = ?
         "#,
     )?;
-    let mut rows = stmt.query([asset_ref])?;
+    let mut rows = stmt.query(params![asset.source.as_str(), asset.asset_id])?;
     let Some(row) = rows.next()? else {
         return Ok(json!([
-            { "type": "text", "text": format!("_Asset not found: `{}`_", asset_ref) }
+            { "type": "text", "text": format!("_Asset not found: `{}`_", serde_json::to_string(&asset)?) }
         ]));
     };
-    let doc_id: String = row.get("doc_id")?;
+    let document = DocumentId {
+        source: asset.source.clone(),
+        native_id: row.get("native_id")?,
+    };
     let media_type: Option<String> = row.get("media_type")?;
     let alt: Option<String> = row.get("alt")?;
     let title: Option<String> = row.get("title")?;
@@ -1064,20 +1195,15 @@ pub(crate) fn get_asset(asset_ref: &str) -> Result<JsonValue> {
     let mime = media_type.unwrap_or_else(|| "application/octet-stream".to_string());
     let caption = match alt.as_deref().or(title.as_deref()) {
         Some(label) if !label.is_empty() => {
-            format!("Asset `{asset_ref}` ({mime}, {bytes} bytes) from `{doc_id}`: {label}")
+            format!("Asset `{asset}` ({mime}, {bytes} bytes) from `{document}`: {label}")
         }
-        _ => format!("Asset `{asset_ref}` ({mime}, {bytes} bytes) from `{doc_id}`"),
+        _ => format!("Asset `{asset}` ({mime}, {bytes} bytes) from `{document}`"),
     };
     let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
     Ok(json!([
         { "type": "text", "text": caption },
         { "type": "image", "data": b64, "mimeType": mime },
     ]))
-}
-
-pub(crate) fn get_doc_anchors_mcp(args: &JsonValue) -> Result<String> {
-    let doc_id = required_str(args, "doc_id")?;
-    get_doc_anchors(doc_id)
 }
 
 /// Convert an ATO point-in-time timestamp (`YYYYMMDDHHMMSS`) to an ISO
@@ -1097,72 +1223,120 @@ pub(crate) fn pit_to_date(pit: &str) -> Option<String> {
     ))
 }
 
-pub(crate) fn get_doc_anchors(doc_id: &str) -> Result<String> {
+pub(crate) fn get_doc_anchors(document: DocumentId) -> Result<String> {
+    validate_source(&document.source)?;
+    let generation = active_generation()?;
     let conn = open_read()?;
     let mut stmt = conn.prepare(
         r#"
-        SELECT ord, kind, label, target_chunk_id, target_doc_id, target_pit
-        FROM doc_anchors
-        WHERE doc_id = ?
-        ORDER BY ord ASC
+        SELECT a.ord, a.kind, a.label, a.target_chunk_id,
+               a.target_source_id, a.target_native_id, a.target_pit,
+               target.canonical_url AS target_canonical_url
+        FROM doc_anchors AS a
+        LEFT JOIN documents AS target
+          ON target.source_id = a.target_source_id
+         AND target.native_id = a.target_native_id
+        WHERE a.source_id = ? AND a.native_id = ?
+        ORDER BY a.ord ASC
         "#,
     )?;
     let mut in_doc = Vec::<JsonValue>::new();
     let mut related_docs = Vec::<JsonValue>::new();
     let mut historical_versions = Vec::<JsonValue>::new();
     let mut unresolved_in_doc = false;
-    let rows = stmt.query_map([doc_id], |row| {
-        let kind: String = row.get("kind")?;
-        let label: String = row.get("label")?;
-        let target_chunk_id: Option<i64> = row.get("target_chunk_id")?;
-        let target_doc_id: Option<String> = row.get("target_doc_id")?;
-        let target_pit: Option<String> = row.get("target_pit")?;
-        Ok((kind, label, target_chunk_id, target_doc_id, target_pit))
-    })?;
+    let rows = stmt.query_map(
+        params![document.source.as_str(), document.native_id],
+        |row| {
+            let kind: String = row.get("kind")?;
+            let label: String = row.get("label")?;
+            let target_chunk_id: Option<i64> = row.get("target_chunk_id")?;
+            let target_source_id: Option<String> = row.get("target_source_id")?;
+            let target_native_id: Option<String> = row.get("target_native_id")?;
+            let target_pit: Option<String> = row.get("target_pit")?;
+            let canonical_url: Option<String> = row.get("target_canonical_url")?;
+            Ok((
+                kind,
+                label,
+                target_chunk_id,
+                target_source_id,
+                target_native_id,
+                target_pit,
+                canonical_url,
+            ))
+        },
+    )?;
     for row in rows {
-        let (kind, label, target_chunk_id, target_doc_id, target_pit) = row?;
+        let (
+            kind,
+            label,
+            target_chunk_id,
+            target_source_id,
+            target_native_id,
+            target_pit,
+            canonical_url,
+        ) = row?;
         match kind.as_str() {
             "in_doc" => {
                 if let Some(chunk_id) = target_chunk_id {
+                    let source = target_source_id.ok_or_else(|| {
+                        anyhow!(
+                            "stored in-doc anchor with a chunk target is missing target_source_id"
+                        )
+                    })?;
+                    let target_source = source
+                        .parse::<SourceId>()
+                        .with_context(|| format!("invalid stored anchor source `{source}`"))?;
+                    validate_source(&target_source)?;
                     in_doc.push(json!({
                         "label": label,
-                        "chunk_id": chunk_id,
+                        "chunk": chunk_ref(&generation, &target_source, chunk_id)?,
                     }));
                 } else {
                     unresolved_in_doc = true;
                 }
             }
             "sister" => {
-                if let Some(target) = target_doc_id {
-                    related_docs.push(json!({
-                        "label": label,
-                        "doc_id": target,
-                    }));
-                }
+                let source = target_source_id
+                    .ok_or_else(|| anyhow!("stored sister anchor is missing target_source_id"))?;
+                let native_id = target_native_id
+                    .ok_or_else(|| anyhow!("stored sister anchor is missing target_native_id"))?;
+                let source = source
+                    .parse::<SourceId>()
+                    .with_context(|| format!("invalid stored anchor source `{source}`"))?;
+                validate_source(&source)?;
+                related_docs.push(json!({
+                    "label": label,
+                    "document": DocumentId { source, native_id },
+                    "canonical_url": canonical_url,
+                }));
             }
             "history" => {
-                if let Some(target) = target_doc_id {
-                    let mut entry = serde_json::Map::new();
-                    entry.insert("label".to_string(), JsonValue::String(label));
-                    entry.insert("doc_id".to_string(), JsonValue::String(target.clone()));
-                    if let Some(pit) = target_pit.as_deref() {
-                        entry.insert("pit".to_string(), JsonValue::String(pit.to_string()));
-                        if let Some(date) = pit_to_date(pit) {
-                            entry.insert("date".to_string(), JsonValue::String(date));
-                        }
-                        // Fully-qualified URL the agent can WebFetch directly.
-                        // Historical content is not stored locally — agents
-                        // requesting the older version follow this URL.
-                        let mut url = Url::parse("https://www.ato.gov.au/law/view/document")?;
-                        url.query_pairs_mut()
-                            .append_pair("docid", &target)
-                            .append_pair("PiT", pit);
-                        entry.insert("url".to_string(), JsonValue::String(url.into()));
-                    }
-                    historical_versions.push(JsonValue::Object(entry));
+                let source = target_source_id
+                    .ok_or_else(|| anyhow!("stored history anchor is missing target_source_id"))?;
+                let native_id = target_native_id
+                    .ok_or_else(|| anyhow!("stored history anchor is missing target_native_id"))?;
+                let source = source
+                    .parse::<SourceId>()
+                    .with_context(|| format!("invalid stored anchor source `{source}`"))?;
+                validate_source(&source)?;
+                let mut entry = serde_json::Map::new();
+                entry.insert("label".to_string(), JsonValue::String(label));
+                entry.insert(
+                    "document".to_string(),
+                    serde_json::to_value(DocumentId { source, native_id })?,
+                );
+                if let Some(url) = canonical_url {
+                    entry.insert("canonical_url".to_string(), JsonValue::String(url));
                 }
+                if let Some(pit) = target_pit.as_deref() {
+                    entry.insert("pit".to_string(), JsonValue::String(pit.to_string()));
+                    if let Some(date) = pit_to_date(pit) {
+                        entry.insert("date".to_string(), JsonValue::String(date));
+                    }
+                }
+                historical_versions.push(JsonValue::Object(entry));
             }
-            _ => {}
+            other => bail!("unsupported stored anchor kind `{other}`"),
         }
     }
     if unresolved_in_doc {
@@ -1171,25 +1345,29 @@ pub(crate) fn get_doc_anchors(doc_id: &str) -> Result<String> {
             .filter_map(|entry| {
                 Some((
                     entry.get("label")?.as_str()?.to_string(),
-                    entry.get("chunk_id")?.as_i64()?,
+                    serde_json::from_value::<ChunkRef>(entry.get("chunk")?.clone()).ok()?,
                 ))
             })
             .collect::<HashSet<_>>();
-        for entry in resolve_in_doc_anchor_chunks(&conn, doc_id)? {
+        for entry in resolve_in_doc_anchor_chunks(&conn, &document, &generation)? {
             let Some(label) = entry.get("label").and_then(|value| value.as_str()) else {
                 continue;
             };
-            let Some(chunk_id) = entry.get("chunk_id").and_then(|value| value.as_i64()) else {
+            let Some(chunk) = entry
+                .get("chunk")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<ChunkRef>(value).ok())
+            else {
                 continue;
             };
-            if seen.insert((label.to_string(), chunk_id)) {
+            if seen.insert((label.to_string(), chunk)) {
                 in_doc.push(entry);
             }
         }
     }
-    let (cited_by, cited_by_total) = load_cited_by(&conn, doc_id)?;
+    let (cited_by, cited_by_total) = load_cited_by(&conn, &document)?;
     let mut response = serde_json::Map::new();
-    response.insert("doc_id".to_string(), JsonValue::String(doc_id.to_string()));
+    response.insert("document".to_string(), serde_json::to_value(document)?);
     response.insert("in_doc".to_string(), JsonValue::Array(in_doc));
     response.insert("related_docs".to_string(), JsonValue::Array(related_docs));
     response.insert(
@@ -1211,12 +1389,13 @@ pub(crate) fn get_doc_anchors(doc_id: &str) -> Result<String> {
 
 pub(crate) fn resolve_in_doc_anchor_chunks(
     conn: &Connection,
-    doc_id: &str,
+    document: &DocumentId,
+    generation: &str,
 ) -> Result<Vec<JsonValue>> {
     let html_blob: Option<Vec<u8>> = conn
         .query_row(
-            "SELECT html FROM documents WHERE doc_id = ?",
-            [doc_id],
+            "SELECT html FROM documents WHERE source_id = ? AND native_id = ?",
+            params![document.source.as_str(), document.native_id],
             |row| row.get(0),
         )
         .optional()?;
@@ -1224,19 +1403,24 @@ pub(crate) fn resolve_in_doc_anchor_chunks(
         return Ok(Vec::new());
     };
     let html = decompress_text(html_blob)?;
-    let refs = extract_anchors(&html, doc_id);
+    let refs = extract_anchors(&html, &document.native_id);
     if refs.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut stmt = conn
-        .prepare("SELECT anchor, chunk_id FROM chunks WHERE doc_id = ? AND anchor IS NOT NULL")?;
-    let rows = stmt.query_map([doc_id], |row| {
-        Ok((
-            row.get::<_, String>("anchor")?,
-            row.get::<_, i64>("chunk_id")?,
-        ))
-    })?;
+    let mut stmt = conn.prepare(
+        "SELECT anchor, chunk_id FROM chunks \
+         WHERE source_id = ? AND native_id = ? AND anchor IS NOT NULL",
+    )?;
+    let rows = stmt.query_map(
+        params![document.source.as_str(), document.native_id],
+        |row| {
+            Ok((
+                row.get::<_, String>("anchor")?,
+                row.get::<_, i64>("chunk_id")?,
+            ))
+        },
+    )?;
     let mut chunk_id_by_anchor = HashMap::new();
     for row in rows {
         let (anchor, chunk_id) = row?;
@@ -1261,38 +1445,44 @@ pub(crate) fn resolve_in_doc_anchor_chunks(
         if seen.insert((r.label.clone(), chunk_id)) {
             out.push(json!({
                 "label": r.label,
-                "chunk_id": chunk_id,
+                "chunk": chunk_ref(generation, &document.source, chunk_id)?,
             }));
         }
     }
     Ok(out)
 }
 
-/// [MT-17] Per-doc cap on the `cited_by` array surfaced by `get_doc_anchors`. The
+/// Per-doc cap on the `cited_by` array surfaced by `get_doc_anchors`. The
 /// most heavily-cited docs (ITAA 1997 s 8-1, Pt IVA, ...) have thousands of
 /// citers and would otherwise dominate the response. Order by source date
 /// DESC so the agent sees the most recent citations first; the total count
 /// lives on `cited_by_total` when truncation occurs.
 ///
-/// [UM-07] Streams `chunks.text` once, regex-extracts every `[doc:X]` marker
-/// (PiT / view qualifiers collapse to the base doc_id), and INSERT OR
-/// IGNORE-batches into `citations`. Idempotent: clears first.
+/// Streams one source's `chunks.text`, extracts canonical source-qualified
+/// document markers, and replaces only that source's derived citation rows.
+/// PiT/view qualifiers collapse to the typed base `DocumentId`.
 ///
 /// Called at the tail of `rebuild_live_db_from_manifest`. The rebuild path
 /// bulk-inserts chunks into a fresh staging DB and then atomic-renames it
 /// over the live file; freshly-inserted chunks carry no citation rows, so
 /// every row must be derived here before the swap.
-pub(crate) fn derive_citations(conn: &Connection) -> Result<()> {
-    static DOC_MARKER_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let re = DOC_MARKER_RE.get_or_init(|| Regex::new(r"\[doc:([^\s\]@]+)").expect("valid regex"));
-
-    conn.execute("DELETE FROM citations", [])?;
-    let mut select = conn.prepare("SELECT chunk_id, doc_id, text FROM chunks")?;
-    let mut insert = conn.prepare(
-        "INSERT OR IGNORE INTO citations (source_chunk_id, source_doc_id, target_doc_id) \
-         VALUES (?, ?, ?)",
+pub(crate) fn derive_citations(conn: &Connection, source_id: &SourceId) -> Result<()> {
+    validate_source(source_id)?;
+    conn.execute(
+        "DELETE FROM citations WHERE source_id = ?1",
+        [source_id.as_str()],
     )?;
-    let rows = select.query_map([], |row| {
+    let mut select = conn.prepare(
+        "SELECT chunk_id, native_id, text FROM chunks \
+         WHERE source_id = ?1 ORDER BY chunk_id ASC",
+    )?;
+    let mut insert = conn.prepare(
+        "INSERT OR IGNORE INTO citations (\
+             source_chunk_id, source_id, source_native_id, \
+             target_source_id, target_native_id\
+         ) VALUES (?, ?, ?, ?, ?)",
+    )?;
+    let rows = select.query_map([source_id.as_str()], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
@@ -1301,18 +1491,34 @@ pub(crate) fn derive_citations(conn: &Connection) -> Result<()> {
     })?;
     let mut total: u64 = 0;
     for row in rows {
-        let (chunk_id, doc_id, blob) = row?;
+        let (chunk_id, native_id, blob) = row?;
+        let source_document = DocumentId {
+            source: source_id.clone(),
+            native_id: native_id.clone(),
+        };
         let text = decompress_text(blob)?;
-        let mut seen = std::collections::HashSet::new();
-        for cap in re.captures_iter(&text) {
-            let target = &cap[1];
-            if target == doc_id {
+        let mut seen = HashSet::new();
+        for captures in doc_marker_regex().captures_iter(&text) {
+            let target: DocumentId = captures[1].parse().with_context(|| {
+                format!(
+                    "invalid source-qualified document marker `[doc:{}]` in chunk {chunk_id}",
+                    &captures[1]
+                )
+            })?;
+            validate_source(&target.source)?;
+            if target == source_document {
                 continue;
             }
-            if !seen.insert(target.to_string()) {
+            if !seen.insert(target.clone()) {
                 continue;
             }
-            insert.execute(params![chunk_id, &doc_id, target])?;
+            insert.execute(params![
+                chunk_id,
+                source_id.as_str(),
+                native_id,
+                target.source.as_str(),
+                target.native_id
+            ])?;
             total += 1;
         }
     }
@@ -1320,37 +1526,68 @@ pub(crate) fn derive_citations(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn load_cited_by(conn: &Connection, doc_id: &str) -> Result<(Vec<JsonValue>, i64)> {
+pub(crate) fn load_cited_by(
+    conn: &Connection,
+    document: &DocumentId,
+) -> Result<(Vec<JsonValue>, i64)> {
+    validate_source(&document.source)?;
     let total: i64 = conn.query_row(
-        "SELECT COUNT(DISTINCT source_doc_id) FROM citations WHERE target_doc_id = ?",
-        [doc_id],
+        "SELECT COUNT(*) FROM (\
+             SELECT DISTINCT source_id, source_native_id FROM citations \
+             WHERE target_source_id = ?1 AND target_native_id = ?2\
+         )",
+        params![document.source.as_str(), document.native_id],
         |row| row.get(0),
     )?;
     let mut stmt = conn.prepare(
         r#"
-        SELECT c.source_doc_id, d.title, d.type, d.date
+        SELECT c.source_id, c.source_native_id, d.title, d.type, d.date,
+               d.canonical_url
         FROM (
-            SELECT DISTINCT source_doc_id FROM citations WHERE target_doc_id = ?
+            SELECT DISTINCT source_id, source_native_id
+            FROM citations
+            WHERE target_source_id = ? AND target_native_id = ?
         ) c
-        JOIN documents d ON d.doc_id = c.source_doc_id
-        ORDER BY d.date DESC NULLS LAST, c.source_doc_id ASC
+        JOIN documents d
+          ON d.source_id = c.source_id AND d.native_id = c.source_native_id
+        ORDER BY d.date DESC NULLS LAST, c.source_id ASC, c.source_native_id ASC
         LIMIT ?
         "#,
     )?;
-    let rows = stmt.query_map(params![doc_id, CITED_BY_LIMIT as i64], |row| {
-        let id: String = row.get("source_doc_id")?;
-        let title: String = row.get("title")?;
-        let dtype: String = row.get("type")?;
-        let date: Option<String> = row.get("date")?;
-        Ok((id, title, dtype, date))
-    })?;
+    let rows = stmt.query_map(
+        params![
+            document.source.as_str(),
+            document.native_id,
+            CITED_BY_LIMIT as i64
+        ],
+        |row| {
+            let source: String = row.get("source_id")?;
+            let native_id: String = row.get("source_native_id")?;
+            let title: String = row.get("title")?;
+            let dtype: String = row.get("type")?;
+            let date: Option<String> = row.get("date")?;
+            let canonical_url: String = row.get("canonical_url")?;
+            Ok((source, native_id, title, dtype, date, canonical_url))
+        },
+    )?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, title, dtype, date) = row?;
+        let (source, native_id, title, dtype, date, canonical_url) = row?;
+        let source = source
+            .parse::<SourceId>()
+            .with_context(|| format!("invalid stored citation source `{source}`"))?;
+        validate_source(&source)?;
         let mut entry = serde_json::Map::new();
-        entry.insert("doc_id".to_string(), JsonValue::String(id));
+        entry.insert(
+            "document".to_string(),
+            serde_json::to_value(DocumentId { source, native_id })?,
+        );
         entry.insert("title".to_string(), JsonValue::String(title));
         entry.insert("type".to_string(), JsonValue::String(dtype));
+        entry.insert(
+            "canonical_url".to_string(),
+            JsonValue::String(canonical_url),
+        );
         if let Some(d) = date {
             entry.insert("date".to_string(), JsonValue::String(d));
         }
@@ -1363,10 +1600,22 @@ pub(crate) fn load_cited_by(conn: &Connection, doc_id: &str) -> Result<(Vec<Json
 mod tests {
     use super::*;
 
+    fn source() -> SourceId {
+        "ato".parse().expect("valid source")
+    }
+
+    fn document(native_id: &str) -> DocumentId {
+        DocumentId::new(source(), native_id).expect("valid document")
+    }
+
+    fn chunk(chunk_id: u64) -> ChunkRef {
+        ChunkRef::new("generation-1", source(), chunk_id).expect("valid chunk")
+    }
+
     #[test]
     fn chunk_cursor_round_trips_all_request_state() -> Result<()> {
         let cursor = GetChunksCursor {
-            chunk_ids: vec![7, 9, 7],
+            chunks: vec![chunk(7), chunk(9), chunk(7)],
             before: 2,
             after: 3,
             max_chars: 1234,
@@ -1378,7 +1627,10 @@ mod tests {
             cursor
         );
         let call = get_chunks_next_call(&cursor)?;
-        assert!(call.contains("chunk_ids=[7, 9, 7]"));
+        assert!(call.contains("chunks=[{"));
+        assert!(call.contains("\"generation\":\"generation-1\""));
+        assert!(call.contains("\"source\":\"ato\""));
+        assert!(call.contains("\"chunk_id\":7"));
         assert!(call.contains("before=2"));
         assert!(call.contains("after=3"));
         assert!(call.contains("max_chars=1234"));
@@ -1386,52 +1638,95 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_chunk_ranges_merge_before_loading() {
+    fn chunk_ranges_preserve_mixed_source_request_order() {
+        let frl: SourceId = "frl".parse().expect("valid source");
         let pointers = [
             (
-                10,
-                ChunkPointer {
+                ChunkKey {
+                    source: source(),
                     chunk_id: 10,
-                    doc_id: "A".into(),
+                },
+                ChunkPointer {
+                    key: ChunkKey {
+                        source: source(),
+                        chunk_id: 10,
+                    },
+                    document: document("A"),
                     ord: 5,
                 },
             ),
             (
-                11,
-                ChunkPointer {
+                ChunkKey {
+                    source: source(),
                     chunk_id: 11,
-                    doc_id: "A".into(),
+                },
+                ChunkPointer {
+                    key: ChunkKey {
+                        source: source(),
+                        chunk_id: 11,
+                    },
+                    document: document("A"),
                     ord: 7,
                 },
             ),
             (
-                20,
-                ChunkPointer {
+                ChunkKey {
+                    source: frl.clone(),
                     chunk_id: 20,
-                    doc_id: "B".into(),
+                },
+                ChunkPointer {
+                    key: ChunkKey {
+                        source: frl.clone(),
+                        chunk_id: 20,
+                    },
+                    document: DocumentId::new(frl.clone(), "B").expect("valid document"),
                     ord: 1,
                 },
             ),
         ]
         .into_iter()
         .collect();
-        let ranges = merged_chunk_ranges(&[10, 11, 20], &pointers, 1, 1);
-        assert_eq!(ranges.len(), 2);
+        let requested = vec![
+            ChunkKey {
+                source: source(),
+                chunk_id: 10,
+            },
+            ChunkKey {
+                source: frl.clone(),
+                chunk_id: 20,
+            },
+            ChunkKey {
+                source: source(),
+                chunk_id: 11,
+            },
+        ];
+        let ranges = chunk_ranges_in_request_order(&requested, &pointers, 1, 1);
+        assert_eq!(ranges.len(), 3);
         assert_eq!(
             (
-                ranges[0].doc_id.as_str(),
+                ranges[0].document.native_id.as_str(),
                 ranges[0].from_ord,
-                ranges[0].to_ord
+                ranges[0].to_ord,
+                ranges[0].request_order
             ),
-            ("A", 4, 8)
+            ("A", 4, 6, 0)
         );
         assert_eq!(
             (
-                ranges[1].doc_id.as_str(),
-                ranges[1].from_ord,
-                ranges[1].to_ord
+                ranges[1].document.source.as_str(),
+                ranges[1].document.native_id.as_str(),
+                ranges[1].request_order
             ),
-            ("B", 0, 2)
+            ("frl", "B", 1)
+        );
+        assert_eq!(
+            (
+                ranges[2].document.native_id.as_str(),
+                ranges[2].from_ord,
+                ranges[2].to_ord,
+                ranges[2].request_order
+            ),
+            ("A", 6, 8, 2)
         );
     }
 
@@ -1454,6 +1749,88 @@ mod tests {
     }
 
     #[test]
+    fn document_markers_require_one_canonical_source_qualified_identity() -> Result<()> {
+        let self_document = document("PAC/1997-38/1-1");
+        let mut corpus = HashMap::new();
+        corpus.insert(
+            source(),
+            Arc::new(HashSet::from(["PAC/1997-38/2-1".to_string()])),
+        );
+        let text = "[doc:ato:PAC/1997-38/1-1] [doc:ato:PAC/1997-38/2-1] [doc:ato:PAC/missing]";
+        let annotated = annotate_doc_refs_with(text, &self_document, &corpus)?;
+        assert_eq!(
+            annotated,
+            "[doc:ato:PAC/1997-38/1-1] [doc:ato:PAC/1997-38/2-1] [fetch:legal://ato/PAC%2Fmissing]"
+        );
+        let error = annotate_doc_refs_with("[doc:PAC/1997-38/1-1]", &self_document, &corpus)
+            .expect_err("bare native ids must not parse");
+        assert!(error.to_string().contains("source-qualified"));
+        Ok(())
+    }
+
+    #[test]
+    fn citation_derivation_replaces_only_the_requested_source() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE chunks (
+                chunk_id INTEGER PRIMARY KEY,
+                source_id TEXT NOT NULL,
+                native_id TEXT NOT NULL,
+                text BLOB NOT NULL
+            );
+            CREATE TABLE citations (
+                source_chunk_id INTEGER NOT NULL,
+                source_id TEXT NOT NULL,
+                source_native_id TEXT NOT NULL,
+                target_source_id TEXT NOT NULL,
+                target_native_id TEXT NOT NULL,
+                PRIMARY KEY (source_chunk_id, target_source_id, target_native_id)
+            );
+            INSERT INTO citations VALUES (99, 'other', 'doc', 'ato', 'preserved');
+            "#,
+        )?;
+        let text = crate::db::compress_text("[doc:ato:PAC/target] [doc:ato:PAC/target]")?;
+        conn.execute(
+            "INSERT INTO chunks VALUES (1, 'ato', 'PAC/source', ?1)",
+            params![text],
+        )?;
+        derive_citations(&conn, &source())?;
+        let rows = conn
+            .prepare(
+                "SELECT source_id, source_native_id, target_source_id, target_native_id \
+                 FROM citations ORDER BY source_chunk_id",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "ato".to_string(),
+                    "PAC/source".to_string(),
+                    "ato".to_string(),
+                    "PAC/target".to_string(),
+                ),
+                (
+                    "other".to_string(),
+                    "doc".to_string(),
+                    "ato".to_string(),
+                    "preserved".to_string(),
+                ),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn get_chunks_rejects_empty_and_unbounded_requests_before_opening_the_db() {
         let empty = get_chunks_from_cursor(
             &[],
@@ -1468,7 +1845,7 @@ mod tests {
         assert!(empty.to_string().contains("at least one"));
 
         let excessive = get_chunks_from_cursor(
-            &[1],
+            &[chunk(1)],
             GetChunksOptions {
                 before: 0,
                 after: 0,

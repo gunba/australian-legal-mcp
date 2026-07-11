@@ -1,161 +1,225 @@
 # AGENTS.md
 
-Instructions for agents installing or operating `ato-mcp` for a user.
-Read this first; use [README.md](README.md) for design detail.
+Instructions for agents developing, installing or operating Australian Legal
+MCP. Read [README.md](./README.md) for the user surface,
+[MAINTENANCE.md](./MAINTENANCE.md) for release operations,
+[CURRENT_STATE.md](./CURRENT_STATE.md) for the implementation snapshot and
+[PLAN.md](./PLAN.md) for planned source and deployment work.
 
-## Design Philosophy
+## Canonical product contract
 
-ATO-MCP exposes clean, source-grounded retrieval primitives and lets agents
-do the reasoning. Prefer fewer tools, fewer parameters, and less context over
-feature breadth.
+| Concern | Canonical value |
+|---|---|
+| Product and package | `australian-legal-mcp` |
+| Executable | `legal-mcp` |
+| MCP key | `australian-legal` |
+| Environment variables | `LEGAL_MCP_*` |
+| Repository | `gunba/australian-legal-mcp` |
+| Data directory name | `australian-legal-mcp` |
+| Corpus database | `legal.db` |
+| ANN sidecars | `ann/<source>.ann` |
+| Registered sources | `ato`, `frl` |
+| Live document URI | `legal://<source>/<encoded-native-id>` |
 
-Good features are deterministic and derived from stable, ubiquitous source
-structure. Examples: parsing an ATO document URL into its exact `doc_id`,
-constructing titles from HTML headings, removing repeated history/navigation
-metadata that appears across the corpus, and preserving exact chunk/document
-references.
+The current implementation is one `legal-mcp` binary. It owns local MCP
+transport, corpus installation, retrieval and maintainer source/build commands.
+Public remote serving, deployment-role separation and Azure are planned work.
 
-The document surface is cleaned source HTML. Preserve stable HTML structure
-so agents can navigate tags and attributes directly. Internal ATO document
-links become deterministic `data-doc-id` attributes rather than retained
-`href` URLs; retained images are compact `data-asset-ref` references
-resolvable through the asset tool. Image bytes and decorative/history icons
-stay out of context.
+## Design principles
 
-The semantic search/index path uses plain, source-derived text from the
-cleaned HTML. Headings live in metadata; links and images contribute only
-useful visible text to search.
+Australian Legal MCP exposes compact, source-grounded retrieval primitives and
+lets agents perform legal reasoning. Prefer deterministic features derived from
+stable official source structure, few parameters and minimal response context.
 
-Avoid features built on string substitutions, guessed citation aliases,
-hand-maintained act maps, or fragile interpretations of user prose. If
-logic would need ongoing maintenance against new ATO document shapes, it
-belongs in source acquisition, not in runtime retrieval.
+Every public concern has one canonical path: one source-qualified identity
+model, one corpus schema, one generation layout, one URI syntax and one MCP
+surface. Runtime logic follows typed source adapters and structured upstream
+data rather than guessed aliases, hand-maintained Act maps or prose heuristics.
 
-Each surface has one path. If a breaking change is needed before there is a
-real installed user base, make the break cleanly and remove the old surface.
+The document surface is cleaned structural HTML. Preserve useful tags and
+attributes so agents can navigate source structure directly. Internal links
+become deterministic source-qualified document references, and retained images
+become compact source-qualified asset references. Search text is plain text
+derived from that HTML; headings remain metadata, while links and images
+contribute useful visible text.
 
-## Plugin install
+## Public MCP surface
 
-```bash
-git clone https://github.com/gunba/ato-mcp.git
-claude plugin install ./ato-mcp
+Expose exactly these seven tools:
+
+- `search`
+- `get_chunks`
+- `get_asset`
+- `get_doc_anchors`
+- `get_definition`
+- `stats`
+- `fetch`
+
+A search resolves exactly one registered source; omission selects `ato`. Public
+document, chunk and asset references carry their source, and chunk references
+also carry their corpus generation. Continuations preserve every explicit
+source and filter.
+
+`fetch` accepts a canonical `legal://` URI. The host is a registered source and
+the native ID is one percent-encoded path segment. Reject whitespace, fragments,
+credentials, ports, noncanonical escapes, extra path segments and unrecognised
+query keys. ATO `pit` and `view` query values are preserved through typed URI
+parsing.
+
+Tool responses contain information a legal-research agent can navigate, quote or
+cite. Keep ranking internals, model identifiers, candidate counts, chunk
+ordinals, query echoes and diagnostic counters out of public payloads. Optional
+empty fields are omitted rather than serialised as `null`.
+
+## Source and update invariants
+
+Each source owns its descriptor, official upstreams, discovery cursor,
+inventory,
+rate policy, retry policy, normalization hooks and fixtures. Source discovery
+jobs run concurrently under independent limits. A failed source retains its last
+publishable state; successful sources continue to validation and publication.
+
+Incremental acquisition is the routine path: discover an overlap window, dedupe
+by stable native ID, fetch changed records, normalize, and commit the cursor
+only
+after the source result is durable. A full inventory is authoritative. Reconcile
+it inside one source transaction and directly delete source rows absent from
+that
+inventory.
+
+Every publication builds a fresh `legal.db`. Rechunk changed documents, reuse
+embeddings by approved model and chunk-text hash, rebuild the affected
+`ann/<source>.ann`, run source and corpus checks, then assemble one immutable
+generation. `active-generation` is the only activation point.
+
+### ATO (`ato`)
+
+Use `/home/jordan/Desktop/Projects/ato_pages` as the integrity-pinned ATO source
+workspace. Routine runs use its `index.jsonl`, payload tree and What's New
+discovery, then fetch discovered changed links. A full ATO acquisition is an
+explicitly authorised repair operation.
+
+Preserve the proven ATO request policy: one shared 50 ms issue interval, four
+fetch workers and a 30-second request timeout. Validate declared payload sizes
+and SHA-256 values before normalization.
+
+Preserve current-guidance search policy:
+
+- `EV` is selected only through an explicit `types` request;
+- `include_old=true` includes non-legislation dated before `2000-01-01`;
+- legislation is exempt from the date cutoff;
+- `current_only=true` filters withdrawn and superseded rulings.
+
+### Federal Register of Legislation (`frl`)
+
+Use the official API at `https://api.prod.legislation.gov.au/v1/`. Initial
+reconciliation pages `Titles` by stable `id` with `$top` at most 100.
+Incremental
+discovery pages `Versions` from a seven-day overlap boundary, ordered by
+`registeredAt`, `titleId`, `start` and `retrospectiveStart`. Persist the full
+cursor tuple and deduplicate the overlap.
+
+Use `titleId` as the stable native document ID, the version tuple as version
+identity and `registerId` as registration provenance. Enumerate `Documents` for
+the selected version and prefer official authorised EPUB, then DOCX, then
+official extracted PDF text. The initial source policy is two concurrent
+operations, a 250 ms issue interval, a 30-second request timeout and bounded
+exponential backoff with jitter.
+
+Periodic authoritative `Titles` reconciliation directly deletes records that
+are absent or outside the selected current corpus.
+
+## Clean-room source development
+
+OALCC is behavioural research evidence for endpoint discovery, pagination, rate
+limits, format selection and browser requirements. Implement adapters from
+official upstream contracts and independently captured fixtures. Record the
+official URL, native identity, pagination, provenance, format selection and
+measured rate policy for every adapter.
+
+Register a source when acquisition, normalization, source-qualified indexing,
+search, assets, links, quality fixtures and update reconciliation work end to
+end. New sources use the shared cleaned-HTML and retrieval syntax rather than
+source-specific public tools.
+
+## Install and operate
+
+Use the release executable and the canonical MCP entry:
+
+```json
+{
+  "mcpServers": {
+    "australian-legal": {
+      "command": "legal-mcp",
+      "args": ["mcp"]
+    }
+  }
+}
 ```
 
-For Pi, install the MCP adapter and then install this checkout as a Pi package:
+`legal-mcp mcp` starts or reuses one loopback backend for the selected data
+directory. Installer agents choose a stable data directory once and supply the
+same `LEGAL_MCP_DATA_DIR` to every command when overriding the platform default.
+The first corpus install is a large verified download; explain it and obtain
+approval before running `legal-mcp update`.
+
+Verify an installation with:
 
 ```bash
-pi install npm:pi-mcp-adapter
-pi install ./ato-mcp
+legal-mcp stats
+legal-mcp search "research and development tax incentive eligibility" \
+  --source ato --k 5
+legal-mcp search "income tax assessment act" --source frl --k 5
 ```
 
-The Pi package manifest in `package.json` exposes the two ATO skills. The MCP
-server remains a standard MCP config entry, so Pi needs `pi-mcp-adapter`.
-Project-local Pi sessions can read this repository's `.mcp.json`; for
-user-global access from any project, add the same `mcpServers.ato` entry to
-`~/.config/mcp/mcp.json` or `~/.pi/agent/mcp.json`.
+Inside the MCP host, call `stats` and a source-specific `search`; confirm
+results
+contain exact `canonical_url` values and resolvable source-qualified references.
 
-The plugin's `.mcp.json` registers `mcpServers.ato` as the stdio command
-`ato-mcp mcp`. That command starts or reuses one local loopback HTTP backend
-and proxies MCP messages to it. This avoids first-run generated-port reloads
-while keeping the SQLite corpus and semantic model in one backend process per
-user data dir.
+## Maintainer boundary
+
+Corpus acquisition, builds and publication run from the maintainer checkout.
+Build release binaries and corpus tooling with:
 
 ```bash
-ato-mcp mcp               # MCP host entry point
-ato-mcp serve             # advanced/manual HTTP backend
-ato-mcp serve --port 51235
+cargo build --release --features cuda
 ```
 
-The plugin includes two skills:
+The CUDA feature selects the GPU execution provider for maintainer embedding
+work. End-user `update`, `stats`, `search`, `fetch`, `mcp` and `serve` use the
+CPU-safe runtime.
 
-- `skills/ato-mcp-server/SKILL.md` is intentionally small and is loaded for
-  ordinary ATO/tax research. It tells the agent to use the ATO tools and gives
-  the minimal recovery path when the server is down.
-- `skills/setup-ato-mcp/SKILL.md` is the larger install/repair guide. Load it
-  only for first-run setup, MCP startup repair, missing corpus, corpus
-  updates, or repeated startup failures.
+Treat installed generation directories as immutable. Serialize `legal-mcp
+update` with its data-directory lock and serialize source updates with each
+workspace lock. Keep the ATO source workspace, FRL workspace, run output and
+published data directory as distinct stable paths.
 
-Installer agents should not ask the user to choose ports or edit config. The
-MCP host starts `ato-mcp mcp`; if no backend is running, that command starts
-one and records the endpoint in `<data_dir>/http.json`.
+## Validation
 
-The binary install location is independent from the corpus data directory.
-Installer agents must choose one corpus data directory and use it consistently
-for `ato-mcp update`, `ato-mcp mcp`, the backend server, `stats`, and
-verification searches.
-Default mode leaves `ATO_MCP_DATA_DIR` unset and uses the default user data dir
-(`%APPDATA%\ato-mcp` on Windows, `~/.local/share/ato-mcp` on Linux, and
-`~/Library/Application Support/ato-mcp` on macOS). Portable/co-located mode
-sets `ATO_MCP_DATA_DIR` to a stable directory next to the binary for every
-future `ato-mcp` command and backend start. Do not install the corpus under a
-temporary extraction directory.
-
-On the first MCP `initialize`, the server tells the agent whether the corpus
-is installed. If not, the agent explains the large download and runs
-`ato-mcp update` with the user's approval.
-
-## Verify the install
+Before publication, run:
 
 ```bash
-ato-mcp stats              # JSON: documents, chunks, embeddings, search policy
-ato-mcp search "research and development tax incentive eligibility" --k 5
+cargo fmt --all -- --check
+cargo test --locked --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+bash -n scripts/*.sh
+git diff --check
+scripts/smoke.sh
 ```
 
-Inside the MCP host, invoke `search` and confirm results include
-`canonical_url` links.
-
-## Updates
-
-```bash
-ato-mcp update
-```
-
-Full corpus replacement uses paginated release discovery to find the newest
-non-prerelease `manifest.json`, streams and verifies `ato.db.zst`, `ato.ann`,
-and model artifacts, then assembles an immutable generation. Atomic replacement
-of `active-generation` activates the complete set; restart the MCP client and
-local backend to use it.
-
-When a newer corpus is published, the server's `initialize` instructions
-include the available index version. The agent surfaces the suggestion and
-runs `ato-mcp update` after the user agrees.
-
-## Search policy
-
-Defaults are tuned for current-guidance-first retrieval:
-
-- Edited private advice (`EV`) is excluded unless `types` includes it.
-- Non-legislation documents dated before `2000-01-01` are excluded unless
-  `include_old=true`.
-- Legislation is exempt from the old-content rule.
-- `current_only=true` (default) filters withdrawn and superseded rulings.
-
-## Maintainer-only
-
-Corpus builds happen via `cargo build --release --features cuda && scripts/maintainer-sync.sh`
-on a machine with the source corpus, Granite embedding model files, and a
-GPU-capable ONNX runtime. The `cuda` Cargo feature both enables the build's
-CUDA execution provider and the runtime's GPU path; there is no separate
-`--gpu` flag.
-
-The end-user runtime stays CPU-safe — install, update, search, and serve
-never require a GPU.
-
-`build`, `tree-crawl`, `link-download`, `scrape-diff`, `package-corpus`, and
-`publish-release` are maintainer commands and require the maintainer
-checkout plus model assets. Don't run them on a user install.
-
-## Don'ts
-
-- Do not edit files under `<data_dir>/live/` manually.
-- Do not run two `ato-mcp update` processes at the same time.
+Validate both sources, strict source isolation, canonical URI rejection cases,
+authoritative deletion, source failure isolation, embedding reuse, per-source
+ANN recall, manifest integrity and atomic activation.
 
 ## Troubleshooting
 
-| Symptom | Fix |
-|---|---|
-| `ato-mcp: command not found` | Put the release binary on `PATH`. |
-| MCP startup reports a stdio command failure | Confirm the MCP entry runs `ato-mcp mcp` and that the release binary is on `PATH` or configured by absolute path. |
-| `ato-mcp serve: bind ... already in use` | Stop whatever holds the port, or run `ato-mcp serve --port <other>` for manual HTTP testing. |
-| `stats` reports zero documents | `update` didn't complete; rerun after deleting the incomplete `live/` dir. |
-| `search` returns no hits | Confirm `stats` shows `chunks > 0`; use `include_old=true` for older authorities. |
+- **`legal-mcp` is not found:** Install the release executable in a stable
+  directory on `PATH`, then verify `legal-mcp --version`.
+- **MCP stdio startup fails:** Confirm `mcpServers.australian-legal` runs
+  `legal-mcp mcp` and inherits the intended `LEGAL_MCP_DATA_DIR`.
+- **Local backend bind fails:** Stop the process holding the port or run
+  `legal-mcp serve --port <port>` for a deliberate local test.
+- **Corpus is unavailable:** Run `legal-mcp update` with approval, restart the
+  MCP host/backend and inspect `legal-mcp stats`.
+- **A source search is empty:** Confirm the source appears in `stats`, inspect
+  its type/date policy and retry with an explicit source.

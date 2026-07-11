@@ -1,15 +1,16 @@
 {
-  "name": "ato-mcp",
-  "version": "0.16.2",
+  "name": "australian-legal-mcp",
+  "version": "0.17.0",
   "private": true,
-  "description": "Local search and retrieval over the Australian Taxation Office legal corpus.",
+  "description": "Local search and retrieval across Australian legal sources.",
   "license": "MIT",
-  "homepage": "https://github.com/gunba/ato-mcp",
+  "homepage": "https://github.com/gunba/australian-legal-mcp",
   "keywords": [
     "pi-package",
     "mcp",
-    "ato",
-    "tax"
+    "australia",
+    "legal",
+    "ato"
   ],
   "files": [
     ".claude-plugin/",
@@ -21,8 +22,8 @@
   ],
   "pi": {
     "skills": [
-      "skills/ato-mcp-server/SKILL.md",
-      "skills/setup-ato-mcp/SKILL.md"
+      "skills/australian-legal-mcp/SKILL.md",
+      "skills/setup-australian-legal-mcp/SKILL.md"
     ]
   }
 }

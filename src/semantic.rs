@@ -11,17 +11,11 @@ use ort::session::{
     Session,
 };
 use ort::value::TensorRef;
-#[allow(unused_imports)]
-use simsimd::SpatialSimilarity as _;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
-
-extern "C" {
-    fn simsimd_dot_i8(a: *const i8, b: *const i8, n: usize, out: *mut f64);
-}
 
 // Avoid expensive online transformer graph rewrites on every fresh CLI/MCP
 // process. The ONNX models are shipped pre-quantized; Level1 keeps cheap
@@ -112,21 +106,16 @@ pub(crate) fn dot_i8(query: &[i8; EMBEDDING_DIM], document: &[u8]) -> Result<f64
             EMBEDDING_DIM
         );
     }
-    // Reinterpret the stored u8 BLOB as i8 by casting the pointer
-    // directly. The bit pattern is identical; the BLOB just happens to be
-    // loaded with rusqlite's default unsigned typing.
-    let mut raw = 0.0f64;
-    // Safety: both pointers reference EMBEDDING_DIM-sized slices we just
-    // bounds-checked; simsimd_dot_i8 reads exactly `n` bytes from each.
-    unsafe {
-        simsimd_dot_i8(
-            query.as_ptr(),
-            document.as_ptr() as *const i8,
-            EMBEDDING_DIM,
-            &mut raw,
-        );
-    }
-    Ok(raw / (127.0 * 127.0))
+    // SQLite exposes BLOB bytes as u8; conversion to i8 restores each stored
+    // two's-complement component before accumulation.
+    let raw = query
+        .iter()
+        .zip(document)
+        .map(|(&query_component, &stored_component)| {
+            i64::from(query_component) * i64::from(stored_component as i8)
+        })
+        .sum::<i64>();
+    Ok(raw as f64 / (127.0 * 127.0))
 }
 
 #[cfg(test)]
@@ -188,19 +177,30 @@ fn initialize_packaged_ort() -> Result<()> {
     static INITIALIZED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     match INITIALIZED.get_or_init(|| {
         let result = (|| -> Result<()> {
-            if std::env::var_os("ORT_DYLIB_PATH").is_some() {
-                return Ok(());
+            let library = if let Some(configured) = std::env::var_os("ORT_DYLIB_PATH") {
+                PathBuf::from(configured)
+            } else {
+                let executable = std::env::current_exe().context("locating legal-mcp executable")?;
+                executable
+                    .parent()
+                    .ok_or_else(|| anyhow!("legal-mcp executable has no parent directory"))?
+                    .join("libonnxruntime.so")
+            };
+            let metadata = std::fs::symlink_metadata(&library).with_context(|| {
+                format!(
+                    "ONNX Runtime library not found at {}; set ORT_DYLIB_PATH to a real libonnxruntime.so",
+                    library.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!(
+                    "ONNX Runtime library must be a real file: {}",
+                    library.display()
+                );
             }
-            let executable = std::env::current_exe().context("locating ato-mcp executable")?;
-            let sibling = executable
-                .parent()
-                .ok_or_else(|| anyhow!("ato-mcp executable has no parent directory"))?
-                .join("libonnxruntime.so");
-            if sibling.is_file() {
-                ort::init_from(&sibling)
-                    .map_err(|error| anyhow!("loading {}: {error}", sibling.display()))?
-                    .commit();
-            }
+            ort::init_from(&library)
+                .map_err(|error| anyhow!("loading {}: {error}", library.display()))?
+                .commit();
             Ok(())
         })();
         result.map_err(|error| format!("{error:#}"))
@@ -223,6 +223,13 @@ pub(crate) struct SemanticRuntime {
 }
 
 impl SemanticRuntime {
+    pub(crate) fn count_tokens(&self, text: &str) -> Result<usize> {
+        self.validation_tokenizer
+            .encode(text, true)
+            .map(|encoding| encoding.get_ids().len())
+            .map_err(|error| anyhow!("tokenizing embedding input: {error}"))
+    }
+
     pub(crate) fn load(use_gpu: bool, model_paths: &SemanticModelPaths) -> Result<Self> {
         initialize_packaged_ort()?;
         let validation_tokenizer = Tokenizer::from_file(&model_paths.tokenizer)
@@ -246,7 +253,7 @@ impl SemanticRuntime {
             .with_optimization_level(optimization_level)
             .map_err(|err| anyhow!("configuring ONNX Runtime session: {err}"))?;
         if use_gpu {
-            // [EM-01] CPU is the default runtime; maintainer GPU builds
+            // CPU is the default runtime; maintainer GPU builds
             // require the cuda feature and fail if CUDA EP registration fails.
             builder = configure_cuda_execution_provider(builder)?;
         }
@@ -372,7 +379,7 @@ impl SemanticRuntime {
         let output = outputs
             .get("sentence_embedding")
             .unwrap_or_else(|| &outputs[0]);
-        // [EM-04] Prefer sentence_embedding when present; otherwise
+        // Prefer sentence_embedding when present; otherwise
         // pooled_embeddings mean-pools 3D token outputs with the attention mask.
         let (shape, data) = output.try_extract_tensor::<f32>()?;
         let embeddings = pooled_embeddings(shape, data, &attention_mask, batch, seq_len)?;
@@ -415,7 +422,7 @@ pub(crate) fn configure_cuda_execution_provider(builder: SessionBuilder) -> Resu
 pub(crate) fn configure_cuda_execution_provider(
     _builder: SessionBuilder,
 ) -> Result<SessionBuilder> {
-    bail!("GPU build requested but this ato-mcp binary was built without CUDA support; rebuild with `cargo build --release --features cuda`")
+    bail!("GPU build requested but this legal-mcp binary was built without CUDA support; rebuild with `cargo build --release --features cuda`")
 }
 
 pub(crate) fn encode_query_embedding(query: &str) -> Result<[i8; EMBEDDING_DIM]> {
@@ -501,7 +508,7 @@ pub(crate) fn quantize_embedding(values: &[f32]) -> Result<[i8; EMBEDDING_DIM]> 
     if norm <= 1e-12 {
         return Ok([0; EMBEDDING_DIM]);
     }
-    // [EM-06] After L2 normalisation, values are clipped, scaled by 127,
+    // After L2 normalisation, values are clipped, scaled by 127,
     // rounded, and stored as int8 bytes.
     let mut out = [0i8; EMBEDDING_DIM];
     for (idx, value) in values.iter().enumerate() {
@@ -516,7 +523,10 @@ mod tests {
 
     #[test]
     fn actual_token_count_validation_rejects_the_first_oversize_input() {
-        let error = ensure_token_counts_within_limit(&[1024, 1025, 2048], 1024).unwrap_err();
+        let error = match ensure_token_counts_within_limit(&[1024, 1025, 2048], 1024) {
+            Ok(()) => panic!("oversize semantic input was accepted"),
+            Err(error) => error,
+        };
         assert_eq!(
             error.to_string(),
             "semantic input 1 contains 1025 tokens, exceeding the 1024-token model limit"
@@ -525,6 +535,6 @@ mod tests {
 
     #[test]
     fn actual_token_count_validation_accepts_the_exact_limit() {
-        ensure_token_counts_within_limit(&[0, 1, 1024], 1024).unwrap();
+        assert!(ensure_token_counts_within_limit(&[0, 1, 1024], 1024).is_ok());
     }
 }

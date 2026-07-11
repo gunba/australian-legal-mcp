@@ -1,12 +1,16 @@
+[workspace]
+members = [".", "crates/legal-model", "crates/legal-source-sdk"]
+resolver = "2"
+
 [package]
-name = "ato-mcp"
-version = "0.16.2"
+name = "australian-legal-mcp"
+version = "0.17.0"
 edition = "2021"
 license = "MIT"
-description = "Standalone MCP server for the Australian Taxation Office legal corpus"
+description = "Standalone MCP server for Australian legal sources"
 
 [[bin]]
-name = "ato-mcp"
+name = "legal-mcp"
 path = "src/main.rs"
 
 [dependencies]
@@ -24,6 +28,8 @@ flate2 = { version = "1.1", default-features = false, features = [
   "rust_backend",
 ] }
 regex = "1.11"
+legal-model = { path = "crates/legal-model" }
+legal-source-sdk = { path = "crates/legal-source-sdk" }
 heed = { version = "=0.22.1", default-features = false }
 rand = "0.8.5"
 rand_chacha = "=0.3.1"
@@ -33,7 +39,6 @@ rusqlite = { version = "0.31", features = ["bundled", "functions"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-simsimd = "5"
 tar = "0.4"
 tiny_http = "0.12"
 scraper = "0.27"

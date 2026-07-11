@@ -1,0 +1,19 @@
+[Unit]
+Description=Australian Legal MCP: maintainer weekly incremental release
+Documentation=https://github.com/gunba/australian-legal-mcp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=LEGAL_MCP_REPO_DIR=%h/src/australian-legal-mcp
+Environment=LEGAL_MCP_ATO_PAGES_DIR=%h/src/ato_pages
+Environment=LEGAL_MCP_FRL_DIR=%h/src/frl_pages
+Environment=LEGAL_MCP_MODEL_DIR=%h/src/australian-legal-mcp/models/granite-embedding-small-r2
+Environment=LEGAL_MCP_GH_REPO=gunba/australian-legal-mcp
+Environment=LEGAL_MCP_ATO_MODE=incremental
+ExecStart=%h/src/australian-legal-mcp/scripts/maintainer-sync.sh
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=10800

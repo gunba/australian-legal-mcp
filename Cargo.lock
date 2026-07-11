@@ -134,8 +134,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d92bec98840b8f03a5ff5413de5293bfcd8bf96467cf5452609f939ec6f5de16"
 
 [[package]]
-name = "ato-mcp"
-version = "0.16.2"
+name = "atomic-waker"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
+
+[[package]]
+name = "australian-legal-mcp"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "arroy",
@@ -147,6 +153,8 @@ dependencies = [
  "flate2",
  "fs2",
  "heed",
+ "legal-model",
+ "legal-source-sdk",
  "openssl-sys",
  "ort",
  "rand 0.8.6",
@@ -160,7 +168,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "simsimd",
  "tar",
  "tempfile",
  "tiny_http",
@@ -169,12 +176,6 @@ dependencies = [
  "zip",
  "zstd",
 ]
-
-[[package]]
-name = "atomic-waker"
-version = "1.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "autocfg"
@@ -1325,6 +1326,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
+name = "legal-model"
+version = "0.1.0"
+dependencies = [
+ "percent-encoding",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "legal-source-sdk"
+version = "0.1.0"
+dependencies = [
+ "legal-model",
+ "mime",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "url",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1455,6 +1478,12 @@ checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "mime"
+version = "0.3.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
 name = "minimal-lexical"
@@ -2351,15 +2380,6 @@ name = "simd-adler32"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
-
-[[package]]
-name = "simsimd"
-version = "5.9.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9638f2829f4887c62a01958903b58fa1b740a64d5dc2bbc4a75a33827ee1bd53"
-dependencies = [
- "cc",
-]
 
 [[package]]
 name = "siphasher"
