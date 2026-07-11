@@ -11,13 +11,15 @@ the supplied tag, requires an exact tagged checkout, and requires `X.Y.Z` to
 match the Cargo package version. It publishes these verified archives plus
 `SHA256SUMS`:
 
-- `ato-mcp-x86_64-unknown-linux-gnu.tar.gz` (built for glibc 2.17)
+- `ato-mcp-x86_64-unknown-linux-gnu.tar.gz` (glibc 2.27 or newer)
 - `ato-mcp-aarch64-apple-darwin.tar.gz`
 - `ato-mcp-x86_64-pc-windows-msvc.zip`
 
-The Linux archive enables the release-only `vendored-openssl` feature so it
-does not depend on the runner's OpenSSL ABI. Its Zig build requires `make`,
-Perl, and the `Time::Piece` module; the workflow installs those prerequisites.
+The Linux executable targets glibc 2.17 and enables the release-only
+`vendored-openssl` feature so it does not depend on the runner's OpenSSL ABI. The
+archive bundles ONNX Runtime, whose official build sets the complete archive
+baseline to glibc 2.27. Its Zig build requires `make`, Perl, and the `Time::Piece`
+module; the workflow installs those prerequisites.
 
 Corpus discovery is asset-based and paginated. The updater reads GitHub releases
 in API order, 100 at a time, ignores drafts and prereleases, and selects the
@@ -58,10 +60,12 @@ or `full`; a full run always rebuilds. Set `ATO_MCP_FORCE_REBUILD=1` for a
 schema-only or model-only publication.
 
 The build requires `tokenizer.json`, `onnx/model_fp16.onnx`, and
-`onnx/model_fp16.onnx_data` under `ATO_MCP_MODEL_DIR`. Fix CUDA or
-`CUDAExecutionProvider` failures rather than publishing a degraded corpus.
-Set `ATO_MCP_CUDA_LIB_PATH` when the runtime libraries are outside the normal
-loader path.
+`onnx/model_fp16.onnx_data` under `ATO_MCP_MODEL_DIR`, plus an ONNX Runtime 1.20
+or newer shared library. CUDA builds require a CUDA-enabled ONNX Runtime; set
+`ORT_DYLIB_PATH` to its `libonnxruntime.so` when it is not the system default.
+Fix CUDA or `CUDAExecutionProvider` failures rather than publishing a degraded
+corpus. Set `ATO_MCP_CUDA_LIB_PATH` when the CUDA runtime libraries are outside
+the normal loader path.
 
 For an approved model mirror, set `ATO_MCP_MODEL_URL`. A Hugging Face value must
 use `hf://repo@revision`. Other URLs also require

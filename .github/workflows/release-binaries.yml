@@ -48,6 +48,7 @@ jobs:
             binary: target/x86_64-unknown-linux-gnu/release/ato-mcp
             archive: tar
             zig: true
+            ort_version: 1.24.4
           - os: macos-14
             target: aarch64-apple-darwin
             asset: ato-mcp-aarch64-apple-darwin.tar.gz
@@ -73,7 +74,7 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
         if: matrix.zig
         with:
-          version: 0.14.1
+          version: 0.13.0
           use-cache: false
       - name: Install pinned Linux compatibility builder
         if: matrix.zig
@@ -89,6 +90,20 @@ jobs:
       - name: Build native target
         if: ${{ !matrix.zig }}
         run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Download and verify ONNX Runtime shared library
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          version="${{ matrix.ort_version }}"
+          name="onnxruntime-linux-x64-$version.tgz"
+          base="https://github.com/microsoft/onnxruntime/releases"
+          curl --fail --location --retry 5 \
+            --output "$name" "$base/download/v$version/$name"
+          checksum=3a211fbea252c1e66290658f1b735b772
+          checksum="${checksum}056149f28321e71c308942cdb54b747"
+          echo "$checksum  $name" \
+            | sha256sum --check -
+          tar -xzf "$name"
       - name: Download and verify ONNX Runtime DLL
         if: runner.os == 'Windows'
         shell: pwsh
@@ -114,6 +129,11 @@ jobs:
           cp "${{ matrix.binary }}" package/ato-mcp
           chmod 755 package/ato-mcp
           cp README.md LICENSE package/
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            ort="onnxruntime-linux-x64-${{ matrix.ort_version }}"
+            cp -L "$ort/lib/libonnxruntime.so" package/libonnxruntime.so
+            cp "$ort/LICENSE" package/ONNXRUNTIME-LICENSE
+          fi
           package/ato-mcp --version | grep -F "${RELEASE_TAG#v}"
           COPYFILE_DISABLE=1 tar -C package -czf "${{ matrix.asset }}" .
           mkdir verify

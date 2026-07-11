@@ -14,6 +14,8 @@ use ort::value::TensorRef;
 #[allow(unused_imports)]
 use simsimd::SpatialSimilarity as _;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
 
@@ -181,6 +183,38 @@ impl SemanticEncodeStats {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn initialize_packaged_ort() -> Result<()> {
+    static INITIALIZED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    match INITIALIZED.get_or_init(|| {
+        let result = (|| -> Result<()> {
+            if std::env::var_os("ORT_DYLIB_PATH").is_some() {
+                return Ok(());
+            }
+            let executable = std::env::current_exe().context("locating ato-mcp executable")?;
+            let sibling = executable
+                .parent()
+                .ok_or_else(|| anyhow!("ato-mcp executable has no parent directory"))?
+                .join("libonnxruntime.so");
+            if sibling.is_file() {
+                ort::init_from(&sibling)
+                    .map_err(|error| anyhow!("loading {}: {error}", sibling.display()))?
+                    .commit();
+            }
+            Ok(())
+        })();
+        result.map_err(|error| format!("{error:#}"))
+    }) {
+        Ok(()) => Ok(()),
+        Err(message) => bail!("{message}"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn initialize_packaged_ort() -> Result<()> {
+    Ok(())
+}
+
 pub(crate) struct SemanticRuntime {
     tokenizer: Tokenizer,
     validation_tokenizer: Tokenizer,
@@ -190,6 +224,7 @@ pub(crate) struct SemanticRuntime {
 
 impl SemanticRuntime {
     pub(crate) fn load(use_gpu: bool, model_paths: &SemanticModelPaths) -> Result<Self> {
+        initialize_packaged_ort()?;
         let validation_tokenizer = Tokenizer::from_file(&model_paths.tokenizer)
             .map_err(|err| anyhow!("loading tokenizer: {err}"))?;
         let mut tokenizer = validation_tokenizer.clone();

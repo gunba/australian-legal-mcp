@@ -15,7 +15,7 @@ use roaring::RoaringBitmap;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -325,6 +325,11 @@ pub(crate) fn build_sidecar(
     Ok(manifest)
 }
 
+fn sync_file(path: &Path) -> Result<()> {
+    OpenOptions::new().write(true).open(path)?.sync_all()?;
+    Ok(())
+}
+
 fn replace_file(source: &Path, destination: &Path) -> Result<()> {
     let backup = destination.with_extension("ann.backup");
     if backup.exists() {
@@ -333,12 +338,12 @@ fn replace_file(source: &Path, destination: &Path) -> Result<()> {
     let had_destination = destination.exists();
     if had_destination {
         fs::copy(destination, &backup)?;
-        File::open(&backup)?.sync_all()?;
+        sync_file(&backup)?;
         fs::remove_file(destination)?;
     }
     let replace = (|| -> Result<()> {
         fs::rename(source, destination)?;
-        File::open(destination)?.sync_all()?;
+        sync_file(destination)?;
         sync_parent(destination)
     })();
     if let Err(error) = replace {
@@ -346,7 +351,7 @@ fn replace_file(source: &Path, destination: &Path) -> Result<()> {
         if had_destination {
             fs::rename(&backup, destination)
                 .context("restoring previous ANN sidecar after replacement failure")?;
-            File::open(destination)?.sync_all()?;
+            sync_file(destination)?;
             sync_parent(destination)?;
         }
         return Err(error)

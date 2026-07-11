@@ -33,9 +33,10 @@ Release archives must be checked against the release `SHA256SUMS` before
 extraction. Install the executable into a stable per-user `PATH` directory
 (`~/.local/bin` on Linux/macOS, or a fixed local-app-data Programs directory on
 Windows), then confirm `command -v ato-mcp` / `Get-Command ato-mcp` resolves that
-exact file and run `ato-mcp --version`. On Windows keep the verified
-`onnxruntime.dll` beside `ato-mcp.exe`. Never configure an executable inside a
-temporary extraction directory.
+exact file and run `ato-mcp --version`. On Linux keep the verified
+`libonnxruntime.so` beside `ato-mcp`; on Windows keep `onnxruntime.dll` beside
+`ato-mcp.exe`. Never configure an executable inside a temporary extraction
+directory.
 
 The binary path and corpus data directory are separate. Enterprise policy may
 require the binary to live under local app data. That is fine, but the

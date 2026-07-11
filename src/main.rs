@@ -1145,18 +1145,22 @@ pub(crate) fn resolve_manifest_asset(asset_url: &str, context: &UrlContext) -> S
 }
 
 pub(crate) fn local_path_from_urlish(value: &str) -> Option<PathBuf> {
+    let bytes = value.as_bytes();
+    let windows_absolute = (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/'))
+        || value.starts_with(r"\\");
+    let path = PathBuf::from(value);
+    if windows_absolute || path.is_absolute() || path.exists() {
+        return Some(path);
+    }
     if let Ok(url) = Url::parse(value) {
         if url.scheme() == "file" {
             return url.to_file_path().ok();
         }
-        return None;
     }
-    let path = PathBuf::from(value);
-    if path.exists() {
-        Some(path)
-    } else {
-        None
-    }
+    None
 }
 
 // [UM-03] Fetch helpers resolve local paths, file://, manifest-relative
@@ -2637,6 +2641,18 @@ mod tests {
             params![chunk_id, doc_id, ord, compress_text(text)?],
         )?;
         Ok(())
+    }
+
+    #[test]
+    fn local_path_detection_precedes_url_scheme_parsing() {
+        let windows = r"C:\corpus\model-bundle.tar.zst";
+        assert_eq!(
+            local_path_from_urlish(windows),
+            Some(PathBuf::from(windows))
+        );
+        let unc = r"\\server\share\model-bundle.tar.zst";
+        assert_eq!(local_path_from_urlish(unc), Some(PathBuf::from(unc)));
+        assert!(local_path_from_urlish("https://example.com/model").is_none());
     }
 
     #[test]

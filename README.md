@@ -38,9 +38,9 @@ visible text.
 ## Install For An Agent
 
 Install the platform archive from the matching `vX.Y.Z` release. Download the
-archive and `SHA256SUMS`, verify the archive entry before extraction, then copy
-only the executable (and `onnxruntime.dll` beside it on Windows) to a stable
-per-user directory on `PATH`:
+archive and `SHA256SUMS`, verify the archive entry before extraction, then install
+the executable and its packaged runtime library together in a stable per-user
+directory on `PATH`:
 
 ```bash
 grep ' ato-mcp-x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS | sha256sum -c -
@@ -48,6 +48,7 @@ mkdir -p "$HOME/.local/bin"
 tmp=$(mktemp -d)
 tar -C "$tmp" -xzf ato-mcp-x86_64-unknown-linux-gnu.tar.gz
 install -m 0755 "$tmp/ato-mcp" "$HOME/.local/bin/ato-mcp"
+install -m 0644 "$tmp/libonnxruntime.so" "$HOME/.local/bin/libonnxruntime.so"
 test "$(command -v ato-mcp)" = "$HOME/.local/bin/ato-mcp"
 ato-mcp --version
 ```
@@ -230,9 +231,10 @@ ATO_MCP_RELEASE_DIR="$PWD/release" \
 ```
 
 `scripts/publish-release.sh <tag>` packages `ato.db.zst`, uploads the database
-and ANN sidecar first, and uploads `manifest.json` last. The manual binary workflow checks out
-the supplied tag and requires it to equal `v<Cargo.toml version>`. Linux release
-binaries target glibc 2.17 with `cargo-zigbuild`; all release archives are
+and ANN sidecar first, and uploads `manifest.json` last. The manual binary workflow
+checks out the supplied tag and requires it to equal `v<Cargo.toml version>`. The
+Linux executable targets glibc 2.17 with `cargo-zigbuild`; the bundled ONNX Runtime
+sets the complete Linux archive baseline to glibc 2.27. All release archives are
 verified before upload and published with `SHA256SUMS`.
 
 The self-hosted GPU workflow adds the corpus contract to the current latest
