@@ -807,8 +807,8 @@ fn promote_generation(
                     &installing.join(file.output_name),
                 )?;
             }
-            fs::write(installing.join(".model.sha256"), &model.marker_value)?;
-            File::open(installing.join(".model.sha256"))?.sync_all()?;
+            let marker = installing.join(".model.sha256");
+            write_synced(&marker, model.marker_value.as_bytes())?;
         } else {
             let current = live_dir()?;
             for name in live_model_file_names() {
@@ -819,8 +819,7 @@ fn promote_generation(
         }
 
         let installed_manifest = installing.join("installed_manifest.json");
-        fs::write(&installed_manifest, serde_json::to_vec_pretty(manifest)?)?;
-        File::open(&installed_manifest)?.sync_all()?;
+        write_synced(&installed_manifest, &serde_json::to_vec_pretty(manifest)?)?;
         #[cfg(unix)]
         File::open(&installing)?.sync_all()?;
         fs::rename(&installing, &final_dir)
@@ -880,9 +879,20 @@ fn cleanup_inactive_generations(active_key: &str) -> Result<()> {
 }
 
 fn copy_synced(source: &Path, destination: &Path) -> Result<()> {
-    fs::copy(source, destination)
+    let mut source_file =
+        File::open(source).with_context(|| format!("opening {}", source.display()))?;
+    let mut destination_file =
+        File::create(destination).with_context(|| format!("creating {}", destination.display()))?;
+    std::io::copy(&mut source_file, &mut destination_file)
         .with_context(|| format!("copying {} to {}", source.display(), destination.display()))?;
-    File::open(destination)?.sync_all()?;
+    destination_file.sync_all()?;
+    Ok(())
+}
+
+fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
     Ok(())
 }
 
