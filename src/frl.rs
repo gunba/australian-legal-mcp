@@ -9,6 +9,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Timelike, Utc};
 use legal_model::{AssetRef, DocumentId};
 use legal_source_sdk::{NormalizedAsset, NormalizedDocument, SourceInventoryRecord};
+use rayon::prelude::*;
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{ACCEPT, CONTENT_LENGTH, RETRY_AFTER};
 use reqwest::{StatusCode, Url};
@@ -30,6 +31,7 @@ const FRL_DISPLAY_NAME: &str = "Federal Register of Legislation";
 const FRL_API_BASE: &str = "https://api.prod.legislation.gov.au/v1/";
 const FRL_PUBLIC_BASE: &str = "https://www.legislation.gov.au/";
 const PAGE_SIZE: usize = 100;
+const FRL_MAX_CONCURRENCY: usize = 2;
 const MAX_TITLE_PAGES: usize = 4_096;
 const MAX_VERSION_PAGES: usize = 16_384;
 const MAX_DOCUMENT_PAGES: usize = 64;
@@ -45,7 +47,9 @@ const OVERLAP_DAYS: i64 = 7;
 const MAX_HTTP_ATTEMPTS: usize = 4;
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const STATE_SCHEMA_VERSION: u32 = 1;
+const ACQUISITION_CACHE_SCHEMA_VERSION: u32 = 1;
 const STATE_RELATIVE_PATH: &str = "frl/state.json";
+const ACQUISITION_CACHE_DIR: &str = "frl/acquisition-cache";
 const DISCOVERY_FILE_NAME: &str = "frl-discovery.json";
 
 pub(crate) fn frl_descriptor() -> Result<SourceDescriptor> {
@@ -64,7 +68,7 @@ impl SourceAcquisition for FrlAcquisition {
     fn rate_policy(&self) -> SourceRatePolicy {
         SourceRatePolicy {
             minimum_request_interval_ms: 250,
-            max_concurrency: 2,
+            max_concurrency: FRL_MAX_CONCURRENCY,
             request_timeout_seconds: 30,
         }
     }
@@ -997,6 +1001,13 @@ struct FrlInventoryEntry {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FrlAcquisitionCacheEntry {
+    schema_version: u32,
+    entry: FrlInventoryEntry,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FrlDiscoveryPlan {
     authoritative_titles: Vec<FrlTitle>,
@@ -1525,44 +1536,45 @@ fn fetch_plan(
         .iter()
         .map(|version| (version.title_id.as_str(), version))
         .collect::<BTreeMap<_, _>>();
-    let mut normalized = Vec::with_capacity(versions_by_title.len());
-    for (title_id, version) in versions_by_title {
-        let title = authoritative_titles
-            .get(title_id)
-            .ok_or_else(|| anyhow!("FRL version references absent title {title_id}"))?;
-        let key = FrlVersionKey::from_version(version)?;
-        let documents = scan_documents(api, &key, page_size)
-            .with_context(|| format!("listing FRL renditions for {title_id}"))?;
-        let rendition = select_rendition(&documents)
-            .with_context(|| format!("selecting FRL rendition for {title_id}"))?;
-        let payload = api
-            .fetch_rendition(&rendition)
-            .with_context(|| format!("fetching FRL rendition for {title_id}"))?;
-        let document = normalize_document(title, version, &rendition, payload)
-            .with_context(|| format!("normalizing FRL title {title_id}"))?;
-        normalized.push((title.clone(), version.clone(), document));
-    }
-
+    let source: SourceId = FRL_SOURCE_ID.parse()?;
+    let jobs = versions_by_title
+        .into_iter()
+        .map(|(title_id, version)| {
+            authoritative_titles
+                .get(title_id)
+                .map(|title| (title_id, title, version))
+                .ok_or_else(|| anyhow!("FRL version references absent title {title_id}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let acquisition_context = FrlAcquisitionContext {
+        api,
+        workspace,
+        source: &source,
+        previous_inventory: &previous_state.inventory,
+        page_size,
+    };
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(FRL_MAX_CONCURRENCY)
+        .thread_name(|index| format!("frl-fetch-{index}"))
+        .build()
+        .context("building FRL fetch pool")?;
+    let mut acquisitions = pool.install(|| {
+        jobs.par_iter()
+            .map(|(title_id, title, version)| {
+                acquire_planned_version(&acquisition_context, title_id, title, version)
+            })
+            .collect::<Result<Vec<_>>>()
+    })?;
+    acquisitions.sort_by(|left, right| left.0.cmp(&right.0));
     let mut completed = 0;
     let mut skipped = 0;
-    for (_title, version, document) in normalized {
-        let stored = persist_document(workspace, &document)?;
-        let cursor = FrlCursor::from_version(&version)?
-            .ok_or_else(|| anyhow!("FRL version {} has no registration time", version.title_id))?;
-        let next_entry = FrlInventoryEntry {
-            native_id: version.title_id.clone(),
-            upstream_version: FrlVersionKey::from_version(&version)?,
-            register_id: version.register_id.clone(),
-            canonical_url: document.canonical_url.clone(),
-            payload_hash: stored.content_hash,
-            last_successful_cursor: cursor,
-        };
-        if reconciled_inventory.get(&version.title_id) == Some(&next_entry) {
+    for (title_id, entry, was_skipped) in acquisitions {
+        if was_skipped {
             skipped += 1;
         } else {
             completed += 1;
-            reconciled_inventory.insert(version.title_id.clone(), next_entry);
         }
+        reconciled_inventory.insert(title_id, entry);
     }
     let reconciled_ids = reconciled_inventory
         .keys()
@@ -1598,6 +1610,76 @@ fn fetch_plan(
         failed: 0,
         skipped,
     })
+}
+
+struct FrlAcquisitionContext<'a> {
+    api: &'a dyn FrlApi,
+    workspace: &'a Path,
+    source: &'a SourceId,
+    previous_inventory: &'a BTreeMap<String, FrlInventoryEntry>,
+    page_size: usize,
+}
+
+fn acquire_planned_version(
+    context: &FrlAcquisitionContext<'_>,
+    title_id: &str,
+    title: &FrlTitle,
+    version: &FrlVersion,
+) -> Result<(String, FrlInventoryEntry, bool)> {
+    let key = FrlVersionKey::from_version(version)?;
+    let cached = match load_acquisition_cache_entry(context.workspace, title_id) {
+        Ok(cached) => cached,
+        Err(error) => {
+            eprintln!("FRL acquisition cache for {title_id} is unusable: {error:#}");
+            None
+        }
+    };
+    let reusable = cached
+        .filter(|entry| entry.upstream_version == key)
+        .or_else(|| {
+            context
+                .previous_inventory
+                .get(title_id)
+                .filter(|entry| entry.upstream_version == key)
+                .cloned()
+        });
+    if let Some(entry) = reusable {
+        match load_inventory_document(context.workspace, context.source, title_id, &entry) {
+            Ok(_) => {
+                commit_acquisition_cache_entry(context.workspace, title_id, &entry)?;
+                return Ok((title_id.to_owned(), entry, true));
+            }
+            Err(error) => {
+                eprintln!(
+                    "FRL cached acquisition for {title_id} failed validation and will be refreshed: {error:#}"
+                );
+            }
+        }
+    }
+    let documents = scan_documents(context.api, &key, context.page_size)
+        .with_context(|| format!("listing FRL renditions for {title_id}"))?;
+    let rendition = select_rendition(&documents)
+        .with_context(|| format!("selecting FRL rendition for {title_id}"))?;
+    let payload = context
+        .api
+        .fetch_rendition(&rendition)
+        .with_context(|| format!("fetching FRL rendition for {title_id}"))?;
+    let document = normalize_document(title, version, &rendition, payload)
+        .with_context(|| format!("normalizing FRL title {title_id}"))?;
+    let stored = persist_document(context.workspace, &document)?;
+    let cursor = FrlCursor::from_version(version)?
+        .ok_or_else(|| anyhow!("FRL version {} has no registration time", version.title_id))?;
+    let next_entry = FrlInventoryEntry {
+        native_id: version.title_id.clone(),
+        upstream_version: key,
+        register_id: version.register_id.clone(),
+        canonical_url: document.canonical_url.clone(),
+        payload_hash: stored.content_hash,
+        last_successful_cursor: cursor,
+    };
+    commit_acquisition_cache_entry(context.workspace, title_id, &next_entry)?;
+    let unchanged = context.previous_inventory.get(title_id) == Some(&next_entry);
+    Ok((title_id.to_owned(), next_entry, unchanged))
 }
 
 fn validate_discovery_plan(plan: &FrlDiscoveryPlan) -> Result<()> {
@@ -1661,19 +1743,24 @@ fn validate_state(state: &FrlState) -> Result<()> {
         cursor.validate()?;
     }
     for (native_id, entry) in &state.inventory {
-        validate_native_id(native_id)?;
-        if entry.native_id != *native_id || entry.upstream_version.title_id != *native_id {
-            bail!("FRL inventory key does not match its record");
-        }
-        if !is_lower_hex_sha256(&entry.payload_hash) {
-            bail!("FRL inventory contains an invalid payload hash");
-        }
-        let canonical = Url::parse(&entry.canonical_url).context("parsing FRL canonical URL")?;
-        if canonical.scheme() != "https" || canonical.host_str() != Some("www.legislation.gov.au") {
-            bail!("FRL inventory contains a non-authoritative canonical URL");
-        }
-        entry.last_successful_cursor.validate()?;
+        validate_inventory_entry(native_id, entry)?;
     }
+    Ok(())
+}
+
+fn validate_inventory_entry(native_id: &str, entry: &FrlInventoryEntry) -> Result<()> {
+    validate_native_id(native_id)?;
+    if entry.native_id != native_id || entry.upstream_version.title_id != native_id {
+        bail!("FRL inventory key does not match its record");
+    }
+    if !is_lower_hex_sha256(&entry.payload_hash) {
+        bail!("FRL inventory contains an invalid payload hash");
+    }
+    let canonical = Url::parse(&entry.canonical_url).context("parsing FRL canonical URL")?;
+    if canonical.scheme() != "https" || canonical.host_str() != Some("www.legislation.gov.au") {
+        bail!("FRL inventory contains a non-authoritative canonical URL");
+    }
+    entry.last_successful_cursor.validate()?;
     Ok(())
 }
 
@@ -1685,6 +1772,61 @@ fn commit_state(workspace: &Path, state: &FrlState) -> Result<()> {
         bail!("FRL state exceeds the bounded state size");
     }
     atomic_write_confined(workspace, Path::new(STATE_RELATIVE_PATH), &bytes)
+}
+
+fn acquisition_cache_relative_path(native_id: &str) -> Result<PathBuf> {
+    validate_native_id(native_id)?;
+    let digest = format!("{:x}", Sha256::digest(native_id.as_bytes()));
+    Ok(PathBuf::from(ACQUISITION_CACHE_DIR)
+        .join(&digest[..2])
+        .join(format!("{digest}.json")))
+}
+
+fn load_acquisition_cache_entry(
+    workspace: &Path,
+    native_id: &str,
+) -> Result<Option<FrlInventoryEntry>> {
+    let relative = acquisition_cache_relative_path(native_id)?;
+    let path = confined_path(workspace, &relative)?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("FRL acquisition cache entry must be a real file");
+    }
+    ensure_existing_path_within(workspace, &path)?;
+    let bytes = read_bounded_file(&path, MAX_JSON_BODY_BYTES)?;
+    let cached: FrlAcquisitionCacheEntry =
+        serde_json::from_slice(&bytes).context("decoding FRL acquisition cache entry")?;
+    if cached.schema_version != ACQUISITION_CACHE_SCHEMA_VERSION {
+        bail!(
+            "unsupported FRL acquisition cache schema version {}",
+            cached.schema_version
+        );
+    }
+    validate_inventory_entry(native_id, &cached.entry)?;
+    Ok(Some(cached.entry))
+}
+
+fn commit_acquisition_cache_entry(
+    workspace: &Path,
+    native_id: &str,
+    entry: &FrlInventoryEntry,
+) -> Result<()> {
+    validate_inventory_entry(native_id, entry)?;
+    let cached = FrlAcquisitionCacheEntry {
+        schema_version: ACQUISITION_CACHE_SCHEMA_VERSION,
+        entry: entry.clone(),
+    };
+    let mut bytes = serde_json::to_vec(&cached).context("serializing FRL acquisition cache")?;
+    bytes.push(b'\n');
+    atomic_write_confined(
+        workspace,
+        &acquisition_cache_relative_path(native_id)?,
+        &bytes,
+    )
 }
 
 fn fingerprint_inventory(
@@ -1914,95 +2056,102 @@ pub(crate) fn load_normalized_documents(workspace: &Path) -> Result<Vec<Normaliz
     let source: SourceId = FRL_SOURCE_ID.parse()?;
     let mut documents = Vec::with_capacity(state.inventory.len());
     for (native_id, entry) in state.inventory {
-        validate_native_id(&native_id)?;
-        if entry.native_id != native_id || !is_lower_hex_sha256(&entry.payload_hash) {
-            bail!("FRL inventory entry `{native_id}` is inconsistent");
-        }
-        let relative = PathBuf::from("frl")
-            .join("documents")
-            .join(&entry.payload_hash[..2])
-            .join(format!("{}.json", entry.payload_hash));
-        let path = confined_path(workspace, &relative)?;
-        ensure_existing_path_within(workspace, &path)?;
-        let bytes = read_bounded_file(&path, MAX_STATE_BYTES)?;
-        let stored: StoredDocumentOwned = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parsing normalized FRL document `{native_id}`"))?;
-        if stored.source != FRL_SOURCE_ID
-            || stored.native_id != native_id
-            || stored.content_hash != entry.payload_hash
-            || stored.canonical_url != entry.canonical_url
-        {
-            bail!("normalized FRL document `{native_id}` does not match its inventory entry");
-        }
-        let document_id = DocumentId::new(source.clone(), native_id.clone())?;
-        let mut assets = Vec::with_capacity(stored.assets.len());
-        let mut verified_assets = Vec::with_capacity(stored.assets.len());
-        for stored_asset in &stored.assets {
-            let asset_path = confined_path(workspace, Path::new(&stored_asset.relative_path))?;
-            ensure_existing_path_within(workspace, &asset_path)?;
-            let data = read_bounded_file(&asset_path, MAX_ARCHIVE_MEMBER_BYTES)?;
-            if data.len() != stored_asset.size
-                || format!("{:x}", Sha256::digest(&data)) != stored_asset.sha256
-            {
-                bail!(
-                    "normalized FRL asset `{}` failed integrity validation",
-                    stored_asset.asset_id
-                );
-            }
-            verified_assets.push(FrlNormalizedAsset {
-                asset_id: stored_asset.asset_id.clone(),
-                media_type: stored_asset.media_type.clone(),
-                bytes: data.clone(),
-            });
-            assets.push(NormalizedAsset::new(
-                AssetRef::new(source.clone(), stored_asset.asset_id.clone())?,
-                stored_asset.media_type.clone(),
-                None,
-                None,
-                stored_asset.sha256.clone(),
-                data,
-            )?);
-        }
-        let reconstructed = FrlNormalizedDocument {
-            source: stored.source.clone(),
-            native_id: stored.native_id.clone(),
-            title: stored.title.clone(),
-            document_type: stored.document_type.clone(),
-            date: stored.date.clone(),
-            citation: stored.citation.clone(),
-            canonical_url: stored.canonical_url.clone(),
-            cleaned_html: stored.cleaned_html.clone(),
-            assets: verified_assets,
-            content_hash: String::new(),
-        };
-        if normalized_content_hash(&reconstructed) != entry.payload_hash {
-            bail!("normalized FRL document `{native_id}` failed content-hash validation");
-        }
-        let upstream_version = entry.register_id.or_else(|| {
-            Some(format!(
-                "{}|{}|{}",
-                entry.upstream_version.title_id,
-                entry.upstream_version.start,
-                entry.upstream_version.retrospective_start
-            ))
-        });
-        let inventory = SourceInventoryRecord::new(
-            document_id,
-            upstream_version,
-            stored.canonical_url,
-            stored.document_type,
-            stored.title,
-            stored.date,
-            path_to_slashes(&relative)?,
-            format!("{:x}", Sha256::digest(&bytes)),
-            bytes.len() as u64,
-            "application/vnd.australian-legal.normalized+json".to_string(),
-        )?;
-        let document = NormalizedDocument::new(inventory, stored.cleaned_html, assets)?;
-        documents.push(document);
+        documents.push(load_inventory_document(
+            workspace, &source, &native_id, &entry,
+        )?);
     }
     documents.sort_by(|left, right| left.inventory.document.cmp(&right.inventory.document));
     Ok(documents)
+}
+
+fn load_inventory_document(
+    workspace: &Path,
+    source: &SourceId,
+    native_id: &str,
+    entry: &FrlInventoryEntry,
+) -> Result<NormalizedDocument> {
+    validate_inventory_entry(native_id, entry)?;
+    let relative = PathBuf::from("frl")
+        .join("documents")
+        .join(&entry.payload_hash[..2])
+        .join(format!("{}.json", entry.payload_hash));
+    let path = confined_path(workspace, &relative)?;
+    ensure_existing_path_within(workspace, &path)?;
+    let bytes = read_bounded_file(&path, MAX_STATE_BYTES)?;
+    let stored: StoredDocumentOwned = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing normalized FRL document `{native_id}`"))?;
+    if stored.source != FRL_SOURCE_ID
+        || stored.native_id != native_id
+        || stored.content_hash != entry.payload_hash
+        || stored.canonical_url != entry.canonical_url
+    {
+        bail!("normalized FRL document `{native_id}` does not match its inventory entry");
+    }
+    let document_id = DocumentId::new(source.clone(), native_id.to_owned())?;
+    let mut assets = Vec::with_capacity(stored.assets.len());
+    let mut verified_assets = Vec::with_capacity(stored.assets.len());
+    for stored_asset in &stored.assets {
+        let asset_path = confined_path(workspace, Path::new(&stored_asset.relative_path))?;
+        ensure_existing_path_within(workspace, &asset_path)?;
+        let data = read_bounded_file(&asset_path, MAX_ARCHIVE_MEMBER_BYTES)?;
+        if data.len() != stored_asset.size
+            || format!("{:x}", Sha256::digest(&data)) != stored_asset.sha256
+        {
+            bail!(
+                "normalized FRL asset `{}` failed integrity validation",
+                stored_asset.asset_id
+            );
+        }
+        verified_assets.push(FrlNormalizedAsset {
+            asset_id: stored_asset.asset_id.clone(),
+            media_type: stored_asset.media_type.clone(),
+            bytes: data.clone(),
+        });
+        assets.push(NormalizedAsset::new(
+            AssetRef::new(source.clone(), stored_asset.asset_id.clone())?,
+            stored_asset.media_type.clone(),
+            None,
+            None,
+            stored_asset.sha256.clone(),
+            data,
+        )?);
+    }
+    let reconstructed = FrlNormalizedDocument {
+        source: stored.source.clone(),
+        native_id: stored.native_id.clone(),
+        title: stored.title.clone(),
+        document_type: stored.document_type.clone(),
+        date: stored.date.clone(),
+        citation: stored.citation.clone(),
+        canonical_url: stored.canonical_url.clone(),
+        cleaned_html: stored.cleaned_html.clone(),
+        assets: verified_assets,
+        content_hash: String::new(),
+    };
+    if normalized_content_hash(&reconstructed) != entry.payload_hash {
+        bail!("normalized FRL document `{native_id}` failed content-hash validation");
+    }
+    let upstream_version = entry.register_id.clone().or_else(|| {
+        Some(format!(
+            "{}|{}|{}",
+            entry.upstream_version.title_id,
+            entry.upstream_version.start,
+            entry.upstream_version.retrospective_start
+        ))
+    });
+    let inventory = SourceInventoryRecord::new(
+        document_id,
+        upstream_version,
+        stored.canonical_url,
+        stored.document_type,
+        stored.title,
+        stored.date,
+        path_to_slashes(&relative)?,
+        format!("{:x}", Sha256::digest(&bytes)),
+        bytes.len() as u64,
+        "application/vnd.australian-legal.normalized+json".to_string(),
+    )?;
+    NormalizedDocument::new(inventory, stored.cleaned_html, assets).map_err(Into::into)
 }
 
 fn normalize_official_pdf_text(text: &str) -> Result<String> {
@@ -3385,8 +3534,20 @@ fn prepare_confined_parent(root: &Path, relative: &Path) -> Result<PathBuf> {
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&current)
-                    .with_context(|| format!("creating FRL directory {}", current.display()))?;
+                if let Err(create_error) = fs::create_dir(&current) {
+                    if create_error.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(create_error).with_context(|| {
+                            format!("creating FRL directory {}", current.display())
+                        });
+                    }
+                    let metadata = fs::symlink_metadata(&current)?;
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        bail!(
+                            "FRL path component is not a real directory: {}",
+                            current.display()
+                        );
+                    }
+                }
             }
             Err(error) => {
                 return Err(error)
@@ -3532,6 +3693,7 @@ fn is_lower_hex_sha256(value: &str) -> bool {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tempfile::tempdir;
 
     struct FixtureEmbeddings;
@@ -3572,6 +3734,9 @@ mod tests {
         payloads: BTreeMap<String, std::result::Result<FrlPayload, String>>,
         title_queries: Mutex<Vec<(String, Option<String>, usize)>>,
         version_queries: Mutex<Vec<VersionPageQuery>>,
+        fetch_delay: Duration,
+        active_fetches: AtomicUsize,
+        max_active_fetches: AtomicUsize,
     }
 
     impl FakeApi {
@@ -3610,6 +3775,11 @@ mod tests {
             payload: std::result::Result<FrlPayload, String>,
         ) -> Self {
             self.payloads.insert(format.to_owned(), payload);
+            self
+        }
+
+        fn with_fetch_delay(mut self, delay: Duration) -> Self {
+            self.fetch_delay = delay;
             self
         }
     }
@@ -3675,11 +3845,17 @@ mod tests {
         }
 
         fn fetch_rendition(&self, rendition: &FrlRendition) -> Result<FrlPayload> {
-            match self.payloads.get(&rendition.format).cloned() {
+            let active = self.active_fetches.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            self.max_active_fetches
+                .fetch_max(active, AtomicOrdering::SeqCst);
+            thread::sleep(self.fetch_delay);
+            let result = match self.payloads.get(&rendition.format).cloned() {
                 Some(Ok(payload)) => Ok(payload),
-                Some(Err(message)) => bail!(message),
-                None => bail!("fixture has no payload for {}", rendition.format),
-            }
+                Some(Err(message)) => Err(anyhow!(message)),
+                None => Err(anyhow!("fixture has no payload for {}", rendition.format)),
+            };
+            self.active_fetches.fetch_sub(1, AtomicOrdering::SeqCst);
+            result
         }
     }
 
@@ -4034,6 +4210,83 @@ mod tests {
         let state = load_state(workspace.path())?;
         assert_eq!(state.cursor, Some(old_cursor));
         assert!(state.inventory.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_full_update_resumes_from_verified_acquisition_cache() -> Result<()> {
+        let workspace = tempdir()?;
+        let first_version = version("A0001", "2024-01-16T00:00:00");
+        let second_version = version("A0002", "2024-01-17T00:00:00");
+        let plan = FrlDiscoveryPlan {
+            authoritative_titles: vec![title("A0001", "One"), title("A0002", "Two")],
+            versions: vec![first_version.clone(), second_version.clone()],
+            proposed_cursor: FrlCursor::from_version(&second_version)?,
+        };
+        let first_api = FakeApi::default()
+            .with_document_pages("A0001", vec![vec![rendition("A0001", "Epub", ".epub")?]])?
+            .with_document_pages("A0002", vec![vec![rendition("A0002", "Word", ".docx")?]])?
+            .with_payload(
+                "Epub",
+                Ok(FrlPayload::Epub(fs::read(
+                    Path::new(FIXTURES).join("sample.epub"),
+                )?)),
+            )
+            .with_payload("Word", Err("fixture interruption".to_owned()));
+        assert!(fetch_plan(&first_api, workspace.path(), plan.clone(), 10).is_err());
+        assert!(load_state(workspace.path())?.inventory.is_empty());
+        assert!(load_acquisition_cache_entry(workspace.path(), "A0001")?.is_some());
+
+        let resumed_api = FakeApi::default()
+            .with_document_pages("A0002", vec![vec![rendition("A0002", "Word", ".docx")?]])?
+            .with_payload(
+                "Word",
+                Ok(FrlPayload::Docx(fs::read(
+                    Path::new(FIXTURES).join("sample.docx"),
+                )?)),
+            );
+        let report = fetch_plan(&resumed_api, workspace.path(), plan, 10)?;
+        assert_eq!(report.completed, 1);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(load_state(workspace.path())?.inventory.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn rendition_acquisition_uses_the_source_concurrency_policy() -> Result<()> {
+        let workspace = tempdir()?;
+        let first_version = version("A0001", "2024-01-16T00:00:00");
+        let second_version = version("A0002", "2024-01-17T00:00:00");
+        let api = FakeApi::default()
+            .with_document_pages("A0001", vec![vec![rendition("A0001", "Epub", ".epub")?]])?
+            .with_document_pages("A0002", vec![vec![rendition("A0002", "Word", ".docx")?]])?
+            .with_payload(
+                "Epub",
+                Ok(FrlPayload::Epub(fs::read(
+                    Path::new(FIXTURES).join("sample.epub"),
+                )?)),
+            )
+            .with_payload(
+                "Word",
+                Ok(FrlPayload::Docx(fs::read(
+                    Path::new(FIXTURES).join("sample.docx"),
+                )?)),
+            )
+            .with_fetch_delay(Duration::from_millis(50));
+        fetch_plan(
+            &api,
+            workspace.path(),
+            FrlDiscoveryPlan {
+                authoritative_titles: vec![title("A0001", "One"), title("A0002", "Two")],
+                versions: vec![first_version, second_version.clone()],
+                proposed_cursor: FrlCursor::from_version(&second_version)?,
+            },
+            10,
+        )?;
+        assert_eq!(
+            api.max_active_fetches.load(AtomicOrdering::SeqCst),
+            FRL_MAX_CONCURRENCY
+        );
         Ok(())
     }
 

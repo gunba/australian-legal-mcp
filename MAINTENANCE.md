@@ -126,6 +126,9 @@ The workflow acquires `ato` and `frl` through the registered adapters, skips
 publication when every source and corpus contract is unchanged, builds a fresh
 `legal.db`, writes `ann/ato.ann` and `ann/frl.ann`, validates the generation,
 packages it and delegates final publication to `scripts/publish-release.sh`.
+FRL full acquisition persists verified per-title cache entries as it progresses,
+so a repeated source update resumes completed renditions before committing the
+next authoritative state.
 
 `LEGAL_MCP_ATO_MODE=incremental` is the routine mode. Use the explicit full or
 catch-up repair mode for an authorised source repair. Set

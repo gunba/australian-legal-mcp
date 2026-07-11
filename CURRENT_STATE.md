@@ -112,6 +112,7 @@ The FRL adapter is registered as `frl` and uses the official
 - authorised EPUB, DOCX and official extracted PDF normalization;
 - two concurrent operations, a 250 ms issue interval, a 30-second timeout and
   bounded retry;
+- a verified per-title acquisition cache that resumes interrupted full updates;
 - atomic state commits after rendition acquisition;
 - direct deletion from periodic authoritative title reconciliation.
 
