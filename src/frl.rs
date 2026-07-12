@@ -4495,7 +4495,10 @@ mod tests {
         let root = tempdir()?;
         let ato_workspace = root.path().join("ato");
         let ato_payload = ato_workspace.join("payloads/cr-2025-13.html");
-        fs::create_dir_all(ato_payload.parent().expect("ATO payload parent"))?;
+        let ato_payload_parent = ato_payload
+            .parent()
+            .ok_or_else(|| anyhow!("ATO fixture payload path has no parent"))?;
+        fs::create_dir_all(ato_payload_parent)?;
         let ato_fixture =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ato/cr-2025-13.html");
         fs::copy(&ato_fixture, &ato_payload)?;
