@@ -793,11 +793,10 @@ pub(crate) fn probe_official_source() -> Result<FrlProbeReport> {
     if renditions.len() >= PAGE_SIZE {
         bail!("FRL probe rendition inventory exceeds its one-page bound");
     }
-    let rendition = select_rendition(&renditions)?;
+    let (rendition, document) =
+        fetch_preferred_normalized_document(&api, &title, &version, &renditions)?;
     let rendition_format = rendition.format.clone();
     let rendition_extension = rendition.extension.clone();
-    let payload = api.fetch_rendition(&rendition)?;
-    let document = normalize_document(&title, &version, &rendition, payload)?;
     Ok(FrlProbeReport {
         source: FRL_SOURCE_ID,
         title_id: title.id,
@@ -1437,7 +1436,15 @@ fn rendition_kind(rendition: &FrlRendition) -> Option<RenditionKind> {
     }
 }
 
+#[cfg(test)]
 fn select_rendition(renditions: &[FrlRendition]) -> Result<FrlRendition> {
+    rendition_candidates(renditions)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("FRL rendition candidate selection returned no result"))
+}
+
+fn rendition_candidates(renditions: &[FrlRendition]) -> Result<Vec<FrlRendition>> {
     let mut candidates = renditions
         .iter()
         .filter(|rendition| rendition.document_type.eq_ignore_ascii_case("Primary"))
@@ -1456,24 +1463,64 @@ fn select_rendition(renditions: &[FrlRendition]) -> Result<FrlRendition> {
             .then_with(|| left.volume_number.cmp(&right.volume_number))
             .then_with(|| left.format.cmp(&right.format))
     });
-    candidates
-        .first()
-        .map(|(_, rendition)| (*rendition).clone())
-        .ok_or_else(|| {
-            let available = renditions
-                .iter()
-                .map(|rendition| {
-                    format!(
-                        "{}/{}/{}",
-                        rendition.document_type,
+    if candidates.is_empty() {
+        let available = renditions
+            .iter()
+            .map(|rendition| {
+                format!(
+                    "{}/{}/{}",
+                    rendition.document_type,
+                    rendition.format,
+                    rendition.extension.as_deref().unwrap_or("")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("FRL version has no supported primary EPUB, DOCX, or PDF rendition; available: {available}");
+    }
+    Ok(candidates
+        .into_iter()
+        .map(|(_, rendition)| rendition.clone())
+        .collect())
+}
+
+fn fetch_preferred_normalized_document(
+    api: &dyn FrlApi,
+    title: &FrlTitle,
+    version: &FrlVersion,
+    renditions: &[FrlRendition],
+) -> Result<(FrlRendition, FrlNormalizedDocument)> {
+    let candidates = rendition_candidates(renditions)?;
+    let mut failures = Vec::new();
+    for rendition in candidates {
+        let result = api
+            .fetch_rendition(&rendition)
+            .with_context(|| {
+                format!(
+                    "fetching {} {}",
+                    rendition.format,
+                    rendition.extension.as_deref().unwrap_or("")
+                )
+            })
+            .and_then(|payload| normalize_document(title, version, &rendition, payload));
+        match result {
+            Ok(document) => return Ok((rendition, document)),
+            Err(error) => {
+                if failures.len() < 8 {
+                    failures.push(format!(
+                        "{} {}: {error:#}",
                         rendition.format,
                         rendition.extension.as_deref().unwrap_or("")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow!("FRL version has no supported primary EPUB, DOCX, or PDF rendition; available: {available}")
-        })
+                    ));
+                }
+            }
+        }
+    }
+    bail!(
+        "all supported official renditions failed for {}: {}",
+        version.title_id,
+        failures.join("; ")
+    )
 }
 
 fn fetch_discovery(
@@ -1658,14 +1705,9 @@ fn acquire_planned_version(
     }
     let documents = scan_documents(context.api, &key, context.page_size)
         .with_context(|| format!("listing FRL renditions for {title_id}"))?;
-    let rendition = select_rendition(&documents)
-        .with_context(|| format!("selecting FRL rendition for {title_id}"))?;
-    let payload = context
-        .api
-        .fetch_rendition(&rendition)
-        .with_context(|| format!("fetching FRL rendition for {title_id}"))?;
-    let document = normalize_document(title, version, &rendition, payload)
-        .with_context(|| format!("normalizing FRL title {title_id}"))?;
+    let (_rendition, document) =
+        fetch_preferred_normalized_document(context.api, title, version, &documents)
+            .with_context(|| format!("normalizing FRL title {title_id}"))?;
     let stored = persist_document(context.workspace, &document)?;
     let cursor = FrlCursor::from_version(version)?
         .ok_or_else(|| anyhow!("FRL version {} has no registration time", version.title_id))?;
@@ -4206,7 +4248,7 @@ mod tests {
             Err(error) => error,
             Ok(_) => bail!("fixture fetch unexpectedly succeeded"),
         };
-        assert!(error.to_string().contains("fetching FRL rendition"));
+        assert!(format!("{error:#}").contains("all supported official renditions failed"));
         let state = load_state(workspace.path())?;
         assert_eq!(state.cursor, Some(old_cursor));
         assert!(state.inventory.is_empty());
@@ -4306,6 +4348,29 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>();
         assert_eq!(select_rendition(&pdf_only)?.format, "Pdf");
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_epub_falls_back_to_the_official_docx_rendition() -> Result<()> {
+        let source_title = title("A0001", "Example Act");
+        let source_version = version("A0001", "2024-02-01T00:00:00");
+        let renditions = vec![
+            rendition("A0001", "Epub", ".epub")?,
+            rendition("A0001", "Word", ".docx")?,
+        ];
+        let api = FakeApi::default()
+            .with_payload("Epub", Ok(FrlPayload::Epub(b"invalid EPUB".to_vec())))
+            .with_payload(
+                "Word",
+                Ok(FrlPayload::Docx(fs::read(
+                    Path::new(FIXTURES).join("sample.docx"),
+                )?)),
+            );
+        let (selected, document) =
+            fetch_preferred_normalized_document(&api, &source_title, &source_version, &renditions)?;
+        assert_eq!(selected.format, "Word");
+        assert!(document.cleaned_html.contains("rule"));
         Ok(())
     }
 
