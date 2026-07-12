@@ -410,6 +410,7 @@ enum FrlPayload {
     Epub(Vec<u8>),
     Docx(Vec<u8>),
     OfficialPdfText(String),
+    OfficialMetadata,
 }
 
 trait FrlApi: Send + Sync {
@@ -731,16 +732,12 @@ impl FrlApi for HttpFrlApi {
                 let mut url = url;
                 url.query_pairs_mut().append_pair("$select", "contents");
                 let entity: OfficialTextResponse = self.get_json(url, MAX_RENDITION_BYTES)?;
-                let text = entity
-                    .contents
-                    .filter(|value| !value.trim().is_empty())
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "FRL PDF rendition for {} supplies no official extracted text",
-                            rendition.title_id
-                        )
-                    })?;
-                Ok(FrlPayload::OfficialPdfText(text))
+                Ok(
+                    match entity.contents.filter(|value| !value.trim().is_empty()) {
+                        Some(text) => FrlPayload::OfficialPdfText(text),
+                        None => FrlPayload::OfficialMetadata,
+                    },
+                )
             }
         }
     }
@@ -1959,13 +1956,6 @@ fn normalize_document(
     rendition: &FrlRendition,
     payload: FrlPayload,
 ) -> Result<FrlNormalizedDocument> {
-    let (cleaned_html, mut assets) = match payload {
-        FrlPayload::Epub(bytes) => normalize_epub(&bytes, &title.id)?,
-        FrlPayload::Docx(bytes) => normalize_docx(&bytes, &title.id)?,
-        FrlPayload::OfficialPdfText(text) => (normalize_official_pdf_text(&text)?, Vec::new()),
-    };
-    assets.sort_by(|left, right| left.asset_id.cmp(&right.asset_id));
-    assets.dedup_by(|left, right| left.asset_id == right.asset_id);
     let display_title = title
         .name
         .as_deref()
@@ -1974,6 +1964,19 @@ fn normalize_document(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("FRL title {} has no display name", title.id))?
         .to_owned();
+    let (cleaned_html, mut assets) = match payload {
+        FrlPayload::Epub(bytes) => normalize_epub(&bytes, &title.id)?,
+        FrlPayload::Docx(bytes) => normalize_docx(&bytes, &title.id)?,
+        FrlPayload::OfficialPdfText(text) => (normalize_official_pdf_text(&text)?, Vec::new()),
+        FrlPayload::OfficialMetadata => {
+            let mut html = String::from("<article><h1>");
+            escape_text_into(&display_title, &mut html);
+            html.push_str("</h1></article>");
+            (html, Vec::new())
+        }
+    };
+    assets.sort_by(|left, right| left.asset_id.cmp(&right.asset_id));
+    assets.dedup_by(|left, right| left.asset_id == right.asset_id);
     let document_type = title
         .sub_collection
         .as_deref()
@@ -4384,6 +4387,25 @@ mod tests {
             .ok_or_else(|| anyhow!("empty official PDF text unexpectedly normalized"))?;
         assert!(error.to_string().contains("empty official extracted text"));
         assert_eq!(rendition_kind(&rendition), Some(RenditionKind::Pdf));
+        Ok(())
+    }
+
+    #[test]
+    fn pdf_without_official_extracted_text_indexes_only_official_metadata() -> Result<()> {
+        let source_title = title("F2006B03624", "AD/BEECH 18/5 & Inspection");
+        let source_version = version("F2006B03624", "2004-12-20T00:00:00");
+        let source_rendition = rendition("F2006B03624", "Pdf", ".pdf")?;
+        let document = normalize_document(
+            &source_title,
+            &source_version,
+            &source_rendition,
+            FrlPayload::OfficialMetadata,
+        )?;
+        assert_eq!(
+            document.cleaned_html,
+            "<article><h1>AD/BEECH 18/5 &amp; Inspection</h1></article>"
+        );
+        assert!(document.assets.is_empty());
         Ok(())
     }
 
