@@ -1,160 +1,222 @@
-# Maintainer Runbook
+# Maintainer runbook
 
-End users install a released Rust binary and use `ato-mcp update`. Corpus
-publication runs only from the maintainer checkout and requires GPU-backed
-embeddings.
+The RTX maintainer PC owns official-source acquisition, OCR, normalization,
+embedding, ANN construction, corpus validation, and immutable activation.
+Corpus and embedding-model artifacts are never packaged for or uploaded to
+GitHub Releases. GitHub tags and releases contain software binaries only.
 
-## Release contracts
+## Software release contract
 
-Binary tags are immutable `vX.Y.Z` tags. The manual binary workflow checks out
-the supplied tag, requires an exact tagged checkout, and requires `X.Y.Z` to
-match the Cargo package version. It publishes these verified archives plus
-`SHA256SUMS`:
+Release tags are immutable `vX.Y.Z` tags. Cargo, plugin/package metadata,
+archive names, and the tag version must agree. Platform archives contain
+`legal-mcp` and the matching CPU ONNX Runtime software library. Publish and
+verify `SHA256SUMS` for every archive.
 
-- `ato-mcp-x86_64-unknown-linux-gnu.tar.gz` (glibc 2.27 or newer)
-- `ato-mcp-aarch64-apple-darwin.tar.gz`
-- `ato-mcp-x86_64-pc-windows-msvc.zip`
+## Canonical local data
 
-The Linux executable targets glibc 2.17 and enables the release-only
-`vendored-openssl` feature so it does not depend on the runner's OpenSSL ABI. The
-archive bundles ONNX Runtime, whose official build sets the complete archive
-baseline to glibc 2.27. Its Zig build requires `make`, Perl, and the `Time::Piece`
-module; the workflow installs those prerequisites.
+All persistent project data is beneath `data/`:
 
-Corpus discovery is asset-based and paginated. The updater reads GitHub releases
-in API order, 100 at a time, ignores drafts and prereleases, and selects the
-first release containing an asset named exactly `manifest.json`. Manifest
-format 2 requires `model`,
-`db`, and `ann`. The database descriptor identifies `ato.db.zst` by
-URL, SHA-256, and size. The ANN descriptor binds `ato.ann` to the exact model,
-dimension, corpus identity, ordered embedding-set digest, construction
-parameters, sidecar format, size, and SHA-256.
+```text
+sources/             current authoritative source workspaces
+source-snapshots/    rollback, failed-refresh, and legacy stores
+models/              pinned unpacked model inputs
+builds/              resumable and inactive corpus builds
+runtime/             active immutable local generations
+cache/               disposable embedding and TensorRT acceleration
+runs/                acquisition evidence and pending-generation journal
+logs/                build/activation logs
+validation/          retained validation-only layouts
+archive/             non-canonical historical diagnostics
+```
 
-The publication invariant is database first, ANN sidecar second, manifest
-last. Upload and verify `ato.db.zst` and then `ato.ann` before making the
-manifest discoverable. Upload
-`manifest.json.minisig`, when used, before `manifest.json`. The self-hosted GPU
-workflow resolves the current latest binary release and adds the corpus assets
-to that release.
+`LEGAL_MCP_PROJECT_DATA_DIR` may override that project root.
+`LEGAL_MCP_DATA_DIR` is different: it selects only a runtime generation root,
+such as `data/runtime` locally or `/var/lib/australian-legal-mcp` on the VM.
 
-## Weekly corpus release
+## Source acquisition contract
 
-Build the maintainer binary with CUDA and run the steady-state script:
+The production catalogue is:
+
+```text
+ato
+frl
+federal-court
+high-court
+nsw-caselaw
+nsw-legislation
+qld-legislation
+wa-legislation
+sa-legislation
+tas-legislation
+```
+
+Each authoritative workspace is flat: `state.json`, `documents/`, `assets/`,
+and temporary `staging/`. Acquisition takes an exclusive workspace lock; builds
+hold shared locks across the exact ten-source set. Empty inventories, duplicate
+identities, unsafe URLs, catastrophic shrinkage, and less than 99% usable full
+text are rejected. Stable authoritative 404s may be omitted; broad failures
+abort. A failed source retains its last committed state while independent
+sources finish.
+
+`source-update` runs requested adapters concurrently. Each adapter owns
+incremental/full discovery, pacing, retries, identity, inventory, and omission
+policy. A reused `data/runs/<run>` allows validated discovery plans and staging
+to resume. Full repair uses a new complete source set under
+`data/source-snapshots/full-refresh/`; the set is built and validated before one
+same-filesystem atomic directory exchange. The former complete set is retained
+under `data/source-snapshots/rollback/`.
+
+### ATO
+
+ATO state is `data/sources/ato`. Routine acquisition retains What's New
+semantics, a shared 50 ms issue interval, adaptive concurrency, 30-second
+requests, exact payload sizes/hashes, and the pinned normalized fixture bytes.
+A failed refresh preserves the last verified payload and remains retryable.
+
+### Federal Register of Legislation
+
+FRL uses `https://api.prod.legislation.gov.au/v1/`. The authoritative inventory
+selects in-force Acts, legislative instruments, notifiable instruments, and
+administrative-arrangements orders. Title scans use bounded `id` keysets;
+version scans use stable registration ordering. `titleId` is identity while the
+selected version tuple and `registerId` retain provenance.
+
+Rendition preference is EPUB, DOCX, then PDF. Genuinely textless official PDFs
+may retain title metadata; parser, OCR, or network failures fail the record.
+
+### Courts and state legislation
+
+The other adapters use only official publisher surfaces: Federal and High Court,
+NSW Caselaw, and NSW, Queensland, Western Australian, South Australian, and
+Tasmanian legislation.
+
+The shared HTTP layer enforces exact HTTPS host allowlists, allowlisted
+redirects, bounded decompression and response sizes, bounded retries, adaptive
+concurrency, cookie affinity where required, and structured request audit
+records. Federal Court alone uses one bounded Chrome/Chromium CDP process for
+protected document hosts; discovery and all other sources use ordinary HTTP.
+Set `LEGAL_MCP_CHROME` only if Chrome is not on `PATH`.
+
+Install these maintainer-only conversion programs:
+
+```text
+unrtf antiword soffice pdftotext pdftoppm tesseract
+```
+
+They cover RTF, legacy Word, image-only Word, PDF text, rendering, and bounded
+OCR. The serving VM does not need them.
+
+## Model contract
+
+The unpacked model input is:
+
+```text
+data/models/mdbr-leaf-ir-standard/
+├── tokenizer.json
+└── onnx/model.onnx
+```
+
+It is exported by `scripts/export-mdbr-leaf-ir-model.py` from
+`MongoDB/mdbr-leaf-ir` revision
+`1bb4fc387c49dee1c10c2b22f59db758be87dcaa`.
+
+- `model.onnx`: 91,555,023 bytes, SHA-256
+  `242a1d386f2f63a7daec443399b32d35b4b155b0820ee19b7c81c50436f95e11`
+- `tokenizer.json`: 711,661 bytes, SHA-256
+  `da0e79933b9ed51798a3ae27893d3c5fa4a201126cef75586296df9b4d2c62a0`
+
+No model archive or mirror is produced. Disposable TensorRT engine/timing caches
+belong under `data/cache`. Production builds use ONNX Runtime 1.25, the
+deterministic FP32 graph, TensorRT FP16 profiles from `1x1` through `64x512`,
+and CUDA fallback. Set `ORT_DYLIB_PATH` and `LEGAL_MCP_CUDA_LIB_PATH` when the
+libraries are not discoverable. Keep `MALLOC_ARENA_MAX=24`.
+
+Documents are unprefixed. Queries use exactly
+`Represent this sentence for searching relevant passages:` followed by one
+ASCII space.
+
+Inputs split losslessly at 512 tokens. Stored vectors are normalized,
+int8-quantized first-256-dimension embeddings.
+
+## Routine local build and activation
 
 ```bash
-cd /path/to/ato-mcp
+cd /path/to/australian-legal-mcp
 cargo build --release --features cuda
-
-ATO_MCP_MODE=incremental \
-ATO_MCP_REPO_DIR="$PWD" \
-ATO_MCP_PAGES_DIR="/path/to/ato_pages" \
-ATO_MCP_MODEL_DIR="$PWD/models/granite-embedding-small-r2" \
-ATO_MCP_GH_REPO=gunba/ato-mcp \
 scripts/maintainer-sync.sh
 ```
 
-The script refreshes the source index, skips an unchanged incremental run,
-builds a fresh `ato.db` and `ato.ann`, packages `ato.db.zst`, and delegates publication to
-`scripts/publish-release.sh`. `ATO_MCP_MODE` accepts `incremental`, `catch_up`,
-or `full`; a full run always rebuilds. Set `ATO_MCP_FORCE_REBUILD=1` for a
-schema-only or model-only publication.
-
-The build requires `tokenizer.json`, `onnx/model_fp16.onnx`, and
-`onnx/model_fp16.onnx_data` under `ATO_MCP_MODEL_DIR`, plus an ONNX Runtime 1.20
-or newer shared library. CUDA builds require a CUDA-enabled ONNX Runtime; set
-`ORT_DYLIB_PATH` to its `libonnxruntime.so` when it is not the system default.
-Fix CUDA or `CUDAExecutionProvider` failures rather than publishing a degraded
-corpus. Set `ATO_MCP_CUDA_LIB_PATH` when the CUDA runtime libraries are outside
-the normal loader path.
-
-For an approved model mirror, set `ATO_MCP_MODEL_URL`. A Hugging Face value must
-use `hf://repo@revision`. Other URLs also require
-`ATO_MCP_MODEL_SHA256` and positive `ATO_MCP_MODEL_SIZE`. Manifest signing uses
-`ATO_MCP_SIGN_KEY` and requires `minisign` on `PATH`.
-
-## Manual corpus publication
-
-After a successful local `ato-mcp build`:
+A complete fresh repair is:
 
 ```bash
-scripts/publish-release.sh vX.Y.Z gunba/ato-mcp
+scripts/maintainer-sync.sh --full
 ```
 
-The script packages the canonical database without mutating it and invokes the
-Rust publisher. The publisher verifies and uploads `ato.db.zst`, `ato.ann`, the
-optional signature, and finally `manifest.json`, stopping before discovery if
-any earlier artifact fails. The script then promotes the release to latest.
+Use `LEGAL_MCP_FORCE_REBUILD=1` for a deliberate schema/chunker/model-only
+rebuild. `LEGAL_MCP_EMBEDDING_CACHE_DB` may point to a completed schema-10 DB;
+only exact `(model_id, chunk_text_sha256)` vectors are reused. This is disposable
+acceleration, never authoritative state.
 
-## Offline bundle
+The script durably journals pending acquisition/build/activation work in
+`data/runs/pending-generation.json`, resumes the same build output, performs
+strict activation/verification, and retains full-refresh rollback stores. It
+never packages or publishes corpus/model bytes.
 
-Create an air-gapped data bundle only from the current database artifact
-format:
+Manual lifecycle commands are:
 
 ```bash
-ATO_MCP_RELEASE_DIR="$PWD/release" \
-ATO_MCP_MODEL_DIR="$PWD/models/granite-embedding-small-r2" \
-scripts/make-offline-bundle.sh release/ato-mcp-offline-bundle.tar.zst
+LEGAL_MCP_DATA_DIR="$PWD/data/runtime" legal-mcp activate \
+  --generation-dir "$PWD/data/builds/<generation-directory>"
+LEGAL_MCP_DATA_DIR="$PWD/data/runtime" legal-mcp verify
+LEGAL_MCP_DATA_DIR="$PWD/data/runtime" legal-mcp rollback \
+  --generation <generation-id>
+LEGAL_MCP_DATA_DIR="$PWD/data/runtime" legal-mcp prune-generations \
+  --keep-inactive 1
 ```
 
-The release directory must contain `manifest.json` and the matching
-`ato.db.zst` and `ato.ann`. The script localizes the database, ANN, and model
-URLs, verifies their digests and sizes, installs through `ato-mcp update
---manifest-url`, and archives the resulting data directory. Extract the archive
-into the platform default data directory, or into another stable directory that
-will always be supplied as `ATO_MCP_DATA_DIR`.
-
-## Systemd operations
-
-The end-user update service runs `update`, tries to restart the optional backend
-service, and runs `stats` against the refreshed data. Install the update and
-serve units together when automatic refresh is desired. A custom data directory
-must be set identically in both units with a systemd environment override.
-
-The maintainer GPU workflow is manual and targets a self-hosted Linux x64 runner.
-It checks `nvidia-smi` before building with the `cuda` feature. The local
-maintainer timer provides the same release path without hosted GPU spend.
-
-## Verification
+Deploy the locally active generation directly:
 
 ```bash
-cargo test --locked
-cargo clippy --all-targets --all-features --locked -- -D warnings
+scripts/deploy-generation.sh deploy@example-vps
+```
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for VM setup, Tailscale, service hardening,
+space requirements, exact-generation readiness checks, and rollback behavior.
+
+## Build semantics
+
+Every generation starts from one complete committed source set. The build:
+
+1. reconciles each authoritative inventory and source-scoped deletion;
+2. streams normalization/chunk preparation without loading whole sources;
+3. splits text losslessly and reuses exact model/text vectors;
+4. encodes missing vectors in bounded batches;
+5. derives metadata, links, definitions, citations, and FTS rows;
+6. builds deterministic source-keyed Arroy sidecars;
+7. clears the disposable embedding cache and finalizes SQLite;
+8. copies and re-verifies pinned model files atomically;
+9. writes `generation.json` last while retaining resumable state until durable;
+10. validates exact registry, DB, model, ANN, FTS, and hash bindings before
+    immutable activation.
+
+SQLite int8 vectors remain authoritative. ANN proposes candidates; exact SQLite
+reranking preserves stable scores/ties. Arroy construction pins crate version,
+ChaCha12 RNG, seed, tree/split parameters, insertion order, and Rayon count.
+
+## Verification gate
+
+```bash
+cargo fmt --all -- --check
+cargo test --workspace --locked --all-features
+cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
+cargo audit
+cargo deny check advisories
 bash -n scripts/*.sh
-ATO_MCP_DATA_DIR=/stable/test/data scripts/smoke.sh
+git diff --check
+LEGAL_MCP_DATA_DIR="$PWD/data/runtime" scripts/smoke.sh
 ```
 
-Before announcing a corpus release, verify:
-
-```bash
-gh release view vX.Y.Z --repo gunba/ato-mcp \
-  --json assets --jq '.assets[].name'
-ato-mcp stats
-ato-mcp search "research and development tax incentive" --k 1
-```
-
-The release must contain matching `ato.db.zst`, `ato.ann`, and `manifest.json` assets, and
-`manifest.json` must be the last publication step.
-
-## ANN implementation contract
-
-The sidecar uses pinned `arroy 0.6.4` with its full-precision cosine forest on
-LMDB. Arroy is maintained by Meilisearch, supports query-time RoaringBitmap
-candidate filters, accepts a seeded build, and reads through LMDB's memory map
-on Linux, macOS, and Windows. It avoids USearch's C++ runtime/ABI surface and
-the native-endian, pointer-width persistence in `hnsw_rs`. The build fixes the
-ChaCha12 algorithm and crate version, seed, tree/split parameters, insertion
-order, and Rayon thread count; CI builds and verifies the embedded contract,
-candidate ordering, and filtered-result behavior on all three release platforms.
-
-SQLite signed-int8 embeddings remain authoritative. ANN discovers candidates;
-runtime search exact-reranks them with `dot_i8`, uses stable chunk-ID ties, and
-falls back to an exact eligible scan whenever deterministic widening cannot
-fill the requested candidate pool. The installed-corpus benchmark defaults to
-1,000 candidates and validates at least 0.99 recall@50 before publication.
-
-Format-2 installs are assembled under `generations/<install-id>/` with the
-database placed first, ANN sidecar second, model files next, and installed
-manifest last. A durable atomic replacement of `active-generation` is the only
-activation step. A crash before it leaves the previous generation active; a
-crash after it leaves the new complete generation active. Incomplete staging
-and inactive generations are cleaned on later successful updates.
+The production gate also exercises `activate`, failed activation, `verify`,
+`rollback`, pruning, direct SSH transfer, exact-generation `/readyz`, service
+restart persistence, and representative keyword/vector/hybrid retrieval across
+all ten sources. Per-source ANN recall must remain at least 0.99 at 50.

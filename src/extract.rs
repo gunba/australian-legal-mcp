@@ -5,13 +5,14 @@
 use crate::html::{assets_html_escape, doc_id_from_ato_link, extract_attr};
 use crate::pit_to_date;
 use chrono::{Datelike, NaiveDate};
+use legal_model::{AssetRef, DocumentId, SourceId};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-// ----- Definition extraction (port of src/ato_mcp/indexer/definitions.py) -----
+// ----- Definition extraction from emphasized legal terms -----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DefinitionChunk {
@@ -120,7 +121,7 @@ pub(crate) fn extract_definitions(
     source_type: &str,
     chunks: &[DefinitionChunk],
 ) -> Vec<Definition> {
-    // Match `***term***` markers — same regex as definitions.py:_TERM_RE.
+    // Match emphasized `***term***` markers emitted by the HTML renderer.
     let term_re = Regex::new(r"\*\*\*\s*([^*\n][^*]{0,180}?)\s*\*\*\*").unwrap();
     let cue_re = Regex::new(
         r"(?im)^\s*(?:,?\s*of\b|,?\s*in relation\b|:|means\b|includes\b|has\b|is\b|\(Repealed\b)",
@@ -188,12 +189,11 @@ pub(crate) fn extract_definitions(
     out
 }
 
-// ----- Doc-navigation anchors (port of src/ato_mcp/indexer/anchors.py) -----
+// ----- Document-navigation anchors -----
 //
-// Walks cleaned HTML for a single doc and classifies every <a href> into
-// one of three kinds, mirroring the Python module: in_doc (#X target inside
-// this doc), sister (cross-doc link, no PiT), history (cross-doc with PiT
-// timestamp pointing at a historical version we don't store).
+// Walk cleaned HTML for one document and classify every link as in_doc
+// (`#X` within the document), sister (cross-document without PiT), or history
+// (cross-document with a PiT timestamp for a historical version).
 
 pub(crate) const ANCHORS_SENTINEL_PITS: &[&str] = &["99991231235958", "10010101000001"];
 
@@ -320,12 +320,19 @@ pub(crate) fn extract_anchors(html: &str, source_doc_id: &str) -> Vec<AnchorRef>
         return Vec::new();
     }
     let doc = scraper::Html::parse_document(html);
-    let targets = anchors_collect_targets(&doc);
+    extract_anchors_from_document(&doc, source_doc_id)
+}
+
+pub(crate) fn extract_anchors_from_document(
+    doc: &scraper::Html,
+    source_doc_id: &str,
+) -> Vec<AnchorRef> {
+    let targets = anchors_collect_targets(doc);
     let mut refs: Vec<AnchorRef> = Vec::new();
     let mut seen: std::collections::HashSet<(String, String, Option<String>, String)> =
         std::collections::HashSet::new();
 
-    let a_sel = scraper::Selector::parse("a[href]").unwrap();
+    let a_sel = scraper::Selector::parse("a[href], a[data-doc-id]").unwrap();
     for a in doc.select(&a_sel) {
         let href = a.value().attr("href").unwrap_or("");
         if let Some(target) = href.strip_prefix('#') {
@@ -352,7 +359,19 @@ pub(crate) fn extract_anchors(html: &str, source_doc_id: &str) -> Vec<AnchorRef>
             });
             continue;
         }
-        let resolved = doc_id_from_ato_link(href);
+        let resolved = if let Some(reference) = a.value().attr("data-doc-id") {
+            reference.parse::<DocumentId>().ok().and_then(|document| {
+                (document.source.as_str() == "ato").then(|| {
+                    (
+                        document.native_id,
+                        a.value().attr("data-pit").map(str::to_owned),
+                        a.value().attr("data-view").map(str::to_owned),
+                    )
+                })
+            })
+        } else {
+            doc_id_from_ato_link(href)
+        };
         let Some((target_doc_id, mut pit, _view)) = resolved else {
             continue;
         };
@@ -409,9 +428,8 @@ pub(crate) fn extract_anchors(html: &str, source_doc_id: &str) -> Vec<AnchorRef>
 }
 
 // ----- Title composition + EM front matter + anchor collection -----
-// Ports of src/ato_mcp/indexer/extract.py:
-//   _collect_anchors, _leading_headings, _compose_title,
-//   _collect_em_front_matter
+// Leading headings provide stable titles, while explanatory-memorandum front
+// matter contributes source references and the document phrase.
 
 pub(crate) fn extract_leading_headings(container_html: &str) -> Vec<String> {
     use scraper::Selector;
@@ -470,7 +488,7 @@ pub(crate) fn extract_leading_headings(container_html: &str) -> Vec<String> {
     out.into_iter().take(4).collect()
 }
 
-// [IB-07] Titles are composed from leading headings with adjacent prefix
+// Titles are composed from leading headings with adjacent prefix
 // overlap suppression, then fall back to source title/doc_id in the build path.
 pub(crate) fn extract_compose_title(headings: &[String]) -> Option<String> {
     let cleaned: Vec<String> = headings
@@ -541,12 +559,11 @@ pub(crate) fn extract_em_front_matter(container_html: &str) -> (Vec<String>, Opt
     (refs, phrase)
 }
 
-// ----- Currency / withdrawal extraction (port of extract.py:extract_currency) -----
+// ----- Currency / withdrawal extraction -----
 //
-// Best-effort currency / supersession extraction from raw page HTML, mirroring
-// src/ato_mcp/indexer/extract.py:extract_currency and its helpers. Each
-// CurrencyInfo field is filled independently — alert panel beats body prose
-// beats timeline table beats title-suffix sentinel.
+// Best-effort currency and supersession extraction from raw page HTML. Each
+// CurrencyInfo field is filled independently: alert panel beats body prose,
+// then timeline table, then the title-suffix sentinel.
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub(crate) struct CurrencyInfo {
@@ -760,8 +777,7 @@ pub(crate) fn currency_extract_self_withdrawn_by(text: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn currency_alert_text(html: &str) -> String {
-    let doc = scraper::Html::parse_document(html);
+fn currency_alert_text_from_document(doc: &scraper::Html) -> String {
     let sel = scraper::Selector::parse("div.alert").unwrap();
     let parts: Vec<String> = doc
         .select(&sel)
@@ -774,8 +790,7 @@ pub(crate) fn currency_alert_text(html: &str) -> String {
     parts.join(" \n ")
 }
 
-pub(crate) fn currency_body_text(html: &str) -> String {
-    let doc = scraper::Html::parse_document(html);
+fn currency_body_text_from_document(doc: &scraper::Html) -> String {
     for sel_str in &["#LawBody", "#LawContent"] {
         let sel = scraper::Selector::parse(sel_str).unwrap();
         if let Some(el) = doc.select(&sel).next() {
@@ -790,8 +805,7 @@ pub(crate) fn currency_body_text(html: &str) -> String {
     String::new()
 }
 
-pub(crate) fn currency_date_from_history_table(html: &str) -> Option<String> {
-    let doc = scraper::Html::parse_document(html);
+fn currency_date_from_history_document(doc: &scraper::Html) -> Option<String> {
     let timeline_sel = scraper::Selector::parse("a[name='LawTimeLine']").unwrap();
     let timeline = doc.select(&timeline_sel).next()?;
     // Walk up to enclosing panel or table — at most 8 hops.
@@ -873,8 +887,7 @@ pub(crate) fn currency_scan_text(text: &str) -> (Option<String>, Option<String>,
     (withdrawn_date, superseded_by, replaces)
 }
 
-pub(crate) fn currency_has_withdrawn_title_suffix(html: &str) -> bool {
-    let doc = scraper::Html::parse_document(html);
+fn currency_has_withdrawn_title_suffix_in_document(doc: &scraper::Html) -> bool {
     let sel = scraper::Selector::parse("h1, h2, h3").unwrap();
     for el in doc.select(&sel) {
         let text = anchors_node_text(el).to_lowercase();
@@ -885,12 +898,9 @@ pub(crate) fn currency_has_withdrawn_title_suffix(html: &str) -> bool {
     false
 }
 
-pub(crate) fn extract_currency(html: &str) -> CurrencyInfo {
-    if html.trim().is_empty() {
-        return CurrencyInfo::default();
-    }
-    let alert_text = currency_alert_text(html);
-    let body_text = currency_body_text(html);
+pub(crate) fn extract_currency_from_document(doc: &scraper::Html) -> CurrencyInfo {
+    let alert_text = currency_alert_text_from_document(doc);
+    let body_text = currency_body_text_from_document(doc);
     let (a_w, a_s, a_r) = currency_scan_text(&alert_text);
     let (p_w, p_s, p_r) = currency_scan_text(&body_text);
 
@@ -899,9 +909,9 @@ pub(crate) fn extract_currency(html: &str) -> CurrencyInfo {
         withdrawn_date = p_w;
     }
     if withdrawn_date.is_none() {
-        withdrawn_date = currency_date_from_history_table(html);
+        withdrawn_date = currency_date_from_history_document(doc);
     }
-    if withdrawn_date.is_none() && currency_has_withdrawn_title_suffix(html) {
+    if withdrawn_date.is_none() && currency_has_withdrawn_title_suffix_in_document(doc) {
         withdrawn_date = Some(CURRENCY_TITLE_SUFFIX_SENTINEL.to_string());
     }
     let mut superseded_by = a_s;
@@ -919,7 +929,7 @@ pub(crate) fn extract_currency(html: &str) -> CurrencyInfo {
     }
 }
 
-// ----- Image asset extraction (port of extract.py:_rewrite_images_html) -----
+// ----- Content-addressed image asset extraction -----
 //
 // Walks <img> tags in cleaned HTML, reads referenced files (src resolved
 // against source_path's parent), SHA256-hashes the bytes, emits
@@ -928,7 +938,7 @@ pub(crate) fn extract_currency(html: &str) -> CurrencyInfo {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExtractedAsset {
-    pub(crate) asset_ref: String,
+    pub(crate) asset_id: String,
     pub(crate) media_type: Option<String>,
     pub(crate) alt: Option<String>,
     pub(crate) title: Option<String>,
@@ -936,25 +946,15 @@ pub(crate) struct ExtractedAsset {
     pub(crate) data: Vec<u8>,
 }
 
-pub(crate) fn assets_url_encode_doc_id(doc_id: &str) -> String {
-    let mut out = String::with_capacity(doc_id.len() * 3);
-    for byte in doc_id.bytes() {
-        let c = byte as char;
-        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
-            out.push(c);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
+pub(crate) fn assets_asset_id(doc_id: &str, ordinal: u32) -> String {
+    format!("{doc_id}/{ordinal}")
 }
 
-pub(crate) fn assets_asset_ref(doc_id: &str, ordinal: u32) -> String {
-    format!(
-        "ato-image://{}/{}",
-        assets_url_encode_doc_id(doc_id),
-        ordinal
-    )
+fn ato_asset_ref(asset_id: &str) -> Option<String> {
+    let source = SourceId::new("ato").ok()?;
+    AssetRef::new(source, asset_id.to_owned())
+        .ok()
+        .map(|asset| asset.public_ref())
 }
 
 pub(crate) fn assets_guess_media_type(src: &str) -> Option<String> {
@@ -1050,18 +1050,20 @@ pub(crate) fn rewrite_images_html(
             let media_type = assets_guess_media_type(&src);
             let mut asset_ref: Option<String> = None;
             if let (Some(d), Some(did)) = (data, doc_id) {
-                let r = assets_asset_ref(did, image_ord);
-                let sha = format!("{:x}", Sha256::digest(&d));
-                assets.push(ExtractedAsset {
-                    asset_ref: r.clone(),
-                    media_type: media_type.clone(),
-                    alt: alt.clone(),
-                    title: title.clone(),
-                    sha256: sha,
-                    data: d,
-                });
-                asset_ref = Some(r);
-                image_ord += 1;
+                let asset_id = assets_asset_id(did, image_ord);
+                if let Some(reference) = ato_asset_ref(&asset_id) {
+                    let sha = format!("{:x}", Sha256::digest(&d));
+                    assets.push(ExtractedAsset {
+                        asset_id,
+                        media_type: media_type.clone(),
+                        alt: alt.clone(),
+                        title: title.clone(),
+                        sha256: sha,
+                        data: d,
+                    });
+                    asset_ref = Some(reference);
+                    image_ord += 1;
+                }
             }
             if asset_ref.is_none() && label.is_empty() {
                 return String::new();
@@ -1107,7 +1109,7 @@ pub(crate) fn metadata_extract_docid_path(canonical_id: &str) -> Option<String> 
     None
 }
 
-// [IB-18] doc_id preserves the ATO docid query path verbatim; malformed or
+// doc_id preserves the ATO docid query path verbatim; malformed or
 // missing URLs fall back to the canonical_id so every source row has a key.
 pub(crate) fn metadata_doc_id_for(canonical_id: &str) -> String {
     metadata_extract_docid_path(canonical_id).unwrap_or_else(|| canonical_id.to_string())
@@ -1135,20 +1137,28 @@ pub(crate) fn metadata_extract_pub_date(text: &str) -> Option<String> {
     validated_date(year, month, day)
 }
 
-pub(crate) fn metadata_content_hash(text: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(text.as_bytes());
-    let digest = h.finalize();
-    let hex = digest
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    format!("sha256:{hex}")
-}
-
 #[cfg(test)]
 mod security_tests {
     use super::*;
+
+    #[test]
+    fn ato_assets_use_one_source_qualified_public_identity() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let source_path = root.path().join("document.html");
+        let image_path = root.path().join("diagram.png");
+        fs::write(&source_path, "source")?;
+        fs::write(&image_path, b"png-bytes")?;
+        let (html, assets) = rewrite_images_html(
+            r#"<p><img src="diagram.png" alt="Diagram"></p>"#,
+            Some("PAC/1"),
+            Some(&source_path),
+        );
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].asset_id, "PAC/1/0");
+        assert!(html.contains(r#"data-asset-ref="ato:PAC/1/0""#));
+        assert!(!html.contains("ato-image"));
+        Ok(())
+    }
 
     #[test]
     fn dates_reject_impossible_calendar_values() {

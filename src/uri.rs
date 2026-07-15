@@ -1,316 +1,222 @@
-//! Document URI parsing.
-//!
-//! Live document identifiers flow through a single typed URI so the `fetch`
-//! tool and its CLI counterpart can dispatch without per-call source
-//! detection. Scheme:
-//!
-//! - `ato:<doc_id>[?pit=...&view=...]` — live-fetch from ato.gov.au's law
-//!   database. `pit` and `view` correspond to the ATO query params of the
-//!   same name and are preserved verbatim.
-//!
-//! Bare strings without a scheme are rejected with a message that tells the
-//! caller what the supported form is.
+//! Canonical source-qualified document URIs used by the live `fetch` tool.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use legal_model::{DocumentId, SourceId};
 use url::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum DocUri {
-    Ato {
-        doc_id: String,
-        pit: Option<String>,
-        view: Option<String>,
-    },
+pub(crate) struct DocUri {
+    document: DocumentId,
+    pit: Option<String>,
+    view: Option<String>,
 }
 
 impl DocUri {
-    /// Render to a canonical URI. URL's path/query serializers provide the
-    /// percent-encoding; no URI field is interpolated into a query string.
+    pub(crate) fn new(
+        document: DocumentId,
+        pit: Option<String>,
+        view: Option<String>,
+    ) -> Result<Self> {
+        validate_qualifiers(&document.source, pit.as_deref(), view.as_deref())?;
+        Ok(Self {
+            document,
+            pit,
+            view,
+        })
+    }
+
+    pub(crate) fn into_parts(self) -> (DocumentId, Option<String>, Option<String>) {
+        (self.document, self.pit, self.view)
+    }
+
     pub(crate) fn to_uri_string(&self) -> String {
-        match self {
-            DocUri::Ato { doc_id, pit, view } => {
-                let mut url = Url::parse("https://ato.invalid/").expect("static URL is valid");
-                url.set_path(doc_id);
-                if pit.is_some() || view.is_some() {
-                    let mut query = url.query_pairs_mut();
-                    if let Some(pit) = pit {
-                        query.append_pair("pit", pit);
-                    }
-                    if let Some(view) = view {
-                        query.append_pair("view", view);
-                    }
-                }
-                let path = url.path().strip_prefix('/').unwrap_or(url.path());
-                match url.query() {
-                    Some(query) => format!("ato:{path}?{query}"),
-                    None => format!("ato:{path}"),
-                }
+        let mut rendered = format!(
+            "legal://{}/{}",
+            self.document.source,
+            encode_path_segment(&self.document.native_id)
+        );
+        if self.pit.is_some() || self.view.is_some() {
+            let mut query = url::form_urlencoded::Serializer::new(String::new());
+            if let Some(pit) = &self.pit {
+                query.append_pair("pit", pit);
             }
+            if let Some(view) = &self.view {
+                query.append_pair("view", view);
+            }
+            rendered.push('?');
+            rendered.push_str(&query.finish());
         }
+        rendered
     }
 }
 
 pub(crate) fn parse_doc_uri(input: &str) -> Result<DocUri> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        bail!("empty URI; expected `ato:<doc_id>`");
+    if input.is_empty() || input.trim() != input {
+        bail!("fetch URI must be a nonempty canonical `legal://` URI");
     }
-    let Some((scheme, rest)) = trimmed.split_once(':') else {
-        bail!(
-            "missing URI scheme in `{input}`; use `ato:<doc_id>` for ATO live-fetch \
-             (e.g. `ato:JUD/2025ATC20-969/00002`)"
-        );
-    };
-    match scheme {
-        "ato" => parse_ato_body(rest),
-        other => bail!("unknown URI scheme `{other}` in `{input}`; supported scheme: `ato`"),
+    let parsed = Url::parse(input).context("fetch URI must be a valid URL")?;
+    if parsed.scheme() != "legal" {
+        bail!("fetch URI must use the `legal` scheme");
     }
-}
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+        || parsed.fragment().is_some()
+    {
+        bail!("fetch URI contains unsupported authority or fragment fields");
+    }
+    let source_text = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("fetch URI is missing its legal source"))?;
+    let source: SourceId = source_text
+        .parse()
+        .map_err(|error| anyhow!("invalid fetch URI source `{source_text}`: {error}"))?;
+    let encoded_native_id = parsed
+        .path()
+        .strip_prefix('/')
+        .ok_or_else(|| anyhow!("fetch URI has an invalid document path"))?;
+    if encoded_native_id.is_empty() || encoded_native_id.contains('/') {
+        bail!("fetch URI must contain one percent-encoded native document id");
+    }
+    let native_id = decode_path_segment(encoded_native_id)?;
+    let document = DocumentId::new(source, native_id)
+        .context("fetch URI contains an invalid document identity")?;
 
-fn decode_uri_component(value: &str, field: &str) -> Result<String> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            let pair = bytes
-                .get(i + 1..i + 3)
-                .ok_or_else(|| anyhow!("invalid percent-encoding in ato URI {field}"))?;
-            let hex = std::str::from_utf8(pair).expect("ASCII slice");
-            let byte = u8::from_str_radix(hex, 16)
-                .map_err(|_| anyhow!("invalid percent-encoding in ato URI {field}"))?;
-            decoded.push(byte);
-            i += 3;
-        } else {
-            decoded.push(bytes[i]);
-            i += 1;
+    let mut pit = None;
+    let mut view = None;
+    if let Some(query) = parsed.query() {
+        if query.is_empty() {
+            bail!("fetch URI query must not be empty");
+        }
+        for (key, value) in parsed.query_pairs() {
+            if value.is_empty() {
+                bail!("fetch URI query parameter `{key}` must not be empty");
+            }
+            match key.as_ref() {
+                "pit" => {
+                    if pit.replace(value.into_owned()).is_some() {
+                        bail!("duplicate fetch URI query parameter `pit`");
+                    }
+                }
+                "view" => {
+                    if view.replace(value.into_owned()).is_some() {
+                        bail!("duplicate fetch URI query parameter `view`");
+                    }
+                }
+                other => {
+                    bail!("unknown fetch URI query parameter `{other}`; supported: `pit`, `view`")
+                }
+            }
         }
     }
-    String::from_utf8(decoded).map_err(|_| anyhow!("ato URI {field} is not valid UTF-8"))
+    let uri = DocUri::new(document, pit, view)?;
+    if uri.to_uri_string() != input {
+        bail!("fetch URI is not in canonical `legal://SOURCE/NATIVE_ID` form");
+    }
+    Ok(uri)
 }
 
-fn validate_doc_id(doc_id: &str) -> Result<()> {
-    if doc_id.is_empty() {
-        bail!("`ato:` URI missing doc_id; example: `ato:JUD/2025ATC20-969/00002`");
+fn validate_qualifiers(source: &SourceId, pit: Option<&str>, view: Option<&str>) -> Result<()> {
+    if (pit.is_some() || view.is_some()) && source.as_str() != "ato" {
+        bail!("fetch URI qualifiers are not supported for source `{source}`");
     }
-    if doc_id.starts_with('/')
-        || doc_id.contains('\\')
-        || doc_id.chars().any(|c| c.is_control() || c.is_whitespace())
-        || doc_id
-            .split('/')
-            .any(|part| part.is_empty() || matches!(part, "." | ".."))
-        || !doc_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
-    {
-        bail!("invalid ato URI doc_id `{doc_id}`");
+    if let Some(pit) = pit {
+        if !(8..=14).contains(&pit.len())
+            || !pit.bytes().all(|byte| byte.is_ascii_digit())
+            || chrono::NaiveDate::parse_from_str(&pit[..8], "%Y%m%d").is_err()
+        {
+            bail!("invalid fetch URI `pit`; expected 8 to 14 digits beginning with a valid date");
+        }
+    }
+    if let Some(view) = view {
+        if view.len() > 32
+            || !view
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            bail!("invalid fetch URI `view`");
+        }
     }
     Ok(())
 }
 
-fn parse_ato_body(body: &str) -> Result<DocUri> {
-    if body.matches('?').count() > 1 || body.contains('#') {
-        bail!("malformed ato URI");
+fn encode_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "%{byte:02X}").expect("writing to String cannot fail");
+        }
     }
-    let (encoded_path, query) = match body.split_once('?') {
-        Some((path, query)) => (path, Some(query)),
-        None => (body, None),
-    };
-    let doc_id = decode_uri_component(encoded_path, "doc_id")?;
-    validate_doc_id(&doc_id)?;
+    encoded
+}
 
-    let mut pit = None;
-    let mut view = None;
-    if let Some(query) = query {
-        if query.is_empty() {
-            bail!("empty query in ato URI");
-        }
-        for pair in query.split('&') {
-            if pair.is_empty() {
-                bail!("empty query parameter in ato URI");
-            }
-            let (encoded_key, encoded_value) = pair
-                .split_once('=')
-                .ok_or_else(|| anyhow!("malformed query parameter `{pair}` in ato URI"))?;
-            let key = decode_uri_component(encoded_key, "query key")?;
-            let value = decode_uri_component(encoded_value, &key)?;
-            if value.is_empty() {
-                bail!("empty ato URI query parameter `{key}`");
-            }
-            match key.as_str() {
-                "pit" => {
-                    if pit.is_some() {
-                        bail!("duplicate ato URI query parameter `pit`");
-                    }
-                    if !(8..=14).contains(&value.len())
-                        || !value.bytes().all(|b| b.is_ascii_digit())
-                        || chrono::NaiveDate::parse_from_str(&value[..8], "%Y%m%d").is_err()
-                    {
-                        bail!(
-                            "invalid ato URI `pit`; expected 8 to 14 digits beginning with a valid date"
-                        );
-                    }
-                    pit = Some(value);
-                }
-                "view" => {
-                    if view.is_some() {
-                        bail!("duplicate ato URI query parameter `view`");
-                    }
-                    if value.len() > 32
-                        || !value
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
-                    {
-                        bail!("invalid ato URI `view`");
-                    }
-                    view = Some(value);
-                }
-                other => {
-                    bail!("unknown ato URI query parameter `{other}`; supported: `pit`, `view`")
-                }
-            }
+fn decode_path_segment(value: &str) -> Result<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let pair = bytes
+                .get(index + 1..index + 3)
+                .ok_or_else(|| anyhow!("fetch URI contains invalid percent-encoding"))?;
+            let hex = std::str::from_utf8(pair).expect("percent-encoding digits are ASCII");
+            decoded.push(
+                u8::from_str_radix(hex, 16)
+                    .map_err(|_| anyhow!("fetch URI contains invalid percent-encoding"))?,
+            );
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
         }
     }
-    Ok(DocUri::Ato { doc_id, pit, view })
+    String::from_utf8(decoded).map_err(|_| anyhow!("fetch URI document id is not valid UTF-8"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_bare_ato_uri() {
-        let parsed = parse_doc_uri("ato:JUD/2025ATC20-969/00002").unwrap();
-        assert_eq!(
-            parsed,
-            DocUri::Ato {
-                doc_id: "JUD/2025ATC20-969/00002".to_string(),
-                pit: None,
-                view: None,
-            }
-        );
+    fn ato(native_id: &str, pit: Option<&str>, view: Option<&str>) -> DocUri {
+        DocUri::new(
+            DocumentId::new("ato".parse().unwrap(), native_id).unwrap(),
+            pit.map(str::to_string),
+            view.map(str::to_string),
+        )
+        .unwrap()
     }
 
     #[test]
-    fn parses_ato_uri_with_pit() {
-        let parsed = parse_doc_uri("ato:PAC/19360027/26?pit=19960320000001").unwrap();
-        assert_eq!(
-            parsed,
-            DocUri::Ato {
-                doc_id: "PAC/19360027/26".to_string(),
-                pit: Some("19960320000001".to_string()),
-                view: None,
-            }
-        );
-    }
-
-    #[test]
-    fn parses_ato_uri_with_view() {
-        let parsed = parse_doc_uri("ato:PAC/19360027/26?view=HISTFT").unwrap();
-        assert_eq!(
-            parsed,
-            DocUri::Ato {
-                doc_id: "PAC/19360027/26".to_string(),
-                pit: None,
-                view: Some("HISTFT".to_string()),
-            }
-        );
-    }
-
-    #[test]
-    fn parses_ato_uri_with_pit_and_view() {
-        let parsed = parse_doc_uri("ato:PAC/19360027/26?pit=19960320000001&view=HISTFT").unwrap();
-        assert_eq!(
-            parsed,
-            DocUri::Ato {
-                doc_id: "PAC/19360027/26".to_string(),
-                pit: Some("19960320000001".to_string()),
-                view: Some("HISTFT".to_string()),
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_unknown_ato_query_param() {
-        let err = parse_doc_uri("ato:JUD/X/Y?wat=1").unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("unknown ato URI query parameter `wat`"));
-    }
-
-    #[test]
-    fn rejects_malformed_query_pair() {
-        let err = parse_doc_uri("ato:JUD/X/Y?nokeyhere").unwrap_err();
-        assert!(err.to_string().contains("malformed query parameter"));
-    }
-
-    #[test]
-    fn rejects_missing_scheme() {
-        let err = parse_doc_uri("JUD/2025ATC20-969/00002").unwrap_err();
-        assert!(err.to_string().contains("missing URI scheme"));
-    }
-
-    #[test]
-    fn rejects_unknown_scheme() {
-        let err = parse_doc_uri("nzlii:nz/cases/NZSC/2020/1").unwrap_err();
-        assert!(err.to_string().contains("unknown URI scheme `nzlii`"));
-    }
-
-    #[test]
-    fn rejects_empty_input() {
-        let err = parse_doc_uri("").unwrap_err();
-        assert!(err.to_string().contains("empty URI"));
-    }
-
-    #[test]
-    fn rejects_empty_ato_doc_id() {
-        let err = parse_doc_uri("ato:").unwrap_err();
-        assert!(err.to_string().contains("missing doc_id"));
-    }
-
-    #[test]
-    fn roundtrips_to_uri_string() {
-        let cases = [
-            "ato:JUD/2025ATC20-969/00002",
-            "ato:PAC/19360027/26?pit=19960320000001",
-            "ato:PAC/19360027/26?view=HISTFT",
-            "ato:PAC/19360027/26?pit=19960320000001&view=HISTFT",
-        ];
-        for input in cases {
-            let parsed = parse_doc_uri(input).unwrap();
-            assert_eq!(parsed.to_uri_string(), input, "input: {input}");
+    fn canonical_legal_uri_round_trips_source_native_id_and_qualifiers() {
+        for uri in [
+            ato("JUD/2025ATC20-969/00002", None, None),
+            ato("PAC/19360027/26", Some("19960320000001"), None),
+            ato("PAC/19360027/26", None, Some("HISTFT")),
+            ato(
+                "JUD/example:one?point=✓",
+                Some("19960320000001"),
+                Some("HISTFT"),
+            ),
+        ] {
+            let rendered = uri.to_uri_string();
+            assert_eq!(parse_doc_uri(&rendered).unwrap(), uri);
+            assert!(!rendered.contains("/JUD/"));
         }
     }
 
     #[test]
-    fn encodes_fields_and_decodes_once() {
-        let uri = DocUri::Ato {
-            doc_id: "JUD/A B/1".to_string(),
-            pit: Some("20250101".to_string()),
-            view: Some("HIST&FT".to_string()),
-        };
-        assert_eq!(
-            uri.to_uri_string(),
-            "ato:JUD/A%20B/1?pit=20250101&view=HIST%26FT"
-        );
-        assert_eq!(
-            parse_doc_uri("ato:JUD/A%252FB/1").unwrap_err().to_string(),
-            "invalid ato URI doc_id `JUD/A%2FB/1`"
-        );
-    }
-
-    #[test]
-    fn rejects_duplicate_invalid_and_ambiguous_fields() {
+    fn rejects_alternate_schemes_noncanonical_paths_and_queries() {
         for input in [
-            "ato:JUD/X/Y?pit=20250101&pit=20250102",
-            "ato:JUD/X/Y?view=A&view=B",
-            "ato:JUD/X/Y?pit=2025-01-01",
-            "ato:JUD/X/Y?pit=20250230",
-            "ato:JUD/../Y",
-            "ato:JUD%2F..%2FY",
-            "ato:JUD/X/Y?",
-            "ato:JUD/X/Y?pit=%GG",
-            "ato:JUD/X/Y?pit=20250101&&view=HISTFT",
+            "ato:JUD/2025ATC20-969/00002",
+            "JUD/2025ATC20-969/00002",
+            "legal://ato/JUD/2025ATC20-969/00002",
+            "legal://ato/JUD%2fX",
+            "legal://ato/JUD%2FX?",
+            "legal://ato/JUD%2FX?wat=1",
+            "legal://ato/JUD%2FX?pit=20250101&pit=20250102",
         ] {
             assert!(parse_doc_uri(input).is_err(), "accepted {input}");
         }

@@ -1,10 +1,10 @@
 //! Block-aware chunker. Walks cleaned ATO HTML into atomic blocks, renders
-//! each to plaintext with markdown markers, then greedy-packs blocks into
-//! chunks bounded by `max_tokens`. Mirrors src/ato_mcp/indexer/chunk.py.
+//! each to plaintext with markdown markers, then greedily packs blocks into
+//! chunks bounded by `max_tokens` while preserving document order.
 
 use crate::config::tokenizer_path;
 use crate::html::{collect_referenced_anchors, render_node};
-use crate::EMBEDDING_TEXT_PREFIX;
+use crate::{DOCUMENT_EMBEDDING_PREFIX, EMBEDDING_INPUT_MAX_TOKENS};
 use regex::Regex;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -12,18 +12,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokenizers::Tokenizer;
 
-// ----- Chunker (port of src/ato_mcp/indexer/chunk.py) -----
+// ----- Block-aware chunking -----
 //
-// Block-aware chunking for cleaned ATO HTML. Walks the DOM into a flat list
-// of atomic blocks, renders each into plaintext with markdown markers, then
-// greedy-packs blocks into chunks bounded by max_tokens. Mirrors chunk.py's
-// public API (chunk_html, html_to_text, approx_tokens) and intermediate
-// shape (_Block, Chunk).
+// Cleaned ATO HTML becomes a flat list of atomic blocks, each rendered as
+// plaintext with markdown markers and greedily packed within `max_tokens`.
+// The public helpers expose HTML rendering, token estimation, and the stable
+// intermediate block and chunk shapes used by the build pipeline.
 
-// [IB-21] Checkpoints pin CHUNKER_FORMAT_VERSION; changing output shape
+// Checkpoints pin CHUNKER_FORMAT_VERSION; changing output shape
 // forces an explicit fresh build instead of resuming stale chunk records.
-pub(crate) const CHUNKER_FORMAT_VERSION: u32 = 3;
-pub(crate) const EMBED_MAX_TOKENS: usize = 1024;
+pub(crate) const CHUNKER_FORMAT_VERSION: u32 = 4;
+pub(crate) const EMBED_MAX_TOKENS: usize = EMBEDDING_INPUT_MAX_TOKENS;
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct Chunk {
@@ -31,6 +30,10 @@ pub(crate) struct Chunk {
     pub(crate) anchor: Option<String>,
     pub(crate) text: String,
     pub(crate) definition_text: Option<String>,
+    #[serde(skip)]
+    pub(crate) token_count: usize,
+    #[serde(skip)]
+    pub(crate) embedding_token_ids: Option<Vec<i64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,10 +52,10 @@ pub(crate) fn chunker_approx_tokens(text: &str) -> usize {
     std::cmp::max(1, ((words as f64) * 1.3) as usize)
 }
 
-/// Tighter whitespace normalisation than `normalise_paragraph_breaks`:
-/// matches chunk.py:_normalise_text. Collapses NBSP and horizontal-only
-/// runs to single spaces, collapses ` *\n *` to `\n`, caps newline runs at
-/// two, normalises numeric-range spacing, and tightens quoted text.
+/// Tighter whitespace normalisation than `normalise_paragraph_breaks`.
+/// Collapses NBSP and horizontal-only runs to single spaces, collapses
+/// ` *\n *` to `\n`, caps newline runs at two, normalises numeric-range
+/// spacing, and tightens quoted text.
 pub(crate) fn chunker_normalise_text(text: &str) -> String {
     static WS_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     static NEWLINE_PAD_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
@@ -60,7 +63,7 @@ pub(crate) fn chunker_normalise_text(text: &str) -> String {
     static NUMERIC_RANGE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     static SPACED_QUOTE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let s = text.replace('\u{a0}', " ");
-    // _WS_RE: horizontal whitespace [ \t\f\v]+
+    // Collapse horizontal whitespace while preserving line boundaries.
     let ws = WS_RE.get_or_init(|| Regex::new(r"[ \t\x0c\x0b]+").unwrap());
     let s = ws.replace_all(&s, " ").into_owned();
     let newline_pad = NEWLINE_PAD_RE.get_or_init(|| Regex::new(r" *\n *").unwrap());
@@ -370,7 +373,7 @@ pub(crate) fn chunker_render_dt_dd_pair(
     })
 }
 
-/// Walk children of `parent` and emit ChunkBlocks. Mirrors chunk.py:_walk.
+/// Walk children of `parent` in document order and emit typed chunk blocks.
 pub(crate) fn chunker_walk(
     parent: scraper::ElementRef,
     blocks: &mut Vec<ChunkBlock>,
@@ -480,7 +483,7 @@ pub(crate) fn chunker_flush_inline(
 }
 
 /// Split an oversize block into pieces that each fit within max_tokens.
-/// Mirrors chunk.py:_split_oversize_block. Order:
+/// Splitting follows this stable order:
 ///   1. oversize tables -> row split (rows stay whole).
 ///   2. prose -> sentence split, greedy-pack within budget.
 ///   3. word-window split as last-resort (single sentence/row over budget).
@@ -589,9 +592,8 @@ pub(crate) fn chunker_table_row_split(
 }
 
 pub(crate) fn chunker_sentence_split(text: &str) -> Vec<String> {
-    // Mirrors Python's _SENT_RE: split on whitespace that follows `.!?` and
-    // precedes an uppercase letter or `(`. Rust's regex crate doesn't
-    // support lookahead, so walk char-by-char.
+    // Split on whitespace that follows `.!?` and precedes an uppercase
+    // letter or `(`. The regex crate lacks lookahead, so scan characters.
     let mut sentences: Vec<String> = Vec::new();
     let mut current = String::new();
     let chars: Vec<char> = text.chars().collect();
@@ -623,9 +625,9 @@ pub(crate) fn chunker_sentence_split(text: &str) -> Vec<String> {
     sentences
 }
 
-/// Greedy-pack blocks into chunks bounded by max_tokens. Mirrors
-/// chunk.py:_pack_chunks. Blocks exceeding max_tokens are split via
-/// chunker_split_oversize_block (table rows, sentences, or word-window
+/// Greedily pack blocks into chunks bounded by max_tokens. Blocks exceeding
+/// max_tokens are split via chunker_split_oversize_block (table rows,
+/// sentences, or word-window
 /// fallback) so every emitted chunk fits the budget.
 pub(crate) fn chunker_pack(blocks: Vec<ChunkBlock>, max_tokens: usize) -> Vec<Chunk> {
     let mut chunks: Vec<Chunk> = Vec::new();
@@ -655,6 +657,8 @@ pub(crate) fn chunker_pack(blocks: Vec<ChunkBlock>, max_tokens: usize) -> Vec<Ch
             } else {
                 None
             },
+            token_count: 0,
+            embedding_token_ids: None,
         });
         *ord_counter += 1;
         current_text.clear();
@@ -681,12 +685,14 @@ pub(crate) fn chunker_pack(blocks: Vec<ChunkBlock>, max_tokens: usize) -> Vec<Ch
                     anchor: block.anchor.clone(),
                     text: text.clone(),
                     definition_text: if defn != text { Some(defn) } else { None },
+                    token_count: 0,
+                    embedding_token_ids: None,
                 });
                 ord_counter += 1;
             }
             continue;
         }
-        // [IB-22] Project token count from accumulated raw words, not summed
+        // Project token count from accumulated raw words, not summed
         // per-block integer token estimates, so truncation drift cannot build up.
         let projected_tokens =
             std::cmp::max(1, (((current_words + block_words) as f64) * 1.3) as usize);
@@ -726,10 +732,39 @@ fn chunker_enforce_final_token_limit<F>(
 where
     F: Fn(&str) -> usize,
 {
+    chunker_enforce_final_token_limit_result(chunks, max_tokens, |text| Ok(token_count(text)))
+        .expect("infallible token counter failed")
+}
+
+fn chunker_enforce_final_token_limit_result<F>(
+    chunks: Vec<Chunk>,
+    max_tokens: usize,
+    token_count: F,
+) -> anyhow::Result<Vec<Chunk>>
+where
+    F: Fn(&str) -> anyhow::Result<usize>,
+{
+    chunker_enforce_final_token_limit_prepared(chunks, max_tokens, |text| {
+        token_count(text).map(|count| (count, None))
+    })
+}
+
+fn chunker_enforce_final_token_limit_prepared<F>(
+    chunks: Vec<Chunk>,
+    max_tokens: usize,
+    prepare_tokens: F,
+) -> anyhow::Result<Vec<Chunk>>
+where
+    F: Fn(&str) -> anyhow::Result<(usize, Option<Vec<i64>>)>,
+{
     let mut output = Vec::new();
-    for chunk in chunks {
-        let prefixed_count = |text: &str| token_count(&format!("{EMBEDDING_TEXT_PREFIX}{text}"));
-        if prefixed_count(&chunk.text) <= max_tokens {
+    for mut chunk in chunks {
+        let prefixed_tokens =
+            |text: &str| prepare_tokens(&format!("{DOCUMENT_EMBEDDING_PREFIX}{text}"));
+        let (chunk_token_count, chunk_token_ids) = prefixed_tokens(&chunk.text)?;
+        if chunk_token_count <= max_tokens {
+            chunk.token_count = chunk_token_count;
+            chunk.embedding_token_ids = chunk_token_ids;
             output.push(chunk);
             continue;
         }
@@ -737,8 +772,9 @@ where
         let mut pieces = Vec::new();
         let mut remaining = chunk.text.as_str();
         while !remaining.is_empty() {
-            if prefixed_count(remaining) <= max_tokens {
-                pieces.push(remaining.to_string());
+            let (remaining_count, remaining_ids) = prefixed_tokens(remaining)?;
+            if remaining_count <= max_tokens {
+                pieces.push((remaining.to_string(), remaining_count, remaining_ids));
                 break;
             }
             let boundaries = remaining
@@ -751,19 +787,23 @@ where
             let mut high = boundaries.len();
             while low < high {
                 let mid = low + (high - low) / 2;
-                if prefixed_count(&remaining[..boundaries[mid]]) <= max_tokens {
+                if prefixed_tokens(&remaining[..boundaries[mid]])?.0 <= max_tokens {
                     low = mid + 1;
                 } else {
                     high = mid;
                 }
             }
-            assert!(low > 0, "a single character exceeds the tokenizer limit");
+            if low == 0 {
+                anyhow::bail!("a single character exceeds the tokenizer limit");
+            }
             let split = boundaries[low - 1];
-            pieces.push(remaining[..split].to_string());
+            let piece = remaining[..split].to_string();
+            let (piece_count, piece_ids) = prefixed_tokens(&piece)?;
+            pieces.push((piece, piece_count, piece_ids));
             remaining = &remaining[split..];
         }
 
-        for (piece_index, piece) in pieces.into_iter().enumerate() {
+        for (piece_index, (piece, token_count, token_ids)) in pieces.into_iter().enumerate() {
             output.push(Chunk {
                 ord: output.len() as i64,
                 anchor: chunk.anchor.clone(),
@@ -771,13 +811,15 @@ where
                 definition_text: (piece_index == 0)
                     .then(|| chunk.definition_text.clone())
                     .flatten(),
+                token_count,
+                embedding_token_ids: token_ids,
             });
         }
     }
     for (ord, chunk) in output.iter_mut().enumerate() {
         chunk.ord = ord as i64;
     }
-    output
+    Ok(output)
 }
 
 fn chunker_apply_live_tokenizer_limit(chunks: Vec<Chunk>, max_tokens: usize) -> Vec<Chunk> {
@@ -793,9 +835,13 @@ fn chunker_apply_live_tokenizer_limit(chunks: Vec<Chunk>, max_tokens: usize) -> 
         if let Some(tokenizer) = cache.get(&path) {
             Arc::clone(tokenizer)
         } else {
-            let Ok(tokenizer) = Tokenizer::from_file(&path) else {
+            let Ok(mut tokenizer) = Tokenizer::from_file(&path) else {
                 return chunks;
             };
+            if tokenizer.with_truncation(None).is_err() {
+                return chunks;
+            }
+            tokenizer.with_padding(None);
             let tokenizer = Arc::new(tokenizer);
             cache.insert(path, Arc::clone(&tokenizer));
             tokenizer
@@ -811,11 +857,65 @@ fn chunker_apply_live_tokenizer_limit(chunks: Vec<Chunk>, max_tokens: usize) -> 
 }
 
 pub(crate) fn chunk_html(html: &str, root_title: Option<&str>, max_tokens: usize) -> Vec<Chunk> {
+    let chunks = chunk_html_packed(html, root_title, max_tokens);
+    chunker_apply_live_tokenizer_limit(chunks, max_tokens)
+}
+
+#[cfg(test)]
+pub(crate) fn chunk_html_with_token_count<F>(
+    html: &str,
+    root_title: Option<&str>,
+    max_tokens: usize,
+    token_count: F,
+) -> anyhow::Result<Vec<Chunk>>
+where
+    F: Fn(&str) -> anyhow::Result<usize>,
+{
+    let doc = scraper::Html::parse_fragment(html);
+    chunk_fragment_with_token_count(&doc, root_title, max_tokens, token_count)
+}
+
+#[cfg(test)]
+pub(crate) fn chunk_fragment_with_token_count<F>(
+    doc: &scraper::Html,
+    root_title: Option<&str>,
+    max_tokens: usize,
+    token_count: F,
+) -> anyhow::Result<Vec<Chunk>>
+where
+    F: Fn(&str) -> anyhow::Result<usize>,
+{
+    let chunks = chunk_fragment_packed(doc, root_title, max_tokens);
+    chunker_enforce_final_token_limit_result(chunks, max_tokens, token_count)
+}
+
+pub(crate) fn chunk_fragment_with_prepared_tokens<F>(
+    doc: &scraper::Html,
+    root_title: Option<&str>,
+    max_tokens: usize,
+    prepare_tokens: F,
+) -> anyhow::Result<Vec<Chunk>>
+where
+    F: Fn(&str) -> anyhow::Result<(usize, Option<Vec<i64>>)>,
+{
+    let chunks = chunk_fragment_packed(doc, root_title, max_tokens);
+    chunker_enforce_final_token_limit_prepared(chunks, max_tokens, prepare_tokens)
+}
+
+fn chunk_html_packed(html: &str, root_title: Option<&str>, max_tokens: usize) -> Vec<Chunk> {
     if html.trim().is_empty() {
         return Vec::new();
     }
     let doc = scraper::Html::parse_fragment(html);
-    let referenced = collect_referenced_anchors(&doc);
+    chunk_fragment_packed(&doc, root_title, max_tokens)
+}
+
+fn chunk_fragment_packed(
+    doc: &scraper::Html,
+    root_title: Option<&str>,
+    max_tokens: usize,
+) -> Vec<Chunk> {
+    let referenced = collect_referenced_anchors(doc);
     let root = doc.root_element();
     let mut blocks: Vec<ChunkBlock> = Vec::new();
     // Find the first <body> or fall back to root. parse_fragment wraps
@@ -823,13 +923,12 @@ pub(crate) fn chunk_html(html: &str, root_title: Option<&str>, max_tokens: usize
     let body_sel = scraper::Selector::parse("body").unwrap();
     let walk_root = doc.select(&body_sel).next().unwrap_or(root);
     chunker_walk(walk_root, &mut blocks, &referenced, root_title);
-    let chunks = chunker_pack(blocks, max_tokens);
-    chunker_apply_live_tokenizer_limit(chunks, max_tokens)
+    chunker_pack(blocks, max_tokens)
 }
 
 // ----- end chunker -----
 
-// ----- Metadata helpers (port of src/ato_mcp/indexer/metadata.py) -----
+// ----- Source metadata helpers -----
 
 #[cfg(test)]
 mod tests {
@@ -842,6 +941,8 @@ mod tests {
             anchor: Some("section".to_string()),
             text: "aa bb cc dd".to_string(),
             definition_text: Some("different".to_string()),
+            token_count: 0,
+            embedding_token_ids: None,
         }];
         let chunks = chunker_enforce_final_token_limit(chunks, 5, |text| text.len());
 
@@ -873,6 +974,8 @@ mod tests {
             anchor: None,
             text: "abc".to_string(),
             definition_text: None,
+            token_count: 0,
+            embedding_token_ids: None,
         }];
         let chunks = chunker_enforce_final_token_limit(chunks, 3, |text| text.len());
         assert_eq!(chunks.len(), 1);

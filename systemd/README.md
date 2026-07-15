@@ -1,84 +1,50 @@
-# systemd user units for ato-mcp
+# systemd units
 
-These are optional Linux user units. They install under
-`~/.config/systemd/user/` and run as the current user; they are not part of
-the normal agent install path.
+## Hosted runtime
 
-## Optional backend prewarm
-
-Normal MCP clients should launch:
+`legal-mcp.service` is a system service for a dedicated `legal-mcp` account. It
+serves only a locally activated immutable generation on
+`127.0.0.1:51235`; it never downloads corpus or model artifacts.
 
 ```bash
-ato-mcp mcp
+sudo install -d -o legal-mcp -g legal-mcp -m 0750 \
+  /var/lib/australian-legal-mcp /etc/australian-legal-mcp
+sudo cp legal-mcp.env.example /etc/australian-legal-mcp/legal-mcp.env
+sudo cp legal-mcp.service /etc/systemd/system/
+sudo systemctl daemon-reload
+# Transfer and activate a generation before the first start.
+sudo systemctl enable --now legal-mcp.service
+curl -fsS http://127.0.0.1:51235/readyz
 ```
 
-That stdio command starts or reuses one local loopback HTTP backend and writes
-the active endpoint to `~/.local/share/ato-mcp/http.json`.
+`ExecStartPre=legal-mcp verify` deliberately blocks a start when the generation,
+model, database, source set, or ANN sidecars are incomplete. SIGTERM marks the
+service not ready, stops acceptance, and drains bounded workers for the
+configured grace period.
 
-If you want the backend running before the first MCP request, install the
-optional user service:
+Keep port 51235 private. See [../DEPLOYMENT.md](../DEPLOYMENT.md) for the
+low-cost Tailscale/VPS design and direct local-PC deployment flow.
+
+## Maintainer PC
+
+`legal-mcp-maintainer-weekly.service` and its timer are optional **user** units
+for the CUDA-capable machine that owns `data/sources` and `data/models`. They
+refresh, build, validate, and activate locally. They do not publish releases.
+
+Adjust `LEGAL_MCP_REPO_DIR` if the checkout is not under
+`%h/src/australian-legal-mcp`, then install:
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp ato-mcp-serve.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now ato-mcp-serve.service
-systemctl --user status ato-mcp-serve.service
-```
-
-## Optional corpus update timer
-
-Install the update and serve units together so a successful update refreshes the
-running backend before verification:
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp ato-mcp-serve.service ato-mcp-update.service ato-mcp-update.timer \
+cp legal-mcp-maintainer-weekly.service legal-mcp-maintainer-weekly.timer \
   ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now ato-mcp-serve.service ato-mcp-update.timer
-systemctl --user list-timers --all | grep ato-mcp
+systemctl --user enable --now legal-mcp-maintainer-weekly.timer
 ```
 
-Both services load the optional
-`~/.config/ato-mcp/environment` file. For a portable corpus, create it once:
+Inspect it with:
 
 ```bash
-mkdir -p ~/.config/ato-mcp
-printf 'ATO_MCP_DATA_DIR=%s\n' "$HOME/path/to/stable/ato-mcp-data" \
-  > ~/.config/ato-mcp/environment
-systemctl --user daemon-reload
-systemctl --user restart ato-mcp-serve.service
-```
-
-The update service runs `ato-mcp update`, tries to restart
-`ato-mcp-serve.service`, then runs `ato-mcp stats` in the same data directory.
-
-## Maintainer timer
-
-Only install these on the machine that publishes corpus releases.
-
-```bash
-cp ato-mcp-maintainer-*.service ato-mcp-maintainer-*.timer \
-   ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now ato-mcp-maintainer-weekly.timer
-```
-
-Edit the `Environment=` and `ExecStart=` lines in the maintainer service if
-your repo path, `ato_pages` path, model path, or optional model mirror URL
-differs from the defaults.
-
-## Manual checks
-
-```bash
-systemctl --user start ato-mcp-serve.service
-systemctl --user start ato-mcp-update.service
-systemctl --user start ato-mcp-maintainer-weekly.service
-
-systemctl --user status ato-mcp-serve.service
-journalctl --user -u ato-mcp-serve.service -n 50 --no-pager
-systemctl --user status ato-mcp-update.timer
-journalctl --user -u ato-mcp-update.service -n 50 --no-pager
-journalctl --user -u ato-mcp-maintainer-weekly.service -n 100 --no-pager
+systemctl --user status legal-mcp-maintainer-weekly.timer
+journalctl --user -u legal-mcp-maintainer-weekly.service -n 100 --no-pager
 ```

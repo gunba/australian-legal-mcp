@@ -8,53 +8,66 @@ use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtensio
 #[allow(unused_imports)]
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
+use std::collections::BTreeSet;
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
-use url::Url;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
+mod adaptive_http;
 mod ann;
+mod ato;
+mod bert_tokenizer;
+mod browser_http;
 mod build;
 mod chunker;
 mod config;
 mod db;
 mod extract;
+mod frl;
 mod html;
+mod legal_source;
+mod official_sources;
+mod pipeline;
 mod retrieval;
 mod rules;
 mod search;
 mod semantic;
 mod source;
+mod source_catalog;
+mod source_update;
 mod uri;
 
-use build::{
-    build_corpus, bundle_localize_manifest, package_corpus, update_manifest_with_db,
-    BuildCorpusArgs,
-};
-use config::{live_dir, model_data_path, model_path, tokenizer_path};
+use bert_tokenizer::BertWordPieceTokenizer;
+use build::{build_corpus, BuildCorpusArgs};
+use config::live_dir;
+use legal_model::{AssetRef, ChunkRef, DocumentId, SourceId};
+use legal_source::source_registry;
 use retrieval::{
-    fetch, get_asset_mcp, get_chunks_mcp, get_definition, get_doc_anchors_mcp, pit_to_date,
+    fetch, get_asset, get_chunks, get_definition, get_doc_anchors, pit_to_date, GetChunksOptions,
     GetDefinitionOptions,
 };
 use search::{search, search_cli, SearchOptions};
 #[cfg(test)]
 use semantic::dot_i8_scalar_reference;
-use semantic::{
-    SemanticEncodeStats, SemanticModelPaths, SemanticRuntime, EMBEDDING_MODEL_HF_FILES,
-};
+#[cfg(test)]
+use semantic::EMBEDDING_MODEL_FILES;
+use semantic::{SemanticEncodeStats, SemanticModelPaths, SemanticRuntime};
 use source::{
-    apply_update, check_for_update_availability, link_download, resolve_latest_corpus_manifest_url,
-    resolve_latest_corpus_manifest_url_probe, scrape_diff, snapshot_reduce, stats, tree_crawl,
-    LinkDownloadArgs, Manifest, ModelInfo, StagedModel, UpdateAvailability,
+    activate_local_generation, link_download, prune_inactive_generations, rollback_generation,
+    scrape_diff, snapshot_reduce, stats, tree_crawl, verify_active_generation, LinkDownloadArgs,
+    ModelInfo,
 };
+use source_update::{run_source_updates, SourceUpdateMode, SourceUpdateRequest};
 
-pub(crate) const APP_NAME: &str = "ato-mcp";
-pub(crate) const DEFAULT_RELEASES_API_URL: &str =
-    "https://api.github.com/repos/gunba/ato-mcp/releases";
+pub(crate) const APP_NAME: &str = "australian-legal-mcp";
 pub(crate) const DEFAULT_K: usize = 8;
 pub(crate) const MAX_K: usize = 50;
 /// Cap on the `title_hits` sidebar `search` returns alongside chunk hits.
@@ -62,34 +75,31 @@ pub(crate) const MAX_K: usize = 50;
 /// fills the rest.
 pub(crate) const TITLE_HITS_K: usize = 10;
 pub(crate) const SNIPPET_CHARS: usize = 280;
-// [EM-05] Stored semantic vectors are the first 256 dimensions of the
+// Stored semantic vectors are the first 256 dimensions of the
 // model output after normalization + int8 quantization.
 pub(crate) const EMBEDDING_DIM: usize = 256;
-// [EM-03] The tokenizer truncates semantic inputs and pads dynamically to
-// each batch's max sequence length.
-pub(crate) const EMBEDDING_INPUT_MAX_TOKENS: usize = 1024;
-// [EM-02] Granite ONNX inputs use source-derived text directly; no
-// query/passage prompt prefix is stored in chunks or added at runtime.
-const EMBEDDING_TEXT_PREFIX: &str = "";
+// Inputs are never truncated. Source text is losslessly split into chunks at
+// this exact model limit, and each inference batch is padded only to its
+// longest member.
+pub(crate) const EMBEDDING_INPUT_MAX_TOKENS: usize = 512;
+// mdbr-leaf-ir is asymmetric: indexed passages are unprefixed, while search
+// queries use the prompt prescribed by the model authors.
+const DOCUMENT_EMBEDDING_PREFIX: &str = "";
+const QUERY_EMBEDDING_PREFIX: &str = "Represent this sentence for searching relevant passages: ";
 pub(crate) const EMBEDDING_MODEL_FINGERPRINT: &str =
-    "granite-small-r2-fp16:ee200de55cb2f94e858aabca54be7697a9c0805a14c858ee26ad0922b05f57d7:28d16e29cd623f25cc6fa0968700c5bc31036466091a5fa06d1353c1777f050e:feeb83348dcb033bc6b9d2e1f7906ca9eb2d122845000c9416d894d7c2927149";
+    "11837cd75c744e30c14e7a009c1beae47a6f63ea89a0a39fe84b2a1d66320f6b";
 pub(crate) const OLD_CONTENT_CUTOFF: &str = "2000-01-01";
 pub(crate) const DEFAULT_EXCLUDED_TYPES: &[&str] = &["EV"];
-pub(crate) const EDITED_PRIVATE_ADVICE_LABEL: &str = "Edited_private_advice";
-pub(crate) const LEGISLATION_TYPE: &str = "Legislation_and_supporting_material";
 pub(crate) const LEGISLATION_TYPE_PREFIXES: &[&str] = &["PAC", "REG", "RPC", "RRG"];
 pub(crate) const STATUTORY_DEFINITION_TYPE_PREFIXES: &[&str] = &["PAC", "REG"];
 pub(crate) const OEWN_2024_URL: &str = "https://en-word.net/static/english-wordnet-2024.zip";
 pub(crate) const OEWN_2024_SOURCE: &str = "Open English WordNet 2024 (CC-BY 4.0)";
-pub(crate) const ORDINARY_DICTIONARY_PATH_ENV: &str = "ATO_MCP_DICTIONARY_PATH";
+pub(crate) const ORDINARY_DICTIONARY_PATH_ENV: &str = "LEGAL_MCP_DICTIONARY_PATH";
 /// Single corpus version this binary supports. Stamped into both
-/// `meta.schema_version` in the SQLite DB and `schema_version` in the
-/// published manifest.json — the two were previously distinct numbers that
-/// always moved together; now they share one identifier. Bump on any
-/// breaking change to the on-disk layout or the manifest contract.
+/// `meta.schema_version` in SQLite and `schema_version` in generation.json
+/// move together. Bump on any breaking local generation layout change.
 pub(crate) const SUPPORTED_SCHEMA_VERSION: u32 = 10;
-pub(crate) const SUPPORTED_MANIFEST_FORMAT_VERSION: u32 = 2;
-pub(crate) const EMBEDDING_MODEL_ID: &str = "granite-embedding-small-r2-fp16-256d";
+pub(crate) const EMBEDDING_MODEL_ID: &str = "mdbr-leaf-ir-tensorrt-fp16-256d";
 
 /// Compile-time switch: corpus build and runtime semantic search use the
 /// CUDA execution provider when this binary was built with `--features cuda`,
@@ -98,9 +108,13 @@ pub(crate) const EMBEDDING_MODEL_ID: &str = "granite-embedding-small-r2-fp16-256
 pub(crate) const USE_GPU: bool = cfg!(feature = "cuda");
 pub(crate) const DEFAULT_MAX_PER_DOC: usize = 2;
 pub(crate) const HARD_MAX_PER_DOC: usize = 3;
-const HTTP_WORKERS: usize = 8;
-const HTTP_QUEUE_CAPACITY: usize = 32;
+const DEFAULT_HTTP_WORKERS: usize = 4;
+const MAX_HTTP_WORKERS: usize = 32;
+const HTTP_QUEUE_PER_WORKER: usize = 4;
+const DEFAULT_SHUTDOWN_GRACE_SECONDS: u64 = 30;
+const MAX_SHUTDOWN_GRACE_SECONDS: u64 = 30;
 const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
+const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
 #[cfg(test)]
 static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -143,28 +157,60 @@ impl Drop for TestEnvironment {
 }
 
 #[derive(Parser)]
-#[command(name = "ato-mcp", version, about = "Standalone ATO MCP server")]
+#[command(
+    name = "legal-mcp",
+    version,
+    about = "Standalone Australian legal MCP server"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
 }
 
-// [CC-01] One Rust binary owns both end-user commands and maintainer-only
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceWorkspaceArg {
+    source: String,
+    path: PathBuf,
+}
+
+impl std::str::FromStr for SourceWorkspaceArg {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let (source, path) = value
+            .split_once('=')
+            .ok_or_else(|| "expected SOURCE=PATH".to_string())?;
+        if source.is_empty() || source.trim() != source {
+            return Err(
+                "source identifier must be nonempty and contain no surrounding whitespace"
+                    .to_string(),
+            );
+        }
+        if path.is_empty() {
+            return Err("source workspace path must be nonempty".to_string());
+        }
+        Ok(Self {
+            source: source.to_string(),
+            path: PathBuf::from(path),
+        })
+    }
+}
+
+// One Rust binary owns both end-user commands and maintainer-only
 // source/corpus commands; AGENTS.md documents which commands require the
 // maintainer checkout, source corpus, model assets, and GPU.
-// [CC-06] The external CLI is a closed clap enum: every command is explicit
+// The external CLI is a closed clap enum: every command is explicit
 // here, with no dynamic plugin subcommands or shell-completion surface.
 #[derive(Subcommand)]
 enum Command {
     /// Run the MCP stdio entry point. This is the preferred MCP-host command:
     /// it connects to one shared local HTTP server, starting that server in
-    /// the background when needed, so the heavy semantic runtime is not loaded
-    /// once per agent host.
-    #[command(alias = "stdio")]
+    /// the background when needed, so agent hosts share one loaded semantic
+    /// runtime.
     Mcp {},
-    /// Run the HTTP MCP backend in the foreground. `ato-mcp mcp` starts this
-    /// automatically for MCP hosts; use `serve` directly only for manual HTTP
-    /// testing or legacy HTTP MCP config. Override the port with `--port` for
+    /// Run the HTTP MCP backend in the foreground. `legal-mcp mcp` starts this
+    /// automatically for MCP hosts; use `serve` directly for manual HTTP
+    /// testing. Override the port with `--port` for
     /// testing or to force a specific binding.
     Serve {
         #[arg(long)]
@@ -174,22 +220,37 @@ enum Command {
         #[arg(long, hide = true)]
         ready_stdout: bool,
     },
-    /// Download or refresh the local corpus. Always performs a full
-    /// replacement; there is no partial-update path.
-    Update {
-        /// Install from an explicit manifest URL or local manifest path.
-        /// Primarily used for verified offline bundles and release testing.
+    /// Validate and atomically activate a complete local corpus generation.
+    /// The directory is moved into LEGAL_MCP_DATA_DIR and is never fetched.
+    Activate {
         #[arg(long)]
-        manifest_url: Option<String>,
+        generation_dir: PathBuf,
+    },
+    /// Atomically reactivate an already installed immutable generation.
+    Rollback {
+        #[arg(long)]
+        generation: String,
+    },
+    /// Remove old inactive generations while never touching the active one.
+    PruneGenerations {
+        #[arg(long, default_value_t = 1)]
+        keep_inactive: usize,
     },
     /// Print index version, counts, and search-policy status (JSON).
     Stats {},
+    /// Fail unless every source, model file, and ANN sidecar in the active
+    /// generation is ready for production search.
+    Verify {},
     /// Run a search from the CLI.
     Search {
         query: String,
+        /// Required legal source identifier; discover available identifiers
+        /// with `source-list` and `stats`.
+        #[arg(long)]
+        source: SourceId,
         #[arg(short, long, default_value_t = DEFAULT_K)]
         k: usize,
-        /// Exact corpus type codes or `*` globs; discover codes with `ato-mcp stats`.
+        /// Exact corpus type codes or `*` globs; discover codes with `legal-mcp stats`.
         #[arg(long, value_delimiter = ',')]
         types: Vec<String>,
         #[arg(long)]
@@ -211,54 +272,71 @@ enum Command {
         #[arg(long)]
         seed_text: Option<String>,
     },
-    /// Live-fetch an ATO document by URI.
-    /// Example: `ato:JUD/2025ATC20-969/00002`.
+    /// Live-fetch a document by canonical legal URI.
+    /// Example: `legal://ato/JUD%2F2025ATC20-969%2F00002`.
     /// The cleaned HTML is chunked the same way the build pipeline chunks
     /// corpus docs, so live docs read like corpus docs.
     Fetch { uri: String },
-    /// In-binary build orchestrator. Reads `pages_dir/index.jsonl` (one
-    /// record per line with canonical_id, payload_path, sha256, and size), runs each doc
-    /// through the cleaning pipeline, the chunker, the rules-engine
-    /// metadata classifier, and the Granite embedder in-process, then
-    /// writes documents/chunks/chunk_embeddings/chunks_fts/title_fts/
-    /// doc_anchors/definitions/citations tables and emits manifest.json
-    /// into --out-dir. Supports same-output-dir checkpoint resume.
-    /// resume.
-    /// [CC-05] Source refresh and corpus build are separate commands: the
-    /// same ato_pages/ tree can feed repeated builds or release dry runs.
+    /// In-binary build orchestrator. Reads one committed workspace for every
+    /// registered source, normalizes and embeds the authoritative snapshots,
+    /// then writes the unified database, source ANN sidecars, and manifest.
+    /// Source refresh and corpus build are separate commands, so a validated
+    /// source workspace can feed repeated builds or release dry runs.
     Build {
-        #[arg(long)]
-        pages_dir: PathBuf,
-        #[arg(long)]
-        db_path: PathBuf,
-        /// Granite embedding model checkout. Must contain tokenizer.json,
-        /// onnx/model_fp16.onnx, and onnx/model_fp16.onnx_data.
+        /// Repeat as SOURCE=PATH. Every registered source must be supplied
+        /// exactly once, including ATO and FRL.
+        #[arg(long = "source-workspace", required = true, value_name = "SOURCE=PATH")]
+        source_workspaces: Vec<SourceWorkspaceArg>,
+        /// Pinned embedding model checkout. Must contain tokenizer.json and
+        /// onnx/model.onnx.
         #[arg(long)]
         model_dir: PathBuf,
-        /// Output directory for manifest.json and the built ato.db.
+        /// Optional completed schema-v10 legal.db from which vectors are reused
+        /// only when model ID and chunk-text SHA-256 are identical.
+        #[arg(long)]
+        embedding_cache_db: Option<PathBuf>,
+        /// Fresh output directory for generation.json, legal.db, model files,
+        /// and source ANN sidecars.
         #[arg(long)]
         out_dir: PathBuf,
         #[arg(long, default_value_t = 3)]
         zstd_level: i32,
-        #[arg(long)]
-        limit: Option<usize>,
         /// Print cumulative build-stage timings to stderr.
         #[arg(long)]
         profile: bool,
     },
+    /// Refresh one or more source workspaces in parallel. Adapters own their
+    /// incremental and full discovery strategies, pacing, and concurrency.
+    SourceUpdate {
+        /// Repeat as SOURCE=PATH. The existing ATO workspace can be supplied
+        /// directly, for example `--workspace ato=data/sources/ato`.
+        #[arg(long = "workspace", required = true, value_name = "SOURCE=PATH")]
+        workspaces: Vec<SourceWorkspaceArg>,
+        /// New directory in which source-specific discovery inventories and
+        /// provenance are retained for this run.
+        #[arg(long)]
+        run_dir: PathBuf,
+        /// Perform a complete source refresh. Every supplied workspace must be
+        /// empty so a failed repair cannot damage its last committed store.
+        #[arg(long)]
+        full: bool,
+    },
+    /// Print the production source catalogue, one canonical source ID per line.
+    SourceList,
     /// Fetch compact statutory definitions for a term.
     GetDefinition {
         term: String,
         #[arg(long)]
-        context_doc_id: Option<String>,
+        source: SourceId,
+        #[arg(long)]
+        context_document: Option<DocumentId>,
         #[arg(long, default_value_t = 5)]
         max_defs: usize,
     },
     /// Crawl the ATO browse-content tree and write nodes.jsonl + meta.json
-    /// to a snapshot directory. Mirrors src/ato_mcp/scraper/tree_crawler.py
-    /// + src/ato_mcp/scraper/snapshot.py.
+    /// to a snapshot directory that preserves hierarchy and canonical links.
     //
-    // [SS-01] Maintainer source modes: whats-new + scrape-diff for incremental
+    // Maintainer source modes: whats-new + scrape-diff for incremental
     // pulls, tree-crawl + snapshot-reduce for full snapshots, and scrape-diff
     // over deduped links for catch-up gaps.
     TreeCrawl {
@@ -278,20 +356,18 @@ enum Command {
         #[arg(long)]
         max_nodes: Option<usize>,
     },
-    /// Reduce a snapshot to deduped_links.jsonl + dedup_summary.json +
-    /// redundant_paths.json + skip_data_urls.json. Mirrors
-    /// src/ato_mcp/scraper/reducer.py.
+    /// Reduce a snapshot into deterministic deduplicated links, summary,
+    /// redundant paths, and skipped data URLs.
     SnapshotReduce {
         #[arg(long)]
         nodes_path: PathBuf,
         #[arg(long)]
         out_dir: Option<PathBuf>,
     },
-    /// [SS-04] Maintainer source download defaults to 0.05s request pacing
-    /// and four link-download workers; the rate lock serializes HTTP issuance.
-    /// Download deduped ATO links to local payloads/<Category>/<slug>.html and
-    /// write integrity-pinned index.jsonl records. Mirrors the Python
-    /// `src/ato_mcp/scraper/downloader.py:LinkDownloader` implementation.
+    /// Maintainer source download uses adaptive request concurrency with an
+    /// optional minimum interval between requests.
+    /// Download deduplicated ATO links to immutable SHA-256-named payloads in
+    /// the source hierarchy and commit integrity-pinned index.jsonl records.
     LinkDownload {
         #[arg(long)]
         deduped_links: PathBuf,
@@ -301,8 +377,6 @@ enum Command {
         base_url: String,
         #[arg(long, default_value_t = 0.05)]
         request_delay_seconds: f64,
-        #[arg(long, default_value_t = 4)]
-        max_workers: usize,
         #[arg(long, default_value_t = 30.0)]
         timeout_seconds: f64,
         #[arg(long, default_value_t = false)]
@@ -329,74 +403,6 @@ enum Command {
         path_prefix: Option<String>,
         #[arg(long)]
         out: PathBuf,
-    },
-    /// Strip FTS5 indexes off a copy of the built ato.db, VACUUM, and zstd-compress
-    /// it into a shippable ato.db.zst artifact. Leaves the input DB untouched.
-    /// Emits {path, sha256, size} JSON on stdout so the release writer can
-    /// embed those into manifest.json. If --manifest is set, updates that
-    /// manifest in-place to point `db: {url, sha256, size}` at the new artifact
-    /// (URL = bare filename; publish-release rewrites it to a GitHub release URL
-    /// later).
-    PackageCorpus {
-        /// Path to the canonical built ato.db (e.g. release/<tag>/ato.db).
-        #[arg(long)]
-        db_path: PathBuf,
-        /// Output path for the compressed artifact (e.g. release/<tag>/ato.db.zst).
-        #[arg(long)]
-        out: PathBuf,
-        /// zstd compression level. 19 maximises ratio; 3 is faster but bigger.
-        #[arg(long, default_value_t = 19)]
-        level: i32,
-        /// Optional: in-place update this manifest's `db` field with the new
-        /// artifact's sha256/size and clear the legacy pack arrays.
-        #[arg(long)]
-        manifest: Option<PathBuf>,
-    },
-    /// Rewrite a manifest.json so packs/model URLs point at filenames
-    /// inside an offline bundle (with fresh SHA256 + size). Used by
-    /// scripts/make-offline-bundle.sh as the post-bundling step.
-    BundleLocalizeManifest {
-        #[arg(long)]
-        manifest: PathBuf,
-        #[arg(long)]
-        packs_dir: PathBuf,
-        #[arg(long)]
-        model_bundle: PathBuf,
-    },
-    /// Publish a corpus release to GitHub. Mirrors
-    /// src/ato_mcp/indexer/release.py:publish — rewrites manifest URLs to
-    /// release asset URLs, fixes embedding-model fields if they're
-    /// placeholder/GitHub-hosted, optionally signs the manifest with
-    /// minisign, then `gh release create` + `gh release upload`s
-    /// manifest.json + manifest.json.minisig + every pack.
-    PublishRelease {
-        #[arg(long)]
-        out_dir: PathBuf,
-        #[arg(long)]
-        tag: String,
-        #[arg(long)]
-        repo: Option<String>,
-        #[arg(long)]
-        title: Option<String>,
-        #[arg(long)]
-        notes: Option<String>,
-        /// Force-overwrite existing release assets (`gh release upload --clobber`).
-        #[arg(long, default_value_t = false)]
-        overwrite: bool,
-        /// Override the embedding-model URL recorded in the manifest. Use
-        /// this when hosting the model bundle outside HuggingFace.
-        #[arg(long)]
-        model_url: Option<String>,
-        /// SHA256 hex of the embedding-model bundle when --model-url is used.
-        #[arg(long)]
-        model_sha256: Option<String>,
-        /// Size in bytes of the embedding-model bundle when --model-url is used.
-        #[arg(long)]
-        model_size: Option<u64>,
-        /// Filesystem path to a minisign secret key. When set, the manifest
-        /// is signed and the .minisig is uploaded alongside.
-        #[arg(long)]
-        sign_key: Option<PathBuf>,
     },
 }
 
@@ -442,23 +448,45 @@ fn main() -> Result<()> {
             ready_stdout,
         } => {
             let choice = config::resolve_serve_port(port)?;
-            let update_notice = resolve_startup_update_notice();
-            let cached_instructions = server_instructions(update_notice.as_ref());
+            let (cached_instructions, corpus_ready) = server_instructions();
             let state = ServerState {
                 cached_instructions,
                 ..Default::default()
             };
+            let model_ready = if corpus_ready {
+                match state.encode_query_embedding("Australian legal service readiness") {
+                    Ok(_) => true,
+                    Err(error) => {
+                        eprintln!("legal-mcp semantic model readiness failed: {error:#}");
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            state.ready.store(model_ready, Ordering::Release);
             serve(choice, &bind, ready_stdout, Arc::new(state))
         }
-        Command::Update { manifest_url } => {
-            let manifest_url = match manifest_url {
-                Some(value) => value,
-                None => resolve_latest_corpus_manifest_url()?,
-            };
-            let stats = apply_update(&manifest_url)?;
+        Command::Activate { generation_dir } => {
             println!(
-                "update complete ({:.2} MB downloaded)",
-                stats.bytes_downloaded as f64 / 1_000_000.0,
+                "{}",
+                serde_json::to_string_pretty(&activate_local_generation(&generation_dir)?)?
+            );
+            Ok(())
+        }
+        Command::Rollback { generation } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&rollback_generation(&generation)?)?
+            );
+            Ok(())
+        }
+        Command::PruneGenerations { keep_inactive } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "removed": prune_inactive_generations(keep_inactive)?
+                }))?
             );
             Ok(())
         }
@@ -466,8 +494,18 @@ fn main() -> Result<()> {
             println!("{}", stats()?);
             Ok(())
         }
+        Command::Verify {} => {
+            let report = verify_active_generation()?;
+            let state = ServerState::default();
+            state
+                .encode_query_embedding("Australian legal service readiness")
+                .context("loading and executing the active semantic model")?;
+            println!("{}", report);
+            Ok(())
+        }
         Command::Search {
             query,
+            source,
             k,
             types,
             date_from,
@@ -479,12 +517,14 @@ fn main() -> Result<()> {
             seed_text,
         } => {
             let types = empty_vec_as_none(types);
+            source_registry().source(&source)?;
             // Construct a transient ServerState so the CLI's `search` call
             // reuses the same lazy semantic runtime the MCP server does for
             // modes that need it.
             let (out, _state) = search_cli(
                 &query,
                 SearchOptions {
+                    source,
                     k,
                     types: types.as_deref(),
                     date_from: date_from.as_deref(),
@@ -496,7 +536,7 @@ fn main() -> Result<()> {
                     current_only: true,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
-                    similar_to_chunk_id: None,
+                    similar_to_chunk: None,
                     seed_text: seed_text.as_deref(),
                 },
             )?;
@@ -505,7 +545,8 @@ fn main() -> Result<()> {
         }
         Command::GetDefinition {
             term,
-            context_doc_id,
+            source,
+            context_document,
             max_defs,
         } => {
             println!(
@@ -513,36 +554,14 @@ fn main() -> Result<()> {
                 get_definition(
                     &term,
                     GetDefinitionOptions {
-                        context_doc_id: context_doc_id.as_deref(),
+                        source,
+                        context_document,
                         max_defs,
                     },
                 )?
             );
             Ok(())
         }
-        Command::PublishRelease {
-            out_dir,
-            tag,
-            repo,
-            title,
-            notes,
-            overwrite,
-            model_url,
-            model_sha256,
-            model_size,
-            sign_key,
-        } => publish_release(PublishReleaseArgs {
-            out_dir,
-            tag,
-            repo,
-            title,
-            notes,
-            overwrite,
-            model_url,
-            model_sha256,
-            model_size,
-            sign_key,
-        }),
         Command::TreeCrawl {
             root_query,
             out_dir,
@@ -567,7 +586,6 @@ fn main() -> Result<()> {
             out_dir,
             base_url,
             request_delay_seconds,
-            max_workers,
             timeout_seconds,
             force,
         } => link_download(LinkDownloadArgs {
@@ -575,10 +593,11 @@ fn main() -> Result<()> {
             out_dir,
             base_url,
             request_delay_seconds,
-            max_workers,
             timeout_seconds,
             force,
-        }),
+            workspace_lock_held: false,
+        })
+        .map(|_| ()),
         Command::ScrapeDiff {
             index,
             deduped,
@@ -592,45 +611,81 @@ fn main() -> Result<()> {
             path_prefix.as_deref(),
             &out,
         ),
-        Command::PackageCorpus {
-            db_path,
-            out,
-            level,
-            manifest,
-        } => {
-            let summary = package_corpus(&db_path, &out, level)?;
-            if let Some(path) = manifest {
-                update_manifest_with_db(&path, &out, &summary)?;
-            }
-            println!("{}", serde_json::to_string_pretty(&summary)?);
-            Ok(())
-        }
-        Command::BundleLocalizeManifest {
-            manifest,
-            packs_dir,
-            model_bundle,
-        } => bundle_localize_manifest(&manifest, &packs_dir, &model_bundle),
         Command::Fetch { uri } => {
+            validate_fetch_uri(&uri)?;
             println!("{}", fetch(&uri)?);
             Ok(())
         }
         Command::Build {
-            pages_dir,
-            db_path,
+            source_workspaces,
             model_dir,
+            embedding_cache_db,
             out_dir,
             zstd_level,
-            limit,
             profile,
-        } => build_corpus(BuildCorpusArgs {
-            pages_dir: &pages_dir,
-            db_path: &db_path,
-            model_dir: &model_dir,
-            out_dir: &out_dir,
-            zstd_level,
-            limit,
-            profile_enabled: profile,
-        }),
+        } => {
+            let registry = source_registry();
+            let mut workspaces = std::collections::BTreeMap::new();
+            for workspace in source_workspaces {
+                let source: SourceId = workspace.source.parse()?;
+                registry.source(&source)?;
+                if workspaces.insert(source.clone(), workspace.path).is_some() {
+                    bail!("duplicate source workspace `{source}`");
+                }
+            }
+            build_corpus(BuildCorpusArgs {
+                source_workspaces: &workspaces,
+                db_path: &out_dir.join(config::LEGAL_DB_FILENAME),
+                model_dir: &model_dir,
+                embedding_cache_db: embedding_cache_db.as_deref(),
+                out_dir: &out_dir,
+                zstd_level,
+                profile_enabled: profile,
+            })
+        }
+        Command::SourceUpdate {
+            workspaces,
+            run_dir,
+            full,
+        } => {
+            let registry = source_registry();
+            let requests = workspaces
+                .into_iter()
+                .map(|workspace| {
+                    let source: SourceId = workspace.source.parse()?;
+                    registry.source(&source)?;
+                    let source_run_dir = run_dir.join(source.as_str());
+                    Ok(SourceUpdateRequest {
+                        source,
+                        workspace: workspace.path,
+                        run_dir: source_run_dir,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mode = if full {
+                SourceUpdateMode::Full
+            } else {
+                SourceUpdateMode::Incremental
+            };
+            let outcomes = run_source_updates(requests, mode)?;
+            let succeeded = outcomes.iter().all(|outcome| outcome.is_success());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({ "sources": outcomes }))?
+            );
+            if !succeeded {
+                bail!(
+                    "one or more sources failed; successful sources committed independently and failed sources retained their last committed state"
+                );
+            }
+            Ok(())
+        }
+        Command::SourceList => {
+            for source in source_registry().source_ids() {
+                println!("{source}");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -644,33 +699,40 @@ fn empty_vec_as_none(values: Vec<String>) -> Option<Vec<String>> {
 
 struct ServerState {
     semantic_runtime: Mutex<Option<SemanticRuntime>>,
+    semantic_tokenizer: OnceLock<BertWordPieceTokenizer>,
     semantic_model_paths: Option<SemanticModelPaths>,
     corpus_generation: Option<String>,
     // Rendered once at server start so MCP initialize is a cheap field read
     // instead of re-running stats() (~5-10s on a cold 4 GB corpus) per call.
-    // The corpus is immutable for the server lifetime — `ato-mcp update`
-    // requires a restart — so a single render is correct. Carries the
-    // startup update-notice via server_instructions(); no separate field
-    // is needed because nothing else reads it.
+    // The corpus is immutable for the server lifetime. Local activation takes
+    // effect after a restart, so one render per process is correct.
     cached_instructions: String,
+    ready: AtomicBool,
+    request_sequence: AtomicU64,
 }
 
 impl ServerState {
     fn new() -> Self {
         Self {
             semantic_runtime: Mutex::new(None),
+            semantic_tokenizer: OnceLock::new(),
             semantic_model_paths: None,
             corpus_generation: config::active_generation_key().ok().flatten(),
             cached_instructions: String::new(),
+            ready: AtomicBool::new(false),
+            request_sequence: AtomicU64::new(0),
         }
     }
 
     fn with_model_paths(semantic_model_paths: SemanticModelPaths) -> Self {
         Self {
             semantic_runtime: Mutex::new(None),
+            semantic_tokenizer: OnceLock::new(),
             semantic_model_paths: Some(semantic_model_paths),
             corpus_generation: config::active_generation_key().ok().flatten(),
             cached_instructions: String::new(),
+            ready: AtomicBool::new(false),
+            request_sequence: AtomicU64::new(0),
         }
     }
 
@@ -685,7 +747,7 @@ impl ServerState {
         let active = config::active_generation_key()?;
         if active != self.corpus_generation {
             bail!(
-                "the installed corpus changed after this process started; restart the ato-mcp backend"
+                "the installed corpus changed after this process started; restart the australian-legal-mcp backend"
             );
         }
         Ok(())
@@ -694,6 +756,50 @@ impl ServerState {
     fn encode_query_embeddings(&self, queries: &[String]) -> Result<Vec<[i8; EMBEDDING_DIM]>> {
         let (embeddings, _stats) = self.encode_query_embeddings_with_stats(queries)?;
         Ok(embeddings)
+    }
+
+    fn encode_document_embeddings(&self, documents: &[String]) -> Result<Vec<[i8; EMBEDDING_DIM]>> {
+        let (embeddings, _stats) = self.encode_document_embeddings_with_stats(documents)?;
+        Ok(embeddings)
+    }
+
+    fn count_embedding_tokens(&self, text: &str) -> Result<usize> {
+        Ok(self.embedding_tokenizer()?.encode(text)?.len())
+    }
+
+    fn embedding_tokenizer(&self) -> Result<&BertWordPieceTokenizer> {
+        let tokenizer = if let Some(tokenizer) = self.semantic_tokenizer.get() {
+            tokenizer
+        } else {
+            let model_paths = self
+                .semantic_model_paths
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(SemanticModelPaths::live)?;
+            let tokenizer = BertWordPieceTokenizer::from_file(&model_paths.tokenizer)?;
+            let _ = self.semantic_tokenizer.set(tokenizer);
+            self.semantic_tokenizer
+                .get()
+                .expect("embedding tokenizer was just initialized")
+        };
+        Ok(tokenizer)
+    }
+
+    fn prepare_document_embedding_tokens(&self, text: &str) -> Result<Vec<i64>> {
+        let token_ids =
+            self.prepare_embedding_tokens_exact(&format!("{DOCUMENT_EMBEDDING_PREFIX}{text}"))?;
+        if token_ids.len() > EMBEDDING_INPUT_MAX_TOKENS {
+            bail!(
+                "document embedding input contains {} tokens, exceeding the {}-token model limit",
+                token_ids.len(),
+                EMBEDDING_INPUT_MAX_TOKENS
+            );
+        }
+        Ok(token_ids)
+    }
+
+    fn prepare_embedding_tokens_exact(&self, input: &str) -> Result<Vec<i64>> {
+        self.embedding_tokenizer()?.encode(input)
     }
 
     fn encode_query_embeddings_with_stats(
@@ -705,7 +811,7 @@ impl ServerState {
             .lock()
             .expect("semantic_runtime mutex");
         if guard.is_none() {
-            // [SW-04] ServerState lazily loads SemanticRuntime on the first
+            // ServerState lazily loads SemanticRuntime on the first
             // semantic query and reuses it for the process lifetime.
             let model_paths = match &self.semantic_model_paths {
                 Some(paths) => paths.clone(),
@@ -718,6 +824,56 @@ impl ServerState {
             .expect("semantic runtime was just initialized")
             .encode_queries_with_stats(queries)
     }
+
+    fn encode_document_embeddings_with_stats(
+        &self,
+        documents: &[String],
+    ) -> Result<(Vec<[i8; EMBEDDING_DIM]>, SemanticEncodeStats)> {
+        let mut guard = self
+            .semantic_runtime
+            .lock()
+            .expect("semantic_runtime mutex");
+        if guard.is_none() {
+            let model_paths = match &self.semantic_model_paths {
+                Some(paths) => paths.clone(),
+                None => SemanticModelPaths::live()?,
+            };
+            *guard = Some(SemanticRuntime::load(USE_GPU, &model_paths)?);
+        }
+        guard
+            .as_mut()
+            .expect("semantic runtime was just initialized")
+            .encode_documents_with_stats(documents)
+    }
+
+    fn encode_document_token_embeddings(
+        &self,
+        token_ids: &[&[i64]],
+    ) -> Result<Vec<[i8; EMBEDDING_DIM]>> {
+        let (embeddings, _stats) = self.encode_document_token_embeddings_with_stats(token_ids)?;
+        Ok(embeddings)
+    }
+
+    fn encode_document_token_embeddings_with_stats(
+        &self,
+        token_ids: &[&[i64]],
+    ) -> Result<(Vec<[i8; EMBEDDING_DIM]>, SemanticEncodeStats)> {
+        let mut guard = self
+            .semantic_runtime
+            .lock()
+            .expect("semantic_runtime mutex");
+        if guard.is_none() {
+            let model_paths = match &self.semantic_model_paths {
+                Some(paths) => paths.clone(),
+                None => SemanticModelPaths::live()?,
+            };
+            *guard = Some(SemanticRuntime::load(USE_GPU, &model_paths)?);
+        }
+        guard
+            .as_mut()
+            .expect("semantic runtime was just initialized")
+            .encode_document_token_ids_with_stats(token_ids)
+    }
 }
 
 impl Default for ServerState {
@@ -726,701 +882,78 @@ impl Default for ServerState {
     }
 }
 
-// ----- External fetch (live ATO scrape) -----
+// ----- External fetch (live ATO source retrieval) -----
 //
-// Ported subset of src/ato_mcp/indexer/extract.py: pick_container, strip_noise,
-// strip_history_ui_controls, html_to_text. Used at runtime to follow [doc:X]
-// markers whose target id isn't in the local corpus (subdivisions, paragraph
-// refs, footnote pointers, historical PiT views). The full Python pipeline
-// remains the build-time path; this is the minimum-viable subset that returns
-// legible plain text to an agent.
+// Live retrieval selects the legal-content container, strips navigation noise
+// and history controls, then renders readable text for [doc:X] targets absent
+// from the local corpus, including subdivisions, paragraph references,
+// footnotes, and historical PiT views.
 
 pub(crate) const ATO_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const ATO_USER_AGENT: &str = concat!(
-    "Mozilla/5.0 (compatible; ato-mcp/",
+    "Mozilla/5.0 (compatible; australian-legal-mcp/",
     env!("CARGO_PKG_VERSION"),
-    "; +https://github.com/gunba/ato-mcp)"
+    "; +https://github.com/gunba/australian-legal-mcp)"
 );
 
-// ----- publish-release (port of src/ato_mcp/indexer/release.py:publish) -----
-
-pub(crate) const EMBEDDING_MODEL_HF_URL: &str =
-    "hf://onnx-community/granite-embedding-small-english-r2-ONNX@1dc7835ba0cb9c76a3618d0bf0c427c97671b3c8";
-pub(crate) const EMBEDDING_MODEL_HF_SIZE: u64 = 99_732_286;
-
-struct PublishReleaseArgs {
-    out_dir: PathBuf,
-    tag: String,
-    repo: Option<String>,
-    title: Option<String>,
-    notes: Option<String>,
-    overwrite: bool,
-    model_url: Option<String>,
-    model_sha256: Option<String>,
-    model_size: Option<u64>,
-    sign_key: Option<PathBuf>,
-}
-
-fn is_placeholder_model_url(url: &str) -> bool {
-    let u = url.trim();
-    u.is_empty()
-        || u == "PENDING"
-        || u.contains("releases/download/PENDING")
-        || u.contains("placeholder")
-}
-
-fn is_github_url(url: &str) -> bool {
-    url.starts_with("https://github.com/") || url.starts_with("http://github.com/")
-}
-
-fn is_hf_http_url(url: &str) -> bool {
-    url.starts_with("https://huggingface.co/") || url.starts_with("http://huggingface.co/")
-}
-
-fn is_hf_scheme_url(url: &str) -> bool {
-    url.starts_with("hf://")
-}
-
-fn is_hf_model_source(url: &str) -> bool {
-    parse_hf_model_url(url).is_some()
-}
-
-fn non_empty_model_sha(value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
-
-fn resolve_publish_model_info(
-    current: &ModelInfo,
-    model_url: Option<&str>,
-    model_sha256: Option<&str>,
-    model_size: Option<u64>,
-) -> Result<ModelInfo> {
-    let mut resolved = current.clone();
-    if current.id != EMBEDDING_MODEL_ID {
-        return Ok(resolved);
-    }
-
-    let explicit_model_url = model_url.is_some();
-    let mut resolved_url = model_url.unwrap_or(&current.url).to_string();
-    let requested_sha = model_sha256.and_then(non_empty_model_sha);
-    let requested_size = model_size.filter(|n| *n > 0);
-    let manifest_sha = non_empty_model_sha(&current.sha256);
-    let manifest_size = (current.size > 0).then_some(current.size);
-
-    let needs_default = is_placeholder_model_url(&resolved_url)
-        || (is_github_url(&resolved_url) && !explicit_model_url);
-
-    let (sha256, size) = if needs_default {
-        resolved_url = EMBEDDING_MODEL_HF_URL.to_string();
-        (
-            EMBEDDING_MODEL_FINGERPRINT.to_string(),
-            EMBEDDING_MODEL_HF_SIZE,
-        )
-    } else if is_hf_model_source(&resolved_url) {
-        if requested_sha
-            .as_deref()
-            .is_some_and(|sha| sha != EMBEDDING_MODEL_FINGERPRINT)
-        {
-            bail!("Hugging Face semantic model sha256 must match the pinned Granite fingerprint");
-        }
-        if requested_size.is_some_and(|size| size != EMBEDDING_MODEL_HF_SIZE) {
-            bail!("Hugging Face semantic model size must match the pinned Granite file set");
-        }
-        if manifest_sha
-            .as_deref()
-            .is_some_and(|sha| sha != EMBEDDING_MODEL_FINGERPRINT)
-        {
-            bail!("Hugging Face semantic model sha256 must match the pinned Granite fingerprint");
-        }
-        if manifest_size.is_some_and(|size| size != EMBEDDING_MODEL_HF_SIZE) {
-            bail!("Hugging Face semantic model size must match the pinned Granite file set");
-        }
-        (
-            EMBEDDING_MODEL_FINGERPRINT.to_string(),
-            EMBEDDING_MODEL_HF_SIZE,
-        )
-    } else {
-        if is_hf_scheme_url(&resolved_url) {
-            bail!("Hugging Face semantic model sources must use hf://repo@revision with an explicit revision");
-        }
-        if is_hf_http_url(&resolved_url) {
-            bail!("Hugging Face semantic model sources must use hf://repo@revision, not HTTPS model URLs");
-        }
-        if is_github_url(&resolved_url) {
-            bail!("semantic model bundles must not be hosted on GitHub");
-        }
-        if explicit_model_url && (requested_sha.is_none() || requested_size.is_none()) {
-            bail!(
-                "non-Hugging Face semantic model mirrors require --model-sha256 and --model-size"
-            );
-        }
-        (
-            requested_sha.or(manifest_sha).unwrap_or_default(),
-            requested_size.or(manifest_size).unwrap_or(0),
-        )
-    };
-
-    if sha256.is_empty() || size == 0 {
-        bail!("semantic model releases require model sha256 and size");
-    }
-    resolved.sha256 = sha256;
-    resolved.size = size;
-    resolved.url = resolved_url;
-    Ok(resolved)
-}
-
-fn publish_release(args: PublishReleaseArgs) -> Result<()> {
-    let manifest_path = args.out_dir.join("manifest.json");
-    if !manifest_path.exists() {
-        bail!("no manifest at {}", manifest_path.display());
-    }
-
-    let repo = args
-        .repo
-        .clone()
-        .or_else(|| std::env::var("GH_REPO").ok())
-        .ok_or_else(|| anyhow!("--repo required (or set $GH_REPO)"))?;
-
-    // Load manifest, fix model fields if necessary.
-    let raw = fs::read_to_string(&manifest_path)?;
-    let mut manifest: Manifest = serde_json::from_str(&raw)
-        .with_context(|| format!("parsing {}", manifest_path.display()))?;
-
-    manifest.model = resolve_publish_model_info(
-        &manifest.model,
-        args.model_url.as_deref(),
-        args.model_sha256.as_deref(),
-        args.model_size,
-    )?;
-
-    // Schema 5+ ships a single ato.db.zst artifact. Rewrite manifest.db.url
-    // to the GitHub release URL and queue the local file for upload.
-    let mut artifacts: Vec<PathBuf> = Vec::new();
-    let db_info = &mut manifest.db;
-    let filename = std::path::Path::new(&db_info.url)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| db_info.url.clone());
-    let local = args.out_dir.join(&filename);
-    if !local.exists() {
-        bail!(
-            "manifest.db points at {} but {} does not exist; run `ato-mcp package-corpus --manifest <path>` first",
-            filename,
-            local.display()
-        );
-    }
-    if fs::metadata(&local)?.len() != db_info.size {
-        bail!("manifest DB size does not match {}", local.display());
-    }
-    verify_sha256_file(&local, &db_info.sha256)?;
-    db_info.url = format!(
-        "https://github.com/{repo}/releases/download/{tag}/{filename}",
-        tag = args.tag,
-    );
-    artifacts.push(local);
-
-    if let Some(ann_info) = manifest.ann.as_mut() {
-        let filename = Path::new(&ann_info.url)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow!("manifest ANN URL has no UTF-8 filename"))?
-            .to_string();
-        let local = args.out_dir.join(&filename);
-        if !local.is_file() {
-            bail!("manifest.ann points at missing {}", local.display());
-        }
-        if fs::metadata(&local)?.len() != ann_info.size {
-            bail!("manifest ANN size does not match {}", local.display());
-        }
-        verify_sha256_file(&local, &ann_info.sha256)?;
-        ann_info.url = format!(
-            "https://github.com/{repo}/releases/download/{tag}/{filename}",
-            tag = args.tag,
-        );
-        artifacts.push(local);
-    }
-
-    // Save updated manifest.
-    let pretty = serde_json::to_vec_pretty(&manifest)?;
-    fs::write(&manifest_path, &pretty)?;
-
-    // [SL-07] Optional release signing shells out to the maintainer minisign
-    // CLI and uploads the generated manifest.json.minisig artifact.
-    if let Some(sign_key) = args.sign_key.as_deref() {
-        let sig_path = args.out_dir.join("manifest.json.minisig");
-        let status = std::process::Command::new("minisign")
-            .args([
-                "-S".as_ref(),
-                "-s".as_ref(),
-                sign_key.as_os_str(),
-                "-m".as_ref(),
-                manifest_path.as_os_str(),
-                "-x".as_ref(),
-                sig_path.as_os_str(),
-            ])
-            .status()
-            .context("running minisign (is it installed?)")?;
-        if !status.success() {
-            bail!("minisign signing failed (exit {:?})", status.code());
-        }
-        artifacts.push(sig_path);
-    }
-
-    // Ensure release exists.
-    let view_status = std::process::Command::new("gh")
-        .args(["release", "view", &args.tag, "--repo", &repo])
-        .status()
-        .context("running gh release view (is the gh CLI installed?)")?;
-    if !view_status.success() {
-        eprintln!("creating release {}", args.tag);
-        let mut create = std::process::Command::new("gh");
-        create.args([
-            "release",
-            "create",
-            &args.tag,
-            "--repo",
-            &repo,
-            "--title",
-            args.title.as_deref().unwrap_or(&args.tag),
-        ]);
-        if let Some(notes) = args.notes.as_deref() {
-            create.args(["--notes", notes]);
-        } else {
-            create.arg("--generate-notes");
-        }
-        let st = create.status().context("running gh release create")?;
-        if !st.success() {
-            bail!("gh release create failed (exit {:?})", st.code());
-        }
-    }
-
-    let assets = std::process::Command::new("gh")
-        .args([
-            "release",
-            "view",
-            &args.tag,
-            "--repo",
-            &repo,
-            "--json",
-            "assets",
-            "--jq",
-            ".assets[].name",
-        ])
-        .output()
-        .context("listing existing release assets")?;
-    if !assets.status.success() {
-        bail!(
-            "gh release asset listing failed (exit {:?})",
-            assets.status.code()
-        );
-    }
-    let has_remote_manifest = String::from_utf8(assets.stdout)?
-        .lines()
-        .any(|name| name == "manifest.json");
-    if has_remote_manifest {
-        if !args.overwrite {
-            bail!(
-                "release {} already has manifest.json; rerun with --overwrite",
-                args.tag
-            );
-        }
-        let status = std::process::Command::new("gh")
-            .args([
-                "release",
-                "delete-asset",
-                &args.tag,
-                "manifest.json",
-                "--repo",
-                &repo,
-                "--yes",
-            ])
-            .status()
-            .context("removing discoverable manifest before artifact replacement")?;
-        if !status.success() {
-            bail!(
-                "could not remove existing manifest before artifact replacement (exit {:?})",
-                status.code()
-            );
-        }
-    }
-
-    // Publish immutable data first and the discoverable manifest last. Each
-    // upload is a separate command so an earlier failure cannot expose a
-    // manifest that references a missing database or ANN sidecar.
-    for artifact in artifacts.iter().chain(std::iter::once(&manifest_path)) {
-        let mut upload = std::process::Command::new("gh");
-        upload.args(["release", "upload", &args.tag, "--repo", &repo]);
-        upload.arg(artifact);
-        if args.overwrite {
-            upload.arg("--clobber");
-        }
-        let st = upload.status().context("running gh release upload")?;
-        if !st.success() {
-            bail!(
-                "gh release upload failed for {} (exit {:?})",
-                artifact.display(),
-                st.code()
-            );
-        }
-    }
-
-    eprintln!(
-        "ato-mcp publish-release: uploaded {} artifacts to {}@{}",
-        artifacts.len() + 1,
-        repo,
-        args.tag,
-    );
-    Ok(())
-}
-
-fn embedding_model_marker_value(info: &ModelInfo) -> String {
-    if parse_hf_model_url(&info.url).is_some() {
-        EMBEDDING_MODEL_FINGERPRINT.to_string()
-    } else {
-        info.sha256.clone()
-    }
-}
-
 pub(crate) fn embedding_model_installed_matches(info: &ModelInfo) -> Result<bool> {
-    if info.id != EMBEDDING_MODEL_ID {
+    if info.id != EMBEDDING_MODEL_ID || info.fingerprint != EMBEDDING_MODEL_FINGERPRINT {
         return Ok(false);
     }
-    let marker_value = embedding_model_marker_value(info);
-    let marker = live_dir()?.join(".model.sha256");
-    Ok(model_path()?.exists()
-        && model_data_path()?.exists()
-        && tokenizer_path()?.exists()
-        && marker.exists()
-        && fs::read_to_string(marker)?.trim() == marker_value)
-}
-
-#[derive(Clone)]
-pub(crate) struct UrlContext {
-    pub(crate) manifest_dir: Option<PathBuf>,
-    pub(crate) manifest_base_url: Option<String>,
-}
-
-impl UrlContext {
-    fn from_manifest_url(manifest_url: &str) -> Self {
-        if let Some(path) = local_path_from_urlish(manifest_url) {
-            return Self {
-                manifest_dir: path.parent().map(Path::to_path_buf),
-                manifest_base_url: None,
-            };
+    for file in [&info.model, &info.tokenizer] {
+        let path = live_dir()?.join(&file.path);
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            return Ok(false);
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != file.size {
+            return Ok(false);
         }
-        let manifest_base_url = manifest_url
-            .rsplit_once('/')
-            .map(|(base, _)| base.to_string());
-        Self {
-            manifest_dir: None,
-            manifest_base_url,
-        }
-    }
-}
-
-pub(crate) fn resolve_manifest_asset(asset_url: &str, context: &UrlContext) -> String {
-    if asset_url.starts_with("http://")
-        || asset_url.starts_with("https://")
-        || asset_url.starts_with("file://")
-    {
-        return asset_url.to_string();
-    }
-    if let Some(dir) = &context.manifest_dir {
-        return dir.join(asset_url).display().to_string();
-    }
-    if let Some(base) = &context.manifest_base_url {
-        return format!(
-            "{}/{}",
-            base.trim_end_matches('/'),
-            asset_url.trim_start_matches('/')
-        );
-    }
-    asset_url.to_string()
-}
-
-pub(crate) fn local_path_from_urlish(value: &str) -> Option<PathBuf> {
-    let bytes = value.as_bytes();
-    let windows_absolute = (bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'\\' | b'/'))
-        || value.starts_with(r"\\");
-    let path = PathBuf::from(value);
-    if windows_absolute || path.is_absolute() || path.exists() {
-        return Some(path);
-    }
-    if let Ok(url) = Url::parse(value) {
-        if url.scheme() == "file" {
-            return url.to_file_path().ok();
-        }
-    }
-    None
-}
-
-// [UM-03] Fetch helpers resolve local paths, file://, manifest-relative
-// assets, HTTP(S), and hf:// Granite model files; downloaded bytes are
-// sha256-verified against the manifest's pinned hash.
-pub(crate) fn fetch_bytes(url_or_path: &str, context: &UrlContext) -> Result<Vec<u8>> {
-    fetch_bytes_with(url_or_path, context, &http_client()?)
-}
-
-// [UM-04] The Rust downloader is credential-free: no GitHub token env vars and no gh shell-out.
-pub(crate) fn fetch_bytes_with(
-    url_or_path: &str,
-    context: &UrlContext,
-    client: &Client,
-) -> Result<Vec<u8>> {
-    if let Some(path) = local_path_from_urlish(url_or_path) {
-        return Ok(fs::read(path)?);
-    }
-    if let Some(dir) = &context.manifest_dir {
-        if let Some(name) = url_or_path.rsplit('/').next() {
-            for candidate in [dir.join(name), dir.join("packs").join(name)] {
-                if candidate.exists() {
-                    return Ok(fs::read(candidate)?);
-                }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() != 1 {
+                return Ok(false);
             }
         }
-        if !url_or_path.starts_with("http://") && !url_or_path.starts_with("https://") {
-            bail!("release asset not found: {url_or_path}");
+        if build::sha256_file(&path)? != file.sha256 {
+            return Ok(false);
         }
     }
-    let mut resp = client.get(url_or_path).send()?.error_for_status().with_context(|| {
-        format!(
-            "download failed for {url_or_path}. This Rust client does not read GitHub tokens or invoke gh; use a public release, an authenticated mirror, or a file URL."
-        )
-    })?;
-    let mut out = Vec::new();
-    resp.copy_to(&mut out)?;
-    Ok(out)
+    Ok(true)
 }
 
-pub(crate) fn validate_manifest_model_source(model: &ModelInfo) -> Result<()> {
-    if model.id != EMBEDDING_MODEL_ID {
-        return Ok(());
+fn configured_http_workers() -> Result<usize> {
+    let Some(value) = std::env::var_os("LEGAL_MCP_HTTP_WORKERS") else {
+        return Ok(DEFAULT_HTTP_WORKERS);
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| anyhow!("LEGAL_MCP_HTTP_WORKERS must be Unicode"))?;
+    let workers = value
+        .parse::<usize>()
+        .context("LEGAL_MCP_HTTP_WORKERS must be an integer")?;
+    if !(1..=MAX_HTTP_WORKERS).contains(&workers) {
+        bail!("LEGAL_MCP_HTTP_WORKERS must be between 1 and {MAX_HTTP_WORKERS}");
     }
-    if parse_hf_model_url(&model.url).is_some() {
-        if model.sha256 != EMBEDDING_MODEL_FINGERPRINT {
-            bail!("Hugging Face semantic model sha256 must match the pinned Granite fingerprint");
-        }
-        if model.size != EMBEDDING_MODEL_HF_SIZE {
-            bail!("Hugging Face semantic model size must match the pinned Granite file set");
-        }
-        return Ok(());
-    }
-    if is_hf_scheme_url(&model.url) {
+    Ok(workers)
+}
+
+fn configured_shutdown_grace() -> Result<Duration> {
+    let Some(value) = std::env::var_os("LEGAL_MCP_SHUTDOWN_GRACE_SECONDS") else {
+        return Ok(Duration::from_secs(DEFAULT_SHUTDOWN_GRACE_SECONDS));
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| anyhow!("LEGAL_MCP_SHUTDOWN_GRACE_SECONDS must be Unicode"))?;
+    let seconds = value
+        .parse::<u64>()
+        .context("LEGAL_MCP_SHUTDOWN_GRACE_SECONDS must be an integer")?;
+    if !(1..=MAX_SHUTDOWN_GRACE_SECONDS).contains(&seconds) {
         bail!(
-            "Hugging Face semantic model sources must use hf://repo@revision with an explicit revision"
+            "LEGAL_MCP_SHUTDOWN_GRACE_SECONDS must be between 1 and {MAX_SHUTDOWN_GRACE_SECONDS}"
         );
     }
-    if model.url.starts_with("https://huggingface.co/")
-        || model.url.starts_with("http://huggingface.co/")
-    {
-        bail!("Hugging Face semantic model sources must use hf://repo@revision, not HTTPS URLs");
-    }
-    if model.sha256.trim().is_empty() || model.size == 0 {
-        bail!("non-Hugging Face semantic model sources require sha256 and positive size");
-    }
-    Ok(())
-}
-
-pub(crate) fn parse_hf_model_url(value: &str) -> Option<(&str, &str)> {
-    let spec = value.strip_prefix("hf://")?;
-    let (repo, revision) = spec.split_once('@')?;
-    if repo.is_empty() || revision.is_empty() {
-        None
-    } else {
-        Some((repo, revision))
-    }
-}
-
-fn hf_resolve_url(repo: &str, revision: &str, path: &str) -> String {
-    format!("https://huggingface.co/{repo}/resolve/{revision}/{path}")
-}
-
-fn http_client() -> Result<Client> {
-    Ok(Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(120))
-        .build()?)
-}
-
-fn verify_sha256_file(path: &Path, expected: &str) -> Result<()> {
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 1024 * 64];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    let actual = format!("{:x}", hasher.finalize());
-    if actual != expected {
-        bail!(
-            "sha256 mismatch for {}: got {actual}, expected {expected}",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-fn stage_model_artifact(
-    value: &str,
-    context: &UrlContext,
-    destination: &Path,
-    expected_size: u64,
-    expected_sha256: &str,
-) -> Result<u64> {
-    let resolved = resolve_manifest_asset(value, context);
-    if let Some(path) = local_path_from_urlish(&resolved) {
-        let path = path
-            .canonicalize()
-            .with_context(|| format!("canonicalizing {}", path.display()))?;
-        if let Some(root) = &context.manifest_dir {
-            let root = root.canonicalize()?;
-            if !path.starts_with(&root) {
-                bail!("model artifact escaped {}", root.display());
-            }
-        }
-        if !path.is_file() {
-            bail!("model artifact is not a regular file: {}", path.display());
-        }
-        let size = fs::copy(&path, destination)?;
-        if size != expected_size {
-            let _ = fs::remove_file(destination);
-            bail!("model artifact size mismatch: got {size}, expected {expected_size}");
-        }
-        if let Err(error) = verify_sha256_file(destination, expected_sha256) {
-            let _ = fs::remove_file(destination);
-            return Err(error);
-        }
-        return Ok(size);
-    }
-
-    source::download_approved_https_to_file(
-        &resolved,
-        destination,
-        expected_size,
-        expected_sha256,
-        Duration::from_secs(60 * 60),
-    )
-}
-
-pub(crate) fn stage_model(
-    manifest: &Manifest,
-    context: &UrlContext,
-    staging: &Path,
-) -> Result<Option<StagedModel>> {
-    if manifest.model.id != EMBEDDING_MODEL_ID {
-        bail!(
-            "semantic search requires a {EMBEDDING_MODEL_ID} model bundle; manifest uses `{}`",
-            manifest.model.id,
-        );
-    }
-    validate_manifest_model_source(&manifest.model)?;
-    let live_model = model_path()?;
-    let live_model_data = model_data_path()?;
-    let tokenizer = tokenizer_path()?;
-    let marker = live_dir()?.join(".model.sha256");
-    let marker_value = embedding_model_marker_value(&manifest.model);
-    if live_model.exists()
-        && live_model_data.exists()
-        && tokenizer.exists()
-        && marker.exists()
-        && fs::read_to_string(&marker)?.trim() == marker_value
-    {
-        return Ok(None);
-    }
-    if staging.exists() {
-        fs::remove_dir_all(staging)?;
-    }
-    fs::create_dir_all(staging)?;
-
-    if let Some((repo, revision)) = parse_hf_model_url(&manifest.model.url) {
-        stage_hf_embedding_model(repo, revision, staging)?;
-        return Ok(Some(StagedModel {
-            dir: staging.to_path_buf(),
-            marker_value,
-        }));
-    }
-    if is_hf_scheme_url(&manifest.model.url) {
-        bail!(
-            "Hugging Face semantic model sources must use hf://repo@revision with an explicit revision"
-        );
-    }
-
-    let bundle = staging.join("model-bundle.tar.zst.part");
-    stage_model_artifact(
-        &manifest.model.url,
-        context,
-        &bundle,
-        manifest.model.size,
-        &manifest.model.sha256,
-    )?;
-    let extract_dir = staging.join("model-bundle-extracted");
-    if extract_dir.exists() {
-        fs::remove_dir_all(&extract_dir)?;
-    }
-    fs::create_dir_all(&extract_dir)?;
-    let bundle_file = File::open(&bundle)?;
-    let decoder = zstd::stream::read::Decoder::new(bundle_file)?;
-    let mut archive = tar::Archive::new(decoder);
-    archive.unpack(&extract_dir)?;
-
-    for file in EMBEDDING_MODEL_HF_FILES {
-        let path = extract_dir.join(file.output_name);
-        if !path.is_file() {
-            bail!("model bundle missing required file {}", file.output_name);
-        }
-    }
-    for file in EMBEDDING_MODEL_HF_FILES {
-        let source = extract_dir.join(file.output_name);
-        let dest = staging.join(file.output_name);
-        fs::rename(source, dest)?;
-    }
-    let _ = fs::remove_file(bundle);
-    let _ = fs::remove_dir_all(extract_dir);
-    Ok(Some(StagedModel {
-        dir: staging.to_path_buf(),
-        marker_value,
-    }))
-}
-
-fn stage_hf_embedding_model(repo: &str, revision: &str, staging: &Path) -> Result<()> {
-    fs::create_dir_all(staging)?;
-    let download_dir = staging.join("hf-model-download");
-    if download_dir.exists() {
-        fs::remove_dir_all(&download_dir)?;
-    }
-    fs::create_dir_all(&download_dir)?;
-    for file in EMBEDDING_MODEL_HF_FILES {
-        let url = hf_resolve_url(repo, revision, file.path);
-        let part = download_dir.join(format!("{}.part", file.output_name));
-        source::download_approved_https_to_file(
-            &url,
-            &part,
-            file.size,
-            file.sha256,
-            Duration::from_secs(60 * 60),
-        )
-        .with_context(|| format!("downloading Hugging Face model file {}", file.path))?;
-        fs::rename(part, download_dir.join(file.output_name))?;
-    }
-    for file in EMBEDDING_MODEL_HF_FILES {
-        let source = download_dir.join(file.output_name);
-        let dest = staging.join(file.output_name);
-        fs::rename(source, dest)?;
-    }
-    let _ = fs::remove_dir_all(download_dir);
-    Ok(())
+    Ok(Duration::from_secs(seconds))
 }
 
 fn serve(
@@ -1429,6 +962,7 @@ fn serve(
     ready_stdout: bool,
     state: Arc<ServerState>,
 ) -> Result<()> {
+    let shutdown_grace = configured_shutdown_grace()?;
     if bind != "127.0.0.1" {
         bail!(
             "HTTP MCP transport is loopback-only; --bind must be the canonical address 127.0.0.1"
@@ -1442,9 +976,12 @@ fn serve(
     let addr = format!("{bind}:{requested_port}");
     let server = tiny_http::Server::http(&addr).map_err(|e| {
         anyhow!(
-            "bind {addr}: {e}. If the port is in use, start with `ato-mcp serve --port <free-port>`."
+            "bind {addr}: {e}. If the port is in use, start with `legal-mcp serve --port <free-port>`."
         )
     })?;
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutting_down))?;
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutting_down))?;
     let port = server
         .server_addr()
         .to_ip()
@@ -1457,51 +994,82 @@ fn serve(
         match config::update_plugin_mcp_json_url(mcp_json, &url) {
             Ok(true) => {
                 eprintln!(
-                    "ato-mcp wrote the new URL to {}; exit and resume your Claude Code session for it to take effect.",
+                    "legal-mcp wrote the new URL to {}; exit and resume your Claude Code session for it to take effect.",
                     mcp_json.display()
                 );
             }
             Ok(false) => {}
             Err(err) => {
                 eprintln!(
-                    "ato-mcp: warning: could not update {}: {err}. Update its `url` to {url} manually and restart your MCP client.",
+                    "legal-mcp: warning: could not update {}: {err}. Update its `url` to {url} manually and restart your MCP client.",
                     mcp_json.display()
                 );
             }
         }
     }
 
-    let (sender, receiver) = mpsc::sync_channel::<tiny_http::Request>(HTTP_QUEUE_CAPACITY);
+    let workers = configured_http_workers()?;
+    let queue_capacity = workers.saturating_mul(HTTP_QUEUE_PER_WORKER);
+    let (sender, receiver) = mpsc::sync_channel::<(tiny_http::Request, Instant)>(queue_capacity);
     let receiver = Arc::new(Mutex::new(receiver));
-    for worker in 0..HTTP_WORKERS {
+    let (worker_done_sender, worker_done_receiver) = mpsc::channel();
+    for worker in 0..workers {
         let receiver = Arc::clone(&receiver);
         let state = Arc::clone(&state);
+        let worker_done_sender = worker_done_sender.clone();
         std::thread::Builder::new()
-            .name(format!("ato-mcp-http-{worker}"))
-            .spawn(move || loop {
-                let request = {
-                    let receiver = receiver.lock().unwrap_or_else(|err| err.into_inner());
-                    receiver.recv()
-                };
-                let Ok(request) = request else {
-                    break;
-                };
-                if let Err(err) = handle_http(request, &state) {
-                    eprintln!("ato-mcp http handler error: {err}");
+            .name(format!("legal-mcp-http-{worker}"))
+            .spawn(move || {
+                loop {
+                    let queued = {
+                        let receiver = receiver.lock().unwrap_or_else(|err| err.into_inner());
+                        receiver.recv()
+                    };
+                    let Ok((request, queued_at)) = queued else {
+                        break;
+                    };
+                    let request_id = state.request_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+                    let method = format!("{:?}", request.method());
+                    let path = request.url().split('?').next().unwrap_or("/").to_string();
+                    let started = Instant::now();
+                    let outcome = handle_http(request, &state);
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "event": "http-request",
+                            "request_id": request_id,
+                            "method": method,
+                            "path": path,
+                            "queue_ms": queued_at.elapsed().as_millis(),
+                            "duration_ms": started.elapsed().as_millis(),
+                            "outcome": if outcome.is_ok() { "ok" } else { "handler-error" },
+                        })
+                    );
+                    if let Err(err) = outcome {
+                        eprintln!("legal-mcp http handler error request_id={request_id}: {err}");
+                    }
                 }
+                let _ = worker_done_sender.send(());
             })
             .context("starting bounded HTTP worker")?;
     }
+    drop(worker_done_sender);
 
-    for request in server.incoming_requests() {
-        match sender.try_send(request) {
+    while !shutting_down.load(Ordering::Acquire) {
+        let Some(request) = server.recv_timeout(Duration::from_millis(250))? else {
+            continue;
+        };
+        match sender.try_send((request, Instant::now())) {
             Ok(()) => {}
-            Err(mpsc::TrySendError::Full(request)) => {
+            Err(mpsc::TrySendError::Full((request, _))) => {
                 let response = tiny_http::Response::from_string(
                     r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"server busy"}}"#,
                 )
                 .with_status_code(503)
-                .with_header(json_content_type());
+                .with_header(json_content_type())
+                .with_header(
+                    tiny_http::Header::from_bytes(&b"Retry-After"[..], &b"1"[..]).unwrap(),
+                );
                 let _ = request.respond(response);
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
@@ -1509,21 +1077,40 @@ fn serve(
             }
         }
     }
+    state.ready.store(false, Ordering::Release);
+    drop(sender);
+    let deadline = Instant::now() + shutdown_grace;
+    let mut stopped = 0usize;
+    while stopped < workers {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        match worker_done_receiver.recv_timeout(remaining) {
+            Ok(()) => stopped += 1,
+            Err(_) => break,
+        }
+    }
+    let _ = fs::remove_file(config::http_state_path()?);
+    eprintln!(
+        "{}",
+        json!({"event":"shutdown","workers":workers,"workers_stopped":stopped})
+    );
     Ok(())
 }
 
 fn emit_ready_line(url: &str, ready_stdout: bool) -> Result<()> {
     if ready_stdout {
         let mut stdout = io::stdout().lock();
-        writeln!(stdout, "ato-mcp listening on {url}")?;
+        writeln!(stdout, "legal-mcp listening on {url}")?;
         stdout.flush()?;
     } else {
-        eprintln!("ato-mcp listening on {url}");
+        eprintln!("legal-mcp listening on {url}");
     }
     Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HttpState {
     port: u16,
     url: String,
@@ -1549,26 +1136,14 @@ fn read_http_state() -> Result<Option<HttpState>> {
         return Ok(None);
     }
     let raw = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let value: JsonValue = match serde_json::from_str(&raw) {
+    let state: HttpState = match serde_json::from_str(&raw) {
         Ok(value) => value,
         Err(_) => return Ok(None),
     };
-    let Some(port) = value.get("port").and_then(|v| v.as_u64()) else {
-        return Ok(None);
-    };
-    let Ok(port) = u16::try_from(port) else {
-        return Ok(None);
-    };
-    if port == 0 {
+    if state.port == 0 || state.url != config::server_url(state.port) {
         return Ok(None);
     }
-    let canonical_url = config::server_url(port);
-    let url = match value.get("url") {
-        None => canonical_url,
-        Some(value) if value.as_str() == Some(canonical_url.as_str()) => canonical_url,
-        Some(_) => return Ok(None),
-    };
-    Ok(Some(HttpState { port, url }))
+    Ok(Some(state))
 }
 
 fn serve_stdio_mcp() -> Result<()> {
@@ -1586,7 +1161,9 @@ fn serve_stdio_mcp() -> Result<()> {
             Ok(response) => response,
             Err(first_err) => {
                 url = ensure_http_server().with_context(|| {
-                    format!("restarting local ATO HTTP server after request failed: {first_err}")
+                    format!(
+                        "restarting local australian-legal-mcp HTTP server after request failed: {first_err}"
+                    )
                 })?;
                 post_mcp_line(&client, &url, &line)
                     .with_context(|| format!("forwarding MCP request to {url}"))?
@@ -1625,7 +1202,9 @@ fn ensure_http_server() -> Result<String> {
     spawn_http_server(port, &url)?;
     write_http_state(port, &url)?;
     if !http_backend_ready(&health_client, &url) {
-        bail!("local ATO HTTP server printed readiness but did not answer initialize at {url}");
+        bail!(
+            "local australian-legal-mcp HTTP server printed readiness but did not answer initialize at {url}"
+        );
     }
     Ok(url)
 }
@@ -1638,20 +1217,25 @@ fn mcp_http_client(timeout: Duration) -> Result<Client> {
 }
 
 fn http_backend_ready(client: &Client, url: &str) -> bool {
-    let message = r#"{"jsonrpc":"2.0","id":"ato-mcp-health","method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ato-mcp-shim","version":"0"}}}"#;
+    let message = r#"{"jsonrpc":"2.0","id":"legal-mcp-health","method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"legal-mcp-shim","version":"0"}}}"#;
     match post_mcp_line(client, url, message) {
         Ok(Some(value)) => {
-            value
-                .pointer("/result/serverInfo/version")
-                .and_then(|version| version.as_str())
-                == Some(env!("CARGO_PKG_VERSION"))
+            let server_info = value.pointer("/result/serverInfo");
+            server_info
+                .and_then(|info| info.get("name"))
+                .and_then(JsonValue::as_str)
+                == Some(APP_NAME)
+                && server_info
+                    .and_then(|info| info.get("version"))
+                    .and_then(JsonValue::as_str)
+                    == Some(env!("CARGO_PKG_VERSION"))
         }
         _ => false,
     }
 }
 
 fn spawn_http_server(port: u16, expected_url: &str) -> Result<()> {
-    let exe = std::env::current_exe().context("resolving ato-mcp executable path")?;
+    let exe = std::env::current_exe().context("resolving legal-mcp executable path")?;
     let log_path = config::server_log_path()?;
     let log = OpenOptions::new()
         .create(true)
@@ -1668,12 +1252,12 @@ fn spawn_http_server(port: u16, expected_url: &str) -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr))
         .spawn()
-        .context("starting local ATO HTTP server")?;
+        .context("starting local australian-legal-mcp HTTP server")?;
 
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| anyhow!("local ATO HTTP server stdout was not piped"))?;
+        .ok_or_else(|| anyhow!("local australian-legal-mcp HTTP server stdout was not piped"))?;
     let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
@@ -1682,12 +1266,14 @@ fn spawn_http_server(port: u16, expected_url: &str) -> Result<()> {
         let _ = ready_sender.send(result);
     });
     let (read, line) = match ready_receiver.recv_timeout(Duration::from_secs(20)) {
-        Ok(result) => result.context("waiting for local ATO HTTP server readiness")?,
+        Ok(result) => {
+            result.context("waiting for local australian-legal-mcp HTTP server readiness")?
+        }
         Err(_) => {
             let _ = child.kill();
             let _ = child.wait();
             bail!(
-                "timed out waiting for local ATO HTTP server readiness; see {}",
+                "timed out waiting for local australian-legal-mcp HTTP server readiness; see {}",
                 log_path.display()
             );
         }
@@ -1695,17 +1281,17 @@ fn spawn_http_server(port: u16, expected_url: &str) -> Result<()> {
     if read == 0 {
         let status = child.try_wait().ok().flatten();
         bail!(
-            "local ATO HTTP server exited before readiness{}; see {}",
+            "local australian-legal-mcp HTTP server exited before readiness{}; see {}",
             status
                 .map(|s| format!(" ({s})"))
                 .unwrap_or_else(String::new),
             log_path.display()
         );
     }
-    let expected_line = format!("ato-mcp listening on {expected_url}");
+    let expected_line = format!("legal-mcp listening on {expected_url}");
     if line.trim() != expected_line {
         bail!(
-            "unexpected local ATO HTTP server readiness line `{}`; expected `{expected_line}`; see {}",
+            "unexpected local australian-legal-mcp HTTP server readiness line `{}`; expected `{expected_line}`; see {}",
             line.trim(),
             log_path.display()
         );
@@ -1717,11 +1303,13 @@ fn post_mcp_line(client: &Client, url: &str, line: &str) -> Result<Option<JsonVa
     let response = client
         .post(url)
         .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
         .body(line.to_string())
         .send()
         .with_context(|| format!("POST {url}"))?;
     let status = response.status();
-    if status.as_u16() == 204 {
+    if matches!(status.as_u16(), 202 | 204) {
         return Ok(None);
     }
     let body = response
@@ -1739,6 +1327,75 @@ fn json_content_type() -> tiny_http::Header {
     tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap()
 }
 
+fn request_header<'a>(request: &'a tiny_http::Request, name: &str) -> Result<Option<&'a str>> {
+    let values = request
+        .headers()
+        .iter()
+        .filter(|header| header.field.to_string().eq_ignore_ascii_case(name))
+        .map(|header| header.value.as_str())
+        .collect::<Vec<_>>();
+    if values.len() > 1 {
+        bail!("request contains duplicate `{name}` headers");
+    }
+    Ok(values.first().copied())
+}
+
+fn origin_allowed(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.scheme(), "http" | "https")
+    {
+        return false;
+    }
+    let canonical = url.origin().ascii_serialization();
+    if canonical != value.trim_end_matches('/') {
+        return false;
+    }
+    let loopback = url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    });
+    if loopback {
+        return true;
+    }
+    std::env::var("LEGAL_MCP_ALLOWED_ORIGINS")
+        .ok()
+        .into_iter()
+        .flat_map(|origins| {
+            origins
+                .split(',')
+                .map(str::trim)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .any(|allowed| !allowed.is_empty() && allowed.trim_end_matches('/') == canonical)
+}
+
+fn accepts_streamable_http(request: &tiny_http::Request) -> Result<bool> {
+    let Some(value) = request_header(request, "Accept")? else {
+        return Ok(false);
+    };
+    let accepted = value
+        .split(',')
+        .map(|part| {
+            part.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .collect::<BTreeSet<_>>();
+    Ok(accepted.contains("application/json") && accepted.contains("text/event-stream"))
+}
+
 fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<()> {
     use tiny_http::{Header, Method, Response};
 
@@ -1751,6 +1408,25 @@ fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<(
     }
 
     let path = request.url().split('?').next().unwrap_or("/").to_string();
+    if path == "/livez" || path == "/readyz" {
+        if !matches!(request.method(), Method::Get) {
+            let resp = Response::from_string("method not allowed").with_status_code(405);
+            return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
+        }
+        let ready = path == "/livez"
+            || (state.ready.load(Ordering::Acquire)
+                && state.ensure_corpus_generation_unchanged().is_ok());
+        let status = if ready { 200 } else { 503 };
+        let body = json!({
+            "status": if ready { "ok" } else { "not-ready" },
+            "generation": state.corpus_generation.as_deref(),
+        });
+        let resp = Response::from_string(serde_json::to_string(&body)?)
+            .with_status_code(status)
+            .with_header(json_content_type());
+        return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
+    }
+
     let is_mcp = path == "/mcp" || path == "/mcp/";
 
     if !is_mcp {
@@ -1761,6 +1437,20 @@ fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<(
         let resp = Response::from_string("method not allowed")
             .with_status_code(405)
             .with_header(Header::from_bytes(&b"Allow"[..], &b"POST"[..]).unwrap());
+        return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
+    }
+
+    if let Some(origin) = request_header(&request, "Origin")? {
+        if !origin_allowed(origin) {
+            let resp = Response::from_string("forbidden origin").with_status_code(403);
+            return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
+        }
+    }
+
+    if !accepts_streamable_http(&request)? {
+        let resp =
+            Response::from_string("Accept must include application/json and text/event-stream")
+                .with_status_code(406);
         return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
     }
 
@@ -1815,8 +1505,30 @@ fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<(
         return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
     }
 
+    let mut response_status = 200;
     let response_json: Option<JsonValue> = match serde_json::from_slice::<JsonValue>(&body) {
-        Ok(message) => handle_rpc(message, state),
+        Ok(message) => {
+            let initialize = message
+                .as_object()
+                .and_then(|object| object.get("method"))
+                .and_then(JsonValue::as_str)
+                == Some("initialize");
+            let protocol = request_header(&request, "MCP-Protocol-Version")?;
+            if protocol.is_some_and(|value| value != MCP_PROTOCOL_VERSION)
+                || (!initialize && protocol != Some(MCP_PROTOCOL_VERSION))
+            {
+                response_status = 400;
+                Some(json_rpc_error(
+                    message.get("id").cloned().unwrap_or(JsonValue::Null),
+                    -32600,
+                    "unsupported or missing MCP-Protocol-Version header",
+                ))
+            } else if is_json_rpc_response(&message) {
+                None
+            } else {
+                handle_rpc(message, state)
+            }
+        }
         Err(err) => Some(json_rpc_error(
             JsonValue::Null,
             -32700,
@@ -1824,40 +1536,46 @@ fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<(
         )),
     };
 
-    // MCP notifications (no id) produce no response; reply 204 so the
-    // client knows the request was accepted.
+    // Streamable HTTP acknowledges accepted notifications with 202.
     let Some(value) = response_json else {
-        let resp = Response::from_string("").with_status_code(204);
+        let resp = Response::from_string("").with_status_code(202);
         return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
     };
 
     let body = serde_json::to_string(&value)?;
-    let resp = Response::from_string(body).with_header(json_content_type());
+    let resp = Response::from_string(body)
+        .with_status_code(response_status)
+        .with_header(json_content_type());
     request.respond(resp).map_err(|e| anyhow!("respond: {e}"))?;
     Ok(())
 }
 
-fn handle_rpc(message: JsonValue, state: &ServerState) -> Option<JsonValue> {
-    if let Some(messages) = message.as_array() {
-        if messages.is_empty() {
-            return Some(json_rpc_error(
-                JsonValue::Null,
-                -32600,
-                "invalid request: empty batch",
-            ));
-        }
-        let responses: Vec<JsonValue> = messages
-            .iter()
-            .filter_map(|m| handle_single_rpc(m.clone(), state))
-            .collect();
-        if responses.is_empty() {
-            None
-        } else {
-            Some(JsonValue::Array(responses))
-        }
-    } else {
-        handle_single_rpc(message, state)
+fn is_json_rpc_response(message: &JsonValue) -> bool {
+    let Some(object) = message.as_object() else {
+        return false;
+    };
+    if object.get("jsonrpc").and_then(JsonValue::as_str) != Some("2.0")
+        || object.contains_key("method")
+    {
+        return false;
     }
+    let valid_id = object
+        .get("id")
+        .is_some_and(|id| id.is_null() || id.is_string() || id.is_number());
+    let result = object.contains_key("result");
+    let error = object.contains_key("error");
+    valid_id && result != error
+}
+
+fn handle_rpc(message: JsonValue, state: &ServerState) -> Option<JsonValue> {
+    if message.is_array() {
+        return Some(json_rpc_error(
+            JsonValue::Null,
+            -32600,
+            "JSON-RPC batching is not supported by MCP 2025-06-18",
+        ));
+    }
+    handle_single_rpc(message, state)
 }
 
 fn handle_single_rpc(message: JsonValue, state: &ServerState) -> Option<JsonValue> {
@@ -1888,9 +1606,9 @@ fn handle_single_rpc(message: JsonValue, state: &ServerState) -> Option<JsonValu
 
     let result: std::result::Result<JsonValue, (i64, String)> = match method {
         "initialize" => Ok(json!({
-            "protocolVersion": "2025-06-18",
+            "protocolVersion": MCP_PROTOCOL_VERSION,
             "capabilities": { "tools": {} },
-            "serverInfo": { "name": "ato-mcp", "version": env!("CARGO_PKG_VERSION") },
+            "serverInfo": { "name": APP_NAME, "version": env!("CARGO_PKG_VERSION") },
             "instructions": state.cached_instructions.as_str(),
         })),
         "ping" => Ok(json!({})),
@@ -1929,6 +1647,91 @@ fn json_rpc_error(id: JsonValue, code: i64, message: &str) -> JsonValue {
     })
 }
 
+fn exact_object<'a>(
+    value: &'a JsonValue,
+    field: &str,
+    required_fields: &[&str],
+) -> Result<&'a serde_json::Map<String, JsonValue>> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("`{field}` must be an object"))?;
+    for name in object.keys() {
+        if !required_fields.contains(&name.as_str()) {
+            bail!("unknown `{field}` field `{name}`");
+        }
+    }
+    for name in required_fields {
+        if !object.contains_key(*name) {
+            bail!("`{field}` is missing required field `{name}`");
+        }
+    }
+    Ok(object)
+}
+
+fn parse_document(value: &JsonValue, field: &str) -> Result<DocumentId> {
+    exact_object(value, field, &["source", "native_id"])?;
+    let decoded: DocumentId = serde_json::from_value(value.clone())
+        .with_context(|| format!("invalid `{field}` document identity"))?;
+    let document = DocumentId::new(decoded.source, decoded.native_id)?;
+    source_registry().source(&document.source)?;
+    Ok(document)
+}
+
+fn parse_chunk(value: &JsonValue, field: &str) -> Result<ChunkRef> {
+    exact_object(value, field, &["generation", "source", "chunk_id"])?;
+    let decoded: ChunkRef = serde_json::from_value(value.clone())
+        .with_context(|| format!("invalid `{field}` chunk identity"))?;
+    let chunk = ChunkRef::new(decoded.generation, decoded.source, decoded.chunk_id)?;
+    source_registry().source(&chunk.source)?;
+    Ok(chunk)
+}
+
+fn parse_asset(value: &JsonValue, field: &str) -> Result<AssetRef> {
+    exact_object(value, field, &["source", "asset_id"])?;
+    let decoded: AssetRef = serde_json::from_value(value.clone())
+        .with_context(|| format!("invalid `{field}` asset identity"))?;
+    let asset = AssetRef::new(decoded.source, decoded.asset_id)?;
+    source_registry().source(&asset.source)?;
+    Ok(asset)
+}
+
+fn parse_source(value: &JsonValue, field: &str) -> Result<SourceId> {
+    let source: SourceId = serde_json::from_value(value.clone())
+        .with_context(|| format!("invalid `{field}` source identifier"))?;
+    source_registry().source(&source)?;
+    Ok(source)
+}
+
+fn parse_definition_scope(
+    args: &serde_json::Map<String, JsonValue>,
+) -> Result<(SourceId, Option<DocumentId>)> {
+    let source = parse_source(
+        args.get("source")
+            .ok_or_else(|| anyhow!("missing required string argument `source`"))?,
+        "source",
+    )?;
+    let context_document = args
+        .get("context_document")
+        .map(|value| parse_document(value, "context_document"))
+        .transpose()?;
+    if let Some(context) = &context_document {
+        if source != context.source {
+            bail!(
+                "definition source `{source}` does not match context document source `{}`",
+                context.source
+            );
+        }
+    }
+    Ok((source, context_document))
+}
+
+fn validate_fetch_uri(value: &str) -> Result<()> {
+    let uri = crate::uri::parse_doc_uri(value)?;
+    let (document, _, _) = uri.into_parts();
+    source_registry().source(&document.source)?;
+    Ok(())
+}
+
 fn validate_tool_call(params: &JsonValue) -> Result<()> {
     let params = params
         .as_object()
@@ -1960,7 +1763,8 @@ fn validate_tool_call(params: &JsonValue) -> Result<()> {
 
     let require_string = |field: &str| -> Result<()> {
         match args.get(field) {
-            Some(JsonValue::String(_)) => Ok(()),
+            Some(JsonValue::String(value)) if !value.is_empty() => Ok(()),
+            Some(JsonValue::String(_)) => bail!("`{field}` must not be empty"),
             Some(_) => bail!("`{field}` must be a string"),
             None => bail!("missing required string argument `{field}`"),
         }
@@ -1977,13 +1781,6 @@ fn validate_tool_call(params: &JsonValue) -> Result<()> {
             Ok(())
         } else {
             bail!("`{field}` must be a boolean")
-        }
-    };
-    let optional_i64 = |field: &str| -> Result<()> {
-        if args.get(field).is_none_or(|value| value.as_i64().is_some()) {
-            Ok(())
-        } else {
-            bail!("`{field}` must be an integer")
         }
     };
     let bounded_u64 = |field: &str, minimum: u64, maximum: Option<u64>| -> Result<()> {
@@ -2022,15 +1819,15 @@ fn validate_tool_call(params: &JsonValue) -> Result<()> {
         }
         Ok(())
     };
-    let integer_array = |field: &str| -> Result<()> {
+    let chunk_array = |field: &str| -> Result<()> {
         let Some(value) = args.get(field) else {
             bail!("missing required array argument `{field}`");
         };
         let values = value
             .as_array()
-            .ok_or_else(|| anyhow!("`{field}` must be an array of integers"))?;
-        if values.iter().any(|value| value.as_i64().is_none()) {
-            bail!("`{field}` must be an array of integers")
+            .ok_or_else(|| anyhow!("`{field}` must be an array of chunk identity objects"))?;
+        for value in values {
+            parse_chunk(value, field)?;
         }
         Ok(())
     };
@@ -2039,6 +1836,7 @@ fn validate_tool_call(params: &JsonValue) -> Result<()> {
         "search" => {
             reject_unknown_args(&[
                 "query",
+                "source",
                 "k",
                 "types",
                 "date_from",
@@ -2050,10 +1848,15 @@ fn validate_tool_call(params: &JsonValue) -> Result<()> {
                 "include_snippet",
                 "sort_by",
                 "seed_text",
-                "similar_to_chunk_id",
-                "format",
+                "similar_to_chunk",
             ])?;
             require_string("query")?;
+            require_string("source")?;
+            let resolved_source = parse_source(
+                args.get("source")
+                    .ok_or_else(|| anyhow!("missing required string argument `source`"))?,
+                "source",
+            )?;
             bounded_u64("k", 1, Some(MAX_K as u64))?;
             string_array("types")?;
             for field in ["date_from", "date_to", "doc_scope", "seed_text"] {
@@ -2064,54 +1867,63 @@ fn validate_tool_call(params: &JsonValue) -> Result<()> {
             for field in ["include_old", "current_only", "include_snippet"] {
                 optional_bool(field)?;
             }
-            optional_i64("similar_to_chunk_id")?;
-            enum_string("format", &["json"])?;
+            if let Some(value) = args.get("similar_to_chunk") {
+                let chunk_ref = parse_chunk(value, "similar_to_chunk")?;
+                if chunk_ref.source != resolved_source {
+                    bail!(
+                        "`similar_to_chunk` source `{}` does not match resolved search source `{resolved_source}`",
+                        chunk_ref.source
+                    );
+                }
+            }
         }
         "get_asset" => {
-            reject_unknown_args(&["asset_ref"])?;
-            require_string("asset_ref")?;
+            reject_unknown_args(&["asset"])?;
+            let asset = args
+                .get("asset")
+                .ok_or_else(|| anyhow!("missing required object argument `asset`"))?;
+            parse_asset(asset, "asset")?;
         }
         "get_doc_anchors" => {
-            reject_unknown_args(&["doc_id"])?;
-            require_string("doc_id")?;
+            reject_unknown_args(&["document"])?;
+            let document = args
+                .get("document")
+                .ok_or_else(|| anyhow!("missing required object argument `document`"))?;
+            parse_document(document, "document")?;
         }
         "get_chunks" => {
-            reject_unknown_args(&[
-                "chunk_ids",
-                "before",
-                "after",
-                "max_chars",
-                "cursor",
-                "format",
-            ])?;
-            integer_array("chunk_ids")?;
-            let chunk_id_count = args
-                .get("chunk_ids")
+            reject_unknown_args(&["chunks", "before", "after", "max_chars", "cursor"])?;
+            chunk_array("chunks")?;
+            let chunk_count = args
+                .get("chunks")
                 .and_then(JsonValue::as_array)
                 .map_or(0, Vec::len);
-            if !(1..=100).contains(&chunk_id_count) {
-                bail!("`chunk_ids` must contain between 1 and 100 integers");
+            if !(1..=100).contains(&chunk_count) {
+                bail!("`chunks` must contain between 1 and 100 chunk identities");
             }
             bounded_u64("before", 0, Some(20))?;
             bounded_u64("after", 0, Some(20))?;
             bounded_u64("max_chars", 1, Some(200_000))?;
             optional_string("cursor")?;
-            enum_string("format", &["json"])?;
         }
         "get_definition" => {
-            reject_unknown_args(&["term", "context_doc_id", "max_defs", "format"])?;
+            reject_unknown_args(&["term", "source", "context_document", "max_defs"])?;
             require_string("term")?;
-            optional_string("context_doc_id")?;
+            require_string("source")?;
+            parse_definition_scope(args)?;
             bounded_u64("max_defs", 1, Some(20))?;
-            enum_string("format", &["json"])?;
         }
         "stats" => {
-            reject_unknown_args(&["format"])?;
-            enum_string("format", &["json"])?;
+            reject_unknown_args(&[])?;
         }
         "fetch" => {
             reject_unknown_args(&["uri"])?;
             require_string("uri")?;
+            validate_fetch_uri(
+                args.get("uri")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| anyhow!("missing required string argument `uri`"))?,
+            )?;
         }
         _ => bail!("unknown tool `{name}`"),
     }
@@ -2130,13 +1942,27 @@ fn call_tool(params: JsonValue, state: &ServerState) -> Result<JsonValue> {
         .cloned()
         .unwrap_or_else(|| json!({}));
     if name == "get_asset" {
-        let content = get_asset_mcp(&args)?;
+        let asset = parse_asset(
+            args.get("asset")
+                .ok_or_else(|| anyhow!("missing required object argument `asset`"))?,
+            "asset",
+        )?;
+        let content = get_asset(asset)?;
         return Ok(json!({ "content": content, "isError": false }));
     }
     let text = match name {
         "search" => {
             let query = required_str(&args, "query")?;
             let types = optional_string_array(&args, "types")?;
+            let resolved_source = parse_source(
+                args.get("source")
+                    .ok_or_else(|| anyhow!("missing required string argument `source`"))?,
+                "source",
+            )?;
+            let similar_to_chunk = args
+                .get("similar_to_chunk")
+                .map(|value| parse_chunk(value, "similar_to_chunk"))
+                .transpose()?;
             let mode = match args
                 .get("mode")
                 .and_then(|v| v.as_str())
@@ -2158,6 +1984,7 @@ fn call_tool(params: JsonValue, state: &ServerState) -> Result<JsonValue> {
             search(
                 query,
                 SearchOptions {
+                    source: resolved_source,
                     k: optional_usize(&args, "k").unwrap_or(DEFAULT_K),
                     types: types.as_deref(),
                     date_from: args.get("date_from").and_then(|v| v.as_str()),
@@ -2169,20 +1996,49 @@ fn call_tool(params: JsonValue, state: &ServerState) -> Result<JsonValue> {
                     current_only: optional_bool(&args, "current_only").unwrap_or(true),
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: optional_bool(&args, "include_snippet").unwrap_or(true),
-                    similar_to_chunk_id: optional_i64(&args, "similar_to_chunk_id"),
+                    similar_to_chunk,
                     seed_text: args.get("seed_text").and_then(|v| v.as_str()),
                 },
                 Some(state),
             )?
         }
-        "get_doc_anchors" => get_doc_anchors_mcp(&args)?,
-        "get_chunks" => get_chunks_mcp(&args)?,
+        "get_doc_anchors" => {
+            let document = parse_document(
+                args.get("document")
+                    .ok_or_else(|| anyhow!("missing required object argument `document`"))?,
+                "document",
+            )?;
+            get_doc_anchors(document)?
+        }
+        "get_chunks" => {
+            let chunks = args
+                .get("chunks")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| anyhow!("missing required array argument `chunks`"))?
+                .iter()
+                .map(|value| parse_chunk(value, "chunks"))
+                .collect::<Result<Vec<_>>>()?;
+            get_chunks(
+                chunks,
+                GetChunksOptions {
+                    before: optional_usize(&args, "before").unwrap_or(0),
+                    after: optional_usize(&args, "after").unwrap_or(0),
+                    max_chars: optional_usize(&args, "max_chars"),
+                },
+                args.get("cursor").and_then(JsonValue::as_str),
+            )?
+        }
         "get_definition" => {
             let term = required_str(&args, "term")?;
+            let argument_map = args
+                .as_object()
+                .ok_or_else(|| anyhow!("tools/call arguments must be an object"))?;
+            let (source, context_document) = parse_definition_scope(argument_map)?;
             get_definition(
                 term,
                 GetDefinitionOptions {
-                    context_doc_id: args.get("context_doc_id").and_then(|v| v.as_str()),
+                    source,
+                    context_document,
                     max_defs: optional_usize(&args, "max_defs").unwrap_or(5),
                 },
             )?
@@ -2190,6 +2046,7 @@ fn call_tool(params: JsonValue, state: &ServerState) -> Result<JsonValue> {
         "stats" => stats()?,
         "fetch" => {
             let uri = required_str(&args, "uri")?;
+            validate_fetch_uri(uri)?;
             fetch(uri)?
         }
         _ => bail!("unknown tool: {name}"),
@@ -2208,10 +2065,6 @@ pub(crate) fn required_str<'a>(args: &'a JsonValue, name: &str) -> Result<&'a st
 
 pub(crate) fn optional_usize(args: &JsonValue, name: &str) -> Option<usize> {
     args.get(name).and_then(|v| v.as_u64()).map(|v| v as usize)
-}
-
-pub(crate) fn optional_i64(args: &JsonValue, name: &str) -> Option<i64> {
-    args.get(name).and_then(|v| v.as_i64())
 }
 
 pub(crate) fn optional_bool(args: &JsonValue, name: &str) -> Option<bool> {
@@ -2239,64 +2092,80 @@ pub(crate) fn optional_string_array(args: &JsonValue, name: &str) -> Result<Opti
     Ok(Some(out))
 }
 
-const ATO_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first; hits are chunk pointers; call `get_chunks` for text. Use `get_doc_anchors` for nav, related, history, and cited-by. Markers: `[doc:X]` is in-corpus; `[fetch:ato:X]` is an ATO live fetch target. For historical/withdrawn set `current_only=false` and `include_old=true`."##;
+const LEGAL_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first; hits carry typed `document` and generation-bound `chunk` identities accepted directly by follow-up tools. Call `get_chunks` for text and `get_doc_anchors` for navigation. `[doc:X]` and `[asset:X]` markers use canonical source-qualified public references; `[fetch:X]` uses a canonical `legal://` URI. For historical/withdrawn material set `current_only=false` and `include_old=true`."##;
 
-/// Probe for a newer corpus index at startup. Runs
-/// `check_for_update_availability` once and is folded directly into the
-/// cached MCP `initialize` instructions by `server_instructions`, so the
-/// agent can offer to run `ato-mcp update`.
-fn resolve_startup_update_notice() -> Option<UpdateAvailability> {
-    let manifest_url = resolve_latest_corpus_manifest_url_probe().ok()?;
-    check_for_update_availability(&manifest_url).ok().flatten()
-}
-
-// [SW-02] Server instructions are built dynamically at start time from corpus
+// Server instructions are built dynamically at start time from corpus
 // stats so the agent sees up-to-date corpus shape without restart-time config.
-// [SW-03] If stats cannot be read (corpus not yet installed) we return a
-// static install message telling the agent to ask the user to run ato-mcp
-// update. When the serve-startup probe stashed an UpdateAvailability on
-// ServerState, both branches append a newer-index-available notice.
-fn server_instructions(update_notice: Option<&UpdateAvailability>) -> String {
-    let body = match stats()
+// If stats cannot be read, tell the operator to activate a locally built
+// generation; the runtime never downloads corpus artifacts.
+fn server_instructions() -> (String, bool) {
+    match verify_active_generation()
         .ok()
         .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
     {
-        Some(s) => format!(
-            "ATO legal corpus. Documents: {}, chunks: {}. Index: {}. Default search excludes EV edited private advice, withdrawn rulings, and content dated before {} except legislation prefixes PAC/REG/RPC/RRG; override with current_only=false and include_old=true.\n\n{}",
+        Some(s) if s["semantic_search_ready"].as_bool() == Some(true) => (format!(
+            "Australian legal corpus. Documents: {}, chunks: {}. Index: {}. Default search excludes EV edited private advice, withdrawn rulings, and content dated before {} except legislation prefixes PAC/REG/RPC/RRG; override with current_only=false and include_old=true.\n\n{}",
             s["documents"].as_i64().unwrap_or(0),
             s["chunks"].as_i64().unwrap_or(0),
             s["index_version"].as_str().unwrap_or("?"),
             OLD_CONTENT_CUTOFF,
-            ATO_MCP_USE_INSTRUCTIONS,
-        ),
-        None => format!(
-            "The ATO corpus is not yet installed on this machine. Offer to run `ato-mcp update` for the user as a visible setup step (~1.5 GB, takes 5-10 min), then restart the MCP host/backend after the download completes.\n\n{}",
-            ATO_MCP_USE_INSTRUCTIONS
-        ),
-    };
-    match update_notice {
-        Some(notice) => format!(
-            "{body}\n\nAn updated ATO corpus generation is available (index {}). Ask whether to run `ato-mcp update` now or continue with the installed corpus; restart the MCP host/backend after updating.",
-            notice.available_index_version
-        ),
-        None => body,
+            LEGAL_MCP_USE_INSTRUCTIONS,
+        ), true),
+        Some(_) => (format!(
+            "The active local corpus generation failed semantic readiness checks. The host operator must run `legal-mcp verify`, repair or roll back the immutable generation, and restart this service.\n\n{}",
+            LEGAL_MCP_USE_INSTRUCTIONS
+        ), false),
+        None => (format!(
+            "No local corpus generation is active. The host operator must build and validate a generation, run `legal-mcp activate --generation-dir <path>`, and restart this service. The runtime performs no corpus downloads.\n\n{}",
+            LEGAL_MCP_USE_INSTRUCTIONS
+        ), false),
     }
 }
 
 fn tool_descriptors() -> JsonValue {
-    // [SW-01] Seven MCP tools are exposed by tool_descriptors/call_tool:
+    // Seven MCP tools are exposed by tool_descriptors/call_tool:
     // search, get_chunks, get_asset, get_doc_anchors, get_definition, stats,
     // fetch.
     //   The surface stays small and explicit; unsupported tools fail through the
     //   normal tools/call error path.
+    let source_schema = json!({"type": "string"});
+    let document_schema = json!({
+        "type": "object",
+        "properties": {
+            "source": source_schema.clone(),
+            "native_id": {"type": "string", "minLength": 1}
+        },
+        "required": ["source", "native_id"],
+        "additionalProperties": false
+    });
+    let chunk_schema = json!({
+        "type": "object",
+        "properties": {
+            "generation": {"type": "string", "minLength": 1},
+            "source": source_schema.clone(),
+            "chunk_id": {"type": "integer", "minimum": 0}
+        },
+        "required": ["generation", "source", "chunk_id"],
+        "additionalProperties": false
+    });
+    let asset_schema = json!({
+        "type": "object",
+        "properties": {
+            "source": source_schema.clone(),
+            "asset_id": {"type": "string", "minLength": 1}
+        },
+        "required": ["source", "asset_id"],
+        "additionalProperties": false
+    });
     json!([
         {
             "name": "search",
-            "description": "Search the ATO corpus. Returns `hits` plus `title_hits`; read bodies with get_chunks. `types` accepts codes from `stats.types` (`JUD` for cases). Hybrid suits natural-language queries; keyword ranks matching terms. `doc_scope` accepts an ID/prefix. Seed inputs run vector-only related search.",
+            "description": "Search one source; returns document and chunk refs.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string"},
+                    "query": {"type": "string", "minLength": 1},
+                    "source": source_schema.clone(),
                     "k": {"type": "integer", "minimum": 1, "maximum": 50},
                     "types": {"type": "array", "items": {"type": "string"}},
                     "date_from": {"type": "string"},
@@ -2306,85 +2175,88 @@ fn tool_descriptors() -> JsonValue {
                     "sort_by": {"type": "string", "enum": ["relevance", "recency"]},
                     "include_old": {"type": "boolean"},
                     "current_only": {"type": "boolean"},
-                    "similar_to_chunk_id": {"type": "integer"},
+                    "similar_to_chunk": chunk_schema.clone(),
                     "seed_text": {"type": "string"},
-                    "include_snippet": {"type": "boolean"},
-                    "format": {"type": "string", "enum": ["json"], "default": "json"}
+                    "include_snippet": {"type": "boolean"}
                 },
-                "required": ["query"]
+                "required": ["query", "source"],
+                "additionalProperties": false
             }
         },
         {
             "name": "get_asset",
-            "description": "Resolve an `[asset:X]` reference to its bytes as an MCP image content item plus a caption.",
+            "description": "Resolve a typed asset to bytes and caption.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "asset_ref": {"type": "string"}
+                    "asset": asset_schema
                 },
-                "required": ["asset_ref"]
+                "required": ["asset"],
+                "additionalProperties": false
             }
         },
         {
             "name": "get_doc_anchors",
-            "description": "Return in-doc anchors, related/history links, and cited-by docs for a doc_id. `in_doc` entries carry chunk_id for get_chunks.",
+            "description": "Return anchors, links, history, and citations.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "doc_id": {"type": "string"}
+                    "document": document_schema.clone()
                 },
-                "required": ["doc_id"]
+                "required": ["document"],
+                "additionalProperties": false
             }
         },
         {
             "name": "get_chunks",
-            "description": "Fetch chunk bodies by chunk_id, with optional before/after neighbours. Continue truncated results with the cursor from meta.next_call. Text may contain `[doc:X]` (in-corpus) and `[fetch:URI]` (external) markers; `[asset:X]` for images.",
+            "description": "Fetch typed chunks and optional neighbours; follow meta.next_call.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "chunk_ids": {"type": "array", "items": {"type": "integer"}, "minItems": 1, "maxItems": 100},
+                    "chunks": {"type": "array", "items": chunk_schema, "minItems": 1, "maxItems": 100},
                     "before": {"type": "integer", "minimum": 0, "maximum": 20},
                     "after": {"type": "integer", "minimum": 0, "maximum": 20},
                     "max_chars": {"type": "integer", "minimum": 1, "maximum": 200000},
-                    "cursor": {"type": "string"},
-                    "format": {"type": "string", "enum": ["json"], "default": "json"}
+                    "cursor": {"type": "string"}
                 },
-                "required": ["chunk_ids"]
+                "required": ["chunks"],
+                "additionalProperties": false
             }
         },
         {
             "name": "get_definition",
-            "description": "Fetch compact statutory definitions for a term, with ordinary-meaning fallback when none are indexed.",
+            "description": "Find definitions within one legal source.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "term": {"type": "string"},
-                    "context_doc_id": {"type": "string"},
-                    "max_defs": {"type": "integer", "minimum": 1, "maximum": 20},
-                    "format": {"type": "string", "enum": ["json"], "default": "json"}
+                    "term": {"type": "string", "minLength": 1},
+                    "source": source_schema,
+                    "context_document": document_schema,
+                    "max_defs": {"type": "integer", "minimum": 1, "maximum": 20}
                 },
-                "required": ["term"]
+                "required": ["term", "source"],
+                "additionalProperties": false
             }
         },
         {
             "name": "stats",
-            "description": "Return index version, counts, search policy, and prefix breakdown.",
+            "description": "Return counts, index metadata, and search policy.",
             "inputSchema": {
                 "type": "object",
-                "properties": {
-                    "format": {"type": "string", "enum": ["json"], "default": "json"}
-                }
+                "properties": {},
+                "additionalProperties": false
             }
         },
         {
             "name": "fetch",
-            "description": "Live-fetch an ATO doc outside the corpus. `uri`: `ato:<doc_id>[?pit=...&view=...]`. Use when chunk text has `[fetch:ato:...]`.",
+            "description": "Live-fetch a canonical legal:// URI from a fetch marker.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "uri": {"type": "string"}
+                    "uri": {"type": "string", "minLength": 1}
                 },
-                "required": ["uri"]
+                "required": ["uri"],
+                "additionalProperties": false
             }
         }
     ])
@@ -2394,6 +2266,7 @@ fn tool_descriptors() -> JsonValue {
 mod tests {
     use super::*;
     use crate::ann::*;
+    use crate::chunker::{chunk_html, chunk_html_with_token_count, EMBED_MAX_TOKENS};
     use crate::config::*;
     use crate::db::*;
     use crate::extract::*;
@@ -2409,26 +2282,96 @@ mod tests {
     use rusqlite::types::Value;
     use rusqlite::Connection;
     use std::collections::{HashMap, HashSet};
-    use std::io::Cursor;
     use tempfile::tempdir;
+
+    const TEST_SOURCE_ID: &str = "ato";
+    const TEST_GENERATION: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn test_source() -> legal_model::SourceId {
+        TEST_SOURCE_ID.parse().expect("valid test source")
+    }
+
+    fn test_doc_filter(source_id: &SourceId, include_old: bool, current_only: bool) -> SqlFilter {
+        build_doc_filter(
+            "d",
+            DocumentFilterSpec {
+                source_id,
+                types: None,
+                date_from: None,
+                date_to: None,
+                doc_scope: None,
+                include_old,
+                current_only,
+            },
+        )
+    }
+
+    fn prepare_test_generation(data_dir: &Path) -> Result<PathBuf> {
+        let generation = data_dir.join("generations").join(TEST_GENERATION);
+        fs::create_dir_all(&generation)?;
+        fs::write(data_dir.join("active-generation"), TEST_GENERATION)?;
+        Ok(generation)
+    }
+
+    #[test]
+    fn source_update_cli_accepts_repeated_source_workspaces() {
+        let cli = Cli::try_parse_from([
+            "legal-mcp",
+            "source-update",
+            "--workspace",
+            "ato=/data/ato",
+            "--workspace",
+            "wa=/data/wa",
+            "--run-dir",
+            "/data/runs/one",
+        ])
+        .expect("valid source-update arguments");
+        let Command::SourceUpdate {
+            workspaces,
+            run_dir,
+            full,
+        } = cli.command
+        else {
+            panic!("expected source-update command");
+        };
+        assert_eq!(
+            workspaces,
+            vec![
+                SourceWorkspaceArg {
+                    source: "ato".to_string(),
+                    path: PathBuf::from("/data/ato"),
+                },
+                SourceWorkspaceArg {
+                    source: "wa".to_string(),
+                    path: PathBuf::from("/data/wa"),
+                },
+            ]
+        );
+        assert_eq!(run_dir, PathBuf::from("/data/runs/one"));
+        assert!(!full);
+        assert!("ato".parse::<SourceWorkspaceArg>().is_err());
+        assert!("ato=".parse::<SourceWorkspaceArg>().is_err());
+    }
 
     // ----- W1.1 SIMD parity -----
 
     #[test]
-    fn dot_i8_simd_matches_scalar() {
+    fn dot_i8_matches_scalar_reference() -> Result<()> {
         let mut rng = StdRng::seed_from_u64(42);
         for _ in 0..100 {
             let q: [i8; EMBEDDING_DIM] = std::array::from_fn(|_| rng.gen());
             let d: Vec<u8> = (0..EMBEDDING_DIM).map(|_| rng.gen::<u8>()).collect();
-            let scalar = dot_i8_scalar_reference(&q, &d).unwrap();
-            let simd = dot_i8(&q, &d).unwrap();
+            let scalar = dot_i8_scalar_reference(&q, &d)?;
+            let actual = dot_i8(&q, &d)?;
             assert!(
-                (scalar - simd).abs() < 1e-6,
-                "scalar {} vs simd {}",
+                (scalar - actual).abs() < 1e-6,
+                "scalar {} vs actual {}",
                 scalar,
-                simd
+                actual
             );
         }
+        Ok(())
     }
 
     #[test]
@@ -2488,7 +2431,8 @@ mod tests {
 
     fn meta(doc_id: &str, is_intro: bool) -> CandidateMeta {
         CandidateMeta {
-            doc_id: doc_id.to_string(),
+            document: DocumentId::new(TEST_SOURCE_ID.parse().expect("valid test source"), doc_id)
+                .expect("valid test document"),
             is_intro,
         }
     }
@@ -2519,7 +2463,7 @@ mod tests {
         // the output, even if there's room left under k.
         let mut counts: HashMap<&str, usize> = HashMap::new();
         for h in &out {
-            let doc_id = metas.get(&h.chunk_id).unwrap().doc_id.as_str();
+            let doc_id = metas.get(&h.chunk_id).unwrap().document.native_id.as_str();
             *counts.entry(doc_id).or_insert(0) += 1;
         }
         assert_eq!(counts.get("A"), Some(&2), "A should be capped at 2");
@@ -2575,24 +2519,30 @@ mod tests {
 
     /// Build an in-memory test corpus, return the open Connection.
     fn make_test_db() -> Result<(tempfile::TempDir, std::path::PathBuf)> {
-        // We can't easily reuse `db_path()` here without setting env vars
-        // for the data dir. Instead we set ATO_MCP_DATA_DIR so init_db
-        // and the test target the same file.
         let dir = tempdir()?;
-        let db_dir = dir.path().join("live");
-        fs::create_dir_all(&db_dir)?;
-        let db = db_dir.join("ato.db");
+        let db_dir = prepare_test_generation(dir.path())?;
+        let db = db_dir.join(LEGAL_DB_FILENAME);
         let conn = open_write_at(&db)?;
         init_db(&conn)?;
+        conn.execute(
+            "INSERT INTO sources(source_id, display_name) VALUES (?1, ?2)",
+            params![TEST_SOURCE_ID, "Australian Taxation Office"],
+        )?;
+        set_corpus_meta(&conn, "index_version", "test")?;
+        set_source_meta(&conn, TEST_SOURCE_ID, "documents_count", "0")?;
         Ok((dir, db))
     }
 
     fn insert_doc(conn: &Connection, doc_id: &str) -> Result<()> {
         conn.execute(
-            "INSERT INTO documents(doc_id, type, title, downloaded_at, content_hash, pack_sha8, html) VALUES (?, 'Public_ruling', ?, ?, ?, '00000000', ?)",
+            "INSERT INTO documents
+                (source_id, native_id, type, title, canonical_url, downloaded_at, content_hash, html)
+             VALUES (?1, ?2, 'Public_ruling', ?3, ?4, ?5, ?6, ?7)",
             params![
+                TEST_SOURCE_ID,
                 doc_id,
                 format!("{doc_id} title"),
+                format!("https://www.ato.gov.au/law/view/document?docid={doc_id}"),
                 Utc::now().to_rfc3339(),
                 "deadbeef",
                 compress_text("<div></div>")?,
@@ -2611,13 +2561,16 @@ mod tests {
         replaces: Option<&str>,
     ) -> Result<()> {
         conn.execute(
-            "INSERT INTO documents(doc_id, type, title, date, downloaded_at, \
-                content_hash, pack_sha8, html, withdrawn_date, superseded_by, replaces) \
-             VALUES (?, 'Public_ruling', ?, ?, ?, ?, '00000000', ?, ?, ?, ?)",
+            "INSERT INTO documents
+                (source_id, native_id, type, title, date, canonical_url, downloaded_at,
+                 content_hash, html, withdrawn_date, superseded_by, replaces)
+             VALUES (?1, ?2, 'Public_ruling', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
+                TEST_SOURCE_ID,
                 doc_id,
                 format!("{doc_id} title"),
                 date,
+                format!("https://www.ato.gov.au/law/view/document?docid={doc_id}"),
                 Utc::now().to_rfc3339(),
                 "deadbeef",
                 compress_text("<div></div>")?,
@@ -2637,41 +2590,11 @@ mod tests {
         text: &str,
     ) -> Result<()> {
         conn.execute(
-            "INSERT INTO chunks(chunk_id, doc_id, ord, anchor, text) VALUES (?, ?, ?, NULL, ?)",
-            params![chunk_id, doc_id, ord, compress_text(text)?],
+            "INSERT INTO chunks(chunk_id, source_id, native_id, ord, anchor, text)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+            params![chunk_id, TEST_SOURCE_ID, doc_id, ord, compress_text(text)?],
         )?;
         Ok(())
-    }
-
-    #[test]
-    fn local_path_detection_precedes_url_scheme_parsing() {
-        let windows = r"C:\corpus\model-bundle.tar.zst";
-        assert_eq!(
-            local_path_from_urlish(windows),
-            Some(PathBuf::from(windows))
-        );
-        let unc = r"\\server\share\model-bundle.tar.zst";
-        assert_eq!(local_path_from_urlish(unc), Some(PathBuf::from(unc)));
-        assert!(local_path_from_urlish("https://example.com/model").is_none());
-    }
-
-    #[test]
-    fn direct_doc_id_parser_accepts_only_deterministic_inputs() {
-        assert_eq!(
-            direct_doc_id_from_query(
-                "https://www.ato.gov.au/law/view/document?docid=PAC%2F19970038%2F203-55"
-            ),
-            Some("PAC/19970038/203-55".to_string())
-        );
-        assert_eq!(
-            direct_doc_id_from_query("PAC/19970038/203-55"),
-            Some("PAC/19970038/203-55".to_string())
-        );
-        assert_eq!(
-            direct_doc_id_from_query("see anchor PAC/19010002/Pt8 in the page"),
-            None
-        );
-        assert_eq!(direct_doc_id_from_query("not/a<script>"), None);
     }
 
     #[test]
@@ -2683,26 +2606,115 @@ mod tests {
     }
 
     #[test]
+    fn ato_link_normalization_preserves_canonical_document_identity() -> Result<()> {
+        let source = r#"<p>See <a href="https://www.ato.gov.au/law/view/document?docid=pac%2F19970038%2F203-55">section 203-55</a>.</p>"#;
+        let rewritten = rewrite_links_html(source);
+        assert!(rewritten.contains(r#"data-doc-id="ato:PAC/19970038/203-55""#));
+        assert!(!rewritten.contains("href="));
+
+        let anchors = extract_anchors(&rewritten, "TR/2026/1");
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].kind, "sister");
+        assert_eq!(
+            anchors[0].target_doc_id.as_deref(),
+            Some("PAC/19970038/203-55")
+        );
+
+        let chunks = chunk_html(&rewritten, Some("Example"), EMBED_MAX_TOKENS);
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.text.contains("[doc:ato:PAC/19970038/203-55]")));
+        Ok(())
+    }
+
+    #[test]
+    fn real_ato_fixture_normalization_is_stable() -> Result<()> {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ato/cr-2025-13.html");
+        let raw = fs::read_to_string(&fixture)?;
+        assert_eq!(
+            format!("{:x}", Sha256::digest(raw.as_bytes())),
+            "c81e129935e1748e87b80e1be91a672511763660e36a6ef685e14bb0854c4a0e"
+        );
+        let cleaned = clean_ato_html(&raw);
+        let (with_assets, assets) = rewrite_images_html(
+            &cleaned.html,
+            Some("CLR/CR202513/NAT/ATO/00001"),
+            Some(&fixture),
+        );
+        let normalized = normalise_named_anchors(&with_assets);
+        let linked = rewrite_links_html(&normalized);
+        let final_html = strip_attributes(&linked);
+        let chunks = chunk_html_with_token_count(
+            &final_html,
+            cleaned.title.as_deref(),
+            EMBED_MAX_TOKENS,
+            |text| Ok(text.split_whitespace().count().max(1)),
+        )?;
+        let chunk_projection = chunks
+            .iter()
+            .map(|chunk| format!("{}\t{:?}\t{}", chunk.ord, chunk.anchor, chunk.text))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let anchors = extract_anchors(&final_html, "CLR/CR202513/NAT/ATO/00001");
+        assert_eq!(assets.len(), 0);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(final_html.as_bytes())),
+            "d35a6cb8d7df1f4cb8bed9a700dc4cdf7ccc78cf9763dc240b6404443faba0cf"
+        );
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(chunk_projection.as_bytes())),
+            "d1332bde3d401fabb500ff799409e1054a854dbcf3957d63ae41ae4e0990152b"
+        );
+        assert_eq!(anchors.len(), 9);
+        assert_eq!(
+            anchors
+                .iter()
+                .filter(|anchor| anchor.kind == "in_doc")
+                .count(),
+            5
+        );
+        assert_eq!(
+            anchors
+                .iter()
+                .filter(|anchor| anchor.kind == "sister")
+                .filter_map(|anchor| anchor.target_doc_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                "PAC/19360027/6(1)",
+                "PAC/19970038/83A-33",
+                "PAC/19970038/83A-45(4)",
+                "PAC/19970038/83A-45(5)(a)",
+            ]
+        );
+        assert!(final_html.contains(r#"data-doc-id="ato:PAC/19970038/83A-33""#));
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.text.contains("[doc:ato:PAC/19970038/83A-33]")));
+        Ok(())
+    }
+
+    #[test]
     fn html_elements_and_assets_are_queryable() -> Result<()> {
         let _lock = lock_test_db();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
-        let html = r#"<div id="LawContent"><h1 id="top">Example</h1><p>See <a data-doc-id="PAC/19970038/203-55">203-55</a>.</p><span data-asset-ref="ato-image://DOC_HTML/0">[image: Diagram]</span></div>"#;
+        let (dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
+        let html = r#"<div id="LawContent"><h1 id="top">Example</h1><p>See <a data-doc-id="ato:PAC/19970038/203-55">203-55</a>.</p><span data-asset-ref="ato:DOC_HTML/0">[image: Diagram]</span></div>"#;
+        insert_doc(&conn, "DOC_HTML")?;
         conn.execute(
-            "INSERT INTO documents(doc_id, type, title, downloaded_at, content_hash, pack_sha8, html) VALUES (?, 'Public_ruling', ?, ?, ?, '00000000', ?)",
-            params![
-                "DOC_HTML",
-                "HTML doc",
-                Utc::now().to_rfc3339(),
-                "htmlhash",
-                compress_text(html)?,
-            ],
+            "UPDATE documents SET title = ?1, html = ?2
+             WHERE source_id = ?3 AND native_id = ?4",
+            params!["HTML doc", compress_text(html)?, TEST_SOURCE_ID, "DOC_HTML"],
         )?;
         let asset_bytes: &[u8] = b"GIF89a-fake-payload";
         conn.execute(
-            "INSERT INTO document_assets(asset_ref, doc_id, media_type, alt, title, sha256, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO document_assets
+                (source_id, asset_id, native_id, media_type, alt, title, sha256, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
-                "ato-image://DOC_HTML/0",
+                TEST_SOURCE_ID,
+                "DOC_HTML/0",
                 "DOC_HTML",
                 "image/gif",
                 Option::<String>::None,
@@ -2714,7 +2726,9 @@ mod tests {
         drop(conn);
 
         with_data_dir(dir.path(), || -> Result<()> {
-            let content = get_asset("ato-image://DOC_HTML/0")?;
+            let source: legal_model::SourceId = TEST_SOURCE_ID.parse()?;
+            let asset = AssetRef::new(source.clone(), "DOC_HTML/0")?;
+            let content = get_asset(asset)?;
             let items = content.as_array().expect("content array");
             assert_eq!(
                 items.len(),
@@ -2726,7 +2740,7 @@ mod tests {
                 items[0]["text"]
                     .as_str()
                     .unwrap()
-                    .contains("ato-image://DOC_HTML/0"),
+                    .contains("ato:DOC_HTML/0"),
                 "caption should reference asset_ref: {}",
                 items[0]["text"]
             );
@@ -2739,7 +2753,7 @@ mod tests {
             };
             assert_eq!(decoded, asset_bytes);
 
-            let missing = get_asset("ato-image://DOC_HTML/missing")?;
+            let missing = get_asset(AssetRef::new(source, "DOC_HTML/missing")?)?;
             let items = missing.as_array().expect("content array");
             assert_eq!(items.len(), 1);
             assert_eq!(items[0]["type"], "text");
@@ -2768,10 +2782,12 @@ mod tests {
         source_type: &str,
     ) -> Result<()> {
         conn.execute(
-            "INSERT INTO definitions(definition_id, term, norm_term, doc_id, source_title, \
-             source_type, scope, anchor, ord, body) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, ?)",
+            "INSERT INTO definitions
+                (source_id, definition_id, term, norm_term, native_id, source_title,
+                 source_type, scope, anchor, ord, body)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, 0, ?9)",
             params![
+                TEST_SOURCE_ID,
                 definition_id,
                 term,
                 normalize_definition_term(term),
@@ -2786,7 +2802,7 @@ mod tests {
     }
 
     fn with_data_dir<R>(dir: &std::path::Path, f: impl FnOnce() -> R) -> R {
-        let _environment = TestEnvironment::set(&[("ATO_MCP_DATA_DIR", dir.as_os_str())]);
+        let _environment = TestEnvironment::set(&[("LEGAL_MCP_DATA_DIR", dir.as_os_str())]);
         f()
     }
 
@@ -2795,7 +2811,7 @@ mod tests {
     }
 
     #[test]
-    fn read_http_state_accepts_legacy_port_only_file() -> Result<()> {
+    fn read_http_state_requires_the_exact_endpoint_contract() -> Result<()> {
         let _lock = lock_test_db();
         let dir = tempdir()?;
         fs::write(
@@ -2807,9 +2823,7 @@ mod tests {
 "#,
         )?;
         with_data_dir(dir.path(), || {
-            let state = read_http_state()?.expect("state");
-            assert_eq!(state.port, 37409);
-            assert_eq!(state.url, "http://127.0.0.1:37409/mcp");
+            assert!(read_http_state()?.is_none());
             Ok(())
         })
     }
@@ -2841,7 +2855,7 @@ mod tests {
                 "method": "tools/call",
                 "params": {
                     "name": "get_chunks",
-                    "arguments": {"chunk_ids": [1], "before": "2"}
+                    "arguments": {"chunks": [{"generation": TEST_GENERATION, "source": TEST_SOURCE_ID, "chunk_id": 1}], "before": "2"}
                 }
             }),
             &state,
@@ -2856,7 +2870,7 @@ mod tests {
                 "method": "tools/call",
                 "params": {
                     "name": "get_chunks",
-                    "arguments": {"chunk_ids": [1], "cursor": false}
+                    "arguments": {"chunks": [{"generation": TEST_GENERATION, "source": TEST_SOURCE_ID, "chunk_id": 1}], "cursor": false}
                 }
             }),
             &state,
@@ -2894,13 +2908,117 @@ mod tests {
         )
         .expect("unknown tools/call parameter response");
         assert_eq!(unknown_param["error"]["code"], -32602);
+
+        let unknown_source = handle_rpc(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "search",
+                    "arguments": {"query": "tax", "source": "unknown-source"}
+                }
+            }),
+            &state,
+        )
+        .expect("unknown source response");
+        assert_eq!(unknown_source["error"]["code"], -32602);
+        assert!(unknown_source["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("available sources: ato")));
+    }
+
+    #[test]
+    fn public_tool_protocol_requires_canonical_source_qualified_references() {
+        let chunk = json!({
+            "generation": TEST_GENERATION,
+            "source": TEST_SOURCE_ID,
+            "chunk_id": 91,
+        });
+        let document = json!({"source": TEST_SOURCE_ID, "native_id": "PAC/1"});
+        let asset = json!({"source": TEST_SOURCE_ID, "asset_id": "DOC/0"});
+        for params in [
+            json!({
+                "name": "search",
+                "arguments": {
+                    "query": "tax",
+                    "source": TEST_SOURCE_ID,
+                    "similar_to_chunk": chunk.clone(),
+                }
+            }),
+            json!({"name": "get_chunks", "arguments": {"chunks": [chunk.clone()]}}),
+            json!({"name": "get_asset", "arguments": {"asset": asset}}),
+            json!({"name": "get_doc_anchors", "arguments": {"document": document.clone()}}),
+            json!({
+                "name": "get_definition",
+                "arguments": {"term": "car", "source": TEST_SOURCE_ID, "context_document": document}
+            }),
+            json!({"name": "stats", "arguments": {}}),
+            json!({"name": "fetch", "arguments": {"uri": "legal://ato/PAC%2F1?pit=20200101000000"}}),
+        ] {
+            validate_tool_call(&params).expect("canonical protocol arguments must validate");
+        }
+
+        for params in [
+            json!({"name": "search", "arguments": {"query": "tax"}}),
+            json!({"name": "search", "arguments": {"query": "tax", "similar_to_chunk_id": 91}}),
+            json!({"name": "search", "arguments": {"query": "tax", "similar_to": chunk.clone()}}),
+            json!({"name": "get_chunks", "arguments": {"chunk_ids": [91]}}),
+            json!({"name": "get_asset", "arguments": {"asset_ref": "ato-image://DOC/0"}}),
+            json!({"name": "get_doc_anchors", "arguments": {"doc_id": "PAC/1"}}),
+            json!({
+                "name": "get_definition",
+                "arguments": {"term": "car", "context_doc_id": "PAC/1"}
+            }),
+            json!({"name": "get_definition", "arguments": {"term": "car"}}),
+            json!({"name": "fetch", "arguments": {"uri": "ato:PAC/1"}}),
+            json!({"name": "fetch", "arguments": {"uri": "legal://ato/PAC/1"}}),
+            json!({"name": "get_chunks", "arguments": {"chunks": [{"generation": TEST_GENERATION, "chunk_id": 1}]}}),
+        ] {
+            assert!(
+                validate_tool_call(&params).is_err(),
+                "alternate identity unexpectedly validated: {params}"
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_uri_validation_requires_canonical_legal_uri() {
+        for uri in [
+            "legal://ato/PAC%2F1",
+            "legal://ato/PAC%2F1?pit=20200101000000",
+            "legal://ato/PAC%2F1?pit=20200101000000&view=HISTFT",
+        ] {
+            validate_fetch_uri(uri).unwrap_or_else(|error| {
+                panic!("canonical fetch URI `{uri}` must validate: {error}")
+            });
+        }
+
+        for uri in [
+            "",
+            "PAC/1",
+            "ato:PAC/1",
+            "legal://ato/PAC/1",
+            "legal://ato/PAC%2f1",
+            "legal://ato/PAC%2F1?",
+            "legal://ato/PAC%2F1#top",
+            "legal://ato/PAC%ZZ1",
+            "legal://ato/%E2%28",
+            "legal://user@ato/PAC%2F1",
+            "legal://unknown-source/PAC%2F1",
+        ] {
+            assert!(
+                validate_fetch_uri(uri).is_err(),
+                "noncanonical fetch URI unexpectedly validated: {uri}"
+            );
+        }
     }
 
     #[test]
     fn get_chunks_cursor_round_trips_through_json_rpc() -> Result<()> {
         let _lock = TEST_DB_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        let (dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
         insert_doc(&conn, "DOC_CURSOR")?;
         insert_chunk(&conn, 91, "DOC_CURSOR", 0, "abcdefghij")?;
         drop(conn);
@@ -2909,8 +3027,9 @@ mod tests {
             let state = ServerState::new();
             let mut cursor = None;
             let mut combined = String::new();
+            let chunk_ref = ChunkRef::new(TEST_GENERATION, TEST_SOURCE_ID.parse()?, 91)?;
             for id in 1..=4 {
-                let mut arguments = json!({"chunk_ids": [91], "max_chars": 4});
+                let mut arguments = json!({"chunks": [chunk_ref.clone()], "max_chars": 4});
                 if let Some(value) = cursor.take() {
                     arguments["cursor"] = JsonValue::String(value);
                 }
@@ -2961,15 +3080,15 @@ mod tests {
     // ----- W1.5 manifest version guards -----
 
     #[test]
-    fn manifest_compat_accepts_current_schema() {
-        let m = sample_manifest(SUPPORTED_SCHEMA_VERSION as i64, "");
-        assert!(enforce_manifest_compatibility(&m).is_ok());
+    fn manifest_accepts_the_exact_current_schema() {
+        let m = sample_manifest(SUPPORTED_SCHEMA_VERSION, "");
+        assert!(validate_manifest(&m).is_ok());
     }
 
     #[test]
-    fn manifest_compat_rejects_newer_schema() {
-        let m = sample_manifest((SUPPORTED_SCHEMA_VERSION + 1) as i64, "");
-        let err = enforce_manifest_compatibility(&m).unwrap_err();
+    fn manifest_rejects_a_different_newer_schema() {
+        let m = sample_manifest(SUPPORTED_SCHEMA_VERSION + 1, "");
+        let err = validate_manifest(&m).unwrap_err();
         assert!(
             err.to_string().contains("not supported"),
             "expected unsupported-schema message, got: {err}"
@@ -2977,9 +3096,9 @@ mod tests {
     }
 
     #[test]
-    fn manifest_compat_rejects_older_schema() {
-        let m = sample_manifest((SUPPORTED_SCHEMA_VERSION - 1) as i64, "");
-        let err = enforce_manifest_compatibility(&m).unwrap_err();
+    fn manifest_rejects_a_different_older_schema() {
+        let m = sample_manifest(SUPPORTED_SCHEMA_VERSION - 1, "");
+        let err = validate_manifest(&m).unwrap_err();
         assert!(
             err.to_string().contains("not supported"),
             "expected unsupported-schema message, got: {err}"
@@ -2987,169 +3106,33 @@ mod tests {
     }
 
     #[test]
-    fn manifest_json_rejects_legacy_or_unknown_fields() -> Result<()> {
-        let mut with_reranker = serde_json::to_value(sample_manifest(
-            SUPPORTED_SCHEMA_VERSION as i64,
+    fn manifest_json_rejects_unknown_fields_at_every_level() -> Result<()> {
+        let mut top_level = serde_json::to_value(sample_manifest(
+            SUPPORTED_SCHEMA_VERSION,
             env!("CARGO_PKG_VERSION"),
         ))?;
-        with_reranker["reranker"] = JsonValue::Null;
+        top_level["unexpected"] = JsonValue::Null;
         assert!(
-            serde_json::from_value::<Manifest>(with_reranker).is_err(),
-            "legacy reranker field must not be silently ignored"
+            serde_json::from_value::<Manifest>(top_level).is_err(),
+            "unknown manifest fields must be rejected"
         );
 
-        let mut with_legacy_docs = serde_json::to_value(sample_manifest(
-            SUPPORTED_SCHEMA_VERSION as i64,
+        let mut nested = serde_json::to_value(sample_manifest(
+            SUPPORTED_SCHEMA_VERSION,
             env!("CARGO_PKG_VERSION"),
         ))?;
-        with_legacy_docs["docs"] = json!([]);
+        nested["model"]["unexpected"] = json!(true);
         assert!(
-            serde_json::from_value::<Manifest>(with_legacy_docs).is_err(),
-            "legacy docs field must not be silently ignored"
-        );
-
-        let mut with_tokenizer_sha = serde_json::to_value(sample_manifest(
-            SUPPORTED_SCHEMA_VERSION as i64,
-            env!("CARGO_PKG_VERSION"),
-        ))?;
-        with_tokenizer_sha["model"]["tokenizer_sha256"] = json!("legacy");
-        assert!(
-            serde_json::from_value::<Manifest>(with_tokenizer_sha).is_err(),
-            "legacy tokenizer_sha256 field must not be silently ignored"
+            serde_json::from_value::<Manifest>(nested).is_err(),
+            "unknown nested fields must be rejected"
         );
         Ok(())
     }
 
     #[test]
-    fn publish_model_info_rejects_non_hf_mirror_without_metadata() {
-        let current = ModelInfo {
-            id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: EMBEDDING_MODEL_FINGERPRINT.to_string(),
-            size: EMBEDDING_MODEL_HF_SIZE,
-            url: EMBEDDING_MODEL_HF_URL.to_string(),
-        };
-        let err = resolve_publish_model_info(
-            &current,
-            Some("https://mirror.example.com/granite.tar.zst"),
-            None,
-            None,
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("--model-sha256") && err.to_string().contains("--model-size"),
-            "expected explicit mirror metadata error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn publish_model_info_accepts_non_hf_mirror_with_metadata() -> Result<()> {
-        let current = ModelInfo {
-            id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: EMBEDDING_MODEL_FINGERPRINT.to_string(),
-            size: EMBEDDING_MODEL_HF_SIZE,
-            url: EMBEDDING_MODEL_HF_URL.to_string(),
-        };
-        let resolved = resolve_publish_model_info(
-            &current,
-            Some("https://mirror.example.com/granite.tar.zst"),
-            Some("abc123"),
-            Some(42),
-        )?;
-        assert_eq!(resolved.url, "https://mirror.example.com/granite.tar.zst");
-        assert_eq!(resolved.sha256, "abc123");
-        assert_eq!(resolved.size, 42);
-        Ok(())
-    }
-
-    #[test]
-    fn publish_model_info_rejects_https_huggingface_url() {
-        let current = ModelInfo {
-            id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: EMBEDDING_MODEL_FINGERPRINT.to_string(),
-            size: EMBEDDING_MODEL_HF_SIZE,
-            url: EMBEDDING_MODEL_HF_URL.to_string(),
-        };
-        let err = resolve_publish_model_info(
-            &current,
-            Some("https://huggingface.co/onnx-community/granite-embedding-small-english-r2-ONNX/resolve/main/model.tar.zst"),
-            None,
-            None,
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("hf://repo@revision"),
-            "expected hf:// guidance, got: {err}"
-        );
-    }
-
-    #[test]
-    fn publish_model_info_rejects_hf_url_without_revision() {
-        let current = ModelInfo {
-            id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: EMBEDDING_MODEL_FINGERPRINT.to_string(),
-            size: EMBEDDING_MODEL_HF_SIZE,
-            url: EMBEDDING_MODEL_HF_URL.to_string(),
-        };
-        let err =
-            resolve_publish_model_info(&current, Some("hf://owner/model"), None, None).unwrap_err();
-        assert!(
-            err.to_string().contains("explicit revision"),
-            "expected explicit revision error, got: {err}"
-        );
-        assert!(parse_hf_model_url("hf://owner/model").is_none());
-    }
-
-    #[test]
-    fn publish_model_info_rejects_hf_metadata_mismatch() {
-        let current = ModelInfo {
-            id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: EMBEDDING_MODEL_FINGERPRINT.to_string(),
-            size: EMBEDDING_MODEL_HF_SIZE,
-            url: EMBEDDING_MODEL_HF_URL.to_string(),
-        };
-        let err = resolve_publish_model_info(
-            &current,
-            Some(EMBEDDING_MODEL_HF_URL),
-            Some("wrong-sha"),
-            Some(EMBEDDING_MODEL_HF_SIZE),
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("pinned Granite fingerprint"),
-            "expected HF sha mismatch error, got: {err}"
-        );
-        let err = resolve_publish_model_info(
-            &current,
-            Some(EMBEDDING_MODEL_HF_URL),
-            Some(EMBEDDING_MODEL_FINGERPRINT),
-            Some(1),
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("pinned Granite file set"),
-            "expected HF size mismatch error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn publish_model_info_defaults_placeholder_to_pinned_hf_source() -> Result<()> {
-        let current = ModelInfo {
-            id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: String::new(),
-            size: 0,
-            url: "PENDING".to_string(),
-        };
-        let resolved = resolve_publish_model_info(&current, None, None, None)?;
-        assert_eq!(resolved.url, EMBEDDING_MODEL_HF_URL);
-        assert_eq!(resolved.sha256, EMBEDDING_MODEL_FINGERPRINT);
-        assert_eq!(resolved.size, EMBEDDING_MODEL_HF_SIZE);
-        Ok(())
-    }
-
-    #[test]
-    fn manifest_compat_rejects_higher_min_client_version() {
-        let m = sample_manifest(SUPPORTED_SCHEMA_VERSION as i64, "999.0.0");
-        let err = enforce_manifest_compatibility(&m).unwrap_err();
+    fn manifest_rejects_a_higher_minimum_client_version() {
+        let m = sample_manifest(SUPPORTED_SCHEMA_VERSION, "999.0.0");
+        let err = validate_manifest(&m).unwrap_err();
         assert!(
             err.to_string().contains("999"),
             "expected min_client_version error, got: {err}"
@@ -3157,95 +3140,13 @@ mod tests {
     }
 
     #[test]
-    fn manifest_compat_accepts_min_client_version_at_or_below_current() {
+    fn manifest_accepts_a_satisfied_minimum_client_version() {
         // Any version that's <= the current binary's version should pass.
         let current = env!("CARGO_PKG_VERSION");
-        let m = sample_manifest(SUPPORTED_SCHEMA_VERSION as i64, current);
-        assert!(enforce_manifest_compatibility(&m).is_ok());
-        let m = sample_manifest(SUPPORTED_SCHEMA_VERSION as i64, "0.0.1");
-        assert!(enforce_manifest_compatibility(&m).is_ok());
-    }
-
-    #[test]
-    fn manifest_compat_rejects_non_hf_model_without_metadata() {
-        let mut m = sample_manifest(SUPPORTED_SCHEMA_VERSION as i64, "");
-        m.model = ModelInfo {
-            id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: String::new(),
-            size: 0,
-            url: "model-bundle.tar.zst".to_string(),
-        };
-        let err = enforce_manifest_compatibility(&m).unwrap_err();
-        assert!(
-            err.to_string().contains("sha256 and positive size"),
-            "expected non-HF model metadata error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn manifest_compat_rejects_hf_model_metadata_mismatch() {
-        let mut m = sample_manifest(SUPPORTED_SCHEMA_VERSION as i64, "");
-        m.model = ModelInfo {
-            id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: "wrong-sha".to_string(),
-            size: EMBEDDING_MODEL_HF_SIZE,
-            url: EMBEDDING_MODEL_HF_URL.to_string(),
-        };
-        let err = enforce_manifest_compatibility(&m).unwrap_err();
-        assert!(
-            err.to_string().contains("pinned Granite fingerprint"),
-            "expected HF sha mismatch error, got: {err}"
-        );
-        m.model.sha256 = EMBEDDING_MODEL_FINGERPRINT.to_string();
-        m.model.size = 1;
-        let err = enforce_manifest_compatibility(&m).unwrap_err();
-        assert!(
-            err.to_string().contains("pinned Granite file set"),
-            "expected HF size mismatch error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn stage_model_rejects_wrong_non_hf_bundle_size() -> Result<()> {
-        let _lock = lock_test_db();
-        let data = tempdir()?;
-        let release = tempdir()?;
-        let model_bundle = release.path().join("model-bundle.tar.zst");
-        let bundle_bytes = write_test_model_bundle(&model_bundle)?;
-        let manifest = Manifest {
-            schema_version: SUPPORTED_SCHEMA_VERSION as i64,
-            manifest_format_version: None,
-            index_version: "wrong-model-size".to_string(),
-            created_at: "2026-05-04T00:00:00Z".to_string(),
-            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
-            model: ModelInfo {
-                id: EMBEDDING_MODEL_ID.to_string(),
-                sha256: sha256_hex(&bundle_bytes),
-                size: bundle_bytes.len() as u64 + 1,
-                url: "model-bundle.tar.zst".to_string(),
-            },
-            db: ManifestDb {
-                url: "ato.db.zst".to_string(),
-                sha256: "0000000000000000000000000000000000000000000000000000000000000000"
-                    .to_string(),
-                size: 1,
-            },
-            ann: None,
-        };
-        let context = UrlContext {
-            manifest_dir: Some(release.path().to_path_buf()),
-            manifest_base_url: None,
-        };
-        with_data_dir(data.path(), || -> Result<()> {
-            let err = stage_model(&manifest, &context, &staging_dir()?).unwrap_err();
-            let message = err.to_string();
-            assert!(
-                message.contains("artifact") && message.contains("size mismatch"),
-                "expected artifact size validation error, got: {err}"
-            );
-            Ok(())
-        })?;
-        Ok(())
+        let m = sample_manifest(SUPPORTED_SCHEMA_VERSION, current);
+        assert!(validate_manifest(&m).is_ok());
+        let m = sample_manifest(SUPPORTED_SCHEMA_VERSION, "0.0.1");
+        assert!(validate_manifest(&m).is_ok());
     }
 
     #[test]
@@ -3262,8 +3163,7 @@ mod tests {
     fn build_model_dir_rejects_wrong_model_bytes() -> Result<()> {
         let dir = tempdir()?;
         fs::create_dir_all(dir.path().join("onnx"))?;
-        fs::write(dir.path().join("onnx/model_fp16.onnx"), b"wrong onnx")?;
-        fs::write(dir.path().join("onnx/model_fp16.onnx_data"), b"wrong data")?;
+        fs::write(dir.path().join("onnx/model.onnx"), b"wrong onnx")?;
         fs::write(dir.path().join("tokenizer.json"), b"wrong tokenizer")?;
 
         let err = SemanticModelPaths::from_model_dir(dir.path()).unwrap_err();
@@ -3280,7 +3180,7 @@ mod tests {
         let (dir, db) = make_test_db()?;
         let conn = open_write_at(&db)?;
         // Force a bogus schema version via raw SQL.
-        set_meta(&conn, "schema_version", "99")?;
+        set_corpus_meta(&conn, "schema_version", "99")?;
         drop(conn);
         with_data_dir(dir.path(), || -> Result<()> {
             let err = open_read().unwrap_err();
@@ -3300,142 +3200,19 @@ mod tests {
         let conn = open_write_at(&db)?;
         // init_db wrote the row; now delete it to simulate a corrupt /
         // partial install.
-        conn.execute("DELETE FROM meta WHERE key = 'schema_version'", [])?;
+        conn.execute("DELETE FROM corpus_meta WHERE key = 'schema_version'", [])?;
         drop(conn);
         with_data_dir(dir.path(), || -> Result<()> {
             let err = open_read().unwrap_err();
             let msg = err.to_string();
             assert!(
-                msg.contains("corrupt or incomplete") && msg.contains("ato-mcp update"),
+                msg.contains("corrupt or incomplete")
+                    && msg.contains("install a complete corpus generation"),
                 "expected corrupt/incomplete error with init hint, got: {msg}"
             );
             Ok(())
         })?;
         Ok(())
-    }
-
-    #[test]
-    fn vector_search_requires_model_marker_match() -> Result<()> {
-        let _lock = lock_test_db();
-        let (dir, db) = make_test_db()?;
-        let conn = open_write_at(&db)?;
-        set_meta(&conn, "embedding_model_id", EMBEDDING_MODEL_ID)?;
-        drop(conn);
-        let model_sha = "expected-model-marker";
-        let manifest = Manifest {
-            schema_version: SUPPORTED_SCHEMA_VERSION as i64,
-            manifest_format_version: None,
-            index_version: "test-marker-readiness".to_string(),
-            created_at: "2026-05-04T00:00:00Z".to_string(),
-            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
-            model: ModelInfo {
-                id: EMBEDDING_MODEL_ID.to_string(),
-                sha256: model_sha.to_string(),
-                size: 5,
-                url: "model-bundle.tar.zst".to_string(),
-            },
-            db: ManifestDb {
-                url: "ato.db.zst".to_string(),
-                sha256: "0000000000000000000000000000000000000000000000000000000000000000"
-                    .to_string(),
-                size: 1,
-            },
-            ann: None,
-        };
-
-        with_data_dir(dir.path(), || -> Result<()> {
-            fs::write(
-                installed_manifest_path()?,
-                serde_json::to_vec_pretty(&manifest)?,
-            )?;
-            fs::write(model_path()?, b"model")?;
-            fs::write(model_data_path()?, b"model-data")?;
-            fs::write(tokenizer_path()?, br#"{"version":"1.0"}"#)?;
-            fs::write(live_dir()?.join(".model.sha256"), "wrong-marker")?;
-
-            let conn = open_read()?;
-            let err = ensure_vector_search_ready(&conn).unwrap_err();
-            assert!(
-                err.to_string().contains("installed semantic model files"),
-                "expected model marker readiness error, got: {err}"
-            );
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    #[test]
-    fn ann_generation_update_commits_with_one_active_pointer() -> Result<()> {
-        let _lock = lock_test_db();
-        let data = tempdir()?;
-        with_data_dir(data.path(), || -> Result<()> {
-            let staging_root = staging_dir()?.join("generation-promotion-test");
-            fs::create_dir_all(&staging_root)?;
-            let staged_db = staging_root.join("ato.db");
-            let staged_ann = staging_root.join(ANN_FILENAME);
-            fs::write(&staged_db, b"database-generation")?;
-            fs::write(&staged_ann, b"ann-generation")?;
-
-            let model_dir = staging_dir()?.join("generation-model-test");
-            fs::create_dir_all(&model_dir)?;
-            for file in EMBEDDING_MODEL_HF_FILES {
-                fs::write(
-                    model_dir.join(file.output_name),
-                    file.output_name.as_bytes(),
-                )?;
-            }
-            let staged_model = StagedModel {
-                dir: model_dir,
-                marker_value: "model-marker".to_string(),
-            };
-            let mut manifest = sample_manifest(SUPPORTED_SCHEMA_VERSION as i64, "");
-            manifest.manifest_format_version = Some(SUPPORTED_MANIFEST_FORMAT_VERSION);
-            manifest.ann = Some(sample_ann("d"));
-            promote_staged_update(
-                Some(&staged_model),
-                StagedCorpusUpdate {
-                    staging_root,
-                    staged_db,
-                    staged_ann: Some(staged_ann),
-                    stats: UpdateStats::default(),
-                },
-                &manifest,
-            )?;
-
-            let key = active_generation_key()?.expect("generation must be active");
-            assert_eq!(key.len(), 64);
-            assert_eq!(fs::read(db_path()?)?, b"database-generation");
-            assert_eq!(fs::read(ann_path()?)?, b"ann-generation");
-            let installed: Manifest =
-                serde_json::from_slice(&fs::read(installed_manifest_path()?)?)?;
-            assert_eq!(installed, manifest);
-            let running_state = ServerState::default();
-
-            let legacy_root = staging_dir()?.join("legacy-generation-promotion-test");
-            fs::create_dir_all(&legacy_root)?;
-            let legacy_db = legacy_root.join("ato.db");
-            fs::write(&legacy_db, b"legacy-database-generation")?;
-            let legacy_manifest = sample_manifest(SUPPORTED_SCHEMA_VERSION as i64, "");
-            promote_staged_update(
-                None,
-                StagedCorpusUpdate {
-                    staging_root: legacy_root,
-                    staged_db: legacy_db,
-                    staged_ann: None,
-                    stats: UpdateStats::default(),
-                },
-                &legacy_manifest,
-            )?;
-            let legacy_key = active_generation_key()?.expect("legacy generation must be active");
-            assert_ne!(legacy_key, key);
-            assert_eq!(fs::read(db_path()?)?, b"legacy-database-generation");
-            assert!(!ann_path()?.exists());
-            let installed: Manifest =
-                serde_json::from_slice(&fs::read(installed_manifest_path()?)?)?;
-            assert_eq!(installed, legacy_manifest);
-            assert!(running_state.ensure_corpus_generation_unchanged().is_err());
-            Ok(())
-        })
     }
 
     // ----- Cleanup: highlight_snippet fallback paths -----
@@ -3479,66 +3256,58 @@ mod tests {
         );
     }
 
-    fn sha256_hex(bytes: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(bytes))
-    }
-
-    fn write_test_tar_zst(path: &Path, files: &[(&str, &[u8])]) -> Result<()> {
-        let file = File::create(path)?;
-        let encoder = zstd::stream::write::Encoder::new(file, 3)?;
-        let mut archive = tar::Builder::new(encoder);
-        for (name, bytes) in files {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(bytes.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            archive.append_data(&mut header, *name, Cursor::new(*bytes))?;
-        }
-        let encoder = archive.into_inner()?;
-        encoder.finish()?;
-        Ok(())
-    }
-
-    fn write_test_model_bundle(path: &Path) -> Result<Vec<u8>> {
-        let files: &[(&str, &[u8])] = &[
-            ("model_fp16.onnx", b"dummy onnx bytes"),
-            ("model_fp16.onnx_data", b"dummy external data"),
-            ("tokenizer.json", br#"{"version":"1.0","truncation":null}"#),
-        ];
-        write_test_tar_zst(path, files)?;
-        fs::read(path).map_err(Into::into)
-    }
-
-    fn sample_manifest(schema_version: i64, min_client_version: &str) -> Manifest {
+    fn sample_manifest(schema_version: u32, min_client_version: &str) -> Manifest {
+        let ann = source_registry()
+            .source_ids()
+            .into_iter()
+            .map(|source| {
+                (
+                    source.parse().expect("valid registered source id"),
+                    sample_ann(source, "3"),
+                )
+            })
+            .collect();
         Manifest {
             schema_version,
-            manifest_format_version: None,
             index_version: "test".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
-            min_client_version: min_client_version.to_string(),
+            min_client_version: if min_client_version.is_empty() {
+                env!("CARGO_PKG_VERSION").to_string()
+            } else {
+                min_client_version.to_string()
+            },
             model: ModelInfo {
-                id: "test-model".to_string(),
-                sha256: "0".to_string(),
-                size: 0,
-                url: "https://example.com".to_string(),
+                id: EMBEDDING_MODEL_ID.to_string(),
+                fingerprint: EMBEDDING_MODEL_FINGERPRINT.to_string(),
+                model: ManifestFile {
+                    path: EMBEDDING_MODEL_FILES[0].output_name.to_string(),
+                    sha256: EMBEDDING_MODEL_FILES[0].sha256.to_string(),
+                    size: EMBEDDING_MODEL_FILES[0].size,
+                },
+                tokenizer: ManifestFile {
+                    path: EMBEDDING_MODEL_FILES[1].output_name.to_string(),
+                    sha256: EMBEDDING_MODEL_FILES[1].sha256.to_string(),
+                    size: EMBEDDING_MODEL_FILES[1].size,
+                },
             },
             db: ManifestDb {
-                url: "ato.db.zst".to_string(),
-                sha256: "0000000000000000000000000000000000000000000000000000000000000000"
-                    .to_string(),
+                path: LEGAL_DB_FILENAME.to_string(),
+                sha256: "5".repeat(64),
                 size: 1,
             },
-            ann: None,
+            ann,
         }
     }
 
-    fn sample_ann(digest_character: &str) -> ManifestAnn {
+    fn sample_ann(source: &str, digest_character: &str) -> ManifestAnn {
+        let source_id: legal_model::SourceId = source.parse().expect("valid test source id");
         ManifestAnn {
+            source_id: source_id.clone(),
             format: ANN_FORMAT.to_string(),
             format_version: ANN_FORMAT_VERSION,
             library: ANN_LIBRARY.to_string(),
             library_version: ANN_LIBRARY_VERSION.to_string(),
-            url: ANN_FILENAME.to_string(),
+            path: crate::ann::sidecar_manifest_path(&source_id),
             sha256: digest_character.repeat(64),
             size: 1,
             corpus_id: format!("sha256:{}", digest_character.repeat(64)),
@@ -3555,60 +3324,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn manifest_v2_requires_ann_while_legacy_manifest_remains_readable() {
-        let mut manifest = sample_manifest(SUPPORTED_SCHEMA_VERSION as i64, "");
-        assert!(enforce_manifest_compatibility(&manifest).is_ok());
-        manifest.manifest_format_version = Some(SUPPORTED_MANIFEST_FORMAT_VERSION);
-        let error = enforce_manifest_compatibility(&manifest).unwrap_err();
-        assert!(error.to_string().contains("requires an ANN sidecar"));
-        manifest.manifest_format_version = None;
-        manifest.ann = Some(sample_ann("e"));
-        let error = enforce_manifest_compatibility(&manifest).unwrap_err();
-        assert!(error.to_string().contains("legacy manifest format 1"));
-    }
-
-    // ----- serve startup: probe + server_instructions -----
+    // ----- serve startup instructions -----
 
     #[test]
-    fn server_instructions_no_db_tells_user_to_run_update() -> Result<()> {
+    fn server_instructions_no_db_requires_local_activation() -> Result<()> {
         let _lock = lock_test_db();
         let data = tempdir()?;
         with_data_dir(data.path(), || {
-            let text = server_instructions(None);
+            let (text, ready) = server_instructions();
+            assert!(!ready);
             assert!(
-                text.contains("not yet installed"),
-                "missing not-installed prefix in: {text}"
+                text.contains("No local corpus generation is active"),
+                "missing no-generation prefix in: {text}"
             );
             assert!(
-                text.contains("ato-mcp update"),
-                "missing install command in: {text}"
-            );
-            assert!(text.contains("1.5 GB"), "missing size hint in: {text}");
-        });
-        Ok(())
-    }
-
-    #[test]
-    fn server_instructions_appends_update_available_notice() -> Result<()> {
-        let _lock = lock_test_db();
-        let data = tempdir()?;
-        with_data_dir(data.path(), || {
-            let notice = UpdateAvailability {
-                available_index_version: "2026.05.20".to_string(),
-            };
-            let text = server_instructions(Some(&notice));
-            assert!(
-                text.contains("updated ATO corpus generation is available"),
-                "missing update notice in: {text}"
+                text.contains("legal-mcp activate"),
+                "missing local activation command in: {text}"
             );
             assert!(
-                text.contains("2026.05.20"),
-                "missing available index_version in: {text}"
-            );
-            assert!(
-                text.contains("ato-mcp update"),
-                "missing update command in: {text}"
+                text.contains("no corpus downloads"),
+                "missing local-only guarantee: {text}"
             );
         });
         Ok(())
@@ -3619,8 +3354,8 @@ mod tests {
         let _lock = lock_test_db();
         let data = tempdir()?;
         with_data_dir(data.path(), || {
-            let static_chars = ATO_MCP_USE_INSTRUCTIONS.chars().count();
-            let static_words = ATO_MCP_USE_INSTRUCTIONS.split_whitespace().count();
+            let static_chars = LEGAL_MCP_USE_INSTRUCTIONS.chars().count();
+            let static_words = LEGAL_MCP_USE_INSTRUCTIONS.split_whitespace().count();
             assert!(
                 static_chars <= 600,
                 "static MCP use instructions are too large: {static_chars} chars"
@@ -3630,7 +3365,8 @@ mod tests {
                 "static MCP use instructions are too large: {static_words} words"
             );
 
-            let text = server_instructions(None);
+            let (text, ready) = server_instructions();
+            assert!(!ready);
             let boot_chars = text.chars().count();
             assert!(
                 boot_chars <= 1_100,
@@ -3677,150 +3413,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn check_for_update_availability_returns_none_when_no_installed_manifest() -> Result<()> {
-        let _lock = lock_test_db();
-        let data = tempdir()?;
-        let result = with_data_dir(data.path(), || {
-            check_for_update_availability("https://example.invalid/manifest.json")
-        });
-        assert!(
-            result?.is_none(),
-            "probe must return None when no installed manifest is present"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn corpus_manifest_discovery_paginates_past_binary_only_releases() -> Result<()> {
-        let first_page = (0..100)
-            .map(|index| {
-                json!({
-                    "tag_name": format!("v0.15.{index}"),
-                    "assets": [{
-                        "name": "ato-mcp-x86_64-unknown-linux-gnu.tar.gz",
-                        "browser_download_url": format!("https://example.test/{index}/binary.tar.gz")
-                    }]
-                })
-            })
-            .collect::<Vec<_>>();
-        let second_page = vec![json!({
-            "tag_name": "corpus",
-            "assets": [{
-                "name": "manifest.json",
-                "browser_download_url": "https://example.test/corpus/manifest.json"
-            }]
-        })];
-        let pages = [
-            serde_json::to_vec(&first_page)?,
-            serde_json::to_vec(&second_page)?,
-        ];
-        let mut fetched_pages = Vec::new();
-        let manifest = source::resolve_corpus_manifest_url_with(|page| {
-            fetched_pages.push(page);
-            pages
-                .get(page - 1)
-                .cloned()
-                .ok_or_else(|| anyhow!("unexpected release page {page}"))
-        })?;
-        assert_eq!(fetched_pages, vec![1, 2]);
-        assert_eq!(manifest, "https://example.test/corpus/manifest.json");
-        Ok(())
-    }
-
-    #[test]
-    fn check_for_update_availability_suppresses_incompatible_schema() -> Result<()> {
-        let _lock = lock_test_db();
-        let data = tempdir()?;
-        let release = tempdir()?;
-        let release_dir = release.path();
-        let manifest_path = release_dir.join("manifest.json");
-
-        let installed = Manifest {
-            schema_version: SUPPORTED_SCHEMA_VERSION as i64,
-            manifest_format_version: None,
-            index_version: "test-installed".to_string(),
-            created_at: "2026-05-04T00:00:00Z".to_string(),
-            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
-            model: ModelInfo {
-                id: EMBEDDING_MODEL_ID.to_string(),
-                sha256: "installed-sha".to_string(),
-                size: 5,
-                url: "model-bundle.tar.zst".to_string(),
-            },
-            db: ManifestDb {
-                url: "ato.db.zst".to_string(),
-                sha256: "0000000000000000000000000000000000000000000000000000000000000000"
-                    .to_string(),
-                size: 1,
-            },
-            ann: None,
-        };
-        // Published manifest declares a schema this binary can't ingest.
-        let published = Manifest {
-            schema_version: (SUPPORTED_SCHEMA_VERSION + 1) as i64,
-            index_version: "test-future".to_string(),
-            ..installed.clone()
-        };
-        fs::write(&manifest_path, serde_json::to_vec_pretty(&published)?)?;
-
-        let result = with_data_dir(data.path(), || -> Result<Option<UpdateAvailability>> {
-            fs::write(
-                installed_manifest_path()?,
-                serde_json::to_vec_pretty(&installed)?,
-            )?;
-            check_for_update_availability(manifest_path.to_str().expect("utf-8 path"))
-        });
-        assert!(
-            result?.is_none(),
-            "probe must suppress the notice when the published index requires a newer binary"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn check_for_update_availability_returns_none_when_already_current() -> Result<()> {
-        let _lock = lock_test_db();
-        let data = tempdir()?;
-        let release = tempdir()?;
-        let release_dir = release.path();
-        let manifest_path = release_dir.join("manifest.json");
-        let manifest = Manifest {
-            schema_version: SUPPORTED_SCHEMA_VERSION as i64,
-            manifest_format_version: None,
-            index_version: "test-probe-current".to_string(),
-            created_at: "2026-05-04T00:00:00Z".to_string(),
-            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
-            model: ModelInfo {
-                id: EMBEDDING_MODEL_ID.to_string(),
-                sha256: "current-probe-sha".to_string(),
-                size: 5,
-                url: "model-bundle.tar.zst".to_string(),
-            },
-            db: ManifestDb {
-                url: "ato.db.zst".to_string(),
-                sha256: "0000000000000000000000000000000000000000000000000000000000000000"
-                    .to_string(),
-                size: 1,
-            },
-            ann: None,
-        };
-        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
-
-        let result = with_data_dir(data.path(), || -> Result<Option<UpdateAvailability>> {
-            fs::write(
-                installed_manifest_path()?,
-                serde_json::to_vec_pretty(&manifest)?,
-            )?;
-            check_for_update_availability(manifest_path.to_str().expect("utf-8 path"))
-        });
-        assert!(
-            result?.is_none(),
-            "probe must return None when installed corpus already matches the published manifest"
-        );
-        Ok(())
-    }
-
     // ===== Wave 2 ===========================================================
 
     // ----- Schema v10 -----
@@ -3830,8 +3422,8 @@ mod tests {
         let _lock = lock_test_db();
         let (_dir, db) = make_test_db()?;
         let conn = open_write_at(&db)?;
-        let value =
-            get_meta(&conn, "schema_version")?.expect("init_db should have written schema_version");
+        let value = get_corpus_meta(&conn, "schema_version")?
+            .expect("init_db should have written schema_version");
         assert_eq!(value, SUPPORTED_SCHEMA_VERSION.to_string());
         assert_eq!(SUPPORTED_SCHEMA_VERSION, 10);
         Ok(())
@@ -3844,7 +3436,7 @@ mod tests {
         let conn = open_write_at(&db)?;
         // Stamp an unsupported schema version. The user-facing error must
         // refuse the corpus cleanly instead of trying to mutate it in place.
-        set_meta(&conn, "schema_version", "5")?;
+        set_corpus_meta(&conn, "schema_version", "5")?;
         drop(conn);
         with_data_dir(dir.path(), || -> Result<()> {
             let err = open_read().unwrap_err();
@@ -3866,7 +3458,7 @@ mod tests {
 
     #[test]
     fn build_doc_filter_includes_withdrawn_clause_by_default() {
-        let f = build_doc_filter("d", None, None, None, None, true, true);
+        let f = test_doc_filter(&test_source(), true, true);
         assert!(
             f.sql.contains("d.withdrawn_date IS NULL"),
             "current_only=true must add withdrawn_date IS NULL clause; sql={}",
@@ -3876,7 +3468,7 @@ mod tests {
 
     #[test]
     fn build_doc_filter_omits_withdrawn_clause_when_disabled() {
-        let f = build_doc_filter("d", None, None, None, None, true, false);
+        let f = test_doc_filter(&test_source(), true, false);
         assert!(
             !f.sql.contains("withdrawn_date"),
             "current_only=false must not mention withdrawn_date; sql={}",
@@ -3886,7 +3478,7 @@ mod tests {
 
     #[test]
     fn build_doc_filter_uses_current_prefix_policy() {
-        let f = build_doc_filter("d", None, None, None, None, false, true);
+        let f = test_doc_filter(&test_source(), false, true);
         assert!(
             f.sql.contains("d.type NOT IN (?)"),
             "default policy must exclude EV by prefix; sql={}",
@@ -3918,6 +3510,17 @@ mod tests {
     }
 
     #[test]
+    fn build_doc_filter_does_not_apply_ato_policy_to_frl() -> Result<()> {
+        let source: SourceId = "frl".parse()?;
+        let filter = test_doc_filter(&source, false, true);
+        assert!(!filter.sql.contains("type NOT IN"));
+        assert!(!filter.sql.contains("date >="));
+        assert!(filter.sql.contains("d.withdrawn_date IS NULL"));
+        assert_eq!(filter.params, vec![Value::Text("frl".to_string())]);
+        Ok(())
+    }
+
+    #[test]
     fn fts_query_uses_or_term_semantics() {
         assert_eq!(
             fts_query("a Body research-development evidence"),
@@ -3926,8 +3529,10 @@ mod tests {
     }
 
     #[test]
-    fn search_next_call_preserves_current_only_false() {
+    fn search_next_call_preserves_current_only_false() -> Result<()> {
+        let source: legal_model::SourceId = TEST_SOURCE_ID.parse()?;
         let opts = SearchOptions {
+            source: source.clone(),
             k: 8,
             types: None,
             date_from: None,
@@ -3939,19 +3544,26 @@ mod tests {
             current_only: false,
             max_per_doc: DEFAULT_MAX_PER_DOC,
             include_snippet: true,
-            similar_to_chunk_id: None,
+            similar_to_chunk: None,
             seed_text: None,
         };
-        let call = search_next_call("depreciation", 16, &opts);
+        let call = search_next_call("depreciation", 16, &opts)?;
         assert!(
             call.contains("current_only=false"),
             "continuation must preserve withdrawn-doc inclusion; got: {call}"
         );
+        assert!(
+            call.contains(r#"source="ato""#),
+            "continuation must preserve the selected source; got: {call}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn search_next_call_preserves_seed_text() {
+    fn search_next_call_preserves_seed_text() -> Result<()> {
+        let source: legal_model::SourceId = TEST_SOURCE_ID.parse()?;
         let opts = SearchOptions {
+            source: source.clone(),
             k: 8,
             types: None,
             date_from: None,
@@ -3963,21 +3575,25 @@ mod tests {
             current_only: true,
             max_per_doc: DEFAULT_MAX_PER_DOC,
             include_snippet: true,
-            similar_to_chunk_id: None,
+            similar_to_chunk: None,
             seed_text: Some("an external passage about depreciation"),
         };
-        let call = search_next_call("ignored", 16, &opts);
+        let call = search_next_call("ignored", 16, &opts)?;
         assert!(
             call.contains(r#"seed_text="an external passage about depreciation""#),
             "continuation must preserve seed_text; got: {call}"
         );
+        Ok(())
     }
 
     #[test]
-    fn search_next_call_prefers_similar_to_chunk_id_over_seed_text() {
-        // similar_to_chunk_id wins if both are set — the continuation must
+    fn search_next_call_prefers_similar_to_over_seed_text() -> Result<()> {
+        let source: legal_model::SourceId = TEST_SOURCE_ID.parse()?;
+        let chunk = ChunkRef::new(TEST_GENERATION, source.clone(), 42)?;
+        // similar_to_chunk wins if both are set — the continuation must
         // not also carry seed_text.
         let opts = SearchOptions {
+            source: source.clone(),
             k: 8,
             types: None,
             date_from: None,
@@ -3989,18 +3605,19 @@ mod tests {
             current_only: true,
             max_per_doc: DEFAULT_MAX_PER_DOC,
             include_snippet: true,
-            similar_to_chunk_id: Some(42),
+            similar_to_chunk: Some(chunk),
             seed_text: Some("should be ignored"),
         };
-        let call = search_next_call("ignored", 16, &opts);
+        let call = search_next_call("ignored", 16, &opts)?;
         assert!(
-            call.contains("similar_to_chunk_id=42"),
-            "continuation must preserve similar_to_chunk_id; got: {call}"
+            call.contains("similar_to_chunk={"),
+            "continuation must preserve similar_to_chunk; got: {call}"
         );
         assert!(
             !call.contains("seed_text"),
-            "similar_to_chunk_id wins — seed_text must not appear; got: {call}"
+            "similar_to_chunk wins — seed_text must not appear; got: {call}"
         );
+        Ok(())
     }
 
     // ----- W2.4 Hit JSON serialisation skips unset currency fields -----
@@ -4008,14 +3625,14 @@ mod tests {
     #[test]
     fn hit_json_skips_unset_currency_fields() -> Result<()> {
         let hit = Hit {
-            doc_id: "DOC".to_string(),
+            document: DocumentId::new(TEST_SOURCE_ID.parse()?, "DOC")?,
             title: "T".to_string(),
             doc_type: "Public_ruling".to_string(),
             date: None,
             anchor: None,
             snippet: Some("snip".to_string()),
             canonical_url: "https://x".to_string(),
-            chunk_id: None,
+            chunk: None,
             next_call: None,
             withdrawn_date: None,
             superseded_by: None,
@@ -4040,26 +3657,32 @@ mod tests {
     #[test]
     fn hit_json_emits_currency_fields_when_set() -> Result<()> {
         let hit = Hit {
-            doc_id: "DOC".to_string(),
+            document: DocumentId::new(TEST_SOURCE_ID.parse()?, "DOC")?,
             title: "T".to_string(),
             doc_type: "Public_ruling".to_string(),
             date: Some("2022-07-01".to_string()),
             anchor: None,
             snippet: Some("snip".to_string()),
             canonical_url: "https://x".to_string(),
-            chunk_id: None,
+            chunk: None,
             next_call: None,
             withdrawn_date: Some("2025-10-31".to_string()),
-            superseded_by: Some("TR 2025/1".to_string()),
-            replaces: Some("TR 2021/3".to_string()),
+            superseded_by: Some(DocumentId::new(TEST_SOURCE_ID.parse()?, "TR 2025/1")?),
+            replaces: Some(DocumentId::new(TEST_SOURCE_ID.parse()?, "TR 2021/3")?),
             has_in_doc_links: None,
             has_related_docs: None,
             has_history: None,
         };
         let parsed: serde_json::Value = serde_json::from_str(&serde_json::to_string(&hit)?)?;
         assert_eq!(parsed["withdrawn_date"], json!("2025-10-31"));
-        assert_eq!(parsed["superseded_by"], json!("TR 2025/1"));
-        assert_eq!(parsed["replaces"], json!("TR 2021/3"));
+        assert_eq!(
+            parsed["superseded_by"],
+            json!({"source": "ato", "native_id": "TR 2025/1"})
+        );
+        assert_eq!(
+            parsed["replaces"],
+            json!({"source": "ato", "native_id": "TR 2021/3"})
+        );
         Ok(())
     }
 
@@ -4068,8 +3691,8 @@ mod tests {
     #[test]
     fn collect_title_hits_excludes_withdrawn_by_default() -> Result<()> {
         let _lock = lock_test_db();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        let (dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
         // Two docs sharing a query keyword in their titles. One is withdrawn.
         insert_doc_full(&conn, "DOC_CURRENT", Some("2024-01-01"), None, None, None)?;
         insert_doc_full(
@@ -4082,49 +3705,74 @@ mod tests {
         )?;
         // title_fts must be populated for the bm25 path.
         conn.execute(
-            "INSERT INTO title_fts(doc_id, title, headings) VALUES (?, ?, '')",
-            params!["DOC_CURRENT", "depreciation effective life rulings"],
+            "INSERT INTO title_fts(source_id, native_id, title, headings)
+             VALUES (?1, ?2, ?3, '')",
+            params![
+                TEST_SOURCE_ID,
+                "DOC_CURRENT",
+                "depreciation effective life rulings"
+            ],
         )?;
         conn.execute(
-            "INSERT INTO title_fts(doc_id, title, headings) VALUES (?, ?, '')",
-            params!["DOC_WITHDRAWN", "depreciation effective life rulings"],
+            "INSERT INTO title_fts(source_id, native_id, title, headings)
+             VALUES (?1, ?2, ?3, '')",
+            params![
+                TEST_SOURCE_ID,
+                "DOC_WITHDRAWN",
+                "depreciation effective life rulings"
+            ],
         )?;
         // Update documents.title to match what title_fts holds (collect_title_hits
         // joins documents to fetch the displayed title back).
         conn.execute(
-            "UPDATE documents SET title = ? WHERE doc_id = ?",
-            params!["depreciation effective life rulings", "DOC_CURRENT"],
+            "UPDATE documents SET title = ?1 WHERE source_id = ?2 AND native_id = ?3",
+            params![
+                "depreciation effective life rulings",
+                TEST_SOURCE_ID,
+                "DOC_CURRENT"
+            ],
         )?;
         conn.execute(
-            "UPDATE documents SET title = ? WHERE doc_id = ?",
-            params!["depreciation effective life rulings", "DOC_WITHDRAWN"],
+            "UPDATE documents SET title = ?1 WHERE source_id = ?2 AND native_id = ?3",
+            params![
+                "depreciation effective life rulings",
+                TEST_SOURCE_ID,
+                "DOC_WITHDRAWN"
+            ],
         )?;
         drop(conn);
 
         with_data_dir(dir.path(), || -> Result<()> {
             let conn = open_read()?;
+            let source = test_source();
             // Default: current_only=true → withdrawn doc filtered out.
-            let filter = build_doc_filter("d", None, None, None, None, true, true);
-            let hits = collect_title_hits(&conn, "depreciation", 10, &filter)?;
-            let doc_ids: Vec<&str> = hits.iter().map(|h| h.doc_id.as_str()).collect();
+            let filter = test_doc_filter(&source, true, true);
+            let hits = collect_title_hits(&conn, &source, "depreciation", 10, &filter)?;
+            let doc_ids: Vec<String> = hits.iter().map(|h| h.document.public_ref()).collect();
             assert!(
-                doc_ids.contains(&"DOC_CURRENT"),
+                doc_ids.contains(&"ato:DOC_CURRENT".to_string()),
                 "current doc should appear; got: {doc_ids:?}"
             );
             assert!(
-                !doc_ids.contains(&"DOC_WITHDRAWN"),
+                !doc_ids.contains(&"ato:DOC_WITHDRAWN".to_string()),
                 "withdrawn doc should be filtered out by default; got: {doc_ids:?}"
             );
 
             // current_only=false → withdrawn doc returned with marker visible.
-            let filter = build_doc_filter("d", None, None, None, None, true, false);
-            let hits = collect_title_hits(&conn, "depreciation", 10, &filter)?;
+            let filter = test_doc_filter(&source, true, false);
+            let hits = collect_title_hits(&conn, &source, "depreciation", 10, &filter)?;
             let withdrawn_hit = hits
                 .iter()
-                .find(|h| h.doc_id == "DOC_WITHDRAWN")
+                .find(|h| h.document.native_id == "DOC_WITHDRAWN")
                 .expect("withdrawn doc should appear when current_only=false");
             assert_eq!(withdrawn_hit.withdrawn_date.as_deref(), Some("2023-06-15"));
-            assert_eq!(withdrawn_hit.superseded_by.as_deref(), Some("TR 2024/1"));
+            assert_eq!(
+                withdrawn_hit
+                    .superseded_by
+                    .as_ref()
+                    .map(|document| document.native_id.as_str()),
+                Some("TR 2024/1")
+            );
             Ok(())
         })?;
         Ok(())
@@ -4133,8 +3781,8 @@ mod tests {
     #[test]
     fn collect_title_hits_prefers_direct_doc_id_hits() -> Result<()> {
         let _lock = lock_test_db();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        let (dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
         insert_doc_full(
             &conn,
             "PAC/19970038/203-50",
@@ -4144,17 +3792,21 @@ mod tests {
             None,
         )?;
         conn.execute(
-            "UPDATE documents SET type = 'PAC', title = ? WHERE doc_id = ?",
+            "UPDATE documents SET type = 'PAC', title = ?1
+             WHERE source_id = ?2 AND native_id = ?3",
             params![
-                "Income Tax Assessment Act 1997 s 203-50",
+                "Completely unrelated provision heading",
+                TEST_SOURCE_ID,
                 "PAC/19970038/203-50"
             ],
         )?;
         conn.execute(
-            "INSERT INTO title_fts(doc_id, title, headings) VALUES (?, ?, '')",
+            "INSERT INTO title_fts(source_id, native_id, title, headings)
+             VALUES (?1, ?2, ?3, '')",
             params![
+                TEST_SOURCE_ID,
                 "PAC/19970038/203-50",
-                "Income Tax Assessment Act 1997 s 203-50"
+                "Completely unrelated provision heading"
             ],
         )?;
         insert_doc_full(
@@ -4166,23 +3818,39 @@ mod tests {
             None,
         )?;
         conn.execute(
-            "UPDATE documents SET type = 'PAC', title = ? WHERE doc_id = ?",
-            params!["Income Tax Assessment Act 1997 s 8-1", "PAC/19970038/8-1"],
+            "UPDATE documents SET type = 'PAC', title = ?1
+             WHERE source_id = ?2 AND native_id = ?3",
+            params![
+                "Income Tax Assessment Act 1997 s 8-1",
+                TEST_SOURCE_ID,
+                "PAC/19970038/8-1"
+            ],
         )?;
         conn.execute(
-            "INSERT INTO title_fts(doc_id, title, headings) VALUES (?, ?, '')",
-            params!["PAC/19970038/8-1", "Income Tax Assessment Act 1997 s 8-1"],
+            "INSERT INTO title_fts(source_id, native_id, title, headings)
+             VALUES (?1, ?2, ?3, '')",
+            params![
+                TEST_SOURCE_ID,
+                "PAC/19970038/8-1",
+                "Income Tax Assessment Act 1997 s 8-1"
+            ],
         )?;
         drop(conn);
 
         with_data_dir(dir.path(), || -> Result<()> {
             let conn = open_read()?;
-            let filter = build_doc_filter("d", None, None, None, None, false, true);
-            let hits = collect_title_hits(&conn, "PAC/19970038/203-50", 5, &filter)?;
-            assert_eq!(hits[0].doc_id, "PAC/19970038/203-50");
-            let hits =
-                collect_title_hits(&conn, "Income Tax Assessment Act 1997 s 8-1", 5, &filter)?;
-            assert_eq!(hits[0].doc_id, "PAC/19970038/8-1");
+            let source = test_source();
+            let filter = test_doc_filter(&source, false, true);
+            let hits = collect_title_hits(&conn, &source, "PAC/19970038/203-50", 5, &filter)?;
+            assert_eq!(hits[0].document.public_ref(), "ato:PAC/19970038/203-50");
+            let hits = collect_title_hits(
+                &conn,
+                &source,
+                "Income Tax Assessment Act 1997 s 8-1",
+                5,
+                &filter,
+            )?;
+            assert_eq!(hits[0].document.public_ref(), "ato:PAC/19970038/8-1");
             Ok(())
         })?;
         Ok(())
@@ -4191,8 +3859,8 @@ mod tests {
     #[test]
     fn get_definition_returns_matching_entry_only() -> Result<()> {
         let _lock = lock_test_db();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        let (dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
         insert_doc_full(
             &conn,
             "PAC/19970038/995-1",
@@ -4218,10 +3886,12 @@ mod tests {
         drop(conn);
 
         with_data_dir(dir.path(), || -> Result<()> {
+            let context = DocumentId::new(TEST_SOURCE_ID.parse()?, "PAC/19970038/203-50")?;
             let json_str = get_definition(
                 "corporate tax gross-up rate",
                 GetDefinitionOptions {
-                    context_doc_id: Some("PAC/19970038/203-50"),
+                    source: TEST_SOURCE_ID.parse()?,
+                    context_document: Some(context),
                     max_defs: 5,
                 },
             )?;
@@ -4240,8 +3910,8 @@ mod tests {
     #[test]
     fn get_definition_ignores_non_legislation_sources() -> Result<()> {
         let _lock = lock_test_db();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        let (dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
         insert_doc_full(
             &conn,
             "PAC/19860039/136",
@@ -4285,10 +3955,12 @@ mod tests {
         drop(conn);
 
         with_data_dir(dir.path(), || -> Result<()> {
+            let context = DocumentId::new(TEST_SOURCE_ID.parse()?, "PAC/19860039/136")?;
             let json_str = get_definition(
                 "car",
                 GetDefinitionOptions {
-                    context_doc_id: Some("PAC/19860039/136"),
+                    source: TEST_SOURCE_ID.parse()?,
+                    context_document: Some(context),
                     max_defs: 10,
                 },
             )?;
@@ -4315,13 +3987,14 @@ mod tests {
             "car\tcar\tnoun\ta road vehicle powered by an engine\n",
         )?;
         let _environment = TestEnvironment::set(&[
-            ("ATO_MCP_DATA_DIR", dir.path().as_os_str()),
+            ("LEGAL_MCP_DATA_DIR", dir.path().as_os_str()),
             (ORDINARY_DICTIONARY_PATH_ENV, dictionary_path.as_os_str()),
         ]);
         let result = get_definition(
             "car",
             GetDefinitionOptions {
-                context_doc_id: None,
+                source: TEST_SOURCE_ID.parse()?,
+                context_document: None,
                 max_defs: 5,
             },
         );
@@ -4361,11 +4034,15 @@ mod tests {
         has_history: i64,
     ) -> Result<()> {
         conn.execute(
-            "INSERT INTO documents(doc_id, type, title, downloaded_at, content_hash, pack_sha8, html, has_in_doc_links, has_related_docs, has_history) \
-             VALUES (?, 'Public_ruling', ?, ?, ?, '00000000', ?, ?, ?, ?)",
+            "INSERT INTO documents
+                (source_id, native_id, type, title, canonical_url, downloaded_at,
+                 content_hash, html, has_in_doc_links, has_related_docs, has_history)
+             VALUES (?1, ?2, 'Public_ruling', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
+                TEST_SOURCE_ID,
                 doc_id,
                 format!("{doc_id} title"),
+                format!("https://www.ato.gov.au/law/view/document?docid={doc_id}"),
                 Utc::now().to_rfc3339(),
                 "deadbeef",
                 compress_text("<div></div>")?,
@@ -4395,7 +4072,9 @@ mod tests {
             )?;
         }
 
-        let hits = lexical_search(&conn, "common distinctive", &SqlFilter::default(), 10)?;
+        let source = test_source();
+        let filter = test_doc_filter(&source, false, true);
+        let hits = lexical_search(&conn, &source, "common distinctive", &filter, 10)?;
         assert_eq!(hits.len(), 3, "OR semantics should retain partial matches");
         assert_eq!(hits[0].chunk_id, 1);
         assert!(hits[0].score > hits[1].score);
@@ -4411,12 +4090,14 @@ mod tests {
         let title = "Body by Michael Pty Ltd v Industry Innovation and Science Australia";
         insert_doc_full(&conn, doc_id, Some("2025-01-24"), None, None, None)?;
         conn.execute(
-            "UPDATE documents SET type = 'JUD', title = ? WHERE doc_id = ?",
-            params![title, doc_id],
+            "UPDATE documents SET type = 'JUD', title = ?1
+             WHERE source_id = ?2 AND native_id = ?3",
+            params![title, TEST_SOURCE_ID, doc_id],
         )?;
         conn.execute(
-            "INSERT INTO title_fts(doc_id, title, headings) VALUES (?, ?, '')",
-            params![doc_id, title],
+            "INSERT INTO title_fts(source_id, native_id, title, headings)
+             VALUES (?1, ?2, ?3, '')",
+            params![TEST_SOURCE_ID, doc_id, title],
         )?;
         let citation_chunk =
             "Body by Michael Pty Ltd v Industry Innovation and Science Australia [2025] ARTA 44";
@@ -4441,8 +4122,9 @@ mod tests {
             None,
         )?;
         conn.execute(
-            "UPDATE documents SET type = 'RUL', title = ? WHERE doc_id = 'RUL/DECOY/00001'",
-            params![title],
+            "UPDATE documents SET type = 'RUL', title = ?1
+             WHERE source_id = ?2 AND native_id = 'RUL/DECOY/00001'",
+            params![title, TEST_SOURCE_ID],
         )?;
         insert_chunk(
             &conn,
@@ -4459,9 +4141,11 @@ mod tests {
 
         with_data_dir(dir.path(), || -> Result<()> {
             let types = vec!["JUD".to_string()];
+            let source = test_source();
             let json_str = search(
                 "Body by Michael Industry Innovation Science Australia 2025 ARTA 44 absence documentary evidence not determinative",
                 SearchOptions {
+                    source: source.clone(),
                     k: 10,
                     types: Some(&types),
                     date_from: None,
@@ -4473,20 +4157,90 @@ mod tests {
                     current_only: true,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
-                    similar_to_chunk_id: None,
+                    similar_to_chunk: None,
                     seed_text: None,
                 },
                 None,
             )?;
             let parsed: JsonValue = serde_json::from_str(&json_str)?;
             let hits = parsed["hits"].as_array().expect("hits array");
-            assert!(hits.iter().any(|hit| hit["doc_id"] == doc_id));
+            assert!(hits.iter().any(|hit| hit["document"]
+                == json!({
+                    "source": TEST_SOURCE_ID,
+                    "native_id": doc_id,
+                })));
             assert!(hits.iter().all(|hit| hit["type"] == "JUD"));
             let title_hits = parsed["title_hits"].as_array().expect("title_hits array");
-            assert!(title_hits.iter().any(|hit| hit["doc_id"] == doc_id));
+            assert!(title_hits.iter().any(|hit| hit["document"]
+                == json!({
+                    "source": TEST_SOURCE_ID,
+                    "native_id": doc_id,
+                })));
             Ok(())
         })?;
         Ok(())
+    }
+
+    #[test]
+    fn keyword_search_isolates_sources_with_the_same_native_id() -> Result<()> {
+        let _lock = lock_test_db();
+        let (dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
+        insert_doc(&conn, "SHARED")?;
+        insert_chunk(&conn, 201, "SHARED", 0, "shared needle ATO material")?;
+        conn.execute(
+            "INSERT INTO chunks_fts(rowid, text) VALUES (201, 'shared needle ATO material')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO sources(source_id, display_name) VALUES ('frl', 'Federal Register of Legislation')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO documents
+                (source_id, native_id, type, title, canonical_url, downloaded_at, content_hash, html)
+             VALUES ('frl', 'SHARED', 'Act', 'Shared Act',
+                     'https://www.legislation.gov.au/SHARED/latest/text', ?1, 'frl-hash', ?2)",
+            params![Utc::now().to_rfc3339(), compress_text("<article>FRL</article>")?],
+        )?;
+        conn.execute(
+            "INSERT INTO chunks(chunk_id, source_id, native_id, ord, text)
+             VALUES (202, 'frl', 'SHARED', 0, ?1)",
+            [compress_text("shared needle Federal Register material")?],
+        )?;
+        conn.execute(
+            "INSERT INTO chunks_fts(rowid, text) VALUES (202, 'shared needle Federal Register material')",
+            [],
+        )?;
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            let response = search(
+                "shared needle",
+                SearchOptions {
+                    source: "frl".parse()?,
+                    k: 10,
+                    types: None,
+                    date_from: None,
+                    date_to: None,
+                    doc_scope: None,
+                    mode: SearchMode::Keyword,
+                    sort_by: SortBy::Relevance,
+                    include_old: true,
+                    current_only: true,
+                    max_per_doc: DEFAULT_MAX_PER_DOC,
+                    include_snippet: true,
+                    similar_to_chunk: None,
+                    seed_text: None,
+                },
+                None,
+            )?;
+            let value: JsonValue = serde_json::from_str(&response)?;
+            let hits = value["hits"].as_array().expect("hits");
+            assert!(!hits.is_empty());
+            assert!(hits.iter().all(|hit| hit["document"]["source"] == "frl"));
+            Ok(())
+        })
     }
 
     #[test]
@@ -4496,16 +4250,19 @@ mod tests {
         let conn = open_write_at(&db)?;
         insert_doc(&conn, "JUD/TEST/00001")?;
         conn.execute(
-            "UPDATE documents SET type = 'JUD' WHERE doc_id = 'JUD/TEST/00001'",
-            [],
+            "UPDATE documents SET type = 'JUD'
+             WHERE source_id = ?1 AND native_id = 'JUD/TEST/00001'",
+            [TEST_SOURCE_ID],
         )?;
         drop(conn);
 
         with_data_dir(dir.path(), || -> Result<()> {
             let types = vec!["case".to_string()];
+            let source = test_source();
             let err = search(
                 "documentary evidence",
                 SearchOptions {
+                    source: source.clone(),
                     k: 10,
                     types: Some(&types),
                     date_from: None,
@@ -4517,7 +4274,7 @@ mod tests {
                     current_only: true,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
-                    similar_to_chunk_id: None,
+                    similar_to_chunk: None,
                     seed_text: None,
                 },
                 None,
@@ -4534,8 +4291,8 @@ mod tests {
     #[test]
     fn test_search_hit_carries_navigation_flags() -> Result<()> {
         let _lock = lock_test_db();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        let (dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
         // Doc with has_in_doc_links=1; one chunk so search returns it.
         insert_doc_with_nav_flags(&conn, "DOC_NAV", 1, 0, 0)?;
         let text = "Research and development tax incentive paragraph navigation flag canary text.";
@@ -4547,9 +4304,11 @@ mod tests {
         drop(conn);
 
         with_data_dir(dir.path(), || -> Result<()> {
+            let source = test_source();
             let json_str = search(
                 "research development",
                 SearchOptions {
+                    source: source.clone(),
                     k: 5,
                     types: None,
                     date_from: None,
@@ -4561,7 +4320,7 @@ mod tests {
                     current_only: true,
                     max_per_doc: DEFAULT_MAX_PER_DOC,
                     include_snippet: true,
-                    similar_to_chunk_id: None,
+                    similar_to_chunk: None,
                     seed_text: None,
                 },
                 None,
@@ -4571,7 +4330,10 @@ mod tests {
                 .as_array()
                 .and_then(|a| a.first())
                 .expect("expected at least one hit");
-            assert_eq!(hit["doc_id"], json!("DOC_NAV"));
+            assert_eq!(
+                hit["document"],
+                json!({"source": TEST_SOURCE_ID, "native_id": "DOC_NAV"})
+            );
             assert_eq!(hit["has_in_doc_links"], json!(true));
             // Unset flags must stay absent on the wire (skip_serializing_if).
             assert!(hit.get("has_related_docs").is_none());
@@ -4584,56 +4346,74 @@ mod tests {
     #[test]
     fn test_get_doc_anchors_returns_three_kinds() -> Result<()> {
         let _lock = lock_test_db();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        let (dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
         insert_doc_with_nav_flags(&conn, "DOC_ANCHORS", 1, 1, 1)?;
         // One chunk to satisfy the in_doc target_chunk_id reference.
         insert_chunk(&conn, 100, "DOC_ANCHORS", 0, "body")?;
-        // Sister and history docs — referenced as targets but only need
-        // documents rows for FK integrity (doc_anchors.target_doc_id is
-        // not a FK, so unreferenced is fine — but we'll insert anyway).
         conn.execute(
-            "INSERT INTO doc_anchors(doc_id, ord, kind, label, target_chunk_id, target_doc_id, target_pit) VALUES (?, ?, 'in_doc', 'Section A', ?, NULL, NULL)",
-            params!["DOC_ANCHORS", 0_i64, 100_i64],
+            "INSERT INTO doc_anchors
+                (source_id, native_id, ord, kind, label, target_source_id,
+                 target_native_id, target_chunk_id, target_pit)
+             VALUES (?1, ?2, ?3, 'in_doc', 'Section A', ?1, ?2, ?4, NULL)",
+            params![TEST_SOURCE_ID, "DOC_ANCHORS", 0_i64, 100_i64],
         )?;
         conn.execute(
-            "INSERT INTO doc_anchors(doc_id, ord, kind, label, target_chunk_id, target_doc_id, target_pit) VALUES (?, ?, 'sister', 'Errata', NULL, ?, NULL)",
-            params!["DOC_ANCHORS", 1_i64, "DOC_SISTER"],
+            "INSERT INTO doc_anchors
+                (source_id, native_id, ord, kind, label, target_source_id,
+                 target_native_id, target_chunk_id, target_pit)
+             VALUES (?1, ?2, ?3, 'sister', 'Errata', ?1, ?4, NULL, NULL)",
+            params![TEST_SOURCE_ID, "DOC_ANCHORS", 1_i64, "DOC_SISTER"],
         )?;
-        // History anchor target_doc_id is the BASE doc_id; the timestamp
-        // travels alongside in target_pit.
         conn.execute(
-            "INSERT INTO doc_anchors(doc_id, ord, kind, label, target_chunk_id, target_doc_id, target_pit) VALUES (?, ?, 'history', 'Earlier version', NULL, ?, ?)",
-            params!["DOC_ANCHORS", 2_i64, "DOC_HISTORY", "20200101000000"],
+            "INSERT INTO doc_anchors
+                (source_id, native_id, ord, kind, label, target_source_id,
+                 target_native_id, target_chunk_id, target_pit)
+             VALUES (?1, ?2, ?3, 'history', 'Earlier version', ?1, ?4, NULL, ?5)",
+            params![
+                TEST_SOURCE_ID,
+                "DOC_ANCHORS",
+                2_i64,
+                "DOC_HISTORY",
+                "20200101000000"
+            ],
         )?;
         drop(conn);
 
         with_data_dir(dir.path(), || -> Result<()> {
-            let json_str = get_doc_anchors("DOC_ANCHORS")?;
+            let json_str = get_doc_anchors(DocumentId::new(test_source(), "DOC_ANCHORS")?)?;
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
-            assert_eq!(parsed["doc_id"], json!("DOC_ANCHORS"));
+            assert_eq!(
+                parsed["document"],
+                json!({"source": TEST_SOURCE_ID, "native_id": "DOC_ANCHORS"})
+            );
             let in_doc = parsed["in_doc"].as_array().unwrap();
             let related = parsed["related_docs"].as_array().unwrap();
             let history = parsed["historical_versions"].as_array().unwrap();
             assert_eq!(in_doc.len(), 1, "expected one in_doc anchor");
-            assert_eq!(in_doc[0]["chunk_id"], json!(100));
+            assert_eq!(
+                in_doc[0]["chunk"],
+                json!({
+                    "generation": TEST_GENERATION,
+                    "source": TEST_SOURCE_ID,
+                    "chunk_id": 100,
+                })
+            );
             assert_eq!(in_doc[0]["label"], json!("Section A"));
             assert_eq!(related.len(), 1);
-            assert_eq!(related[0]["doc_id"], json!("DOC_SISTER"));
+            assert_eq!(
+                related[0]["document"],
+                json!({"source": TEST_SOURCE_ID, "native_id": "DOC_SISTER"})
+            );
             assert_eq!(related[0]["label"], json!("Errata"));
             assert_eq!(history.len(), 1);
-            // doc_id is the BASE doc_id; pit carries the timestamp; date is
-            // derived from pit.
-            assert_eq!(history[0]["doc_id"], json!("DOC_HISTORY"));
+            assert_eq!(
+                history[0]["document"],
+                json!({"source": TEST_SOURCE_ID, "native_id": "DOC_HISTORY"})
+            );
             assert_eq!(history[0]["pit"], json!("20200101000000"));
             assert_eq!(history[0]["label"], json!("Earlier version"));
             assert_eq!(history[0]["date"], json!("2020-01-01"));
-            assert_eq!(
-                history[0]["url"],
-                json!(
-                    "https://www.ato.gov.au/law/view/document?docid=DOC_HISTORY&PiT=20200101000000"
-                )
-            );
             Ok(())
         })?;
         Ok(())
@@ -4642,8 +4422,8 @@ mod tests {
     #[test]
     fn get_doc_anchors_resolves_in_doc_chunks_from_stored_html() -> Result<()> {
         let _lock = lock_test_db();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        let (dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
         insert_doc_full(
             &conn,
             "DOC_HTML_ANCHORS",
@@ -4653,18 +4433,21 @@ mod tests {
             None,
         )?;
         conn.execute(
-            "UPDATE documents SET html = ? WHERE doc_id = ?",
+            "UPDATE documents SET html = ?1 WHERE source_id = ?2 AND native_id = ?3",
             params![
                 compress_text(
                     r##"<nav><a href="#target">Target section</a></nav><h2 id="target">Target</h2>"##
                 )?,
+                TEST_SOURCE_ID,
                 "DOC_HTML_ANCHORS"
             ],
         )?;
         conn.execute(
-            "INSERT INTO chunks(chunk_id, doc_id, ord, anchor, text) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO chunks(chunk_id, source_id, native_id, ord, anchor, text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 9001i64,
+                TEST_SOURCE_ID,
                 "DOC_HTML_ANCHORS",
                 0i64,
                 "target",
@@ -4672,17 +4455,27 @@ mod tests {
             ],
         )?;
         conn.execute(
-            "INSERT INTO doc_anchors(doc_id, ord, kind, label, target_chunk_id, target_doc_id, target_pit) VALUES (?, 0, 'in_doc', 'Target section', NULL, NULL, NULL)",
-            params!["DOC_HTML_ANCHORS"],
+            "INSERT INTO doc_anchors
+                (source_id, native_id, ord, kind, label, target_source_id,
+                 target_native_id, target_chunk_id, target_pit)
+             VALUES (?1, ?2, 0, 'in_doc', 'Target section', ?1, ?2, NULL, NULL)",
+            params![TEST_SOURCE_ID, "DOC_HTML_ANCHORS"],
         )?;
         drop(conn);
 
         with_data_dir(dir.path(), || -> Result<()> {
-            let json_str = get_doc_anchors("DOC_HTML_ANCHORS")?;
+            let json_str = get_doc_anchors(DocumentId::new(test_source(), "DOC_HTML_ANCHORS")?)?;
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
             assert_eq!(parsed["in_doc"].as_array().unwrap().len(), 1);
             assert_eq!(parsed["in_doc"][0]["label"], json!("Target section"));
-            assert_eq!(parsed["in_doc"][0]["chunk_id"], json!(9001));
+            assert_eq!(
+                parsed["in_doc"][0]["chunk"],
+                json!({
+                    "generation": TEST_GENERATION,
+                    "source": TEST_SOURCE_ID,
+                    "chunk_id": 9001,
+                })
+            );
             Ok(())
         })?;
         Ok(())
@@ -4691,31 +4484,35 @@ mod tests {
     #[test]
     fn test_get_doc_anchors_pit_to_date() -> Result<()> {
         let _lock = lock_test_db();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        let (dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
         insert_doc_with_nav_flags(&conn, "DOC_PIT", 0, 0, 1)?;
         conn.execute(
-            "INSERT INTO doc_anchors(doc_id, ord, kind, label, target_chunk_id, target_doc_id, target_pit) VALUES (?, ?, 'history', 'Original ruling', NULL, ?, ?)",
-            params!["DOC_PIT", 0_i64, "TR_1996_X", "19960320000001"],
+            "INSERT INTO doc_anchors
+                (source_id, native_id, ord, kind, label, target_source_id,
+                 target_native_id, target_chunk_id, target_pit)
+             VALUES (?1, ?2, ?3, 'history', 'Original ruling', ?1, ?4, NULL, ?5)",
+            params![
+                TEST_SOURCE_ID,
+                "DOC_PIT",
+                0_i64,
+                "TR_1996_X",
+                "19960320000001"
+            ],
         )?;
         drop(conn);
 
         with_data_dir(dir.path(), || -> Result<()> {
-            let json_str = get_doc_anchors("DOC_PIT")?;
+            let json_str = get_doc_anchors(DocumentId::new(test_source(), "DOC_PIT")?)?;
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
             let history = parsed["historical_versions"].as_array().unwrap();
             assert_eq!(history.len(), 1);
-            // Base doc_id is preserved; the timestamp is exposed separately
-            // on the response so the agent can construct the external URL.
-            assert_eq!(history[0]["doc_id"], json!("TR_1996_X"));
+            assert_eq!(
+                history[0]["document"],
+                json!({"source": TEST_SOURCE_ID, "native_id": "TR_1996_X"})
+            );
             assert_eq!(history[0]["pit"], json!("19960320000001"));
             assert_eq!(history[0]["date"], json!("1996-03-20"));
-            assert_eq!(
-                history[0]["url"],
-                json!(
-                    "https://www.ato.gov.au/law/view/document?docid=TR_1996_X&PiT=19960320000001"
-                )
-            );
             Ok(())
         })?;
         Ok(())
@@ -4735,157 +4532,21 @@ mod tests {
         assert!(pit_to_date("abcd0320000000").is_none());
     }
 
-    #[test]
-    fn ensure_model_rejects_incomplete_bundle_before_marker() -> Result<()> {
-        let _lock = lock_test_db();
-        let data = tempdir()?;
-        let release = tempdir()?;
-        let release_dir = release.path();
-        let model_bundle = release_dir.join("model-bundle.tar.zst");
-        write_test_tar_zst(
-            &model_bundle,
-            &[
-                ("model_fp16.onnx", b"dummy onnx bytes"),
-                ("tokenizer.json", br#"{"version":"1.0","truncation":null}"#),
-            ],
-        )?;
-        let model_bundle_bytes = fs::read(&model_bundle)?;
-        let manifest = Manifest {
-            schema_version: SUPPORTED_SCHEMA_VERSION as i64,
-            manifest_format_version: None,
-            index_version: "test-incomplete-model-bundle".to_string(),
-            created_at: "2026-05-04T00:00:00Z".to_string(),
-            min_client_version: env!("CARGO_PKG_VERSION").to_string(),
-            model: ModelInfo {
-                id: EMBEDDING_MODEL_ID.to_string(),
-                sha256: sha256_hex(&model_bundle_bytes),
-                size: model_bundle_bytes.len() as u64,
-                url: "model-bundle.tar.zst".to_string(),
-            },
-            db: ManifestDb {
-                url: "ato.db.zst".to_string(),
-                sha256: "0000000000000000000000000000000000000000000000000000000000000000"
-                    .to_string(),
-                size: 1,
-            },
-            ann: None,
-        };
-        let context = UrlContext {
-            manifest_dir: Some(release_dir.to_path_buf()),
-            manifest_base_url: None,
-        };
-
-        with_data_dir(data.path(), || -> Result<()> {
-            let err = stage_model(&manifest, &context, &staging_dir()?).unwrap_err();
-            assert!(
-                err.to_string().contains("model_fp16.onnx_data"),
-                "expected missing model data error, got: {err}"
-            );
-            assert!(
-                !live_dir()?.join(".model.sha256").exists(),
-                "incomplete bundle must not mark the model installed"
-            );
-            assert!(
-                !model_data_path()?.exists(),
-                "incomplete bundle must not partially install model data"
-            );
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    #[test]
-    fn stage_model_rejects_insecure_or_unapproved_remote_sources() -> Result<()> {
-        let _lock = lock_test_db();
-        let data = tempdir()?;
-        with_data_dir(data.path(), || -> Result<()> {
-            for (url, expected) in [
-                ("http://github.com/model.tar.zst", "must use HTTPS"),
-                (
-                    "https://example.com/model.tar.zst",
-                    "unapproved acquisition hostname",
-                ),
-                (
-                    "https://127.0.0.1/model.tar.zst",
-                    "unapproved acquisition hostname",
-                ),
-            ] {
-                let mut manifest = sample_manifest(SUPPORTED_SCHEMA_VERSION as i64, "");
-                manifest.model = ModelInfo {
-                    id: EMBEDDING_MODEL_ID.to_string(),
-                    sha256: "0000000000000000000000000000000000000000000000000000000000000000"
-                        .to_string(),
-                    size: 1,
-                    url: url.to_string(),
-                };
-                let context = UrlContext {
-                    manifest_dir: None,
-                    manifest_base_url: None,
-                };
-                let error = stage_model(
-                    &manifest,
-                    &context,
-                    &data.path().join("remote-model-staging"),
-                )
-                .unwrap_err();
-                assert!(
-                    error.to_string().contains(expected),
-                    "expected `{expected}` for {url}, got: {error:#}"
-                );
-            }
-            Ok(())
-        })
-    }
-
-    #[test]
-    fn stage_model_rejects_local_artifacts_outside_manifest_directory() -> Result<()> {
-        let _lock = lock_test_db();
-        let data = tempdir()?;
-        let release = tempdir()?;
-        let outside = tempdir()?;
-        let artifact = outside.path().join("model-bundle.tar.zst");
-        fs::write(&artifact, b"x")?;
-        let mut manifest = sample_manifest(SUPPORTED_SCHEMA_VERSION as i64, "");
-        manifest.model = ModelInfo {
-            id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: sha256_hex(b"x"),
-            size: 1,
-            url: artifact.display().to_string(),
-        };
-        let context = UrlContext {
-            manifest_dir: Some(release.path().to_path_buf()),
-            manifest_base_url: None,
-        };
-
-        with_data_dir(data.path(), || -> Result<()> {
-            let error = stage_model(
-                &manifest,
-                &context,
-                &data.path().join("local-model-staging"),
-            )
-            .unwrap_err();
-            assert!(
-                error.to_string().contains("model artifact escaped"),
-                "unexpected error: {error:#}"
-            );
-            Ok(())
-        })
-    }
-
     // ===== Slim Search Surface ============================================
 
     /// Helper: build a Hit with the slim contract. Tests below pin that the
     /// wire shape stays slim (no score, no ord, no debug metadata).
     fn make_test_hit() -> Hit {
+        let source: legal_model::SourceId = TEST_SOURCE_ID.parse().expect("valid test source");
         Hit {
-            doc_id: "DOC".to_string(),
+            document: DocumentId::new(source.clone(), "DOC").expect("valid test document"),
             title: "T".to_string(),
             doc_type: "Public_ruling".to_string(),
             date: None,
             anchor: None,
             snippet: Some("snip".to_string()),
             canonical_url: "https://x".to_string(),
-            chunk_id: Some(1),
+            chunk: Some(ChunkRef::new(TEST_GENERATION, source, 1).expect("valid test chunk")),
             next_call: None,
             withdrawn_date: None,
             superseded_by: None,
@@ -4930,7 +4591,11 @@ mod tests {
             meta.insert(
                 i as i64 + 1,
                 CandidateMeta {
-                    doc_id: format!("DOC_H{i}"),
+                    document: DocumentId::new(
+                        TEST_SOURCE_ID.parse().expect("valid test source"),
+                        format!("DOC_H{i}"),
+                    )
+                    .expect("valid test document"),
                     is_intro: false,
                 },
             );
@@ -4939,7 +4604,11 @@ mod tests {
             meta.insert(
                 11 + j as i64,
                 CandidateMeta {
-                    doc_id: "DOC_TAIL_ONLY".to_string(),
+                    document: DocumentId::new(
+                        TEST_SOURCE_ID.parse().expect("valid test source"),
+                        "DOC_TAIL_ONLY",
+                    )
+                    .expect("valid test document"),
                     is_intro: false,
                 },
             );
@@ -4948,14 +4617,14 @@ mod tests {
         let deduped = dedup_per_doc(hits, &meta, 11, 1);
         let tail_position = deduped
             .iter()
-            .position(|hit| meta[&hit.chunk_id].doc_id == "DOC_TAIL_ONLY")
+            .position(|hit| meta[&hit.chunk_id].document.native_id == "DOC_TAIL_ONLY")
             .expect("tail-only doc should appear in frontier");
         assert_eq!(tail_position, 10);
 
         let mut counts: HashMap<&str, usize> = HashMap::new();
         for hit in &deduped {
             *counts
-                .entry(meta[&hit.chunk_id].doc_id.as_str())
+                .entry(meta[&hit.chunk_id].document.native_id.as_str())
                 .or_insert(0) += 1;
         }
         for (doc, n) in &counts {
@@ -4964,10 +4633,9 @@ mod tests {
     }
 
     #[test]
-    fn manifest_compat_rejects_newer_manifest_format() {
-        let m = sample_manifest((SUPPORTED_SCHEMA_VERSION + 1) as i64, "");
-        let err =
-            enforce_manifest_compatibility(&m).expect_err("newer manifest should be rejected");
+    fn manifest_rejects_an_unknown_format_field() {
+        let m = sample_manifest(SUPPORTED_SCHEMA_VERSION + 1, "");
+        let err = validate_manifest(&m).expect_err("newer manifest should be rejected");
         assert!(
             err.to_string().contains("not supported"),
             "expected unsupported-schema error, got: {err}"
@@ -4977,53 +4645,74 @@ mod tests {
     #[test]
     fn test_get_doc_anchors_includes_cited_by() -> Result<()> {
         let _lock = lock_test_db();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        let (dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
         // Three docs cite TARGET. Two are 2024 dated (modern); one 2010.
         // `cited_by` should order by date DESC.
         insert_doc(&conn, "TARGET")?;
+        insert_doc_full(&conn, "CITER_2024A", Some("2024-06-15"), None, None, None)?;
+        insert_doc_full(&conn, "CITER_2024B", Some("2024-01-10"), None, None, None)?;
+        insert_doc_full(&conn, "CITER_2010", Some("2010-02-02"), None, None, None)?;
         conn.execute(
-            "INSERT INTO documents(doc_id, type, title, downloaded_at, content_hash, pack_sha8, html, date) VALUES (?, 'Public_ruling', 'Citer 2024', ?, ?, '00000000', x'00', '2024-06-15')",
-            params!["CITER_2024A", Utc::now().to_rfc3339(), "h1"],
+            "UPDATE documents SET title = 'Citer 2024'
+             WHERE source_id = ?1 AND native_id = 'CITER_2024A'",
+            [TEST_SOURCE_ID],
         )?;
         conn.execute(
-            "INSERT INTO documents(doc_id, type, title, downloaded_at, content_hash, pack_sha8, html, date) VALUES (?, 'Public_ruling', 'Citer 2024 B', ?, ?, '00000000', x'00', '2024-01-10')",
-            params!["CITER_2024B", Utc::now().to_rfc3339(), "h2"],
+            "UPDATE documents SET title = 'Citer 2024 B'
+             WHERE source_id = ?1 AND native_id = 'CITER_2024B'",
+            [TEST_SOURCE_ID],
         )?;
         conn.execute(
-            "INSERT INTO documents(doc_id, type, title, downloaded_at, content_hash, pack_sha8, html, date) VALUES (?, 'Cases', 'Citer 2010', ?, ?, '00000000', x'00', '2010-02-02')",
-            params!["CITER_2010", Utc::now().to_rfc3339(), "h3"],
+            "UPDATE documents SET type = 'Cases', title = 'Citer 2010'
+             WHERE source_id = ?1 AND native_id = 'CITER_2010'",
+            [TEST_SOURCE_ID],
         )?;
         // One citing chunk per citer; TARGET is the citation target.
-        insert_chunk(&conn, 10, "CITER_2024A", 0, "see [doc:TARGET]")?;
-        insert_chunk(&conn, 11, "CITER_2024B", 0, "also [doc:TARGET]")?;
-        insert_chunk(&conn, 12, "CITER_2010", 0, "refer [doc:TARGET]")?;
+        insert_chunk(&conn, 10, "CITER_2024A", 0, "see [doc:ato:TARGET]")?;
+        insert_chunk(&conn, 11, "CITER_2024B", 0, "also [doc:ato:TARGET]")?;
+        insert_chunk(&conn, 12, "CITER_2010", 0, "refer [doc:ato:TARGET]")?;
         conn.execute(
-            "INSERT INTO citations(source_chunk_id, source_doc_id, target_doc_id) VALUES (?, ?, ?)",
-            params![10_i64, "CITER_2024A", "TARGET"],
+            "INSERT INTO citations
+                (source_chunk_id, source_id, source_native_id, target_source_id, target_native_id)
+             VALUES (?1, ?2, ?3, ?2, ?4)",
+            params![10_i64, TEST_SOURCE_ID, "CITER_2024A", "TARGET"],
         )?;
         conn.execute(
-            "INSERT INTO citations(source_chunk_id, source_doc_id, target_doc_id) VALUES (?, ?, ?)",
-            params![11_i64, "CITER_2024B", "TARGET"],
+            "INSERT INTO citations
+                (source_chunk_id, source_id, source_native_id, target_source_id, target_native_id)
+             VALUES (?1, ?2, ?3, ?2, ?4)",
+            params![11_i64, TEST_SOURCE_ID, "CITER_2024B", "TARGET"],
         )?;
         conn.execute(
-            "INSERT INTO citations(source_chunk_id, source_doc_id, target_doc_id) VALUES (?, ?, ?)",
-            params![12_i64, "CITER_2010", "TARGET"],
+            "INSERT INTO citations
+                (source_chunk_id, source_id, source_native_id, target_source_id, target_native_id)
+             VALUES (?1, ?2, ?3, ?2, ?4)",
+            params![12_i64, TEST_SOURCE_ID, "CITER_2010", "TARGET"],
         )?;
         drop(conn);
 
         with_data_dir(dir.path(), || -> Result<()> {
-            let json_str = get_doc_anchors("TARGET")?;
+            let json_str = get_doc_anchors(DocumentId::new(test_source(), "TARGET")?)?;
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
             let cited_by = parsed["cited_by"].as_array().unwrap();
             assert_eq!(cited_by.len(), 3);
             // Date-DESC order.
-            assert_eq!(cited_by[0]["doc_id"], json!("CITER_2024A"));
+            assert_eq!(
+                cited_by[0]["document"],
+                json!({"source": TEST_SOURCE_ID, "native_id": "CITER_2024A"})
+            );
             assert_eq!(cited_by[0]["date"], json!("2024-06-15"));
             assert_eq!(cited_by[0]["title"], json!("Citer 2024"));
             assert_eq!(cited_by[0]["type"], json!("Public_ruling"));
-            assert_eq!(cited_by[1]["doc_id"], json!("CITER_2024B"));
-            assert_eq!(cited_by[2]["doc_id"], json!("CITER_2010"));
+            assert_eq!(
+                cited_by[1]["document"],
+                json!({"source": TEST_SOURCE_ID, "native_id": "CITER_2024B"})
+            );
+            assert_eq!(
+                cited_by[2]["document"],
+                json!({"source": TEST_SOURCE_ID, "native_id": "CITER_2010"})
+            );
             // Total field omitted when no truncation occurred.
             assert!(parsed.get("cited_by_total").is_none());
             Ok(())
@@ -5034,27 +4723,31 @@ mod tests {
     #[test]
     fn test_get_doc_anchors_cited_by_truncates_with_total() -> Result<()> {
         let _lock = lock_test_db();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        let (dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
         insert_doc(&conn, "POPULAR")?;
         // Insert CITED_BY_LIMIT + 5 citers so truncation kicks in.
         let count = CITED_BY_LIMIT + 5;
         for i in 0..count {
             let citer = format!("CITER_{:03}", i);
+            insert_doc_full(&conn, &citer, Some("2024-01-01"), None, None, None)?;
             conn.execute(
-                "INSERT INTO documents(doc_id, type, title, downloaded_at, content_hash, pack_sha8, html, date) VALUES (?, 'Public_ruling', ?, ?, ?, '00000000', x'00', '2024-01-01')",
-                params![citer.clone(), format!("Citer {i}"), Utc::now().to_rfc3339(), format!("h{i}")],
+                "UPDATE documents SET title = ?1 WHERE source_id = ?2 AND native_id = ?3",
+                params![format!("Citer {i}"), TEST_SOURCE_ID, &citer],
             )?;
-            insert_chunk(&conn, (1000 + i) as i64, &citer, 0, "[doc:POPULAR]")?;
+            insert_chunk(&conn, (1000 + i) as i64, &citer, 0, "[doc:ato:POPULAR]")?;
             conn.execute(
-                "INSERT INTO citations(source_chunk_id, source_doc_id, target_doc_id) VALUES (?, ?, ?)",
-                params![(1000 + i) as i64, citer, "POPULAR"],
+                "INSERT INTO citations
+                    (source_chunk_id, source_id, source_native_id,
+                     target_source_id, target_native_id)
+                 VALUES (?1, ?2, ?3, ?2, ?4)",
+                params![(1000 + i) as i64, TEST_SOURCE_ID, citer, "POPULAR"],
             )?;
         }
         drop(conn);
 
         with_data_dir(dir.path(), || -> Result<()> {
-            let json_str = get_doc_anchors("POPULAR")?;
+            let json_str = get_doc_anchors(DocumentId::new(test_source(), "POPULAR")?)?;
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
             let cited_by = parsed["cited_by"].as_array().unwrap();
             assert_eq!(cited_by.len(), CITED_BY_LIMIT);
@@ -5067,8 +4760,8 @@ mod tests {
     #[test]
     fn test_load_chunk_embedding_roundtrip() -> Result<()> {
         let _lock = lock_test_db();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        let (_dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
         insert_doc(&conn, "EMB")?;
         insert_chunk(&conn, 42, "EMB", 0, "body")?;
         let mut bytes = vec![0u8; EMBEDDING_DIM];
@@ -5079,7 +4772,7 @@ mod tests {
             "INSERT INTO chunk_embeddings(chunk_id, embedding) VALUES (?, ?)",
             params![42_i64, bytes.clone()],
         )?;
-        let loaded = load_chunk_embedding(&conn, 42)?;
+        let loaded = load_chunk_embedding(&conn, &test_source(), 42)?;
         let expected: Vec<i8> = bytes.iter().map(|b| *b as i8).collect();
         assert_eq!(loaded.to_vec(), expected);
         Ok(())
@@ -5088,9 +4781,9 @@ mod tests {
     #[test]
     fn test_load_chunk_embedding_missing_chunk_errors() -> Result<()> {
         let _lock = lock_test_db();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
-        let err = load_chunk_embedding(&conn, 99999).unwrap_err();
+        let (_dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
+        let err = load_chunk_embedding(&conn, &test_source(), 99999).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("no stored embedding"),
@@ -5102,8 +4795,8 @@ mod tests {
     #[test]
     fn test_derive_citations_extracts_doc_markers() -> Result<()> {
         let _lock = lock_test_db();
-        let (dir, _db) = make_test_db()?;
-        let conn = open_write_at(&dir.path().join("live/ato.db"))?;
+        let (_dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
         insert_doc(&conn, "SRC")?;
         insert_doc(&conn, "T1")?;
         insert_doc(&conn, "T2")?;
@@ -5116,20 +4809,33 @@ mod tests {
             10,
             "SRC",
             0,
-            "see [doc:T1] and [doc:T2@19960320000001] and [doc:T2 view=HISTFT] and [doc:SRC] and [doc:T1]",
+            "see [doc:ato:T1] and [doc:ato:T2@19960320000001] and [doc:ato:T2 view=HISTFT] and [doc:ato:SRC] and [doc:ato:T1]",
         )?;
         // pre-populate with stale rows so we can confirm clear + repopulate
         conn.execute(
-            "INSERT INTO citations(source_chunk_id, source_doc_id, target_doc_id) VALUES (?, ?, ?)",
-            params![10_i64, "SRC", "STALE"],
+            "INSERT INTO citations
+                (source_chunk_id, source_id, source_native_id,
+                 target_source_id, target_native_id)
+             VALUES (?1, ?2, ?3, ?2, ?4)",
+            params![10_i64, TEST_SOURCE_ID, "SRC", "STALE"],
         )?;
 
-        derive_citations(&conn)?;
+        let source_id: legal_model::SourceId = TEST_SOURCE_ID.parse()?;
+        derive_citations(&conn, &source_id)?;
 
         let rows: Vec<(i64, String, String)> = conn
-            .prepare("SELECT source_chunk_id, source_doc_id, target_doc_id FROM citations ORDER BY target_doc_id")?
-            .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            .prepare(
+                "SELECT source_chunk_id, source_native_id, target_native_id
+                 FROM citations
+                 WHERE source_id = ?1
+                 ORDER BY target_native_id",
+            )?
+            .query_map([TEST_SOURCE_ID], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
@@ -5150,58 +4856,59 @@ mod tests {
     static TEST_DB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn test_annotate_doc_refs_rewrites_external_markers_to_fetch() {
-        let mut corpus = HashSet::new();
-        corpus.insert("JUD/HAYES".to_string());
-        corpus.insert("PAC/19360027/6".to_string());
-        // Bare in-corpus marker: unchanged.
+    fn test_annotate_doc_refs_rewrites_external_markers_to_fetch() -> Result<()> {
+        let source_id: legal_model::SourceId = TEST_SOURCE_ID.parse()?;
+        let self_document = DocumentId::new(source_id.clone(), "SRC")?;
+        let mut native_ids = HashSet::new();
+        native_ids.insert("JUD/HAYES".to_string());
+        native_ids.insert("PAC/19360027/6".to_string());
+        let mut corpus = HashMap::new();
+        corpus.insert(source_id, Arc::new(native_ids));
         assert_eq!(
-            annotate_doc_refs_with("see [doc:JUD/HAYES]", "SRC", &corpus),
-            "see [doc:JUD/HAYES]"
+            annotate_doc_refs_with("see [doc:ato:JUD/HAYES]", &self_document, &corpus,)?,
+            "see [doc:ato:JUD/HAYES]"
         );
-        // External target: rewritten to a `[fetch:ato:X]` marker so the
-        // agent routes to the `fetch` tool instead of `get_chunks`.
         assert_eq!(
-            annotate_doc_refs_with("see [doc:LRP/117CLR514]", "SRC", &corpus),
-            "see [fetch:ato:LRP/117CLR514]"
+            annotate_doc_refs_with("see [doc:ato:LRP/117CLR514]", &self_document, &corpus,)?,
+            "see [fetch:legal://ato/LRP%2F117CLR514]"
         );
-        // Self-reference: never rewritten even if not in corpus.
         assert_eq!(
-            annotate_doc_refs_with("see [doc:SRC]", "SRC", &corpus),
-            "see [doc:SRC]"
+            annotate_doc_refs_with("see [doc:ato:SRC]", &self_document, &corpus)?,
+            "see [doc:ato:SRC]"
         );
-        // The regex matches `[doc:...]` only, so an already-rewritten
-        // `[fetch:...]` marker passes through untouched (idempotent).
         assert_eq!(
-            annotate_doc_refs_with("see [fetch:ato:LRP/X]", "SRC", &corpus,),
-            "see [fetch:ato:LRP/X]"
+            annotate_doc_refs_with("see [fetch:legal://ato/LRP%2FX]", &self_document, &corpus,)?,
+            "see [fetch:legal://ato/LRP%2FX]"
         );
-        // View qualifier becomes a URI query parameter on the rewritten
-        // marker — preserves the navigation context without inventing a
-        // new qualifier grammar.
         assert_eq!(
-            annotate_doc_refs_with("see [doc:LRP/X view=HISTFT]", "SRC", &corpus),
-            "see [fetch:ato:LRP/X?view=HISTFT]"
+            annotate_doc_refs_with("see [doc:ato:LRP/X view=HISTFT]", &self_document, &corpus,)?,
+            "see [fetch:legal://ato/LRP%2FX?view=HISTFT]"
         );
-        // PiT qualifier (separator is `@`) collapses to `?pit=...`.
-        assert_eq!(
-            annotate_doc_refs_with("see [doc:LRP/X@19960320000001]", "SRC", &corpus),
-            "see [fetch:ato:LRP/X?pit=19960320000001]"
-        );
-        // Combined PiT + view qualifiers stack into one query string.
-        assert_eq!(
-            annotate_doc_refs_with("see [doc:LRP/X@19960320000001 view=HISTFT]", "SRC", &corpus,),
-            "see [fetch:ato:LRP/X?pit=19960320000001&view=HISTFT]"
-        );
-        // Multiple markers in one text, mixed in/out of corpus.
         assert_eq!(
             annotate_doc_refs_with(
-                "[doc:JUD/HAYES] and [doc:LRP/X] and [doc:PAC/19360027/6]",
-                "SRC",
+                "see [doc:ato:LRP/X@19960320000001]",
+                &self_document,
                 &corpus,
-            ),
-            "[doc:JUD/HAYES] and [fetch:ato:LRP/X] and [doc:PAC/19360027/6]"
+            )?,
+            "see [fetch:legal://ato/LRP%2FX?pit=19960320000001]"
         );
+        assert_eq!(
+            annotate_doc_refs_with(
+                "see [doc:ato:LRP/X@19960320000001 view=HISTFT]",
+                &self_document,
+                &corpus,
+            )?,
+            "see [fetch:legal://ato/LRP%2FX?pit=19960320000001&view=HISTFT]"
+        );
+        assert_eq!(
+            annotate_doc_refs_with(
+                "[doc:ato:JUD/HAYES] and [doc:ato:LRP/X] and [doc:ato:PAC/19360027/6]",
+                &self_document,
+                &corpus,
+            )?,
+            "[doc:ato:JUD/HAYES] and [fetch:legal://ato/LRP%2FX] and [doc:ato:PAC/19360027/6]"
+        );
+        Ok(())
     }
 
     #[test]

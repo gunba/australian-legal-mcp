@@ -1,235 +1,284 @@
 #!/usr/bin/env bash
-# Maintainer steady-state: refresh ato_pages, rebuild corpus, and publish to the
-# current binary release tag.
-#
-# Invokes the Rust ato-mcp binary directly. The released corpus lives on the
-# same GitHub tag as the binary archives. Update discovery paginates releases
-# until it finds the newest non-prerelease manifest asset.
-#
-# Expects these env vars (set in the systemd unit or your shell):
-#   ATO_MCP_REPO_DIR   absolute path to this repo checkout
-#   ATO_MCP_PAGES_DIR  absolute path to ato_pages/ (default: $ATO_MCP_REPO_DIR/../ato_pages)
-#   ATO_MCP_MODEL_DIR  absolute path to the Granite embedding dir holding
-#                      tokenizer.json, onnx/model_fp16.onnx, and
-#                      onnx/model_fp16.onnx_data
-#   ATO_MCP_MODEL_URL  optional approved model mirror URL
-#   ATO_MCP_MODEL_SHA256 required with a non-Hugging Face ATO_MCP_MODEL_URL
-#   ATO_MCP_MODEL_SIZE   required with a non-Hugging Face ATO_MCP_MODEL_URL
-#   ATO_MCP_FORCE_REBUILD set to 1/true/yes/on to rebuild even when source did not change
-#   ATO_MCP_GH_REPO    owner/name (default: gunba/ato-mcp)
-#   ATO_MCP_MODE       incremental | catch_up | full (default: incremental)
-#   ATO_MCP_BIN        path to the Rust ato-mcp binary
-#                      (default: $ATO_MCP_REPO_DIR/target/release/ato-mcp)
-#   ATO_MCP_RELEASE_TAG override the publish tag (default: latest gh release on the repo)
-#   ATO_MCP_ZSTD_LEVEL package-corpus zstd level (default: 19)
-#
-# Flow:
-#   1. Run the requested source refresh mode (catch_up or full) when set.
-#   2. Always run an incremental What's New refresh as the final pre-build step.
-#   3. If ato_pages/index.jsonl changed, rebuild the corpus from scratch.
-#   4. Package ato.db.zst and publish the database before manifest.json.
-
+# Refresh official source workspaces, build one complete local generation on
+# this maintainer PC, validate/activate it atomically, and retain rollback data.
+# Corpus/model bytes are never published or downloaded by the runtime.
 set -euo pipefail
 
-if [[ -z "${ATO_MCP_SLEEP_INHIBITED:-}" && -z "${ATO_MCP_ALLOW_SLEEP:-}" ]]; then
-	if command -v systemd-inhibit >/dev/null 2>&1 &&
-		systemd-inhibit --who=ato-mcp --what=sleep --mode=block \
-			--why="ato-mcp maintainer sync probe" true >/dev/null 2>&1; then
-		export ATO_MCP_SLEEP_INHIBITED=1
-		exec systemd-inhibit --who=ato-mcp --what=sleep:idle:handle-lid-switch \
-			--mode=block --why="ato-mcp maintainer sync" "$0" "$@"
-	fi
+REQUESTED_MODE=incremental
+if (($# > 1)); then
+  echo "usage: $0 [--full]" >&2
+  exit 2
+fi
+if (($# == 1)); then
+  [[ "$1" == "--full" ]] || { echo "usage: $0 [--full]" >&2; exit 2; }
+  REQUESTED_MODE=full
 fi
 
-REPO_DIR="${ATO_MCP_REPO_DIR:?set ATO_MCP_REPO_DIR}"
-PAGES_DIR="${ATO_MCP_PAGES_DIR:-$REPO_DIR/../ato_pages}"
-MODEL_DIR="${ATO_MCP_MODEL_DIR:?set ATO_MCP_MODEL_DIR (path to Granite embedding checkout)}"
-MODEL_ONNX="$MODEL_DIR/onnx/model_fp16.onnx"
-MODEL_ONNX_DATA="$MODEL_DIR/onnx/model_fp16.onnx_data"
-TOKENIZER="$MODEL_DIR/tokenizer.json"
-MODEL_URL="${ATO_MCP_MODEL_URL:-}"
-MODEL_SHA256="${ATO_MCP_MODEL_SHA256:-}"
-MODEL_SIZE="${ATO_MCP_MODEL_SIZE:-}"
-if [[ "$MODEL_URL" == https://huggingface.co/* || "$MODEL_URL" == http://huggingface.co/* ]]; then
-	echo "ATO_MCP_MODEL_URL must use hf://repo@revision for Hugging Face sources, not HTTPS" >&2
-	exit 2
-fi
-if [[ "$MODEL_URL" == hf://* ]]; then
-	HF_SPEC="${MODEL_URL#hf://}"
-	if [[ "$HF_SPEC" != *@* || "$HF_SPEC" == *@ ]]; then
-		echo "ATO_MCP_MODEL_URL must include an explicit Hugging Face revision: hf://repo@revision" >&2
-		exit 2
-	fi
-fi
-if [[ "$MODEL_URL" != "" &&
-	"$MODEL_URL" != hf://* ]]; then
-	if [[ -z "$MODEL_SHA256" || ! "$MODEL_SIZE" =~ ^[1-9][0-9]*$ ]]; then
-		echo "non-Hugging Face ATO_MCP_MODEL_URL requires ATO_MCP_MODEL_SHA256 and positive numeric ATO_MCP_MODEL_SIZE" >&2
-		exit 2
-	fi
+if [[ -z "${LEGAL_MCP_SLEEP_INHIBITED:-}" && -z "${LEGAL_MCP_ALLOW_SLEEP:-}" ]]; then
+  if command -v systemd-inhibit >/dev/null 2>&1 &&
+    systemd-inhibit --who=legal-mcp --what=sleep --mode=block \
+      --why="Australian Legal MCP maintainer sync probe" true >/dev/null 2>&1; then
+    export LEGAL_MCP_SLEEP_INHIBITED=1
+    exec systemd-inhibit --who=legal-mcp --what=sleep:idle:handle-lid-switch \
+      --mode=block --why="Australian Legal MCP maintainer sync" "$0" "$@"
+  fi
 fi
 
-GH_REPO="${ATO_MCP_GH_REPO:-gunba/ato-mcp}"
-MODE="${ATO_MCP_MODE:-incremental}"
-FORCE_REBUILD="${ATO_MCP_FORCE_REBUILD:-}"
-ZSTD_LEVEL="${ATO_MCP_ZSTD_LEVEL:-19}"
+REPO_DIR="${LEGAL_MCP_REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+DATA_ROOT="${LEGAL_MCP_PROJECT_DATA_DIR:-$REPO_DIR/data}"
+SOURCE_DATA_DIR="${LEGAL_MCP_SOURCE_DATA_DIR:-$DATA_ROOT/sources}"
+MODEL_DIR="${LEGAL_MCP_MODEL_DIR:-$DATA_ROOT/models/mdbr-leaf-ir-standard}"
+RUNTIME_DIR="${LEGAL_MCP_DATA_DIR:-$DATA_ROOT/runtime}"
+BUILD_ROOT="$DATA_ROOT/builds"
+RUN_ROOT="$DATA_ROOT/runs"
+CACHE_ROOT="$DATA_ROOT/cache"
+LOG_ROOT="$DATA_ROOT/logs"
+SNAPSHOT_ROOT="$DATA_ROOT/source-snapshots"
+PENDING_FILE="$RUN_ROOT/pending-generation.json"
+BIN="${LEGAL_MCP_BIN:-$REPO_DIR/target/release/legal-mcp}"
+FORCE_REBUILD="${LEGAL_MCP_FORCE_REBUILD:-}"
 
 cd "$REPO_DIR"
-if [[ -n "${ATO_MCP_CUDA_LIB_PATH:-}" ]]; then
-	export LD_LIBRARY_PATH="$ATO_MCP_CUDA_LIB_PATH:${LD_LIBRARY_PATH:-}"
-else
-	CUDA_LIB_DIRS=()
-	shopt -s nullglob
-	for nvidia_root in \
-		"$REPO_DIR"/.venv/lib/python*/site-packages/nvidia \
-		"$HOME"/.local/lib/python*/site-packages/nvidia; do
-		for component_lib in "$nvidia_root"/*/lib; do
-			[[ -d "$component_lib" ]] && CUDA_LIB_DIRS+=("$component_lib")
-		done
-	done
-	shopt -u nullglob
-	if ((${#CUDA_LIB_DIRS[@]} > 0)); then
-		printf -v CUDA_LIB_PATH '%s:' "${CUDA_LIB_DIRS[@]}"
-		CUDA_LIB_PATH="${CUDA_LIB_PATH%:}"
-		export LD_LIBRARY_PATH="$CUDA_LIB_PATH:${LD_LIBRARY_PATH:-}"
-	fi
-fi
-
-ATO_MCP="${ATO_MCP_BIN:-$REPO_DIR/target/release/ato-mcp}"
-if [[ ! -x "$ATO_MCP" ]]; then
-	echo "ato-mcp binary not found at $ATO_MCP — run: cargo build --release --features cuda" >&2
-	exit 2
-fi
-for model_file in "$MODEL_ONNX" "$MODEL_ONNX_DATA" "$TOKENIZER"; do
-	if [[ ! -f "$model_file" ]]; then
-		echo "required Granite model file not found: $model_file" >&2
-		exit 2
-	fi
+for command_name in flock python3 unrtf antiword soffice pdftotext pdftoppm tesseract; do
+  command -v "$command_name" >/dev/null 2>&1 || { echo "missing command: $command_name" >&2; exit 2; }
 done
+[[ -x "$BIN" ]] || { echo "legal-mcp binary not found at $BIN" >&2; exit 2; }
+for model_file in "$MODEL_DIR/onnx/model.onnx" "$MODEL_DIR/tokenizer.json"; do
+  [[ -f "$model_file" && ! -L "$model_file" ]] || { echo "required model file missing: $model_file" >&2; exit 2; }
+done
+mkdir -p "$SOURCE_DATA_DIR" "$RUNTIME_DIR" "$BUILD_ROOT" "$RUN_ROOT" "$CACHE_ROOT" "$LOG_ROOT" \
+  "$SNAPSHOT_ROOT/rollback" "$SNAPSHOT_ROOT/full-refresh" "$SNAPSHOT_ROOT/failed"
+exec 9>"$RUN_ROOT/maintainer-sync.lock"
+flock -n 9 || { echo "another maintainer sync is already running" >&2; exit 2; }
 
-LOG="$REPO_DIR/logs/maintainer-sync-$(date -u +%Y%m%dT%H%M%SZ).log"
-mkdir -p "$(dirname "$LOG")"
+write_pending() {
+  local phase="$1" previous="${2:-}" active="${3:-}" fingerprint="${4:-}"
+  python3 - "$PENDING_FILE" "$RUN_ID" "$UPDATE_MODE" "$phase" "$RUN_DIR" "$BUILD_DIR" \
+    "$FRESH_ROOT" "$previous" "$active" "$fingerprint" <<'PY'
+import json, os, sys
+path, run_id, mode, phase, run_dir, build_dir, fresh_root, previous, active, fingerprint = sys.argv[1:]
+payload = {"schema_version": 1, "run_id": run_id, "mode": mode, "phase": phase,
+           "run_dir": run_dir, "build_dir": build_dir, "fresh_root": fresh_root,
+           "previous_generation": previous or None, "active_generation": active or None,
+           "fresh_source_fingerprint": fingerprint or None}
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(payload, f, sort_keys=True, indent=2); f.write("\n"); f.flush(); os.fsync(f.fileno())
+os.replace(tmp, path)
+fd = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY)
+try: os.fsync(fd)
+finally: os.close(fd)
+PY
+}
+
+remove_pending() {
+  python3 - "$PENDING_FILE" <<'PY'
+import os, sys
+path=sys.argv[1]
+try: os.unlink(path)
+except FileNotFoundError: pass
+fd=os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY)
+try: os.fsync(fd)
+finally: os.close(fd)
+PY
+}
+
+source_set_fingerprint() {
+  local root="$1"; shift
+  python3 - "$root" "$@" <<'PY'
+import hashlib, pathlib, sys
+root=pathlib.Path(sys.argv[1]); h=hashlib.sha256()
+for source in sorted(sys.argv[2:]):
+    state=root/source/"state.json"
+    if not state.is_file() or state.is_symlink(): raise SystemExit(f"missing real source state: {state}")
+    h.update(source.encode()); h.update(b"\0"); h.update(state.read_bytes()); h.update(b"\0")
+print(h.hexdigest())
+PY
+}
+
+rename_path() {
+  python3 - "$1" "$2" <<'PY'
+import os, sys
+source, destination = sys.argv[1:]
+if os.path.lexists(destination): raise SystemExit(f"rename destination exists: {destination}")
+os.rename(source, destination)
+for directory in {os.path.dirname(source), os.path.dirname(destination)}:
+    fd=os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+PY
+}
+
+active_key() {
+  local path="$RUNTIME_DIR/active-generation"
+  [[ -f "$path" ]] || return 0
+  local key; key="$(<"$path")"
+  [[ "$key" =~ ^[0-9a-f]{64}$ ]] || { echo "malformed active-generation" >&2; return 2; }
+  printf '%s' "$key"
+}
+
+if [[ -n "${LEGAL_MCP_CUDA_LIB_PATH:-}" ]]; then
+  export LD_LIBRARY_PATH="$LEGAL_MCP_CUDA_LIB_PATH:${LD_LIBRARY_PATH:-}"
+else
+  CUDA_LIB_DIRS=()
+  shopt -s nullglob
+  for nvidia_root in "$REPO_DIR"/.venv/lib/python*/site-packages/nvidia "$HOME"/.local/lib/python*/site-packages/nvidia; do
+    for component_lib in "$nvidia_root"/*/lib; do [[ -d "$component_lib" ]] && CUDA_LIB_DIRS+=("$component_lib"); done
+  done
+  for tensorrt_lib in "$REPO_DIR"/.venv/lib/python*/site-packages/tensorrt_libs "$HOME"/.local/lib/python*/site-packages/tensorrt_libs; do
+    [[ -d "$tensorrt_lib" ]] && CUDA_LIB_DIRS+=("$tensorrt_lib")
+  done
+  shopt -u nullglob
+  if ((${#CUDA_LIB_DIRS[@]})); then
+    printf -v CUDA_LIB_PATH '%s:' "${CUDA_LIB_DIRS[@]}"
+    export LD_LIBRARY_PATH="${CUDA_LIB_PATH%:}:${LD_LIBRARY_PATH:-}"
+  fi
+fi
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-24}"
+case "$FORCE_REBUILD" in 1|true|TRUE|yes|YES|on|ON) FORCE_REBUILD=true ;; *) FORCE_REBUILD=false ;; esac
+
+mapfile -t SOURCE_IDS < <("$BIN" source-list)
+((${#SOURCE_IDS[@]})) || { echo "production source catalogue is empty" >&2; exit 2; }
+[[ ! -L "$SOURCE_DATA_DIR" && -d "$SOURCE_DATA_DIR" ]] || { echo "source root must be a real directory" >&2; exit 2; }
+
+RESUMING=false
+PHASE=""
+PREVIOUS_GENERATION=""
+NEW_GENERATION=""
+FRESH_FINGERPRINT=""
+if [[ -f "$PENDING_FILE" ]]; then
+  mapfile -t pending < <(python3 - "$PENDING_FILE" <<'PY'
+import json,sys
+x=json.load(open(sys.argv[1],encoding="utf-8"))
+if x.get("schema_version") != 1: raise SystemExit("unsupported pending-generation schema")
+for key in ("run_id","mode","phase","run_dir","build_dir","fresh_root"):
+    print(x.get(key) or "")
+print(x.get("previous_generation") or "")
+print(x.get("active_generation") or "")
+print(x.get("fresh_source_fingerprint") or "")
+PY
+  )
+  RUN_ID="${pending[0]}"; UPDATE_MODE="${pending[1]}"; PHASE="${pending[2]}"
+  RUN_DIR="${pending[3]}"; BUILD_DIR="${pending[4]}"; FRESH_ROOT="${pending[5]}"
+  PREVIOUS_GENERATION="${pending[6]}"; NEW_GENERATION="${pending[7]}"; FRESH_FINGERPRINT="${pending[8]}"
+  RESUMING=true
+  if [[ "$REQUESTED_MODE" == full && "$UPDATE_MODE" != full ]]; then
+    echo "finish the pending incremental generation before requesting --full" >&2; exit 2
+  fi
+fi
+
+if [[ "$RESUMING" != true ]]; then
+  UPDATE_MODE="$REQUESTED_MODE"
+  RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+  RUN_DIR="$RUN_ROOT/$RUN_ID"
+  BUILD_DIR="$BUILD_ROOT/generation-$RUN_ID"
+  if [[ "$UPDATE_MODE" == full ]]; then FRESH_ROOT="$SNAPSHOT_ROOT/full-refresh/$RUN_ID/sources"; else FRESH_ROOT=""; fi
+  PHASE=acquiring
+  write_pending "$PHASE"
+fi
+
+LOG="$LOG_ROOT/maintainer-sync-$RUN_ID.log"
 exec > >(tee -a "$LOG") 2>&1
+echo "== $(date -u +%FT%TZ) local maintainer sync (mode: $UPDATE_MODE, phase: $PHASE) =="
 
-echo "== $(date -u +%FT%TZ) maintainer sync ($MODE) =="
-
-BEFORE_COUNT=$(wc -l <"$PAGES_DIR/index.jsonl" 2>/dev/null || echo 0)
-index_hash() {
-	if [[ ! -f "$PAGES_DIR/index.jsonl" ]]; then
-		echo "missing"
-		return
-	fi
-	if command -v sha256sum >/dev/null 2>&1; then
-		sha256sum "$PAGES_DIR/index.jsonl" | awk '{print $1}'
-	else
-		shasum -a 256 "$PAGES_DIR/index.jsonl" | awk '{print $1}'
-	fi
-}
-BEFORE_HASH=$(index_hash)
-
-SNAPSHOT_BASE="$REPO_DIR/release/scrape_snapshots"
-mkdir -p "$SNAPSHOT_BASE"
-
-run_full() {
-	local ts snap
-	ts="$(date -u +%Y%m%dT%H%M%SZ)"
-	snap="$SNAPSHOT_BASE/$ts"
-	echo "== full crawl into $snap =="
-	"$ATO_MCP" tree-crawl --out-dir "$snap"
-	"$ATO_MCP" snapshot-reduce --nodes-path "$snap/nodes.jsonl"
-	"$ATO_MCP" link-download \
-		--deduped-links "$snap/deduped_links.jsonl" \
-		--out-dir "$PAGES_DIR"
-}
-
-run_catch_up() {
-	local ts snap
-	ts="$(date -u +%Y%m%dT%H%M%SZ)"
-	snap="$SNAPSHOT_BASE/$ts"
-	echo "== catch-up crawl into $snap =="
-	"$ATO_MCP" tree-crawl --out-dir "$snap"
-	"$ATO_MCP" snapshot-reduce --nodes-path "$snap/nodes.jsonl"
-	"$ATO_MCP" scrape-diff \
-		--index "$PAGES_DIR/index.jsonl" \
-		--deduped "$snap/deduped_links.jsonl" \
-		--out "$snap/missing_links.jsonl"
-	"$ATO_MCP" link-download \
-		--deduped-links "$snap/missing_links.jsonl" \
-		--out-dir "$PAGES_DIR"
-}
-
-run_incremental() {
-	local ts pending
-	ts="$(date -u +%Y%m%dT%H%M%SZ)"
-	pending="$SNAPSHOT_BASE/whatsnew_${ts}.jsonl"
-	echo "== What's New incremental ($pending) =="
-	"$ATO_MCP" scrape-diff \
-		--index "$PAGES_DIR/index.jsonl" \
-		--whats-new-url "https://www.ato.gov.au/law/view/whatsnew.htm?fid=whatsnew" \
-		--out "$pending"
-	"$ATO_MCP" link-download \
-		--deduped-links "$pending" \
-		--out-dir "$PAGES_DIR"
-}
-
-case "$MODE" in
-incremental) run_incremental ;;
-catch_up)
-	run_catch_up
-	run_incremental
-	;;
-full)
-	run_full
-	run_incremental
-	;;
-*)
-	echo "unknown MODE=$MODE (incremental|catch_up|full)" >&2
-	exit 2
-	;;
-esac
-
-AFTER_COUNT=$(wc -l <"$PAGES_DIR/index.jsonl" 2>/dev/null || echo 0)
-AFTER_HASH=$(index_hash)
-echo "index.jsonl rows: $BEFORE_COUNT -> $AFTER_COUNT"
-echo "index.jsonl sha256: $BEFORE_HASH -> $AFTER_HASH"
-
-FORCE=false
-case "$FORCE_REBUILD" in
-1 | true | TRUE | yes | YES | on | ON) FORCE=true ;;
-esac
-
-if [[ "$FORCE" != true && "$MODE" != "full" && "$AFTER_HASH" == "$BEFORE_HASH" ]]; then
-	echo "no source index changes; skipping rebuild+release"
-	exit 0
+declare -A UPDATE_WORKSPACES
+if [[ "$UPDATE_MODE" == full ]]; then
+  mkdir -p "$FRESH_ROOT"
+  for source in "${SOURCE_IDS[@]}"; do UPDATE_WORKSPACES["$source"]="$FRESH_ROOT/$source"; done
+else
+  for source in "${SOURCE_IDS[@]}"; do UPDATE_WORKSPACES["$source"]="$SOURCE_DATA_DIR/$source"; done
 fi
 
-# Target tag: explicit override, or the current latest binary release.
-TAG="${ATO_MCP_RELEASE_TAG:-}"
-if [[ -z "$TAG" ]]; then
-	TAG=$(gh release view --repo "$GH_REPO" --json tagName --jq .tagName 2>/dev/null || true)
-	if [[ -z "$TAG" ]]; then
-		echo "could not determine latest release tag from $GH_REPO; set ATO_MCP_RELEASE_TAG" >&2
-		exit 2
-	fi
+if [[ "$PHASE" == acquiring ]]; then
+  UPDATE_ARGS=()
+  for source in "${SOURCE_IDS[@]}"; do
+    mkdir -p "${UPDATE_WORKSPACES[$source]}"
+    if [[ "$UPDATE_MODE" == full && -f "${UPDATE_WORKSPACES[$source]}/state.json" ]]; then
+      echo "full refresh source already committed; retaining $source"
+      continue
+    fi
+    UPDATE_ARGS+=(--workspace "$source=${UPDATE_WORKSPACES[$source]}")
+  done
+  if ((${#UPDATE_ARGS[@]})); then
+    [[ "$UPDATE_MODE" == full ]] && UPDATE_ARGS+=(--full)
+    echo "== source $UPDATE_MODE update ($RUN_DIR) =="
+    UPDATE_JSON="$("$BIN" source-update "${UPDATE_ARGS[@]}" --run-dir "$RUN_DIR")"
+    echo "$UPDATE_JSON"
+    SOURCE_CHANGED="$(python3 -c 'import json,sys; print("true" if any(x.get("changed") for x in json.load(sys.stdin)["sources"]) else "false")' <<<"$UPDATE_JSON")"
+  else
+    UPDATE_JSON='{"sources":[]}'
+    SOURCE_CHANGED=true
+    echo "all full-refresh sources were already committed"
+  fi
+  if [[ "$FORCE_REBUILD" != true && "$UPDATE_MODE" != full && "$SOURCE_CHANGED" != true && "$RESUMING" != true ]]; then
+    remove_pending
+    echo "no source inventory changes; local active generation is unchanged"
+    exit 0
+  fi
+  if [[ "$UPDATE_MODE" == full ]]; then FRESH_FINGERPRINT="$(source_set_fingerprint "$FRESH_ROOT" "${SOURCE_IDS[@]}")"; fi
+  PHASE=build
+  write_pending "$PHASE" "" "" "$FRESH_FINGERPRINT"
 fi
-RELEASE_DIR="$REPO_DIR/release/build-$(date -u +%Y%m%d)"
-mkdir -p "$RELEASE_DIR"
-echo "== build corpus =="
-"$ATO_MCP" build \
-	--pages-dir "$PAGES_DIR" \
-	--db-path "$RELEASE_DIR/ato.db" \
-	--model-dir "$MODEL_DIR" \
-	--out-dir "$RELEASE_DIR" \
-	--profile
 
-echo "== package and publish corpus to $TAG =="
-ATO_MCP_RELEASE_DIR="$RELEASE_DIR" \
-	ATO_MCP_BIN="$ATO_MCP" \
-	ATO_MCP_GH_REPO="$GH_REPO" \
-	ATO_MCP_ZSTD_LEVEL="$ZSTD_LEVEL" \
-	ATO_MCP_MODEL_URL="$MODEL_URL" \
-	ATO_MCP_MODEL_SHA256="$MODEL_SHA256" \
-	ATO_MCP_MODEL_SIZE="$MODEL_SIZE" \
-	"$REPO_DIR/scripts/publish-release.sh" "$TAG" "$GH_REPO"
+if [[ "$PHASE" == build ]]; then
+  mkdir -p "$BUILD_DIR"
+  command -v chattr >/dev/null 2>&1 && chattr +C "$BUILD_DIR" 2>/dev/null || true
+  export LEGAL_MCP_TENSORRT_CACHE_DIR="$CACHE_ROOT/tensorrt/$RUN_ID"
+  mkdir -p "$LEGAL_MCP_TENSORRT_CACHE_DIR"
+  BUILD_CACHE_ARGS=()
+  if [[ -n "${LEGAL_MCP_EMBEDDING_CACHE_DB:-}" ]]; then
+    [[ -f "$LEGAL_MCP_EMBEDDING_CACHE_DB" ]] || { echo "embedding cache DB missing" >&2; exit 2; }
+    BUILD_CACHE_ARGS=(--embedding-cache-db "$LEGAL_MCP_EMBEDDING_CACHE_DB")
+  fi
+  BUILD_SOURCE_ARGS=()
+  for source in "${SOURCE_IDS[@]}"; do BUILD_SOURCE_ARGS+=(--source-workspace "$source=${UPDATE_WORKSPACES[$source]}"); done
+  if [[ ! -f "$BUILD_DIR/generation.json" ]]; then
+    echo "== build local generation =="
+    "$BIN" build "${BUILD_SOURCE_ARGS[@]}" --model-dir "$MODEL_DIR" --out-dir "$BUILD_DIR" \
+      "${BUILD_CACHE_ARGS[@]}" --profile
+  fi
+  PREVIOUS_GENERATION="$(active_key)"
+  PHASE=activating
+  write_pending "$PHASE" "$PREVIOUS_GENERATION" "" "$FRESH_FINGERPRINT"
+fi
 
-echo "== done: corpus shipped to $TAG ($((AFTER_COUNT - BEFORE_COUNT)) new rows) =="
+if [[ "$PHASE" == activating ]]; then
+  if [[ -d "$BUILD_DIR" ]]; then
+    ACTIVATION_JSON="$(LEGAL_MCP_DATA_DIR="$RUNTIME_DIR" "$BIN" activate --generation-dir "$BUILD_DIR")"
+    echo "$ACTIVATION_JSON"
+    NEW_GENERATION="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["active_generation"])' <<<"$ACTIVATION_JSON")"
+    PREVIOUS_GENERATION="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("previous_generation") or "")' <<<"$ACTIVATION_JSON")"
+  else
+    NEW_GENERATION="$(active_key)"
+    [[ -n "$NEW_GENERATION" && "$NEW_GENERATION" != "$PREVIOUS_GENERATION" ]] || {
+      echo "activation was interrupted before its outcome could be recovered" >&2; exit 1;
+    }
+  fi
+  LEGAL_MCP_DATA_DIR="$RUNTIME_DIR" "$BIN" verify >/dev/null
+  PHASE=activated
+  write_pending "$PHASE" "$PREVIOUS_GENERATION" "$NEW_GENERATION" "$FRESH_FINGERPRINT"
+fi
+
+if [[ "$UPDATE_MODE" == full && "$PHASE" == activated ]]; then
+  echo "== atomically promote complete full source set =="
+  current_fingerprint="$(source_set_fingerprint "$SOURCE_DATA_DIR" "${SOURCE_IDS[@]}")"
+  if [[ "$current_fingerprint" != "$FRESH_FINGERPRINT" ]]; then
+    [[ -d "$FRESH_ROOT" && ! -L "$FRESH_ROOT" ]] || { echo "fresh source set missing: $FRESH_ROOT" >&2; exit 1; }
+    mv -T --exchange --no-copy "$FRESH_ROOT" "$SOURCE_DATA_DIR"
+    current_fingerprint="$(source_set_fingerprint "$SOURCE_DATA_DIR" "${SOURCE_IDS[@]}")"
+    [[ "$current_fingerprint" == "$FRESH_FINGERPRINT" ]] || { echo "source-set exchange verification failed" >&2; exit 1; }
+  fi
+  if [[ -d "$FRESH_ROOT" ]]; then
+    backup="$SNAPSHOT_ROOT/rollback/pre-full-$RUN_ID"
+    [[ ! -e "$backup" ]] || { echo "rollback snapshot collision: $backup" >&2; exit 2; }
+    mkdir -p "$(dirname "$backup")"
+    rename_path "$FRESH_ROOT" "$backup"
+  fi
+fi
+
+remove_pending
+if [[ -n "${LEGAL_MCP_RESTART_USER_SERVICE:-}" ]]; then
+  systemctl --user try-restart "$LEGAL_MCP_RESTART_USER_SERVICE"
+fi
+echo "== active local generation: $NEW_GENERATION =="
+echo "Builds and acquisition ran on this PC; no corpus bytes were published."

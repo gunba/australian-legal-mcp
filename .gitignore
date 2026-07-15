@@ -11,13 +11,8 @@ target/
 .DS_Store
 /tmp/
 /Temp/
-# ML model weights and build outputs — too large for git.
-models/
-release/
-release_full/
-release-v*/
-release-prod-fast*/
-ato_pages/
+/data/
+# ML model weights and generated artifacts are never tracked.
 *.onnx
 *.onnx_data
 *.bin.zst

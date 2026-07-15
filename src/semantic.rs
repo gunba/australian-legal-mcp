@@ -1,59 +1,50 @@
-//! Granite ONNX embedding runtime: model files, tokenizer, session, batched
+//! mdbr-leaf-ir ONNX embedding runtime: model files, tokenizer, session, batched
 //! encode, and int8 quantisation.
 
-use crate::config::{model_data_path, model_path, tokenizer_path};
-use crate::{EMBEDDING_DIM, EMBEDDING_INPUT_MAX_TOKENS, EMBEDDING_TEXT_PREFIX};
+use crate::bert_tokenizer::BertWordPieceTokenizer;
+use crate::config::{model_path, tokenizer_path};
+use crate::{
+    DOCUMENT_EMBEDDING_PREFIX, EMBEDDING_DIM, EMBEDDING_INPUT_MAX_TOKENS, QUERY_EMBEDDING_PREFIX,
+};
 use anyhow::{anyhow, bail, Context, Result};
 #[cfg(feature = "cuda")]
 use ort::ep;
 use ort::session::{
     builder::{GraphOptimizationLevel, SessionBuilder},
-    Session,
+    OutputSelector, RunOptions, Session,
 };
 use ort::value::TensorRef;
-#[allow(unused_imports)]
-use simsimd::SpatialSimilarity as _;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 use std::time::Duration;
-use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
 
-extern "C" {
-    fn simsimd_dot_i8(a: *const i8, b: *const i8, n: usize, out: *mut f64);
-}
-
-// Avoid expensive online transformer graph rewrites on every fresh CLI/MCP
-// process. The ONNX models are shipped pre-quantized; Level1 keeps cheap
-// semantics-preserving cleanup without the high startup cost of Level2/All.
+// Keep the exported standard attention graph intact for TensorRT partitioning
+// and avoid expensive online transformer rewrites on every CLI/MCP process.
+// Level1 performs only cheap semantics-preserving cleanup.
 pub(crate) const ONLINE_MODEL_OPTIMIZATION_LEVEL: GraphOptimizationLevel =
     GraphOptimizationLevel::Level1;
+pub(crate) const EMBEDDING_BATCH_SIZE: usize = 64;
 
-pub(crate) struct HfModelFile {
+pub(crate) struct EmbeddingModelFile {
     pub(crate) path: &'static str,
     pub(crate) output_name: &'static str,
     pub(crate) sha256: &'static str,
     pub(crate) size: u64,
 }
 
-pub(crate) const EMBEDDING_MODEL_HF_FILES: &[HfModelFile] = &[
-    HfModelFile {
-        path: "onnx/model_fp16.onnx",
-        output_name: "model_fp16.onnx",
-        sha256: "ee200de55cb2f94e858aabca54be7697a9c0805a14c858ee26ad0922b05f57d7",
-        size: 200_792,
+pub(crate) const EMBEDDING_MODEL_FILES: &[EmbeddingModelFile] = &[
+    EmbeddingModelFile {
+        path: "onnx/model.onnx",
+        output_name: "model.onnx",
+        sha256: "242a1d386f2f63a7daec443399b32d35b4b155b0820ee19b7c81c50436f95e11",
+        size: 91_555_023,
     },
-    HfModelFile {
-        path: "onnx/model_fp16.onnx_data",
-        output_name: "model_fp16.onnx_data",
-        sha256: "28d16e29cd623f25cc6fa0968700c5bc31036466091a5fa06d1353c1777f050e",
-        size: 97_402_880,
-    },
-    HfModelFile {
+    EmbeddingModelFile {
         path: "tokenizer.json",
         output_name: "tokenizer.json",
-        sha256: "feeb83348dcb033bc6b9d2e1f7906ca9eb2d122845000c9416d894d7c2927149",
-        size: 2_128_614,
+        sha256: "da0e79933b9ed51798a3ae27893d3c5fa4a201126cef75586296df9b4d2c62a0",
+        size: 711_661,
     },
 ];
 
@@ -66,42 +57,51 @@ pub(crate) struct SemanticModelPaths {
 impl SemanticModelPaths {
     pub(crate) fn live() -> Result<Self> {
         let model = model_path()?;
-        let model_data = model_data_path()?;
         let tokenizer = tokenizer_path()?;
-        for path in [&model, &model_data, &tokenizer] {
+        for path in [&model, &tokenizer] {
             if !path.is_file() {
-                bail!("missing installed Granite model file at {}", path.display());
+                bail!(
+                    "missing installed embedding model file at {}",
+                    path.display()
+                );
             }
         }
         Ok(Self { model, tokenizer })
     }
 
     pub(crate) fn from_model_dir(model_dir: &Path) -> Result<Self> {
-        for file in EMBEDDING_MODEL_HF_FILES {
+        for file in EMBEDDING_MODEL_FILES {
             let path = model_dir.join(file.path);
             validate_embedding_model_file(&path, file)?;
         }
-        let model = model_dir.join("onnx").join("model_fp16.onnx");
+        let model = model_dir.join("onnx").join("model.onnx");
         let tokenizer = model_dir.join("tokenizer.json");
         Ok(Self { model, tokenizer })
     }
 }
 
-pub(crate) fn validate_embedding_model_file(path: &Path, file: &HfModelFile) -> Result<()> {
+pub(crate) fn validate_embedding_model_file(path: &Path, file: &EmbeddingModelFile) -> Result<()> {
     if !path.is_file() {
-        bail!("missing Granite model file at {}", path.display());
+        bail!("missing embedding model file at {}", path.display());
     }
     let size = path.metadata()?.len();
     if size != file.size {
         bail!(
-            "size mismatch for Granite model file {}: got {}, expected {}",
+            "size mismatch for embedding model file {}: got {}, expected {}",
             path.display(),
             size,
             file.size
         );
     }
-    crate::verify_sha256_file(path, file.sha256)
-        .with_context(|| format!("verifying Granite model file {}", path.display()))
+    let actual = crate::build::sha256_file(path)
+        .with_context(|| format!("verifying embedding model file {}", path.display()))?;
+    if actual != file.sha256 {
+        bail!(
+            "SHA-256 mismatch for embedding model file {}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn dot_i8(query: &[i8; EMBEDDING_DIM], document: &[u8]) -> Result<f64> {
@@ -112,21 +112,16 @@ pub(crate) fn dot_i8(query: &[i8; EMBEDDING_DIM], document: &[u8]) -> Result<f64
             EMBEDDING_DIM
         );
     }
-    // Reinterpret the stored u8 BLOB as i8 by casting the pointer
-    // directly. The bit pattern is identical; the BLOB just happens to be
-    // loaded with rusqlite's default unsigned typing.
-    let mut raw = 0.0f64;
-    // Safety: both pointers reference EMBEDDING_DIM-sized slices we just
-    // bounds-checked; simsimd_dot_i8 reads exactly `n` bytes from each.
-    unsafe {
-        simsimd_dot_i8(
-            query.as_ptr(),
-            document.as_ptr() as *const i8,
-            EMBEDDING_DIM,
-            &mut raw,
-        );
-    }
-    Ok(raw / (127.0 * 127.0))
+    // SQLite exposes BLOB bytes as u8; conversion to i8 restores each stored
+    // two's-complement component before accumulation.
+    let raw = query
+        .iter()
+        .zip(document)
+        .map(|(&query_component, &stored_component)| {
+            i64::from(query_component) * i64::from(stored_component as i8)
+        })
+        .sum::<i64>();
+    Ok(raw as f64 / (127.0 * 127.0))
 }
 
 #[cfg(test)]
@@ -168,19 +163,6 @@ impl SemanticEncodeStats {
         self.max_batch = self.max_batch.max(batch);
         self.max_seq_len = self.max_seq_len.max(seq_len);
     }
-
-    pub(crate) fn merge(&mut self, other: Self) {
-        self.tokenize += other.tokenize;
-        self.prepare += other.prepare;
-        self.run += other.run;
-        self.postprocess += other.postprocess;
-        self.batches += other.batches;
-        self.inputs += other.inputs;
-        self.active_tokens += other.active_tokens;
-        self.padded_tokens += other.padded_tokens;
-        self.max_batch = self.max_batch.max(other.max_batch);
-        self.max_seq_len = self.max_seq_len.max(other.max_seq_len);
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -188,19 +170,30 @@ fn initialize_packaged_ort() -> Result<()> {
     static INITIALIZED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     match INITIALIZED.get_or_init(|| {
         let result = (|| -> Result<()> {
-            if std::env::var_os("ORT_DYLIB_PATH").is_some() {
-                return Ok(());
+            let library = if let Some(configured) = std::env::var_os("ORT_DYLIB_PATH") {
+                PathBuf::from(configured)
+            } else {
+                let executable = std::env::current_exe().context("locating legal-mcp executable")?;
+                executable
+                    .parent()
+                    .ok_or_else(|| anyhow!("legal-mcp executable has no parent directory"))?
+                    .join("libonnxruntime.so")
+            };
+            let metadata = std::fs::symlink_metadata(&library).with_context(|| {
+                format!(
+                    "ONNX Runtime library not found at {}; set ORT_DYLIB_PATH to a real libonnxruntime.so",
+                    library.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!(
+                    "ONNX Runtime library must be a real file: {}",
+                    library.display()
+                );
             }
-            let executable = std::env::current_exe().context("locating ato-mcp executable")?;
-            let sibling = executable
-                .parent()
-                .ok_or_else(|| anyhow!("ato-mcp executable has no parent directory"))?
-                .join("libonnxruntime.so");
-            if sibling.is_file() {
-                ort::init_from(&sibling)
-                    .map_err(|error| anyhow!("loading {}: {error}", sibling.display()))?
-                    .commit();
-            }
+            ort::init_from(&library)
+                .map_err(|error| anyhow!("loading {}: {error}", library.display()))?
+                .commit();
             Ok(())
         })();
         result.map_err(|error| format!("{error:#}"))
@@ -216,37 +209,30 @@ fn initialize_packaged_ort() -> Result<()> {
 }
 
 pub(crate) struct SemanticRuntime {
-    tokenizer: Tokenizer,
-    validation_tokenizer: Tokenizer,
+    tokenizer: BertWordPieceTokenizer,
     session: Session,
     has_token_type_ids: bool,
+    has_sentence_embedding: bool,
 }
 
 impl SemanticRuntime {
     pub(crate) fn load(use_gpu: bool, model_paths: &SemanticModelPaths) -> Result<Self> {
+        eprintln!(
+            "legal-mcp semantic: loading {} execution backend",
+            if use_gpu { "CUDA" } else { "CPU" }
+        );
         initialize_packaged_ort()?;
-        let validation_tokenizer = Tokenizer::from_file(&model_paths.tokenizer)
-            .map_err(|err| anyhow!("loading tokenizer: {err}"))?;
-        let mut tokenizer = validation_tokenizer.clone();
-        tokenizer
-            .with_truncation(Some(TruncationParams {
-                max_length: EMBEDDING_INPUT_MAX_TOKENS,
-                ..TruncationParams::default()
-            }))
-            .map_err(|err| anyhow!("configuring tokenizer truncation: {err}"))?;
-        tokenizer.with_padding(Some(PaddingParams::default()));
+        let tokenizer = BertWordPieceTokenizer::from_file(&model_paths.tokenizer)?;
 
-        let optimization_level = if use_gpu {
-            GraphOptimizationLevel::All
-        } else {
-            ONLINE_MODEL_OPTIMIZATION_LEVEL
-        };
+        // TensorRT must see the standard attention graph before ORT's extended
+        // transformer fusions replace it with provider-specific contrib nodes.
+        let optimization_level = ONLINE_MODEL_OPTIMIZATION_LEVEL;
         let mut builder = Session::builder()
             .map_err(|err| anyhow!("creating ONNX Runtime session: {err}"))?
             .with_optimization_level(optimization_level)
             .map_err(|err| anyhow!("configuring ONNX Runtime session: {err}"))?;
         if use_gpu {
-            // [EM-01] CPU is the default runtime; maintainer GPU builds
+            // CPU is the default runtime; maintainer GPU builds
             // require the cuda feature and fail if CUDA EP registration fails.
             builder = configure_cuda_execution_provider(builder)?;
         }
@@ -257,12 +243,16 @@ impl SemanticRuntime {
             .inputs()
             .iter()
             .any(|input| input.name() == "token_type_ids");
+        let has_sentence_embedding = session
+            .outputs()
+            .iter()
+            .any(|output| output.name() == "sentence_embedding");
 
         Ok(Self {
             tokenizer,
-            validation_tokenizer,
             session,
             has_token_type_ids,
+            has_sentence_embedding,
         })
     }
 
@@ -281,68 +271,83 @@ impl SemanticRuntime {
         Ok(embeddings)
     }
 
-    fn validate_input_token_counts(&self, prefixed: &[String]) -> Result<()> {
-        let encodings = self
-            .validation_tokenizer
-            .encode_batch(prefixed.to_vec(), true)
-            .map_err(|err| anyhow!("validating semantic input token counts: {err}"))?;
-        let counts = encodings
-            .iter()
-            .map(|encoding| encoding.get_ids().len())
-            .collect::<Vec<_>>();
-        ensure_token_counts_within_limit(&counts, EMBEDDING_INPUT_MAX_TOKENS)
-    }
-
     pub(crate) fn encode_queries_with_stats(
         &mut self,
         queries: &[String],
     ) -> Result<(Vec<[i8; EMBEDDING_DIM]>, SemanticEncodeStats)> {
-        if queries.is_empty() {
+        self.encode_with_stats(queries, QUERY_EMBEDDING_PREFIX)
+    }
+
+    pub(crate) fn encode_documents_with_stats(
+        &mut self,
+        documents: &[String],
+    ) -> Result<(Vec<[i8; EMBEDDING_DIM]>, SemanticEncodeStats)> {
+        self.encode_with_stats(documents, DOCUMENT_EMBEDDING_PREFIX)
+    }
+
+    pub(crate) fn encode_document_token_ids_with_stats(
+        &mut self,
+        token_ids: &[&[i64]],
+    ) -> Result<(Vec<[i8; EMBEDDING_DIM]>, SemanticEncodeStats)> {
+        self.encode_token_ids_with_stats(token_ids)
+    }
+
+    fn encode_with_stats(
+        &mut self,
+        inputs: &[String],
+        prefix: &str,
+    ) -> Result<(Vec<[i8; EMBEDDING_DIM]>, SemanticEncodeStats)> {
+        if inputs.is_empty() {
             return Ok((Vec::new(), SemanticEncodeStats::default()));
         }
-        let prefixed: Vec<String> = queries
+        let prefixed = inputs
             .iter()
-            .map(|query| format!("{EMBEDDING_TEXT_PREFIX}{query}"))
-            .collect();
-        self.validate_input_token_counts(&prefixed)?;
-        let mut stats = SemanticEncodeStats::default();
+            .map(|input| format!("{prefix}{input}"))
+            .collect::<Vec<_>>();
         let started = std::time::Instant::now();
-        let encodings = self
-            .tokenizer
-            .encode_batch(prefixed, true)
-            .map_err(|err| anyhow!("tokenizing queries: {err}"))?;
-        stats.tokenize += started.elapsed();
-        let batch = encodings.len();
-        if batch != queries.len() {
+        let encodings = prefixed
+            .iter()
+            .map(|input| self.tokenizer.encode(input))
+            .collect::<Result<Vec<_>>>()?;
+        let tokenize = started.elapsed();
+        if encodings.len() != inputs.len() {
             bail!(
                 "tokenizer returned {} encodings for {} inputs",
-                batch,
-                queries.len()
+                encodings.len(),
+                inputs.len()
             );
         }
-        let seq_len = encodings
-            .first()
-            .map(|encoding| encoding.get_ids().len())
-            .unwrap_or(0);
-        if seq_len == 0 {
-            bail!("semantic search unavailable: query produced no tokens");
+        let slices = encodings.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let (embeddings, mut stats) = self.encode_token_ids_with_stats(&slices)?;
+        stats.tokenize += tokenize;
+        Ok((embeddings, stats))
+    }
+
+    fn encode_token_ids_with_stats(
+        &mut self,
+        token_ids: &[&[i64]],
+    ) -> Result<(Vec<[i8; EMBEDDING_DIM]>, SemanticEncodeStats)> {
+        if token_ids.is_empty() {
+            return Ok((Vec::new(), SemanticEncodeStats::default()));
         }
+        let counts = token_ids.iter().map(|ids| ids.len()).collect::<Vec<_>>();
+        ensure_token_counts_within_limit(&counts, EMBEDDING_INPUT_MAX_TOKENS)?;
+        let batch = token_ids.len();
+        let seq_len = counts.iter().copied().max().unwrap_or(0);
+        if seq_len == 0 {
+            bail!("semantic input produced no tokens");
+        }
+        let mut stats = SemanticEncodeStats::default();
         let started = std::time::Instant::now();
         let mut input_ids = Vec::with_capacity(batch * seq_len);
         let mut attention_mask = Vec::with_capacity(batch * seq_len);
         let mut active_tokens = 0usize;
-        for encoding in &encodings {
-            if encoding.get_ids().len() != seq_len {
-                bail!(
-                    "tokenizer produced ragged encodings: expected {seq_len}, got {}",
-                    encoding.get_ids().len()
-                );
-            }
-            input_ids.extend(encoding.get_ids().iter().map(|id| i64::from(*id)));
-            for mask in encoding.get_attention_mask() {
-                active_tokens += usize::try_from(*mask).unwrap_or(0);
-                attention_mask.push(i64::from(*mask));
-            }
+        for ids in token_ids {
+            input_ids.extend_from_slice(ids);
+            attention_mask.resize(attention_mask.len() + ids.len(), 1);
+            active_tokens += ids.len();
+            input_ids.resize(input_ids.len() + seq_len - ids.len(), 0);
+            attention_mask.resize(attention_mask.len() + seq_len - ids.len(), 0);
         }
         stats.record_batch(batch, seq_len, active_tokens);
 
@@ -352,27 +357,43 @@ impl SemanticRuntime {
             TensorRef::from_array_view(([batch, seq_len], attention_mask.as_slice()))?;
         stats.prepare += started.elapsed();
         let started = std::time::Instant::now();
+        let output_selector = self
+            .has_sentence_embedding
+            .then(|| OutputSelector::no_default().with("sentence_embedding"));
+        let run_options = output_selector
+            .map(|outputs| RunOptions::new().map(|options| options.with_outputs(outputs)))
+            .transpose()?;
         let outputs = if self.has_token_type_ids {
             let token_type_ids = vec![0i64; batch * seq_len];
             let token_type_ids_tensor =
                 TensorRef::from_array_view(([batch, seq_len], token_type_ids.as_slice()))?;
-            self.session.run(ort::inputs! {
+            let inputs = ort::inputs! {
                 "input_ids" => input_ids_tensor,
                 "attention_mask" => attention_mask_tensor,
                 "token_type_ids" => token_type_ids_tensor,
-            })?
+            };
+            if let Some(options) = &run_options {
+                self.session.run_with_options(inputs, options)?
+            } else {
+                self.session.run(inputs)?
+            }
         } else {
-            self.session.run(ort::inputs! {
+            let inputs = ort::inputs! {
                 "input_ids" => input_ids_tensor,
                 "attention_mask" => attention_mask_tensor,
-            })?
+            };
+            if let Some(options) = &run_options {
+                self.session.run_with_options(inputs, options)?
+            } else {
+                self.session.run(inputs)?
+            }
         };
         stats.run += started.elapsed();
         let started = std::time::Instant::now();
         let output = outputs
             .get("sentence_embedding")
             .unwrap_or_else(|| &outputs[0]);
-        // [EM-04] Prefer sentence_embedding when present; otherwise
+        // Prefer sentence_embedding when present; otherwise
         // pooled_embeddings mean-pools 3D token outputs with the attention mask.
         let (shape, data) = output.try_extract_tensor::<f32>()?;
         let embeddings = pooled_embeddings(shape, data, &attention_mask, batch, seq_len)?;
@@ -401,21 +422,51 @@ fn ensure_token_counts_within_limit(counts: &[usize], max_tokens: usize) -> Resu
 
 #[cfg(feature = "cuda")]
 pub(crate) fn configure_cuda_execution_provider(builder: SessionBuilder) -> Result<SessionBuilder> {
+    let cache = std::env::var_os("LEGAL_MCP_TENSORRT_CACHE_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("CUDA corpus builds require LEGAL_MCP_TENSORRT_CACHE_DIR"))?;
+    std::fs::create_dir_all(&cache)
+        .with_context(|| format!("creating TensorRT cache directory {}", cache.display()))?;
+    let cache = cache
+        .to_str()
+        .ok_or_else(|| anyhow!("TensorRT cache path is not valid UTF-8"))?;
+    let profile_min = "input_ids:1x1,attention_mask:1x1,token_type_ids:1x1";
+    let profile_opt = format!(
+        "input_ids:{}x384,attention_mask:{}x384,token_type_ids:{}x384",
+        EMBEDDING_BATCH_SIZE / 2,
+        EMBEDDING_BATCH_SIZE / 2,
+        EMBEDDING_BATCH_SIZE / 2
+    );
+    let profile_max = format!(
+        "input_ids:{EMBEDDING_BATCH_SIZE}x{EMBEDDING_INPUT_MAX_TOKENS},attention_mask:{EMBEDDING_BATCH_SIZE}x{EMBEDDING_INPUT_MAX_TOKENS},token_type_ids:{EMBEDDING_BATCH_SIZE}x{EMBEDDING_INPUT_MAX_TOKENS}"
+    );
+    let tensorrt = ep::TensorRT::default()
+        .with_device_id(0)
+        .with_fp16(true)
+        .with_engine_cache(true)
+        .with_engine_cache_path(cache)
+        .with_timing_cache(true)
+        .with_timing_cache_path(cache)
+        .with_profile_min_shapes(profile_min)
+        .with_profile_opt_shapes(profile_opt)
+        .with_profile_max_shapes(profile_max)
+        .build()
+        .error_on_failure();
     let cuda = ep::CUDA::default()
         .with_device_id(0)
         .with_conv_algorithm_search(ep::cuda::ConvAlgorithmSearch::Heuristic)
         .build()
         .error_on_failure();
     builder
-        .with_execution_providers([cuda])
-        .map_err(|err| anyhow!("registering CUDA execution provider: {err}"))
+        .with_execution_providers([tensorrt, cuda])
+        .map_err(|err| anyhow!("registering TensorRT/CUDA execution providers: {err}"))
 }
 
 #[cfg(not(feature = "cuda"))]
 pub(crate) fn configure_cuda_execution_provider(
     _builder: SessionBuilder,
 ) -> Result<SessionBuilder> {
-    bail!("GPU build requested but this ato-mcp binary was built without CUDA support; rebuild with `cargo build --release --features cuda`")
+    bail!("GPU build requested but this legal-mcp binary was built without CUDA support; rebuild with `cargo build --release --features cuda`")
 }
 
 pub(crate) fn encode_query_embedding(query: &str) -> Result<[i8; EMBEDDING_DIM]> {
@@ -501,7 +552,7 @@ pub(crate) fn quantize_embedding(values: &[f32]) -> Result<[i8; EMBEDDING_DIM]> 
     if norm <= 1e-12 {
         return Ok([0; EMBEDDING_DIM]);
     }
-    // [EM-06] After L2 normalisation, values are clipped, scaled by 127,
+    // After L2 normalisation, values are clipped, scaled by 127,
     // rounded, and stored as int8 bytes.
     let mut out = [0i8; EMBEDDING_DIM];
     for (idx, value) in values.iter().enumerate() {
@@ -512,19 +563,86 @@ pub(crate) fn quantize_embedding(values: &[f32]) -> Result<[i8; EMBEDDING_DIM]> 
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_token_counts_within_limit;
+    use super::{ensure_token_counts_within_limit, SemanticModelPaths, SemanticRuntime};
+    use anyhow::{Context, Result};
 
     #[test]
     fn actual_token_count_validation_rejects_the_first_oversize_input() {
-        let error = ensure_token_counts_within_limit(&[1024, 1025, 2048], 1024).unwrap_err();
+        let error = match ensure_token_counts_within_limit(&[512, 513, 1024], 512) {
+            Ok(()) => panic!("oversize semantic input was accepted"),
+            Err(error) => error,
+        };
         assert_eq!(
             error.to_string(),
-            "semantic input 1 contains 1025 tokens, exceeding the 1024-token model limit"
+            "semantic input 1 contains 513 tokens, exceeding the 512-token model limit"
         );
     }
 
     #[test]
     fn actual_token_count_validation_accepts_the_exact_limit() {
-        ensure_token_counts_within_limit(&[0, 1, 1024], 1024).unwrap();
+        assert!(ensure_token_counts_within_limit(&[0, 1, 512], 512).is_ok());
+    }
+
+    #[test]
+    #[ignore = "requires LEGAL_MCP_BENCH_DB and LEGAL_MCP_TEST_MODEL_DIR"]
+    fn benchmark_cuda_document_throughput() -> Result<()> {
+        let db = std::env::var("LEGAL_MCP_BENCH_DB").context("LEGAL_MCP_BENCH_DB is required")?;
+        let model = std::env::var("LEGAL_MCP_TEST_MODEL_DIR")
+            .context("LEGAL_MCP_TEST_MODEL_DIR is required")?;
+        let source =
+            std::env::var("LEGAL_MCP_BENCH_SOURCE").unwrap_or_else(|_| "federal-court".to_string());
+        let requested = std::env::var("LEGAL_MCP_BENCH_SAMPLES")
+            .ok()
+            .map(|value| value.parse::<usize>())
+            .transpose()?
+            .unwrap_or(5_000);
+        let mut runtime = SemanticRuntime::load(
+            true,
+            &SemanticModelPaths::from_model_dir(std::path::Path::new(&model))?,
+        )?;
+        let connection = rusqlite::Connection::open_with_flags(
+            db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let mut statement = connection
+            .prepare("SELECT text FROM chunks WHERE source_id = ?1 ORDER BY chunk_id LIMIT ?2")?;
+        let rows = statement.query_map(
+            rusqlite::params![source, i64::try_from(requested * 8)?],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        let mut texts = Vec::with_capacity(requested);
+        for row in rows {
+            let text = crate::db::decompress_text(row?)?;
+            let tokens = runtime.tokenizer.encode(text.as_str())?.len();
+            if tokens <= crate::EMBEDDING_INPUT_MAX_TOKENS {
+                texts.push((tokens, text));
+                if texts.len() == requested {
+                    break;
+                }
+            }
+        }
+        texts.sort_by_key(|(tokens, text)| (*tokens, text.len()));
+        let started = std::time::Instant::now();
+        let mut active_tokens = 0usize;
+        let mut padded_tokens = 0usize;
+        for batch in texts.chunks(64) {
+            let inputs = batch
+                .iter()
+                .map(|(_, text)| text.clone())
+                .collect::<Vec<_>>();
+            let (_, stats) = runtime.encode_documents_with_stats(&inputs)?;
+            active_tokens += stats.active_tokens;
+            padded_tokens += stats.padded_tokens;
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        eprintln!(
+            "EMBED_BENCH inputs={} active_tokens={} elapsed_s={elapsed:.3} inputs_per_s={:.1} active_tokens_per_s={:.0} padding_efficiency={:.3}",
+            texts.len(),
+            active_tokens,
+            texts.len() as f64 / elapsed,
+            active_tokens as f64 / elapsed,
+            active_tokens as f64 / padded_tokens as f64,
+        );
+        Ok(())
     }
 }

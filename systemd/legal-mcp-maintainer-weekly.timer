@@ -1,11 +1,11 @@
 [Unit]
-Description=ato-mcp: maintainer weekly incremental release
+Description=Australian Legal MCP: weekly local refresh, build, and activation
 
 [Timer]
 OnCalendar=Sun *-*-* 03:43:00
 RandomizedDelaySec=30min
 Persistent=true
-Unit=ato-mcp-maintainer-weekly.service
+Unit=legal-mcp-maintainer-weekly.service
 
 [Install]
 WantedBy=timers.target

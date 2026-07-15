@@ -1,12 +1,17 @@
+[workspace]
+members = [".", "crates/legal-model", "crates/legal-source-sdk"]
+resolver = "2"
+
 [package]
-name = "ato-mcp"
-version = "0.16.2"
+name = "australian-legal-mcp"
+version = "0.17.0"
 edition = "2021"
 license = "MIT"
-description = "Standalone MCP server for the Australian Taxation Office legal corpus"
+description = "Standalone MCP server for Australian legal sources"
+repository = "https://github.com/gunba/australian-legal-mcp"
 
 [[bin]]
-name = "ato-mcp"
+name = "legal-mcp"
 path = "src/main.rs"
 
 [dependencies]
@@ -19,11 +24,12 @@ chrono = { version = "0.4", default-features = false, features = [
 ] }
 clap = { version = "4.5", features = ["derive"] }
 dirs = "6.0"
+encoding_rs = "0.8"
 fs2 = "0.4"
-flate2 = { version = "1.1", default-features = false, features = [
-  "rust_backend",
-] }
 regex = "1.11"
+legal-model = { version = "0.1.0", path = "crates/legal-model" }
+legal-source-sdk = { version = "0.1.0", path = "crates/legal-source-sdk" }
+libc = "0.2"
 heed = { version = "=0.22.1", default-features = false }
 rand = "0.8.5"
 rand_chacha = "=0.3.1"
@@ -33,8 +39,7 @@ rusqlite = { version = "0.31", features = ["bundled", "functions"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-simsimd = "5"
-tar = "0.4"
+signal-hook = "0.3"
 tiny_http = "0.12"
 scraper = "0.27"
 ego_tree = { package = "ego-tree", version = "0.11" }
@@ -42,6 +47,9 @@ tempfile = "3.15"
 tokenizers = { version = "0.23", default-features = false, features = [
   "fancy-regex",
 ] }
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+unicode_categories = "0.1"
+unicode-normalization = "0.1"
 url = "2.5"
 zip = { version = "4.6", default-features = false, features = [
   "deflate-flate2",
@@ -56,7 +64,12 @@ zstd = "0.13"
 # whats-new, update); the MCP transport itself is plain localhost HTTP.
 reqwest = { version = "0.12", default-features = false, features = [
   "blocking",
+  "brotli",
+  "cookies",
+  "deflate",
+  "gzip",
   "native-tls",
+  "zstd",
 ] }
 # ATO outbound requests use reqwest+native-tls so the runtime stays on the
 # platform TLS stack.
@@ -65,7 +78,7 @@ openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
 
 [features]
 default = []
-cuda = ["ort/cuda"]
+cuda = ["ort/cuda", "ort/tensorrt"]
 vendored-openssl = ["dep:openssl-sys"]
 
 [target.'cfg(windows)'.dependencies]

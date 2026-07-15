@@ -2,14 +2,50 @@
 //! `<a href>` rewriting to `data-doc-id`, attribute stripping, named-anchor
 //! normalisation, and ATO doc-link parsing.
 
+use legal_model::{DocumentId, SourceId};
 use regex::Regex;
 use std::collections::HashSet;
 
-// [IB-06] Containers ATO has used over the years. First selector match wins;
+pub(crate) fn canonical_source_character(character: char) -> Option<char> {
+    Some(match character {
+        '\u{80}' => '€',
+        '\u{82}' => '‚',
+        '\u{83}' => 'ƒ',
+        '\u{84}' => '„',
+        '\u{85}' => '…',
+        '\u{86}' => '†',
+        '\u{87}' => '‡',
+        '\u{88}' => 'ˆ',
+        '\u{89}' => '‰',
+        '\u{8a}' => 'Š',
+        '\u{8b}' => '‹',
+        '\u{8c}' => 'Œ',
+        '\u{8e}' => 'Ž',
+        '\u{91}' => '‘',
+        '\u{92}' => '’',
+        '\u{93}' => '“',
+        '\u{94}' => '”',
+        '\u{95}' => '•',
+        '\u{96}' => '–',
+        '\u{97}' => '—',
+        '\u{98}' => '˜',
+        '\u{99}' => '™',
+        '\u{9a}' => 'š',
+        '\u{9b}' => '›',
+        '\u{9c}' => 'œ',
+        '\u{9e}' => 'ž',
+        '\u{9f}' => 'Ÿ',
+        '\n' | '\r' | '\t' => character,
+        _ if character.is_control() => return None,
+        _ => character,
+    })
+}
+
+// Containers ATO has used over the years. First selector match wins;
 // pick_container_html falls back to <main>/<body> if none match.
 pub(crate) const ATO_CONTAINER_SELECTORS: &[&str] =
     &["#LawContent", "#lawContents", "#LawContents", "#contents"];
-// Strip these wholesale before any text extraction. Mirrors extract.py:_strip_noise.
+// Strip these source-page elements wholesale before text extraction.
 pub(crate) const ATO_NOISE_SELECTORS: &[&str] = &[
     "script",
     "style",
@@ -20,8 +56,8 @@ pub(crate) const ATO_NOISE_SELECTORS: &[&str] = &[
     ".minimenu",
     ".minimenu-bar",
 ];
-// History-toggle UI labels — case-insensitive match on text-node content and
-// img title/alt attributes. Mirrors extract.py:_HISTORY_UI_LABELS.
+// ATO history-toggle labels matched case-insensitively in text nodes and image
+// title/alt attributes.
 pub(crate) const ATO_HISTORY_UI_LABELS: &[&str] = &[
     "view history note",
     "hide history note",
@@ -29,8 +65,7 @@ pub(crate) const ATO_HISTORY_UI_LABELS: &[&str] = &[
     "hide history reference",
 ];
 
-// ATO URL parsing — port of extract.py:_doc_id_from_ato_link and helpers.
-// We accept either ato.gov.au hosts or any URL whose path contains one of the
+// ATO URL parsing accepts ato.gov.au hosts and URLs whose paths contain one of the
 // ATO doc path hints. Recognised query params (case-insensitive): docid, locid,
 // PiT, db. Recognised db values: HISTFT (amendment-history view).
 pub(crate) const ATO_DOC_PATH_HINTS: &[&str] = &[
@@ -196,12 +231,10 @@ pub(crate) fn has_descendant_with_tag(
     false
 }
 
-/// Walk the cleaned tree and emit text with inline markdown markers, ported
-/// from src/ato_mcp/indexer/chunk.py:_inline_text + html_to_text. Block-level
-/// tags introduce paragraph breaks. Inline tags emit:
+/// Walk the cleaned tree and emit text with inline markdown markers.
+/// Block-level tags introduce paragraph breaks. Inline tags emit:
 ///   <a> with an ATO docid in href: "text [doc:X]" (with @PiT / view= when
-///     present) — ported from chunk.py:_inline_text and
-///     extract.py:_doc_id_from_ato_link.
+///     present).
 ///   <a name="X"> where X is referenced: "text [anchor:X]"
 ///   any element with id="X" referenced (fallback): "text [anchor:X]"
 ///   <span data-asset-ref="X">: "[asset:X]"
@@ -307,7 +340,9 @@ pub(crate) fn render_node(
                         el.attr("data-view").map(|s| s.to_string()),
                     ))
                 } else if !href.is_empty() {
-                    doc_id_from_ato_link(href)
+                    doc_id_from_ato_link(href).and_then(|(native_id, pit, view)| {
+                        ato_document_ref(&native_id).map(|document| (document, pit, view))
+                    })
                 } else {
                     None
                 };
@@ -724,12 +759,15 @@ pub(crate) fn rewrite_links_html(html: &str) -> String {
             return caps.get(0).unwrap().as_str().to_string();
         };
         if let Some((doc_id, pit, view)) = doc_id_from_ato_link(href) {
+            let Some(document_ref) = ato_document_ref(&doc_id) else {
+                return caps.get(0).unwrap().as_str().to_string();
+            };
             let href_re = Regex::new(r#"(?is)\s+href\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)"#).unwrap();
             let stripped = href_re.replace_all(attrs, "").into_owned();
             let mut new_attrs = stripped;
             new_attrs.push_str(&format!(
                 r#" data-doc-id="{}""#,
-                assets_html_escape(&doc_id)
+                assets_html_escape(&document_ref)
             ));
             if let Some(p) = pit {
                 new_attrs.push_str(&format!(r#" data-pit="{}""#, assets_html_escape(&p)));
@@ -754,6 +792,32 @@ pub(crate) fn rewrite_links_html(html: &str) -> String {
     .into_owned()
 }
 
+fn ato_document_ref(native_id: &str) -> Option<String> {
+    let source = SourceId::new("ato").ok()?;
+    DocumentId::new(source, canonical_ato_native_id(native_id))
+        .ok()
+        .map(|document| document.public_ref())
+}
+
+pub(crate) fn canonical_ato_native_id(native_id: &str) -> String {
+    let mut parts = native_id.split('/').map(str::to_owned).collect::<Vec<_>>();
+    if let Some(family) = parts.first_mut() {
+        family.make_ascii_uppercase();
+    }
+    if let Some(series) = parts.get_mut(1) {
+        series.make_ascii_uppercase();
+    }
+    if parts
+        .first()
+        .is_some_and(|family| matches!(family.as_str(), "CLR" | "OPS"))
+    {
+        for part in parts.iter_mut().skip(2) {
+            part.make_ascii_uppercase();
+        }
+    }
+    parts.join("/")
+}
+
 pub(crate) fn assets_html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -772,6 +836,18 @@ pub(crate) fn assets_html_escape(s: &str) -> String {
 #[cfg(test)]
 mod security_tests {
     use super::*;
+
+    #[test]
+    fn ato_identity_normalizes_source_series_without_changing_section_case() {
+        assert_eq!(
+            canonical_ato_native_id("clr/cr20269/nat/ato/00001"),
+            "CLR/CR20269/NAT/ATO/00001"
+        );
+        assert_eq!(
+            canonical_ato_native_id("pac/19970038/83A-45(5)(a)"),
+            "PAC/19970038/83A-45(5)(a)"
+        );
+    }
 
     #[test]
     fn ato_hostname_matching_has_label_boundaries() {

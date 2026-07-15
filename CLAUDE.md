@@ -1,66 +1,103 @@
-# ATO-MCP Guidelines
+# Australian Legal MCP guidelines
 
-The goal of this project is to maintain an on-device (with database build pulled from repo pre-baked) MCP server for searching the entire ATO database. 
+Australian Legal MCP is source-grounded legal retrieval over prebuilt immutable
+generations. The package is `australian-legal-mcp`, executable `legal-mcp`, MCP
+key `australian-legal`, and environment prefix `LEGAL_MCP_*`.
 
-IMPORTANT: The user is not expected to have a GPU and may be using a low performance enterprise laptop.
+Acquisition, OCR, embedding, ANN construction, and builds run on the local RTX
+maintainer host. Validated generations are activated locally and transferred
+directly over SSH to a CPU serving VM. The runtime never downloads, scrapes,
+embeds, packages, or publishes corpus/model artifacts. GitHub Releases contain
+software binaries only.
 
-IMPORTANT: We should be looking to simplify the MCP surface and minimise extraneous context at all times.
+Persistent project data is
+`data/{sources,source-snapshots,models,builds,runtime,cache,runs,logs,validation,archive}`.
+`LEGAL_MCP_DATA_DIR` selects a runtime root only.
 
-IMPORTANT: Tool responses must contain only information a tax-professional agent would act on. Do NOT serialise internal debug metadata to the agent — no ranking scores, no model identifiers, no candidate counts, no chunk ordinals, no echo of the query, no excluded-types policy, no `returned_chars`, no `distinct_docs`. If a field doesn't help the agent navigate or cite documents, it doesn't belong on the wire. Empty-value Option fields must use `skip_serializing_if = "Option::is_none"` rather than render as JSON null. Every byte the agent reads competes with the source text for their attention budget.
+## Public contract
 
-# Design Philosophy
+Expose exactly seven tools: `search`, `get_chunks`, `get_asset`,
+`get_doc_anchors`, `get_definition`, `stats`, and `fetch`. Every source-scoped
+request requires exactly one registered source. Public references are typed and
+source-qualified; chunk references include the generation. Live fetch accepts
+only canonical `legal://<source>/<percent-encoded-native-id>` URIs.
 
-- ATO-MCP should expose clean, source-grounded retrieval primitives and let agents do the reasoning. Prefer fewer tools, fewer parameters, and less context over feature breadth.
+Tool responses contain only actionable legal-research data: identity, title,
+type, date/currency metadata, exact stored canonical URL, heading path, snippet,
+and navigable typed references. Keep scores, model identifiers, candidate
+counts, ordinals, echoed queries, diagnostics, and debug counters internal.
+Omit empty optional values.
 
-- Good features are deterministic and derived from stable, ubiquitous source structure. Examples: parsing an ATO document URL into its exact `doc_id`, constructing titles from HTML headings, removing repeated history/navigation metadata that appears across the corpus, and preserving exact chunk/document references.
+Preserve cleaned structural HTML and useful attributes. Internal links/assets
+become deterministic typed references. Derive FTS/embedding text from visible
+source content, retaining headings as metadata.
 
-The document surface is cleaned source HTML, not Markdown. Preserve stable HTML structure so agents can navigate tags and attributes directly. 
-Internal ATO document links should become deterministic `data-doc-id` attributes rather than retained `href` URLs, and retained images should be compact `data-asset-ref` references resolvable through the asset tool. Do not inline image bytes or carry decorative/history icons into context.
+## Engineering choices
 
-- The semantic search/index path should use plain, source-derived text from the cleaned HTML. Do not introduce HTML-to-Markdown conversion, 
-- Markdown escaping, or host-rendering assumptions into stored chunks. Headings belong in metadata; links and images should contribute only useful visible text to search.
+Prefer typed deterministic logic from official structure. Keep source volatility
+inside acquisition/normalization adapters. Use one path for identities, storage,
+ANN, continuations, generation validation, activation, rollback, and pruning.
+Do not add compatibility surfaces or guessed mappings.
 
-- Do not add features built on hacky string substitutions, guessed citation aliases, hand-maintained act maps, or fragile interpretations of user prose.
-- If logic would need ongoing maintenance against new ATO document shapes, it is not a good runtime feature. If it relies on an ephemeral ATO structure, add an audit/telemetry step first or leave it out.
+Use deterministic completion signals, durable journals, locks, and atomic
+same-filesystem operations. Bound queues, bodies, decompression, retries,
+timeouts, concurrency, and blocking work. Installed generations are immutable;
+`active-generation` is the only switch.
 
-- Do not add backwards-compatibility shims for users or installs that do not exist. Prefer one current deterministic layout, one environment variable, and one source-derived code path. If a breaking change is needed before there is a real installed user base, make the break cleanly and remove the old surface.
+## Source and corpus rules
 
-- No arbitrary timers, sleeps, or polling loops as control flow. Use deterministic completion signals or do not implement the behavior.
+Current authoritative workspaces are `data/sources/<source>`. ATO retains the
+pinned What's New path, 50 ms issue interval, adaptive ten-request ceiling, and
+30-second timeout. FRL uses the official API, authoritative title/version
+ordering, and EPUB → DOCX → PDF rendition preference. Other adapters use only
+official publisher surfaces. Federal Court protected document hosts alone use
+bounded Chrome CDP.
 
-- Do not expose date-sensitive law resolution, historical-version selection, or similar legal interpretation helpers unless the corpus contains broad, source-derived version/effective-date data that can support the feature safely.
+Run source jobs independently. A broad source failure aborts that source and
+preserves its last committed state. Full repairs build a fresh complete source
+set and atomically exchange the whole set. Builds consume committed workspaces
+only and always create a fresh `legal.db` generation. Reuse vectors solely by
+exact model ID and chunk-text hash.
 
-# Workflow
+Every generation binds SQLite, the pinned model/tokenizer, and one deterministic
+ANN sidecar per source. ANN finds candidates; SQLite int8 vectors provide exact
+authoritative reranking.
 
-Use `/r`, `/j`, `/b`, `/c`, and `/rj` from this repo root.
+## Build and hosting workflow
 
-For long-running Bash commands such as builds or test suites, launch them with background execution when the runtime supports it.
-Do NOT poll background tasks. Wait for completion before acting on dependent results.
+```bash
+cargo build --release --features cuda
+scripts/maintainer-sync.sh             # or --full
+LEGAL_MCP_DATA_DIR="$PWD/data/runtime" legal-mcp verify
+scripts/deploy-generation.sh deploy@example-vps
+```
 
-`build` consumes local embedding model files and writes corpus artifacts.
-Do not thread hosted model URLs or other distribution metadata through corpus
-building. The `publish-release` step owns model distribution metadata and final
-manifest publication.
-Use `cargo build --release --features cuda` for release builds.
-Maintainer corpus builds should pass `--gpu` and fail fast if CUDA is not
-available. The Rust end-user runtime must remain CPU-safe; do not make ordinary
-install, update, search, or serve require a GPU.
-Maintainer corpus rebuilds should run with sleep prevention active. `build`
-and `scripts/maintainer-sync.sh` do this automatically through `systemd-inhibit`
-or `caffeinate` when available.
+The unpacked model is under `data/models/mdbr-leaf-ir-standard`. Maintainer
+builds use deterministic FP32 ONNX, TensorRT FP16, CUDA fallback, lossless
+512-token splitting, and normalized first-256-dimension int8 vectors. Serving is
+CPU-safe.
 
-# Documentation
+Lifecycle commands are `activate`, `verify`, `rollback`, and
+`prune-generations`. There is no runtime updater, remote model assumption,
+corpus package/publication, or offline bundle.
 
-All tagged documentation is managed by `proofd`. Canonical rule data lives outside the repo in the proofd knowledge base. `proofd sync` generates Claude Markdown snapshots under `.claude/rules/`.
-Codex does not have Claude-style path-scoped rule auto-load, so repo bootstrap configures Codex hooks that inject proofd guidance on session start and targeted proofd context on relevant prompts.
+Production `legal-mcp.service` binds loopback behind private Tailscale HTTPS.
+Local stdio development may use `legal-mcp mcp`. See [DEPLOYMENT.md](DEPLOYMENT.md).
 
-Do not hand-edit `.claude/rules/*.md`. They are refreshed by `proofd sync`, typically during janitor, build, release, or finalization work. Use `"$HOME/.claude/agent-proofs/bin/proofd.py"` subcommands to create rules, add entries, split rules, record verifications, and regenerate the rule output.
-Generated rule markdown is file-scoped and intentionally omits stored file lists. If you need source-reference files for a tag, use `"$HOME/.claude/agent-proofs/bin/proofd.py" entry-files --tag <TAG>`.
+## Documentation and proofd
 
-Tags are embedded in source code as language-appropriate comments containing `[TAG]` near the implementation site. Tags must be allocated by `proofd`; agents must not invent tag IDs themselves.
+[README.md](README.md) defines the user surface, [AGENTS.md](AGENTS.md) agent
+rules, [MAINTENANCE.md](MAINTENANCE.md) maintainer operations,
+[CURRENT_STATE.md](CURRENT_STATE.md) the implementation snapshot, and
+[PLAN.md](PLAN.md) remaining work.
 
-Useful commands:
-- `"$HOME/.claude/agent-proofs/bin/proofd.py" sync`
-- `"$HOME/.claude/agent-proofs/bin/proofd.py" lint`
-- `"$HOME/.claude/agent-proofs/bin/proofd.py" entry-files --tag <TAG>`
-- `"$HOME/.claude/agent-proofs/bin/proofd.py" select-matching <paths...>`
-- `"$HOME/.claude/agent-proofs/bin/proofd.py" context <paths...>`
+Canonical tagged guidance is managed by `proofd`; `proofd sync` generates
+`.claude/rules/*.md`:
+
+```bash
+"$HOME/.claude/agent-proofs/bin/proofd.py" sync
+"$HOME/.claude/agent-proofs/bin/proofd.py" lint
+"$HOME/.claude/agent-proofs/bin/proofd.py" entry-files --tag <TAG>
+"$HOME/.claude/agent-proofs/bin/proofd.py" select-matching <paths...>
+"$HOME/.claude/agent-proofs/bin/proofd.py" context <paths...>
+```
