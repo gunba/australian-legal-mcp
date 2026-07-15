@@ -8,16 +8,24 @@ use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtensio
 #[allow(unused_imports)]
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
+use std::collections::BTreeSet;
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
-use url::Url;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
+mod adaptive_http;
 mod ann;
+mod ato;
+mod bert_tokenizer;
+mod browser_http;
 mod build;
 mod chunker;
 mod config;
@@ -26,17 +34,20 @@ mod extract;
 mod frl;
 mod html;
 mod legal_source;
+mod official_sources;
 mod pipeline;
 mod retrieval;
 mod rules;
 mod search;
 mod semantic;
 mod source;
+mod source_catalog;
 mod source_update;
 mod uri;
 
-use build::{build_corpus, package_corpus, update_manifest_with_db, BuildCorpusArgs};
-use config::{live_dir, model_data_path, model_path, tokenizer_path};
+use bert_tokenizer::BertWordPieceTokenizer;
+use build::{build_corpus, BuildCorpusArgs};
+use config::live_dir;
 use legal_model::{AssetRef, ChunkRef, DocumentId, SourceId};
 use legal_source::source_registry;
 use retrieval::{
@@ -46,20 +57,17 @@ use retrieval::{
 use search::{search, search_cli, SearchOptions};
 #[cfg(test)]
 use semantic::dot_i8_scalar_reference;
-use semantic::{
-    SemanticEncodeStats, SemanticModelPaths, SemanticRuntime, EMBEDDING_MODEL_HF_FILES,
-};
+#[cfg(test)]
+use semantic::EMBEDDING_MODEL_FILES;
+use semantic::{SemanticEncodeStats, SemanticModelPaths, SemanticRuntime};
 use source::{
-    apply_update, check_for_update_availability, link_download, resolve_latest_corpus_manifest_url,
-    resolve_latest_corpus_manifest_url_probe, scrape_diff, snapshot_reduce, stats, tree_crawl,
-    LinkDownloadArgs, Manifest, ModelInfo, StagedModel, UpdateAvailability,
+    activate_local_generation, link_download, prune_inactive_generations, rollback_generation,
+    scrape_diff, snapshot_reduce, stats, tree_crawl, verify_active_generation, LinkDownloadArgs,
+    ModelInfo,
 };
-use source_update::{run_source_updates, SourceUpdateRequest};
+use source_update::{run_source_updates, SourceUpdateMode, SourceUpdateRequest};
 
 pub(crate) const APP_NAME: &str = "australian-legal-mcp";
-pub(crate) const DEFAULT_GITHUB_REPOSITORY: &str = "gunba/australian-legal-mcp";
-pub(crate) const DEFAULT_RELEASES_API_URL: &str =
-    "https://api.github.com/repos/gunba/australian-legal-mcp/releases";
 pub(crate) const DEFAULT_K: usize = 8;
 pub(crate) const MAX_K: usize = 50;
 /// Cap on the `title_hits` sidebar `search` returns alongside chunk hits.
@@ -70,30 +78,28 @@ pub(crate) const SNIPPET_CHARS: usize = 280;
 // Stored semantic vectors are the first 256 dimensions of the
 // model output after normalization + int8 quantization.
 pub(crate) const EMBEDDING_DIM: usize = 256;
-// The tokenizer truncates semantic inputs and pads dynamically to
-// each batch's max sequence length.
-pub(crate) const EMBEDDING_INPUT_MAX_TOKENS: usize = 1024;
-// Granite ONNX inputs use source-derived text directly; no
-// query/passage prompt prefix is stored in chunks or added at runtime.
-const EMBEDDING_TEXT_PREFIX: &str = "";
+// Inputs are never truncated. Source text is losslessly split into chunks at
+// this exact model limit, and each inference batch is padded only to its
+// longest member.
+pub(crate) const EMBEDDING_INPUT_MAX_TOKENS: usize = 512;
+// mdbr-leaf-ir is asymmetric: indexed passages are unprefixed, while search
+// queries use the prompt prescribed by the model authors.
+const DOCUMENT_EMBEDDING_PREFIX: &str = "";
+const QUERY_EMBEDDING_PREFIX: &str = "Represent this sentence for searching relevant passages: ";
 pub(crate) const EMBEDDING_MODEL_FINGERPRINT: &str =
-    "granite-small-r2-fp16:ee200de55cb2f94e858aabca54be7697a9c0805a14c858ee26ad0922b05f57d7:28d16e29cd623f25cc6fa0968700c5bc31036466091a5fa06d1353c1777f050e:feeb83348dcb033bc6b9d2e1f7906ca9eb2d122845000c9416d894d7c2927149";
+    "11837cd75c744e30c14e7a009c1beae47a6f63ea89a0a39fe84b2a1d66320f6b";
 pub(crate) const OLD_CONTENT_CUTOFF: &str = "2000-01-01";
 pub(crate) const DEFAULT_EXCLUDED_TYPES: &[&str] = &["EV"];
-pub(crate) const EDITED_PRIVATE_ADVICE_LABEL: &str = "Edited_private_advice";
-pub(crate) const LEGISLATION_TYPE: &str = "Legislation_and_supporting_material";
 pub(crate) const LEGISLATION_TYPE_PREFIXES: &[&str] = &["PAC", "REG", "RPC", "RRG"];
 pub(crate) const STATUTORY_DEFINITION_TYPE_PREFIXES: &[&str] = &["PAC", "REG"];
 pub(crate) const OEWN_2024_URL: &str = "https://en-word.net/static/english-wordnet-2024.zip";
 pub(crate) const OEWN_2024_SOURCE: &str = "Open English WordNet 2024 (CC-BY 4.0)";
 pub(crate) const ORDINARY_DICTIONARY_PATH_ENV: &str = "LEGAL_MCP_DICTIONARY_PATH";
 /// Single corpus version this binary supports. Stamped into both
-/// `meta.schema_version` in the SQLite DB and `schema_version` in the
-/// published manifest.json — the two were previously distinct numbers that
-/// always moved together; now they share one identifier. Bump on any
-/// breaking change to the on-disk layout or the manifest contract.
+/// `meta.schema_version` in SQLite and `schema_version` in generation.json
+/// move together. Bump on any breaking local generation layout change.
 pub(crate) const SUPPORTED_SCHEMA_VERSION: u32 = 10;
-pub(crate) const EMBEDDING_MODEL_ID: &str = "granite-embedding-small-r2-fp16-256d";
+pub(crate) const EMBEDDING_MODEL_ID: &str = "mdbr-leaf-ir-tensorrt-fp16-256d";
 
 /// Compile-time switch: corpus build and runtime semantic search use the
 /// CUDA execution provider when this binary was built with `--features cuda`,
@@ -102,9 +108,13 @@ pub(crate) const EMBEDDING_MODEL_ID: &str = "granite-embedding-small-r2-fp16-256
 pub(crate) const USE_GPU: bool = cfg!(feature = "cuda");
 pub(crate) const DEFAULT_MAX_PER_DOC: usize = 2;
 pub(crate) const HARD_MAX_PER_DOC: usize = 3;
-const HTTP_WORKERS: usize = 8;
-const HTTP_QUEUE_CAPACITY: usize = 32;
+const DEFAULT_HTTP_WORKERS: usize = 4;
+const MAX_HTTP_WORKERS: usize = 32;
+const HTTP_QUEUE_PER_WORKER: usize = 4;
+const DEFAULT_SHUTDOWN_GRACE_SECONDS: u64 = 30;
+const MAX_SHUTDOWN_GRACE_SECONDS: u64 = 30;
 const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
+const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
 #[cfg(test)]
 static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -210,22 +220,34 @@ enum Command {
         #[arg(long, hide = true)]
         ready_stdout: bool,
     },
-    /// Download or refresh the complete local corpus generation.
-    Update {
-        /// Install from an explicit manifest URL or local manifest path.
-        /// Primarily used for verified offline bundles and release testing.
+    /// Validate and atomically activate a complete local corpus generation.
+    /// The directory is moved into LEGAL_MCP_DATA_DIR and is never fetched.
+    Activate {
         #[arg(long)]
-        manifest_url: Option<String>,
+        generation_dir: PathBuf,
+    },
+    /// Atomically reactivate an already installed immutable generation.
+    Rollback {
+        #[arg(long)]
+        generation: String,
+    },
+    /// Remove old inactive generations while never touching the active one.
+    PruneGenerations {
+        #[arg(long, default_value_t = 1)]
+        keep_inactive: usize,
     },
     /// Print index version, counts, and search-policy status (JSON).
     Stats {},
+    /// Fail unless every source, model file, and ANN sidecar in the active
+    /// generation is ready for production search.
+    Verify {},
     /// Run a search from the CLI.
     Search {
         query: String,
-        /// Legal source identifier. Defaults to `ato`; discover available
-        /// identifiers from the search tool schema and `stats`.
+        /// Required legal source identifier; discover available identifiers
+        /// with `source-list` and `stats`.
         #[arg(long)]
-        source: Option<SourceId>,
+        source: SourceId,
         #[arg(short, long, default_value_t = DEFAULT_K)]
         k: usize,
         /// Exact corpus type codes or `*` globs; discover codes with `legal-mcp stats`.
@@ -255,32 +277,26 @@ enum Command {
     /// The cleaned HTML is chunked the same way the build pipeline chunks
     /// corpus docs, so live docs read like corpus docs.
     Fetch { uri: String },
-    /// In-binary build orchestrator. Reads `pages_dir/index.jsonl` (one
-    /// record per line with canonical_id, payload_path, sha256, and size), runs each doc
-    /// through the cleaning pipeline, the chunker, the rules-engine
-    /// metadata classifier, and the Granite embedder in-process, then writes
-    /// documents, chunks, embeddings, FTS, anchors, definitions and citations
-    /// and emits manifest.json
-    /// into --out-dir. Supports same-output-dir checkpoint resume.
+    /// In-binary build orchestrator. Reads one committed workspace for every
+    /// registered source, normalizes and embeds the authoritative snapshots,
+    /// then writes the unified database, source ANN sidecars, and manifest.
     /// Source refresh and corpus build are separate commands, so a validated
     /// source workspace can feed repeated builds or release dry runs.
     Build {
-        #[arg(long)]
-        pages_dir: PathBuf,
-        /// Federal Register workspace populated by `source-update`.
-        #[arg(long)]
-        frl_workspace: PathBuf,
-        #[arg(long)]
-        db_path: PathBuf,
-        /// Granite embedding model checkout. Must contain tokenizer.json,
-        /// onnx/model_fp16.onnx, and onnx/model_fp16.onnx_data.
+        /// Repeat as SOURCE=PATH. Every registered source must be supplied
+        /// exactly once, including ATO and FRL.
+        #[arg(long = "source-workspace", required = true, value_name = "SOURCE=PATH")]
+        source_workspaces: Vec<SourceWorkspaceArg>,
+        /// Pinned embedding model checkout. Must contain tokenizer.json and
+        /// onnx/model.onnx.
         #[arg(long)]
         model_dir: PathBuf,
-        /// Optional completed schema-v10 legal.db whose model-keyed embedding
-        /// cache seeds this otherwise fresh generation.
+        /// Optional completed schema-v10 legal.db from which vectors are reused
+        /// only when model ID and chunk-text SHA-256 are identical.
         #[arg(long)]
         embedding_cache_db: Option<PathBuf>,
-        /// Output directory for manifest.json, legal.db, and source ANN sidecars.
+        /// Fresh output directory for generation.json, legal.db, model files,
+        /// and source ANN sidecars.
         #[arg(long)]
         out_dir: PathBuf,
         #[arg(long, default_value_t = 3)]
@@ -289,27 +305,29 @@ enum Command {
         #[arg(long)]
         profile: bool,
     },
-    /// Incrementally refresh one or more source workspaces in parallel. Each
-    /// source uses its incremental discovery strategy, request pacing,
-    /// concurrency and timeout policy.
+    /// Refresh one or more source workspaces in parallel. Adapters own their
+    /// incremental and full discovery strategies, pacing, and concurrency.
     SourceUpdate {
         /// Repeat as SOURCE=PATH. The existing ATO workspace can be supplied
-        /// directly, for example `--workspace ato=../ato_pages`.
+        /// directly, for example `--workspace ato=data/sources/ato`.
         #[arg(long = "workspace", required = true, value_name = "SOURCE=PATH")]
         workspaces: Vec<SourceWorkspaceArg>,
         /// New directory in which source-specific discovery inventories and
         /// provenance are retained for this run.
         #[arg(long)]
         run_dir: PathBuf,
+        /// Perform a complete source refresh. Every supplied workspace must be
+        /// empty so a failed repair cannot damage its last committed store.
+        #[arg(long)]
+        full: bool,
     },
-    /// Perform a bounded live validation of the official FRL API, one current
-    /// title, one rendition page and one normalized document.
-    FrlProbe,
+    /// Print the production source catalogue, one canonical source ID per line.
+    SourceList,
     /// Fetch compact statutory definitions for a term.
     GetDefinition {
         term: String,
         #[arg(long)]
-        source: Option<SourceId>,
+        source: SourceId,
         #[arg(long)]
         context_document: Option<DocumentId>,
         #[arg(long, default_value_t = 5)]
@@ -346,8 +364,8 @@ enum Command {
         #[arg(long)]
         out_dir: Option<PathBuf>,
     },
-    /// Maintainer source download defaults to 0.05s request pacing
-    /// and four link-download workers; the rate lock serializes HTTP issuance.
+    /// Maintainer source download uses adaptive request concurrency with an
+    /// optional minimum interval between requests.
     /// Download deduplicated ATO links to immutable SHA-256-named payloads in
     /// the source hierarchy and commit integrity-pinned index.jsonl records.
     LinkDownload {
@@ -359,8 +377,6 @@ enum Command {
         base_url: String,
         #[arg(long, default_value_t = 0.05)]
         request_delay_seconds: f64,
-        #[arg(long, default_value_t = 4)]
-        max_workers: usize,
         #[arg(long, default_value_t = 30.0)]
         timeout_seconds: f64,
         #[arg(long, default_value_t = false)]
@@ -387,54 +403,6 @@ enum Command {
         path_prefix: Option<String>,
         #[arg(long)]
         out: PathBuf,
-    },
-    /// Strip FTS5 indexes off a copy of legal.db, VACUUM, and zstd-compress
-    /// it into the shippable legal.db.zst artifact.
-    /// Emits {path, sha256, size} JSON on stdout so the release writer can
-    /// embed those into manifest.json. If --manifest is set, updates that
-    /// manifest in-place to point `db: {url, sha256, size}` at the new artifact
-    /// (URL = bare filename; publish-release rewrites it to a GitHub release URL
-    /// later).
-    PackageCorpus {
-        /// Path to the canonical built legal.db (e.g. release/<tag>/legal.db).
-        #[arg(long)]
-        db_path: PathBuf,
-        /// Output path for the compressed artifact (e.g. release/<tag>/legal.db.zst).
-        #[arg(long)]
-        out: PathBuf,
-        /// zstd compression level. 19 maximises ratio; 3 is faster but bigger.
-        #[arg(long, default_value_t = 19)]
-        level: i32,
-        /// Optional: update this manifest's `db` field in place with the new
-        /// artifact's SHA-256 and size.
-        #[arg(long)]
-        manifest: Option<PathBuf>,
-    },
-    /// Publish a corpus release to GitHub: finalize and validate remote artifact
-    /// URLs, create a non-latest draft, upload the database, source ANNs and
-    /// model artifacts, upload manifest.json last, then publish the draft.
-    PublishRelease {
-        #[arg(long)]
-        out_dir: PathBuf,
-        #[arg(long)]
-        tag: String,
-        /// Target GitHub repository. Defaults to `gunba/australian-legal-mcp`.
-        #[arg(long)]
-        repo: Option<String>,
-        #[arg(long)]
-        title: Option<String>,
-        #[arg(long)]
-        notes: Option<String>,
-        /// Override the embedding-model URL recorded in the manifest. Use
-        /// this when hosting the model bundle outside HuggingFace.
-        #[arg(long)]
-        model_url: Option<String>,
-        /// SHA256 hex of the embedding-model bundle when --model-url is used.
-        #[arg(long)]
-        model_sha256: Option<String>,
-        /// Size in bytes of the embedding-model bundle when --model-url is used.
-        #[arg(long)]
-        model_size: Option<u64>,
     },
 }
 
@@ -480,28 +448,59 @@ fn main() -> Result<()> {
             ready_stdout,
         } => {
             let choice = config::resolve_serve_port(port)?;
-            let update_notice = resolve_startup_update_notice();
-            let cached_instructions = server_instructions(update_notice.as_ref());
+            let (cached_instructions, corpus_ready) = server_instructions();
             let state = ServerState {
                 cached_instructions,
                 ..Default::default()
             };
+            let model_ready = if corpus_ready {
+                match state.encode_query_embedding("Australian legal service readiness") {
+                    Ok(_) => true,
+                    Err(error) => {
+                        eprintln!("legal-mcp semantic model readiness failed: {error:#}");
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            state.ready.store(model_ready, Ordering::Release);
             serve(choice, &bind, ready_stdout, Arc::new(state))
         }
-        Command::Update { manifest_url } => {
-            let manifest_url = match manifest_url {
-                Some(value) => value,
-                None => resolve_latest_corpus_manifest_url()?,
-            };
-            let stats = apply_update(&manifest_url)?;
+        Command::Activate { generation_dir } => {
             println!(
-                "update complete ({:.2} MB downloaded)",
-                stats.bytes_downloaded as f64 / 1_000_000.0,
+                "{}",
+                serde_json::to_string_pretty(&activate_local_generation(&generation_dir)?)?
+            );
+            Ok(())
+        }
+        Command::Rollback { generation } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&rollback_generation(&generation)?)?
+            );
+            Ok(())
+        }
+        Command::PruneGenerations { keep_inactive } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "removed": prune_inactive_generations(keep_inactive)?
+                }))?
             );
             Ok(())
         }
         Command::Stats {} => {
             println!("{}", stats()?);
+            Ok(())
+        }
+        Command::Verify {} => {
+            let report = verify_active_generation()?;
+            let state = ServerState::default();
+            state
+                .encode_query_embedding("Australian legal service readiness")
+                .context("loading and executing the active semantic model")?;
+            println!("{}", report);
             Ok(())
         }
         Command::Search {
@@ -518,15 +517,14 @@ fn main() -> Result<()> {
             seed_text,
         } => {
             let types = empty_vec_as_none(types);
-            let resolved_source =
-                source_registry().resolve(source.as_ref().map(SourceId::as_str))?;
+            source_registry().source(&source)?;
             // Construct a transient ServerState so the CLI's `search` call
             // reuses the same lazy semantic runtime the MCP server does for
             // modes that need it.
             let (out, _state) = search_cli(
                 &query,
                 SearchOptions {
-                    source: resolved_source,
+                    source,
                     k,
                     types: types.as_deref(),
                     date_from: date_from.as_deref(),
@@ -564,25 +562,6 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
-        Command::PublishRelease {
-            out_dir,
-            tag,
-            repo,
-            title,
-            notes,
-            model_url,
-            model_sha256,
-            model_size,
-        } => publish_release(PublishReleaseArgs {
-            out_dir,
-            tag,
-            repo,
-            title,
-            notes,
-            model_url,
-            model_sha256,
-            model_size,
-        }),
         Command::TreeCrawl {
             root_query,
             out_dir,
@@ -607,7 +586,6 @@ fn main() -> Result<()> {
             out_dir,
             base_url,
             request_delay_seconds,
-            max_workers,
             timeout_seconds,
             force,
         } => link_download(LinkDownloadArgs {
@@ -615,7 +593,6 @@ fn main() -> Result<()> {
             out_dir,
             base_url,
             request_delay_seconds,
-            max_workers,
             timeout_seconds,
             force,
             workspace_lock_held: false,
@@ -634,52 +611,49 @@ fn main() -> Result<()> {
             path_prefix.as_deref(),
             &out,
         ),
-        Command::PackageCorpus {
-            db_path,
-            out,
-            level,
-            manifest,
-        } => {
-            let summary = package_corpus(&db_path, &out, level)?;
-            if let Some(path) = manifest {
-                update_manifest_with_db(&path, &out, &summary)?;
-            }
-            println!("{}", serde_json::to_string_pretty(&summary)?);
-            Ok(())
-        }
         Command::Fetch { uri } => {
             validate_fetch_uri(&uri)?;
             println!("{}", fetch(&uri)?);
             Ok(())
         }
         Command::Build {
-            pages_dir,
-            frl_workspace,
-            db_path,
+            source_workspaces,
             model_dir,
             embedding_cache_db,
             out_dir,
             zstd_level,
             profile,
-        } => build_corpus(BuildCorpusArgs {
-            pages_dir: &pages_dir,
-            frl_workspace: &frl_workspace,
-            db_path: &db_path,
-            model_dir: &model_dir,
-            embedding_cache_db: embedding_cache_db.as_deref(),
-            out_dir: &out_dir,
-            zstd_level,
-            profile_enabled: profile,
-        }),
+        } => {
+            let registry = source_registry();
+            let mut workspaces = std::collections::BTreeMap::new();
+            for workspace in source_workspaces {
+                let source: SourceId = workspace.source.parse()?;
+                registry.source(&source)?;
+                if workspaces.insert(source.clone(), workspace.path).is_some() {
+                    bail!("duplicate source workspace `{source}`");
+                }
+            }
+            build_corpus(BuildCorpusArgs {
+                source_workspaces: &workspaces,
+                db_path: &out_dir.join(config::LEGAL_DB_FILENAME),
+                model_dir: &model_dir,
+                embedding_cache_db: embedding_cache_db.as_deref(),
+                out_dir: &out_dir,
+                zstd_level,
+                profile_enabled: profile,
+            })
+        }
         Command::SourceUpdate {
             workspaces,
             run_dir,
+            full,
         } => {
             let registry = source_registry();
             let requests = workspaces
                 .into_iter()
                 .map(|workspace| {
-                    let source = registry.resolve(Some(&workspace.source))?;
+                    let source: SourceId = workspace.source.parse()?;
+                    registry.source(&source)?;
                     let source_run_dir = run_dir.join(source.as_str());
                     Ok(SourceUpdateRequest {
                         source,
@@ -688,24 +662,28 @@ fn main() -> Result<()> {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let outcomes = run_source_updates(requests)?;
+            let mode = if full {
+                SourceUpdateMode::Full
+            } else {
+                SourceUpdateMode::Incremental
+            };
+            let outcomes = run_source_updates(requests, mode)?;
             let succeeded = outcomes.iter().all(|outcome| outcome.is_success());
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({ "sources": outcomes }))?
             );
             if !succeeded {
-                eprintln!(
-                    "legal-mcp source-update: one or more sources retained their last committed state"
+                bail!(
+                    "one or more sources failed; successful sources committed independently and failed sources retained their last committed state"
                 );
             }
             Ok(())
         }
-        Command::FrlProbe => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&frl::probe_official_source()?)?
-            );
+        Command::SourceList => {
+            for source in source_registry().source_ids() {
+                println!("{source}");
+            }
             Ok(())
         }
     }
@@ -721,33 +699,40 @@ fn empty_vec_as_none(values: Vec<String>) -> Option<Vec<String>> {
 
 struct ServerState {
     semantic_runtime: Mutex<Option<SemanticRuntime>>,
+    semantic_tokenizer: OnceLock<BertWordPieceTokenizer>,
     semantic_model_paths: Option<SemanticModelPaths>,
     corpus_generation: Option<String>,
     // Rendered once at server start so MCP initialize is a cheap field read
     // instead of re-running stats() (~5-10s on a cold 4 GB corpus) per call.
-    // The corpus is immutable for the server lifetime — `legal-mcp update`
-    // requires a restart — so a single render is correct. Carries the
-    // startup update-notice via server_instructions(); no separate field
-    // is needed because nothing else reads it.
+    // The corpus is immutable for the server lifetime. Local activation takes
+    // effect after a restart, so one render per process is correct.
     cached_instructions: String,
+    ready: AtomicBool,
+    request_sequence: AtomicU64,
 }
 
 impl ServerState {
     fn new() -> Self {
         Self {
             semantic_runtime: Mutex::new(None),
+            semantic_tokenizer: OnceLock::new(),
             semantic_model_paths: None,
             corpus_generation: config::active_generation_key().ok().flatten(),
             cached_instructions: String::new(),
+            ready: AtomicBool::new(false),
+            request_sequence: AtomicU64::new(0),
         }
     }
 
     fn with_model_paths(semantic_model_paths: SemanticModelPaths) -> Self {
         Self {
             semantic_runtime: Mutex::new(None),
+            semantic_tokenizer: OnceLock::new(),
             semantic_model_paths: Some(semantic_model_paths),
             corpus_generation: config::active_generation_key().ok().flatten(),
             cached_instructions: String::new(),
+            ready: AtomicBool::new(false),
+            request_sequence: AtomicU64::new(0),
         }
     }
 
@@ -773,22 +758,48 @@ impl ServerState {
         Ok(embeddings)
     }
 
+    fn encode_document_embeddings(&self, documents: &[String]) -> Result<Vec<[i8; EMBEDDING_DIM]>> {
+        let (embeddings, _stats) = self.encode_document_embeddings_with_stats(documents)?;
+        Ok(embeddings)
+    }
+
     fn count_embedding_tokens(&self, text: &str) -> Result<usize> {
-        let mut guard = self
-            .semantic_runtime
-            .lock()
-            .expect("semantic_runtime mutex");
-        if guard.is_none() {
-            let model_paths = match &self.semantic_model_paths {
-                Some(paths) => paths.clone(),
-                None => SemanticModelPaths::live()?,
-            };
-            *guard = Some(SemanticRuntime::load(USE_GPU, &model_paths)?);
+        Ok(self.embedding_tokenizer()?.encode(text)?.len())
+    }
+
+    fn embedding_tokenizer(&self) -> Result<&BertWordPieceTokenizer> {
+        let tokenizer = if let Some(tokenizer) = self.semantic_tokenizer.get() {
+            tokenizer
+        } else {
+            let model_paths = self
+                .semantic_model_paths
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(SemanticModelPaths::live)?;
+            let tokenizer = BertWordPieceTokenizer::from_file(&model_paths.tokenizer)?;
+            let _ = self.semantic_tokenizer.set(tokenizer);
+            self.semantic_tokenizer
+                .get()
+                .expect("embedding tokenizer was just initialized")
+        };
+        Ok(tokenizer)
+    }
+
+    fn prepare_document_embedding_tokens(&self, text: &str) -> Result<Vec<i64>> {
+        let token_ids =
+            self.prepare_embedding_tokens_exact(&format!("{DOCUMENT_EMBEDDING_PREFIX}{text}"))?;
+        if token_ids.len() > EMBEDDING_INPUT_MAX_TOKENS {
+            bail!(
+                "document embedding input contains {} tokens, exceeding the {}-token model limit",
+                token_ids.len(),
+                EMBEDDING_INPUT_MAX_TOKENS
+            );
         }
-        guard
-            .as_ref()
-            .expect("semantic runtime was just initialized")
-            .count_tokens(text)
+        Ok(token_ids)
+    }
+
+    fn prepare_embedding_tokens_exact(&self, input: &str) -> Result<Vec<i64>> {
+        self.embedding_tokenizer()?.encode(input)
     }
 
     fn encode_query_embeddings_with_stats(
@@ -813,6 +824,56 @@ impl ServerState {
             .expect("semantic runtime was just initialized")
             .encode_queries_with_stats(queries)
     }
+
+    fn encode_document_embeddings_with_stats(
+        &self,
+        documents: &[String],
+    ) -> Result<(Vec<[i8; EMBEDDING_DIM]>, SemanticEncodeStats)> {
+        let mut guard = self
+            .semantic_runtime
+            .lock()
+            .expect("semantic_runtime mutex");
+        if guard.is_none() {
+            let model_paths = match &self.semantic_model_paths {
+                Some(paths) => paths.clone(),
+                None => SemanticModelPaths::live()?,
+            };
+            *guard = Some(SemanticRuntime::load(USE_GPU, &model_paths)?);
+        }
+        guard
+            .as_mut()
+            .expect("semantic runtime was just initialized")
+            .encode_documents_with_stats(documents)
+    }
+
+    fn encode_document_token_embeddings(
+        &self,
+        token_ids: &[&[i64]],
+    ) -> Result<Vec<[i8; EMBEDDING_DIM]>> {
+        let (embeddings, _stats) = self.encode_document_token_embeddings_with_stats(token_ids)?;
+        Ok(embeddings)
+    }
+
+    fn encode_document_token_embeddings_with_stats(
+        &self,
+        token_ids: &[&[i64]],
+    ) -> Result<(Vec<[i8; EMBEDDING_DIM]>, SemanticEncodeStats)> {
+        let mut guard = self
+            .semantic_runtime
+            .lock()
+            .expect("semantic_runtime mutex");
+        if guard.is_none() {
+            let model_paths = match &self.semantic_model_paths {
+                Some(paths) => paths.clone(),
+                None => SemanticModelPaths::live()?,
+            };
+            *guard = Some(SemanticRuntime::load(USE_GPU, &model_paths)?);
+        }
+        guard
+            .as_mut()
+            .expect("semantic runtime was just initialized")
+            .encode_document_token_ids_with_stats(token_ids)
+    }
 }
 
 impl Default for ServerState {
@@ -835,699 +896,64 @@ pub(crate) const ATO_USER_AGENT: &str = concat!(
     "; +https://github.com/gunba/australian-legal-mcp)"
 );
 
-// ----- Deterministic GitHub corpus release publication -----
-
-pub(crate) const EMBEDDING_MODEL_HF_URL: &str =
-    "hf://onnx-community/granite-embedding-small-english-r2-ONNX@1dc7835ba0cb9c76a3618d0bf0c427c97671b3c8";
-pub(crate) const EMBEDDING_MODEL_HF_SIZE: u64 = 99_732_286;
-
-struct PublishReleaseArgs {
-    out_dir: PathBuf,
-    tag: String,
-    repo: Option<String>,
-    title: Option<String>,
-    notes: Option<String>,
-    model_url: Option<String>,
-    model_sha256: Option<String>,
-    model_size: Option<u64>,
-}
-
-fn is_placeholder_model_url(url: &str) -> bool {
-    let u = url.trim();
-    u.is_empty()
-        || u == "PENDING"
-        || u.contains("releases/download/PENDING")
-        || u.contains("placeholder")
-}
-
-fn is_github_url(url: &str) -> bool {
-    url.starts_with("https://github.com/") || url.starts_with("http://github.com/")
-}
-
-fn is_hf_http_url(url: &str) -> bool {
-    url.starts_with("https://huggingface.co/") || url.starts_with("http://huggingface.co/")
-}
-
-fn is_hf_scheme_url(url: &str) -> bool {
-    url.starts_with("hf://")
-}
-
-fn is_hf_model_source(url: &str) -> bool {
-    parse_hf_model_url(url).is_some()
-}
-
-fn non_empty_model_sha(value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
-
-fn resolve_publish_model_info(
-    current: &ModelInfo,
-    model_url: Option<&str>,
-    model_sha256: Option<&str>,
-    model_size: Option<u64>,
-) -> Result<ModelInfo> {
-    let mut resolved = current.clone();
-    if current.id != EMBEDDING_MODEL_ID {
-        return Ok(resolved);
-    }
-
-    let explicit_model_url = model_url.is_some();
-    let mut resolved_url = model_url.unwrap_or(&current.url).to_string();
-    let requested_sha = model_sha256.and_then(non_empty_model_sha);
-    let requested_size = model_size.filter(|n| *n > 0);
-    let manifest_sha = non_empty_model_sha(&current.sha256);
-    let manifest_size = (current.size > 0).then_some(current.size);
-
-    let needs_default = is_placeholder_model_url(&resolved_url)
-        || (is_github_url(&resolved_url) && !explicit_model_url);
-
-    let (sha256, size) = if needs_default {
-        resolved_url = EMBEDDING_MODEL_HF_URL.to_string();
-        (
-            EMBEDDING_MODEL_FINGERPRINT.to_string(),
-            EMBEDDING_MODEL_HF_SIZE,
-        )
-    } else if is_hf_model_source(&resolved_url) {
-        if requested_sha
-            .as_deref()
-            .is_some_and(|sha| sha != EMBEDDING_MODEL_FINGERPRINT)
-        {
-            bail!("Hugging Face semantic model sha256 must match the pinned Granite fingerprint");
-        }
-        if requested_size.is_some_and(|size| size != EMBEDDING_MODEL_HF_SIZE) {
-            bail!("Hugging Face semantic model size must match the pinned Granite file set");
-        }
-        if manifest_sha
-            .as_deref()
-            .is_some_and(|sha| sha != EMBEDDING_MODEL_FINGERPRINT)
-        {
-            bail!("Hugging Face semantic model sha256 must match the pinned Granite fingerprint");
-        }
-        if manifest_size.is_some_and(|size| size != EMBEDDING_MODEL_HF_SIZE) {
-            bail!("Hugging Face semantic model size must match the pinned Granite file set");
-        }
-        (
-            EMBEDDING_MODEL_FINGERPRINT.to_string(),
-            EMBEDDING_MODEL_HF_SIZE,
-        )
-    } else {
-        if is_hf_scheme_url(&resolved_url) {
-            bail!("Hugging Face semantic model sources must use hf://repo@revision with an explicit revision");
-        }
-        if is_hf_http_url(&resolved_url) {
-            bail!("Hugging Face semantic model sources must use hf://repo@revision, not HTTPS model URLs");
-        }
-        if is_github_url(&resolved_url) {
-            bail!("semantic model bundles must not be hosted on GitHub");
-        }
-        if explicit_model_url && (requested_sha.is_none() || requested_size.is_none()) {
-            bail!(
-                "non-Hugging Face semantic model mirrors require --model-sha256 and --model-size"
-            );
-        }
-        (
-            requested_sha.or(manifest_sha).unwrap_or_default(),
-            requested_size.or(manifest_size).unwrap_or(0),
-        )
-    };
-
-    if sha256.is_empty() || size == 0 {
-        bail!("semantic model releases require model sha256 and size");
-    }
-    resolved.sha256 = sha256;
-    resolved.size = size;
-    resolved.url = resolved_url;
-    Ok(resolved)
-}
-
-fn publish_release(args: PublishReleaseArgs) -> Result<()> {
-    let manifest_path = args.out_dir.join("manifest.json");
-    if !manifest_path.exists() {
-        bail!("no manifest at {}", manifest_path.display());
-    }
-
-    let repo = args
-        .repo
-        .clone()
-        .or_else(|| std::env::var("LEGAL_MCP_GH_REPO").ok())
-        .unwrap_or_else(|| DEFAULT_GITHUB_REPOSITORY.to_string());
-
-    // Load manifest, fix model fields if necessary.
-    let raw = fs::read_to_string(&manifest_path)?;
-    let mut manifest: Manifest = serde_json::from_str(&raw)
-        .with_context(|| format!("parsing {}", manifest_path.display()))?;
-
-    manifest.model = resolve_publish_model_info(
-        &manifest.model,
-        args.model_url.as_deref(),
-        args.model_sha256.as_deref(),
-        args.model_size,
-    )?;
-
-    // The release ships one legal.db.zst artifact. Rewrite manifest.db.url
-    // to the GitHub release URL and queue the local file for upload.
-    let mut artifacts: Vec<PathBuf> = Vec::new();
-    let db_info = &mut manifest.db;
-    let filename = std::path::Path::new(&db_info.url)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| db_info.url.clone());
-    let local = args.out_dir.join(&filename);
-    if !local.exists() {
-        bail!(
-            "manifest.db points at {} but {} does not exist; run `legal-mcp package-corpus --manifest <path>` first",
-            filename,
-            local.display()
-        );
-    }
-    if fs::metadata(&local)?.len() != db_info.size {
-        bail!("manifest DB size does not match {}", local.display());
-    }
-    verify_sha256_file(&local, &db_info.sha256)?;
-    db_info.url = format!(
-        "https://github.com/{repo}/releases/download/{tag}/{filename}",
-        tag = args.tag,
-    );
-    artifacts.push(local);
-
-    for (source_id, ann_info) in &mut manifest.ann {
-        let filename = Path::new(&ann_info.url)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow!("manifest ANN URL has no UTF-8 filename"))?
-            .to_string();
-        let local = args.out_dir.join(&ann_info.url);
-        if !local.is_file() {
-            bail!(
-                "manifest ANN sidecar for source `{source_id}` points at missing {}",
-                local.display()
-            );
-        }
-        if fs::metadata(&local)?.len() != ann_info.size {
-            bail!(
-                "manifest ANN size for source `{source_id}` does not match {}",
-                local.display()
-            );
-        }
-        verify_sha256_file(&local, &ann_info.sha256)?;
-        ann_info.url = format!(
-            "https://github.com/{repo}/releases/download/{tag}/{filename}",
-            tag = args.tag,
-        );
-        artifacts.push(local);
-    }
-
-    crate::source::validate_manifest(&manifest).context("validating finalized release manifest")?;
-
-    // Keep the validated build manifest immutable. The release-specific copy
-    // carries remote artifact URLs and is uploaded as the commit point.
-    let pretty = serde_json::to_vec_pretty(&manifest)?;
-    let publish_dir = tempfile::Builder::new()
-        .prefix(".publish-")
-        .tempdir_in(&args.out_dir)?;
-    let published_manifest_path = publish_dir.path().join("manifest.json");
-    fs::write(&published_manifest_path, &pretty)?;
-
-    // Ensure release exists.
-    let view_status = std::process::Command::new("gh")
-        .args(["release", "view", &args.tag, "--repo", &repo])
-        .status()
-        .context("running gh release view (is the gh CLI installed?)")?;
-    if !view_status.success() {
-        eprintln!("creating release {}", args.tag);
-        let mut create = std::process::Command::new("gh");
-        create.args([
-            "release",
-            "create",
-            &args.tag,
-            "--repo",
-            &repo,
-            "--title",
-            args.title.as_deref().unwrap_or(&args.tag),
-            "--draft",
-            "--latest=false",
-        ]);
-        if let Some(notes) = args.notes.as_deref() {
-            create.args(["--notes", notes]);
-        } else {
-            create.arg("--generate-notes");
-        }
-        let st = create.status().context("running gh release create")?;
-        if !st.success() {
-            bail!("gh release create failed (exit {:?})", st.code());
-        }
-    }
-
-    let assets = std::process::Command::new("gh")
-        .args([
-            "release",
-            "view",
-            &args.tag,
-            "--repo",
-            &repo,
-            "--json",
-            "assets",
-            "--jq",
-            ".assets[].name",
-        ])
-        .output()
-        .context("listing existing release assets")?;
-    if !assets.status.success() {
-        bail!(
-            "gh release asset listing failed (exit {:?})",
-            assets.status.code()
-        );
-    }
-    let has_remote_manifest = String::from_utf8(assets.stdout)?
-        .lines()
-        .any(|name| name == "manifest.json");
-    let draft = std::process::Command::new("gh")
-        .args([
-            "release", "view", &args.tag, "--repo", &repo, "--json", "isDraft", "--jq", ".isDraft",
-        ])
-        .output()
-        .context("reading release draft status")?;
-    if !draft.status.success() {
-        bail!(
-            "gh release draft-status lookup failed (exit {:?})",
-            draft.status.code()
-        );
-    }
-    let is_draft = String::from_utf8(draft.stdout)?.trim() == "true";
-    if has_remote_manifest {
-        if is_draft {
-            publish_corpus_release(&args.tag, &repo)?;
-            return Ok(());
-        }
-        bail!("published corpus release {} is immutable", args.tag);
-    }
-    if !is_draft {
-        bail!(
-            "release {} is already public and has no corpus manifest; use a fresh corpus tag",
-            args.tag
-        );
-    }
-
-    // Publish immutable data first and the discoverable manifest last. Each
-    // upload is a separate command so an earlier failure cannot expose a
-    // manifest that references a missing database or ANN sidecar.
-    for artifact in artifacts
-        .iter()
-        .chain(std::iter::once(&published_manifest_path))
-    {
-        let mut upload = std::process::Command::new("gh");
-        upload.args(["release", "upload", &args.tag, "--repo", &repo]);
-        upload.arg(artifact);
-        let st = upload.status().context("running gh release upload")?;
-        if !st.success() {
-            bail!(
-                "gh release upload failed for {} (exit {:?})",
-                artifact.display(),
-                st.code()
-            );
-        }
-    }
-
-    eprintln!(
-        "legal-mcp publish-release: uploaded {} artifacts to {}@{}",
-        artifacts.len() + 1,
-        repo,
-        args.tag,
-    );
-    publish_corpus_release(&args.tag, &repo)?;
-    Ok(())
-}
-
-fn publish_corpus_release(tag: &str, repo: &str) -> Result<()> {
-    let status = std::process::Command::new("gh")
-        .args([
-            "release",
-            "edit",
-            tag,
-            "--repo",
-            repo,
-            "--draft=false",
-            "--latest=false",
-        ])
-        .status()
-        .context("publishing verified corpus release")?;
-    if !status.success() {
-        bail!(
-            "gh release publication failed for {tag} (exit {:?})",
-            status.code()
-        );
-    }
-    eprintln!("legal-mcp publish-release: published {repo}@{tag}");
-    Ok(())
-}
-
-fn embedding_model_marker_value(info: &ModelInfo) -> String {
-    if parse_hf_model_url(&info.url).is_some() {
-        EMBEDDING_MODEL_FINGERPRINT.to_string()
-    } else {
-        info.sha256.clone()
-    }
-}
-
 pub(crate) fn embedding_model_installed_matches(info: &ModelInfo) -> Result<bool> {
-    if info.id != EMBEDDING_MODEL_ID {
+    if info.id != EMBEDDING_MODEL_ID || info.fingerprint != EMBEDDING_MODEL_FINGERPRINT {
         return Ok(false);
     }
-    let marker_value = embedding_model_marker_value(info);
-    let marker = live_dir()?.join(".model.sha256");
-    Ok(model_path()?.exists()
-        && model_data_path()?.exists()
-        && tokenizer_path()?.exists()
-        && marker.exists()
-        && fs::read_to_string(marker)?.trim() == marker_value)
-}
-
-#[derive(Clone)]
-pub(crate) struct UrlContext {
-    pub(crate) manifest_dir: Option<PathBuf>,
-    pub(crate) manifest_base_url: Option<String>,
-}
-
-impl UrlContext {
-    fn from_manifest_url(manifest_url: &str) -> Self {
-        if let Some(path) = local_path_from_urlish(manifest_url) {
-            return Self {
-                manifest_dir: path.parent().map(Path::to_path_buf),
-                manifest_base_url: None,
-            };
+    for file in [&info.model, &info.tokenizer] {
+        let path = live_dir()?.join(&file.path);
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            return Ok(false);
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != file.size {
+            return Ok(false);
         }
-        let manifest_base_url = manifest_url
-            .rsplit_once('/')
-            .map(|(base, _)| base.to_string());
-        Self {
-            manifest_dir: None,
-            manifest_base_url,
-        }
-    }
-}
-
-pub(crate) fn resolve_manifest_asset(asset_url: &str, context: &UrlContext) -> String {
-    if asset_url.starts_with("http://")
-        || asset_url.starts_with("https://")
-        || asset_url.starts_with("file://")
-    {
-        return asset_url.to_string();
-    }
-    if let Some(dir) = &context.manifest_dir {
-        return dir.join(asset_url).display().to_string();
-    }
-    if let Some(base) = &context.manifest_base_url {
-        return format!(
-            "{}/{}",
-            base.trim_end_matches('/'),
-            asset_url.trim_start_matches('/')
-        );
-    }
-    asset_url.to_string()
-}
-
-pub(crate) fn local_path_from_urlish(value: &str) -> Option<PathBuf> {
-    let bytes = value.as_bytes();
-    let windows_absolute = (bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'\\' | b'/'))
-        || value.starts_with(r"\\");
-    let path = PathBuf::from(value);
-    if windows_absolute || path.is_absolute() || path.exists() {
-        return Some(path);
-    }
-    if let Ok(url) = Url::parse(value) {
-        if url.scheme() == "file" {
-            return url.to_file_path().ok();
-        }
-    }
-    None
-}
-
-// Fetch helpers resolve local paths, file://, manifest-relative
-// assets, HTTP(S), and hf:// Granite model files; downloaded bytes are
-// sha256-verified against the manifest's pinned hash.
-pub(crate) fn fetch_bytes(url_or_path: &str, context: &UrlContext) -> Result<Vec<u8>> {
-    fetch_bytes_with(url_or_path, context, &http_client()?)
-}
-
-// Downloads resolve through the supplied local or remote source context.
-pub(crate) fn fetch_bytes_with(
-    url_or_path: &str,
-    context: &UrlContext,
-    client: &Client,
-) -> Result<Vec<u8>> {
-    if let Some(path) = local_path_from_urlish(url_or_path) {
-        return Ok(fs::read(path)?);
-    }
-    if let Some(dir) = &context.manifest_dir {
-        if let Some(name) = url_or_path.rsplit('/').next() {
-            let candidate = dir.join(name);
-            if candidate.exists() {
-                return Ok(fs::read(candidate)?);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() != 1 {
+                return Ok(false);
             }
         }
-        if !url_or_path.starts_with("http://") && !url_or_path.starts_with("https://") {
-            bail!("release asset not found: {url_or_path}");
+        if build::sha256_file(&path)? != file.sha256 {
+            return Ok(false);
         }
     }
-    let mut resp = client.get(url_or_path).send()?.error_for_status().with_context(|| {
-        format!(
-            "download failed for {url_or_path}; use a public release, an authenticated mirror, or a file URL"
-        )
-    })?;
-    let mut out = Vec::new();
-    resp.copy_to(&mut out)?;
-    Ok(out)
+    Ok(true)
 }
 
-pub(crate) fn validate_manifest_model_source(model: &ModelInfo) -> Result<()> {
-    if model.id != EMBEDDING_MODEL_ID {
-        return Ok(());
+fn configured_http_workers() -> Result<usize> {
+    let Some(value) = std::env::var_os("LEGAL_MCP_HTTP_WORKERS") else {
+        return Ok(DEFAULT_HTTP_WORKERS);
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| anyhow!("LEGAL_MCP_HTTP_WORKERS must be Unicode"))?;
+    let workers = value
+        .parse::<usize>()
+        .context("LEGAL_MCP_HTTP_WORKERS must be an integer")?;
+    if !(1..=MAX_HTTP_WORKERS).contains(&workers) {
+        bail!("LEGAL_MCP_HTTP_WORKERS must be between 1 and {MAX_HTTP_WORKERS}");
     }
-    if parse_hf_model_url(&model.url).is_some() {
-        if model.sha256 != EMBEDDING_MODEL_FINGERPRINT {
-            bail!("Hugging Face semantic model sha256 must match the pinned Granite fingerprint");
-        }
-        if model.size != EMBEDDING_MODEL_HF_SIZE {
-            bail!("Hugging Face semantic model size must match the pinned Granite file set");
-        }
-        return Ok(());
-    }
-    if is_hf_scheme_url(&model.url) {
+    Ok(workers)
+}
+
+fn configured_shutdown_grace() -> Result<Duration> {
+    let Some(value) = std::env::var_os("LEGAL_MCP_SHUTDOWN_GRACE_SECONDS") else {
+        return Ok(Duration::from_secs(DEFAULT_SHUTDOWN_GRACE_SECONDS));
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| anyhow!("LEGAL_MCP_SHUTDOWN_GRACE_SECONDS must be Unicode"))?;
+    let seconds = value
+        .parse::<u64>()
+        .context("LEGAL_MCP_SHUTDOWN_GRACE_SECONDS must be an integer")?;
+    if !(1..=MAX_SHUTDOWN_GRACE_SECONDS).contains(&seconds) {
         bail!(
-            "Hugging Face semantic model sources must use hf://repo@revision with an explicit revision"
+            "LEGAL_MCP_SHUTDOWN_GRACE_SECONDS must be between 1 and {MAX_SHUTDOWN_GRACE_SECONDS}"
         );
     }
-    if model.url.starts_with("https://huggingface.co/")
-        || model.url.starts_with("http://huggingface.co/")
-    {
-        bail!("Hugging Face semantic model sources must use hf://repo@revision, not HTTPS URLs");
-    }
-    if model.sha256.trim().is_empty() || model.size == 0 {
-        bail!("non-Hugging Face semantic model sources require sha256 and positive size");
-    }
-    Ok(())
-}
-
-pub(crate) fn parse_hf_model_url(value: &str) -> Option<(&str, &str)> {
-    let spec = value.strip_prefix("hf://")?;
-    let (repo, revision) = spec.split_once('@')?;
-    if repo.is_empty() || revision.is_empty() {
-        None
-    } else {
-        Some((repo, revision))
-    }
-}
-
-fn hf_resolve_url(repo: &str, revision: &str, path: &str) -> String {
-    format!("https://huggingface.co/{repo}/resolve/{revision}/{path}")
-}
-
-fn http_client() -> Result<Client> {
-    Ok(Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(120))
-        .build()?)
-}
-
-fn verify_sha256_file(path: &Path, expected: &str) -> Result<()> {
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 1024 * 64];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    let actual = format!("{:x}", hasher.finalize());
-    if actual != expected {
-        bail!(
-            "sha256 mismatch for {}: got {actual}, expected {expected}",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-fn stage_model_artifact(
-    value: &str,
-    context: &UrlContext,
-    destination: &Path,
-    expected_size: u64,
-    expected_sha256: &str,
-) -> Result<u64> {
-    let resolved = resolve_manifest_asset(value, context);
-    if let Some(path) = local_path_from_urlish(&resolved) {
-        let path = path
-            .canonicalize()
-            .with_context(|| format!("canonicalizing {}", path.display()))?;
-        if let Some(root) = &context.manifest_dir {
-            let root = root.canonicalize()?;
-            if !path.starts_with(&root) {
-                bail!("model artifact escaped {}", root.display());
-            }
-        }
-        if !path.is_file() {
-            bail!("model artifact is not a regular file: {}", path.display());
-        }
-        let size = fs::copy(&path, destination)?;
-        if size != expected_size {
-            let _ = fs::remove_file(destination);
-            bail!("model artifact size mismatch: got {size}, expected {expected_size}");
-        }
-        if let Err(error) = verify_sha256_file(destination, expected_sha256) {
-            let _ = fs::remove_file(destination);
-            return Err(error);
-        }
-        return Ok(size);
-    }
-
-    source::download_approved_https_to_file(
-        &resolved,
-        destination,
-        expected_size,
-        expected_sha256,
-        Duration::from_secs(60 * 60),
-    )
-}
-
-pub(crate) fn stage_model(
-    manifest: &Manifest,
-    context: &UrlContext,
-    staging: &Path,
-) -> Result<Option<StagedModel>> {
-    if manifest.model.id != EMBEDDING_MODEL_ID {
-        bail!(
-            "semantic search requires a {EMBEDDING_MODEL_ID} model bundle; manifest uses `{}`",
-            manifest.model.id,
-        );
-    }
-    validate_manifest_model_source(&manifest.model)?;
-    let live_model = model_path()?;
-    let live_model_data = model_data_path()?;
-    let tokenizer = tokenizer_path()?;
-    let marker = live_dir()?.join(".model.sha256");
-    let marker_value = embedding_model_marker_value(&manifest.model);
-    if live_model.exists()
-        && live_model_data.exists()
-        && tokenizer.exists()
-        && marker.exists()
-        && fs::read_to_string(&marker)?.trim() == marker_value
-    {
-        return Ok(None);
-    }
-    if staging.exists() {
-        fs::remove_dir_all(staging)?;
-    }
-    fs::create_dir_all(staging)?;
-
-    if let Some((repo, revision)) = parse_hf_model_url(&manifest.model.url) {
-        stage_hf_embedding_model(repo, revision, staging)?;
-        return Ok(Some(StagedModel {
-            dir: staging.to_path_buf(),
-            marker_value,
-        }));
-    }
-    if is_hf_scheme_url(&manifest.model.url) {
-        bail!(
-            "Hugging Face semantic model sources must use hf://repo@revision with an explicit revision"
-        );
-    }
-
-    let bundle = staging.join("model-bundle.tar.zst.part");
-    stage_model_artifact(
-        &manifest.model.url,
-        context,
-        &bundle,
-        manifest.model.size,
-        &manifest.model.sha256,
-    )?;
-    let extract_dir = staging.join("model-bundle-extracted");
-    if extract_dir.exists() {
-        fs::remove_dir_all(&extract_dir)?;
-    }
-    fs::create_dir_all(&extract_dir)?;
-    let bundle_file = File::open(&bundle)?;
-    let decoder = zstd::stream::read::Decoder::new(bundle_file)?;
-    let mut archive = tar::Archive::new(decoder);
-    archive.unpack(&extract_dir)?;
-
-    for file in EMBEDDING_MODEL_HF_FILES {
-        let path = extract_dir.join(file.output_name);
-        if !path.is_file() {
-            bail!("model bundle missing required file {}", file.output_name);
-        }
-    }
-    for file in EMBEDDING_MODEL_HF_FILES {
-        let source = extract_dir.join(file.output_name);
-        let dest = staging.join(file.output_name);
-        fs::rename(source, dest)?;
-    }
-    let _ = fs::remove_file(bundle);
-    let _ = fs::remove_dir_all(extract_dir);
-    Ok(Some(StagedModel {
-        dir: staging.to_path_buf(),
-        marker_value,
-    }))
-}
-
-fn stage_hf_embedding_model(repo: &str, revision: &str, staging: &Path) -> Result<()> {
-    fs::create_dir_all(staging)?;
-    let download_dir = staging.join("hf-model-download");
-    if download_dir.exists() {
-        fs::remove_dir_all(&download_dir)?;
-    }
-    fs::create_dir_all(&download_dir)?;
-    for file in EMBEDDING_MODEL_HF_FILES {
-        let url = hf_resolve_url(repo, revision, file.path);
-        let part = download_dir.join(format!("{}.part", file.output_name));
-        source::download_approved_https_to_file(
-            &url,
-            &part,
-            file.size,
-            file.sha256,
-            Duration::from_secs(60 * 60),
-        )
-        .with_context(|| format!("downloading Hugging Face model file {}", file.path))?;
-        fs::rename(part, download_dir.join(file.output_name))?;
-    }
-    for file in EMBEDDING_MODEL_HF_FILES {
-        let source = download_dir.join(file.output_name);
-        let dest = staging.join(file.output_name);
-        fs::rename(source, dest)?;
-    }
-    let _ = fs::remove_dir_all(download_dir);
-    Ok(())
+    Ok(Duration::from_secs(seconds))
 }
 
 fn serve(
@@ -1536,6 +962,7 @@ fn serve(
     ready_stdout: bool,
     state: Arc<ServerState>,
 ) -> Result<()> {
+    let shutdown_grace = configured_shutdown_grace()?;
     if bind != "127.0.0.1" {
         bail!(
             "HTTP MCP transport is loopback-only; --bind must be the canonical address 127.0.0.1"
@@ -1552,6 +979,9 @@ fn serve(
             "bind {addr}: {e}. If the port is in use, start with `legal-mcp serve --port <free-port>`."
         )
     })?;
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutting_down))?;
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutting_down))?;
     let port = server
         .server_addr()
         .to_ip()
@@ -1578,37 +1008,68 @@ fn serve(
         }
     }
 
-    let (sender, receiver) = mpsc::sync_channel::<tiny_http::Request>(HTTP_QUEUE_CAPACITY);
+    let workers = configured_http_workers()?;
+    let queue_capacity = workers.saturating_mul(HTTP_QUEUE_PER_WORKER);
+    let (sender, receiver) = mpsc::sync_channel::<(tiny_http::Request, Instant)>(queue_capacity);
     let receiver = Arc::new(Mutex::new(receiver));
-    for worker in 0..HTTP_WORKERS {
+    let (worker_done_sender, worker_done_receiver) = mpsc::channel();
+    for worker in 0..workers {
         let receiver = Arc::clone(&receiver);
         let state = Arc::clone(&state);
+        let worker_done_sender = worker_done_sender.clone();
         std::thread::Builder::new()
             .name(format!("legal-mcp-http-{worker}"))
-            .spawn(move || loop {
-                let request = {
-                    let receiver = receiver.lock().unwrap_or_else(|err| err.into_inner());
-                    receiver.recv()
-                };
-                let Ok(request) = request else {
-                    break;
-                };
-                if let Err(err) = handle_http(request, &state) {
-                    eprintln!("legal-mcp http handler error: {err}");
+            .spawn(move || {
+                loop {
+                    let queued = {
+                        let receiver = receiver.lock().unwrap_or_else(|err| err.into_inner());
+                        receiver.recv()
+                    };
+                    let Ok((request, queued_at)) = queued else {
+                        break;
+                    };
+                    let request_id = state.request_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+                    let method = format!("{:?}", request.method());
+                    let path = request.url().split('?').next().unwrap_or("/").to_string();
+                    let started = Instant::now();
+                    let outcome = handle_http(request, &state);
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "event": "http-request",
+                            "request_id": request_id,
+                            "method": method,
+                            "path": path,
+                            "queue_ms": queued_at.elapsed().as_millis(),
+                            "duration_ms": started.elapsed().as_millis(),
+                            "outcome": if outcome.is_ok() { "ok" } else { "handler-error" },
+                        })
+                    );
+                    if let Err(err) = outcome {
+                        eprintln!("legal-mcp http handler error request_id={request_id}: {err}");
+                    }
                 }
+                let _ = worker_done_sender.send(());
             })
             .context("starting bounded HTTP worker")?;
     }
+    drop(worker_done_sender);
 
-    for request in server.incoming_requests() {
-        match sender.try_send(request) {
+    while !shutting_down.load(Ordering::Acquire) {
+        let Some(request) = server.recv_timeout(Duration::from_millis(250))? else {
+            continue;
+        };
+        match sender.try_send((request, Instant::now())) {
             Ok(()) => {}
-            Err(mpsc::TrySendError::Full(request)) => {
+            Err(mpsc::TrySendError::Full((request, _))) => {
                 let response = tiny_http::Response::from_string(
                     r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"server busy"}}"#,
                 )
                 .with_status_code(503)
-                .with_header(json_content_type());
+                .with_header(json_content_type())
+                .with_header(
+                    tiny_http::Header::from_bytes(&b"Retry-After"[..], &b"1"[..]).unwrap(),
+                );
                 let _ = request.respond(response);
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
@@ -1616,6 +1077,24 @@ fn serve(
             }
         }
     }
+    state.ready.store(false, Ordering::Release);
+    drop(sender);
+    let deadline = Instant::now() + shutdown_grace;
+    let mut stopped = 0usize;
+    while stopped < workers {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        match worker_done_receiver.recv_timeout(remaining) {
+            Ok(()) => stopped += 1,
+            Err(_) => break,
+        }
+    }
+    let _ = fs::remove_file(config::http_state_path()?);
+    eprintln!(
+        "{}",
+        json!({"event":"shutdown","workers":workers,"workers_stopped":stopped})
+    );
     Ok(())
 }
 
@@ -1824,11 +1303,13 @@ fn post_mcp_line(client: &Client, url: &str, line: &str) -> Result<Option<JsonVa
     let response = client
         .post(url)
         .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
         .body(line.to_string())
         .send()
         .with_context(|| format!("POST {url}"))?;
     let status = response.status();
-    if status.as_u16() == 204 {
+    if matches!(status.as_u16(), 202 | 204) {
         return Ok(None);
     }
     let body = response
@@ -1846,6 +1327,75 @@ fn json_content_type() -> tiny_http::Header {
     tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap()
 }
 
+fn request_header<'a>(request: &'a tiny_http::Request, name: &str) -> Result<Option<&'a str>> {
+    let values = request
+        .headers()
+        .iter()
+        .filter(|header| header.field.to_string().eq_ignore_ascii_case(name))
+        .map(|header| header.value.as_str())
+        .collect::<Vec<_>>();
+    if values.len() > 1 {
+        bail!("request contains duplicate `{name}` headers");
+    }
+    Ok(values.first().copied())
+}
+
+fn origin_allowed(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.scheme(), "http" | "https")
+    {
+        return false;
+    }
+    let canonical = url.origin().ascii_serialization();
+    if canonical != value.trim_end_matches('/') {
+        return false;
+    }
+    let loopback = url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    });
+    if loopback {
+        return true;
+    }
+    std::env::var("LEGAL_MCP_ALLOWED_ORIGINS")
+        .ok()
+        .into_iter()
+        .flat_map(|origins| {
+            origins
+                .split(',')
+                .map(str::trim)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .any(|allowed| !allowed.is_empty() && allowed.trim_end_matches('/') == canonical)
+}
+
+fn accepts_streamable_http(request: &tiny_http::Request) -> Result<bool> {
+    let Some(value) = request_header(request, "Accept")? else {
+        return Ok(false);
+    };
+    let accepted = value
+        .split(',')
+        .map(|part| {
+            part.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .collect::<BTreeSet<_>>();
+    Ok(accepted.contains("application/json") && accepted.contains("text/event-stream"))
+}
+
 fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<()> {
     use tiny_http::{Header, Method, Response};
 
@@ -1858,6 +1408,25 @@ fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<(
     }
 
     let path = request.url().split('?').next().unwrap_or("/").to_string();
+    if path == "/livez" || path == "/readyz" {
+        if !matches!(request.method(), Method::Get) {
+            let resp = Response::from_string("method not allowed").with_status_code(405);
+            return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
+        }
+        let ready = path == "/livez"
+            || (state.ready.load(Ordering::Acquire)
+                && state.ensure_corpus_generation_unchanged().is_ok());
+        let status = if ready { 200 } else { 503 };
+        let body = json!({
+            "status": if ready { "ok" } else { "not-ready" },
+            "generation": state.corpus_generation.as_deref(),
+        });
+        let resp = Response::from_string(serde_json::to_string(&body)?)
+            .with_status_code(status)
+            .with_header(json_content_type());
+        return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
+    }
+
     let is_mcp = path == "/mcp" || path == "/mcp/";
 
     if !is_mcp {
@@ -1868,6 +1437,20 @@ fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<(
         let resp = Response::from_string("method not allowed")
             .with_status_code(405)
             .with_header(Header::from_bytes(&b"Allow"[..], &b"POST"[..]).unwrap());
+        return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
+    }
+
+    if let Some(origin) = request_header(&request, "Origin")? {
+        if !origin_allowed(origin) {
+            let resp = Response::from_string("forbidden origin").with_status_code(403);
+            return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
+        }
+    }
+
+    if !accepts_streamable_http(&request)? {
+        let resp =
+            Response::from_string("Accept must include application/json and text/event-stream")
+                .with_status_code(406);
         return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
     }
 
@@ -1922,8 +1505,30 @@ fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<(
         return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
     }
 
+    let mut response_status = 200;
     let response_json: Option<JsonValue> = match serde_json::from_slice::<JsonValue>(&body) {
-        Ok(message) => handle_rpc(message, state),
+        Ok(message) => {
+            let initialize = message
+                .as_object()
+                .and_then(|object| object.get("method"))
+                .and_then(JsonValue::as_str)
+                == Some("initialize");
+            let protocol = request_header(&request, "MCP-Protocol-Version")?;
+            if protocol.is_some_and(|value| value != MCP_PROTOCOL_VERSION)
+                || (!initialize && protocol != Some(MCP_PROTOCOL_VERSION))
+            {
+                response_status = 400;
+                Some(json_rpc_error(
+                    message.get("id").cloned().unwrap_or(JsonValue::Null),
+                    -32600,
+                    "unsupported or missing MCP-Protocol-Version header",
+                ))
+            } else if is_json_rpc_response(&message) {
+                None
+            } else {
+                handle_rpc(message, state)
+            }
+        }
         Err(err) => Some(json_rpc_error(
             JsonValue::Null,
             -32700,
@@ -1931,40 +1536,46 @@ fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<(
         )),
     };
 
-    // MCP notifications (no id) produce no response; reply 204 so the
-    // client knows the request was accepted.
+    // Streamable HTTP acknowledges accepted notifications with 202.
     let Some(value) = response_json else {
-        let resp = Response::from_string("").with_status_code(204);
+        let resp = Response::from_string("").with_status_code(202);
         return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
     };
 
     let body = serde_json::to_string(&value)?;
-    let resp = Response::from_string(body).with_header(json_content_type());
+    let resp = Response::from_string(body)
+        .with_status_code(response_status)
+        .with_header(json_content_type());
     request.respond(resp).map_err(|e| anyhow!("respond: {e}"))?;
     Ok(())
 }
 
-fn handle_rpc(message: JsonValue, state: &ServerState) -> Option<JsonValue> {
-    if let Some(messages) = message.as_array() {
-        if messages.is_empty() {
-            return Some(json_rpc_error(
-                JsonValue::Null,
-                -32600,
-                "invalid request: empty batch",
-            ));
-        }
-        let responses: Vec<JsonValue> = messages
-            .iter()
-            .filter_map(|m| handle_single_rpc(m.clone(), state))
-            .collect();
-        if responses.is_empty() {
-            None
-        } else {
-            Some(JsonValue::Array(responses))
-        }
-    } else {
-        handle_single_rpc(message, state)
+fn is_json_rpc_response(message: &JsonValue) -> bool {
+    let Some(object) = message.as_object() else {
+        return false;
+    };
+    if object.get("jsonrpc").and_then(JsonValue::as_str) != Some("2.0")
+        || object.contains_key("method")
+    {
+        return false;
     }
+    let valid_id = object
+        .get("id")
+        .is_some_and(|id| id.is_null() || id.is_string() || id.is_number());
+    let result = object.contains_key("result");
+    let error = object.contains_key("error");
+    valid_id && result != error
+}
+
+fn handle_rpc(message: JsonValue, state: &ServerState) -> Option<JsonValue> {
+    if message.is_array() {
+        return Some(json_rpc_error(
+            JsonValue::Null,
+            -32600,
+            "JSON-RPC batching is not supported by MCP 2025-06-18",
+        ));
+    }
+    handle_single_rpc(message, state)
 }
 
 fn handle_single_rpc(message: JsonValue, state: &ServerState) -> Option<JsonValue> {
@@ -1995,7 +1606,7 @@ fn handle_single_rpc(message: JsonValue, state: &ServerState) -> Option<JsonValu
 
     let result: std::result::Result<JsonValue, (i64, String)> = match method {
         "initialize" => Ok(json!({
-            "protocolVersion": "2025-06-18",
+            "protocolVersion": MCP_PROTOCOL_VERSION,
             "capabilities": { "tools": {} },
             "serverInfo": { "name": APP_NAME, "version": env!("CARGO_PKG_VERSION") },
             "instructions": state.cached_instructions.as_str(),
@@ -2093,17 +1704,18 @@ fn parse_source(value: &JsonValue, field: &str) -> Result<SourceId> {
 
 fn parse_definition_scope(
     args: &serde_json::Map<String, JsonValue>,
-) -> Result<(Option<SourceId>, Option<DocumentId>)> {
-    let source = args
-        .get("source")
-        .map(|value| parse_source(value, "source"))
-        .transpose()?;
+) -> Result<(SourceId, Option<DocumentId>)> {
+    let source = parse_source(
+        args.get("source")
+            .ok_or_else(|| anyhow!("missing required string argument `source`"))?,
+        "source",
+    )?;
     let context_document = args
         .get("context_document")
         .map(|value| parse_document(value, "context_document"))
         .transpose()?;
-    if let (Some(source), Some(context)) = (&source, &context_document) {
-        if source != &context.source {
+    if let Some(context) = &context_document {
+        if source != context.source {
             bail!(
                 "definition source `{source}` does not match context document source `{}`",
                 context.source
@@ -2239,10 +1851,12 @@ fn validate_tool_call(params: &JsonValue) -> Result<()> {
                 "similar_to_chunk",
             ])?;
             require_string("query")?;
-            let resolved_source = match args.get("source") {
-                Some(value) => parse_source(value, "source")?,
-                None => source_registry().resolve(None)?,
-            };
+            require_string("source")?;
+            let resolved_source = parse_source(
+                args.get("source")
+                    .ok_or_else(|| anyhow!("missing required string argument `source`"))?,
+                "source",
+            )?;
             bounded_u64("k", 1, Some(MAX_K as u64))?;
             string_array("types")?;
             for field in ["date_from", "date_to", "doc_scope", "seed_text"] {
@@ -2295,6 +1909,7 @@ fn validate_tool_call(params: &JsonValue) -> Result<()> {
         "get_definition" => {
             reject_unknown_args(&["term", "source", "context_document", "max_defs"])?;
             require_string("term")?;
+            require_string("source")?;
             parse_definition_scope(args)?;
             bounded_u64("max_defs", 1, Some(20))?;
         }
@@ -2339,10 +1954,11 @@ fn call_tool(params: JsonValue, state: &ServerState) -> Result<JsonValue> {
         "search" => {
             let query = required_str(&args, "query")?;
             let types = optional_string_array(&args, "types")?;
-            let resolved_source = match args.get("source") {
-                Some(value) => parse_source(value, "source")?,
-                None => source_registry().resolve(None)?,
-            };
+            let resolved_source = parse_source(
+                args.get("source")
+                    .ok_or_else(|| anyhow!("missing required string argument `source`"))?,
+                "source",
+            )?;
             let similar_to_chunk = args
                 .get("similar_to_chunk")
                 .map(|value| parse_chunk(value, "similar_to_chunk"))
@@ -2478,44 +2094,31 @@ pub(crate) fn optional_string_array(args: &JsonValue, name: &str) -> Result<Opti
 
 const LEGAL_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first; hits carry typed `document` and generation-bound `chunk` identities accepted directly by follow-up tools. Call `get_chunks` for text and `get_doc_anchors` for navigation. `[doc:X]` and `[asset:X]` markers use canonical source-qualified public references; `[fetch:X]` uses a canonical `legal://` URI. For historical/withdrawn material set `current_only=false` and `include_old=true`."##;
 
-/// Probe for a newer corpus index at startup. Runs
-/// `check_for_update_availability` once and is folded directly into the
-/// cached MCP `initialize` instructions by `server_instructions`, so the
-/// agent can offer to run `legal-mcp update`.
-fn resolve_startup_update_notice() -> Option<UpdateAvailability> {
-    let manifest_url = resolve_latest_corpus_manifest_url_probe().ok()?;
-    check_for_update_availability(&manifest_url).ok().flatten()
-}
-
 // Server instructions are built dynamically at start time from corpus
 // stats so the agent sees up-to-date corpus shape without restart-time config.
-// If stats cannot be read (corpus not yet installed), return a static
-// install message asking the user to run `legal-mcp update`. When the startup
-// probe found an UpdateAvailability, both branches append a newer-index notice.
-fn server_instructions(update_notice: Option<&UpdateAvailability>) -> String {
-    let body = match stats()
+// If stats cannot be read, tell the operator to activate a locally built
+// generation; the runtime never downloads corpus artifacts.
+fn server_instructions() -> (String, bool) {
+    match verify_active_generation()
         .ok()
         .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
     {
-        Some(s) => format!(
-            "ATO legal corpus. Documents: {}, chunks: {}. Index: {}. Default search excludes EV edited private advice, withdrawn rulings, and content dated before {} except legislation prefixes PAC/REG/RPC/RRG; override with current_only=false and include_old=true.\n\n{}",
+        Some(s) if s["semantic_search_ready"].as_bool() == Some(true) => (format!(
+            "Australian legal corpus. Documents: {}, chunks: {}. Index: {}. Default search excludes EV edited private advice, withdrawn rulings, and content dated before {} except legislation prefixes PAC/REG/RPC/RRG; override with current_only=false and include_old=true.\n\n{}",
             s["documents"].as_i64().unwrap_or(0),
             s["chunks"].as_i64().unwrap_or(0),
             s["index_version"].as_str().unwrap_or("?"),
             OLD_CONTENT_CUTOFF,
             LEGAL_MCP_USE_INSTRUCTIONS,
-        ),
-        None => format!(
-            "The ATO corpus is not yet installed on this machine. Offer to run `legal-mcp update` for the user as a visible setup step (~1.5 GB, takes 5-10 min), then restart the MCP host/backend after the download completes.\n\n{}",
+        ), true),
+        Some(_) => (format!(
+            "The active local corpus generation failed semantic readiness checks. The host operator must run `legal-mcp verify`, repair or roll back the immutable generation, and restart this service.\n\n{}",
             LEGAL_MCP_USE_INSTRUCTIONS
-        ),
-    };
-    match update_notice {
-        Some(notice) => format!(
-            "{body}\n\nAn updated ATO corpus generation is available (index {}). Ask whether to run `legal-mcp update` now or continue with the installed corpus; restart the MCP host/backend after updating.",
-            notice.available_index_version
-        ),
-        None => body,
+        ), false),
+        None => (format!(
+            "No local corpus generation is active. The host operator must build and validate a generation, run `legal-mcp activate --generation-dir <path>`, and restart this service. The runtime performs no corpus downloads.\n\n{}",
+            LEGAL_MCP_USE_INSTRUCTIONS
+        ), false),
     }
 }
 
@@ -2525,12 +2128,7 @@ fn tool_descriptors() -> JsonValue {
     // fetch.
     //   The surface stays small and explicit; unsupported tools fail through the
     //   normal tools/call error path.
-    let registry = source_registry();
-    let source_ids = registry.source_ids();
-    let default_source = registry
-        .resolve(None)
-        .expect("source registry must contain its configured default");
-    let source_schema = json!({"type": "string", "enum": source_ids.clone()});
+    let source_schema = json!({"type": "string"});
     let document_schema = json!({
         "type": "object",
         "properties": {
@@ -2567,7 +2165,7 @@ fn tool_descriptors() -> JsonValue {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "minLength": 1},
-                    "source": {"type": "string", "enum": source_ids, "default": default_source},
+                    "source": source_schema.clone(),
                     "k": {"type": "integer", "minimum": 1, "maximum": 50},
                     "types": {"type": "array", "items": {"type": "string"}},
                     "date_from": {"type": "string"},
@@ -2581,7 +2179,7 @@ fn tool_descriptors() -> JsonValue {
                     "seed_text": {"type": "string"},
                     "include_snippet": {"type": "boolean"}
                 },
-                "required": ["query"],
+                "required": ["query", "source"],
                 "additionalProperties": false
             }
         },
@@ -2636,7 +2234,7 @@ fn tool_descriptors() -> JsonValue {
                     "context_document": document_schema,
                     "max_defs": {"type": "integer", "minimum": 1, "maximum": 20}
                 },
-                "required": ["term"],
+                "required": ["term", "source"],
                 "additionalProperties": false
             }
         },
@@ -2683,8 +2281,7 @@ mod tests {
     use rand::{Rng, SeedableRng};
     use rusqlite::types::Value;
     use rusqlite::Connection;
-    use std::collections::{BTreeMap, HashMap, HashSet};
-    use std::io::Cursor;
+    use std::collections::{HashMap, HashSet};
     use tempfile::tempdir;
 
     const TEST_SOURCE_ID: &str = "ato";
@@ -2733,6 +2330,7 @@ mod tests {
         let Command::SourceUpdate {
             workspaces,
             run_dir,
+            full,
         } = cli.command
         else {
             panic!("expected source-update command");
@@ -2751,6 +2349,7 @@ mod tests {
             ]
         );
         assert_eq!(run_dir, PathBuf::from("/data/runs/one"));
+        assert!(!full);
         assert!("ato".parse::<SourceWorkspaceArg>().is_err());
         assert!("ato=".parse::<SourceWorkspaceArg>().is_err());
     }
@@ -2999,18 +2598,6 @@ mod tests {
     }
 
     #[test]
-    fn local_path_detection_precedes_url_scheme_parsing() {
-        let windows = r"C:\corpus\model-bundle.tar.zst";
-        assert_eq!(
-            local_path_from_urlish(windows),
-            Some(PathBuf::from(windows))
-        );
-        let unc = r"\\server\share\model-bundle.tar.zst";
-        assert_eq!(local_path_from_urlish(unc), Some(PathBuf::from(unc)));
-        assert!(local_path_from_urlish("https://example.com/model").is_none());
-    }
-
-    #[test]
     fn metadata_extract_pub_date_handles_utf8_boundary() {
         let mut text = "a".repeat(1999);
         text.push('•');
@@ -3075,10 +2662,10 @@ mod tests {
             format!("{:x}", Sha256::digest(final_html.as_bytes())),
             "d35a6cb8d7df1f4cb8bed9a700dc4cdf7ccc78cf9763dc240b6404443faba0cf"
         );
-        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks.len(), 2);
         assert_eq!(
             format!("{:x}", Sha256::digest(chunk_projection.as_bytes())),
-            "10f1333f7ab7d1bb09c6ae95a75335d7e6e59481837383ad78fac5225e9b8cf9"
+            "d1332bde3d401fabb500ff799409e1054a854dbcf3957d63ae41ae4e0990152b"
         );
         assert_eq!(anchors.len(), 9);
         assert_eq!(
@@ -3102,7 +2689,9 @@ mod tests {
             ]
         );
         assert!(final_html.contains(r#"data-doc-id="ato:PAC/19970038/83A-33""#));
-        assert!(chunks[0].text.contains("[doc:ato:PAC/19970038/83A-33]"));
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.text.contains("[doc:ato:PAC/19970038/83A-33]")));
         Ok(())
     }
 
@@ -3327,7 +2916,7 @@ mod tests {
                 "method": "tools/call",
                 "params": {
                     "name": "search",
-                    "arguments": {"query": "tax", "source": "wa-legislation"}
+                    "arguments": {"query": "tax", "source": "unknown-source"}
                 }
             }),
             &state,
@@ -3353,6 +2942,7 @@ mod tests {
                 "name": "search",
                 "arguments": {
                     "query": "tax",
+                    "source": TEST_SOURCE_ID,
                     "similar_to_chunk": chunk.clone(),
                 }
             }),
@@ -3370,6 +2960,7 @@ mod tests {
         }
 
         for params in [
+            json!({"name": "search", "arguments": {"query": "tax"}}),
             json!({"name": "search", "arguments": {"query": "tax", "similar_to_chunk_id": 91}}),
             json!({"name": "search", "arguments": {"query": "tax", "similar_to": chunk.clone()}}),
             json!({"name": "get_chunks", "arguments": {"chunk_ids": [91]}}),
@@ -3379,6 +2970,7 @@ mod tests {
                 "name": "get_definition",
                 "arguments": {"term": "car", "context_doc_id": "PAC/1"}
             }),
+            json!({"name": "get_definition", "arguments": {"term": "car"}}),
             json!({"name": "fetch", "arguments": {"uri": "ato:PAC/1"}}),
             json!({"name": "fetch", "arguments": {"uri": "legal://ato/PAC/1"}}),
             json!({"name": "get_chunks", "arguments": {"chunks": [{"generation": TEST_GENERATION, "chunk_id": 1}]}}),
@@ -3413,7 +3005,7 @@ mod tests {
             "legal://ato/PAC%ZZ1",
             "legal://ato/%E2%28",
             "legal://user@ato/PAC%2F1",
-            "legal://wa-legislation/PAC%2F1",
+            "legal://unknown-source/PAC%2F1",
         ] {
             assert!(
                 validate_fetch_uri(uri).is_err(),
@@ -3538,132 +3130,6 @@ mod tests {
     }
 
     #[test]
-    fn publish_model_info_rejects_non_hf_mirror_without_metadata() {
-        let current = ModelInfo {
-            id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: EMBEDDING_MODEL_FINGERPRINT.to_string(),
-            size: EMBEDDING_MODEL_HF_SIZE,
-            url: EMBEDDING_MODEL_HF_URL.to_string(),
-        };
-        let err = resolve_publish_model_info(
-            &current,
-            Some("https://mirror.example.com/granite.tar.zst"),
-            None,
-            None,
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("--model-sha256") && err.to_string().contains("--model-size"),
-            "expected explicit mirror metadata error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn publish_model_info_accepts_non_hf_mirror_with_metadata() -> Result<()> {
-        let current = ModelInfo {
-            id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: EMBEDDING_MODEL_FINGERPRINT.to_string(),
-            size: EMBEDDING_MODEL_HF_SIZE,
-            url: EMBEDDING_MODEL_HF_URL.to_string(),
-        };
-        let resolved = resolve_publish_model_info(
-            &current,
-            Some("https://mirror.example.com/granite.tar.zst"),
-            Some("abc123"),
-            Some(42),
-        )?;
-        assert_eq!(resolved.url, "https://mirror.example.com/granite.tar.zst");
-        assert_eq!(resolved.sha256, "abc123");
-        assert_eq!(resolved.size, 42);
-        Ok(())
-    }
-
-    #[test]
-    fn publish_model_info_rejects_https_huggingface_url() {
-        let current = ModelInfo {
-            id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: EMBEDDING_MODEL_FINGERPRINT.to_string(),
-            size: EMBEDDING_MODEL_HF_SIZE,
-            url: EMBEDDING_MODEL_HF_URL.to_string(),
-        };
-        let err = resolve_publish_model_info(
-            &current,
-            Some("https://huggingface.co/onnx-community/granite-embedding-small-english-r2-ONNX/resolve/main/model.tar.zst"),
-            None,
-            None,
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("hf://repo@revision"),
-            "expected hf:// guidance, got: {err}"
-        );
-    }
-
-    #[test]
-    fn publish_model_info_rejects_hf_url_without_revision() {
-        let current = ModelInfo {
-            id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: EMBEDDING_MODEL_FINGERPRINT.to_string(),
-            size: EMBEDDING_MODEL_HF_SIZE,
-            url: EMBEDDING_MODEL_HF_URL.to_string(),
-        };
-        let err =
-            resolve_publish_model_info(&current, Some("hf://owner/model"), None, None).unwrap_err();
-        assert!(
-            err.to_string().contains("explicit revision"),
-            "expected explicit revision error, got: {err}"
-        );
-        assert!(parse_hf_model_url("hf://owner/model").is_none());
-    }
-
-    #[test]
-    fn publish_model_info_rejects_hf_metadata_mismatch() {
-        let current = ModelInfo {
-            id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: EMBEDDING_MODEL_FINGERPRINT.to_string(),
-            size: EMBEDDING_MODEL_HF_SIZE,
-            url: EMBEDDING_MODEL_HF_URL.to_string(),
-        };
-        let err = resolve_publish_model_info(
-            &current,
-            Some(EMBEDDING_MODEL_HF_URL),
-            Some("wrong-sha"),
-            Some(EMBEDDING_MODEL_HF_SIZE),
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("pinned Granite fingerprint"),
-            "expected HF sha mismatch error, got: {err}"
-        );
-        let err = resolve_publish_model_info(
-            &current,
-            Some(EMBEDDING_MODEL_HF_URL),
-            Some(EMBEDDING_MODEL_FINGERPRINT),
-            Some(1),
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("pinned Granite file set"),
-            "expected HF size mismatch error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn publish_model_info_defaults_placeholder_to_pinned_hf_source() -> Result<()> {
-        let current = ModelInfo {
-            id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: String::new(),
-            size: 0,
-            url: "PENDING".to_string(),
-        };
-        let resolved = resolve_publish_model_info(&current, None, None, None)?;
-        assert_eq!(resolved.url, EMBEDDING_MODEL_HF_URL);
-        assert_eq!(resolved.sha256, EMBEDDING_MODEL_FINGERPRINT);
-        assert_eq!(resolved.size, EMBEDDING_MODEL_HF_SIZE);
-        Ok(())
-    }
-
-    #[test]
     fn manifest_rejects_a_higher_minimum_client_version() {
         let m = sample_manifest(SUPPORTED_SCHEMA_VERSION, "999.0.0");
         let err = validate_manifest(&m).unwrap_err();
@@ -3684,77 +3150,6 @@ mod tests {
     }
 
     #[test]
-    fn manifest_rejects_non_hf_model_without_metadata() {
-        let mut m = sample_manifest(SUPPORTED_SCHEMA_VERSION, "");
-        m.model = ModelInfo {
-            id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: String::new(),
-            size: 0,
-            url: "model-bundle.tar.zst".to_string(),
-        };
-        let err = validate_manifest(&m).unwrap_err();
-        assert!(
-            err.to_string().contains("sha256 and positive size"),
-            "expected non-HF model metadata error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn manifest_rejects_hf_model_metadata_mismatch() {
-        let mut m = sample_manifest(SUPPORTED_SCHEMA_VERSION, "");
-        m.model = ModelInfo {
-            id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: "wrong-sha".to_string(),
-            size: EMBEDDING_MODEL_HF_SIZE,
-            url: EMBEDDING_MODEL_HF_URL.to_string(),
-        };
-        let err = validate_manifest(&m).unwrap_err();
-        assert!(
-            err.to_string().contains("pinned Granite fingerprint"),
-            "expected HF sha mismatch error, got: {err}"
-        );
-        m.model.sha256 = EMBEDDING_MODEL_FINGERPRINT.to_string();
-        m.model.size = 1;
-        let err = validate_manifest(&m).unwrap_err();
-        assert!(
-            err.to_string().contains("pinned Granite file set"),
-            "expected HF size mismatch error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn stage_model_rejects_wrong_non_hf_bundle_size() -> Result<()> {
-        let _lock = lock_test_db();
-        let data = tempdir()?;
-        prepare_test_generation(data.path())?;
-        let release = tempdir()?;
-        let model_bundle = release.path().join("model-bundle.tar.zst");
-        let bundle_bytes = write_test_model_bundle(&model_bundle)?;
-        let mut manifest = sample_manifest(SUPPORTED_SCHEMA_VERSION, env!("CARGO_PKG_VERSION"));
-        manifest.index_version = "wrong-model-size".to_string();
-        manifest.model = ModelInfo {
-            id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: sha256_hex(&bundle_bytes),
-            size: bundle_bytes.len() as u64 + 1,
-            url: "model-bundle.tar.zst".to_string(),
-        };
-        let context = UrlContext {
-            manifest_dir: Some(release.path().to_path_buf()),
-            manifest_base_url: None,
-        };
-        with_data_dir(data.path(), || -> Result<()> {
-            let err = stage_model(&manifest, &context, &staging_dir()?).unwrap_err();
-            let message = err.to_string();
-            assert!(
-                message.contains("artifact") && message.contains("size mismatch"),
-                "expected artifact size validation error, got: {err}"
-            );
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    #[test]
     fn cmp_dotted_version_basics() {
         use std::cmp::Ordering;
         assert_eq!(cmp_dotted_version("1.2.3", "1.2.3"), Ordering::Equal);
@@ -3768,8 +3163,7 @@ mod tests {
     fn build_model_dir_rejects_wrong_model_bytes() -> Result<()> {
         let dir = tempdir()?;
         fs::create_dir_all(dir.path().join("onnx"))?;
-        fs::write(dir.path().join("onnx/model_fp16.onnx"), b"wrong onnx")?;
-        fs::write(dir.path().join("onnx/model_fp16.onnx_data"), b"wrong data")?;
+        fs::write(dir.path().join("onnx/model.onnx"), b"wrong onnx")?;
         fs::write(dir.path().join("tokenizer.json"), b"wrong tokenizer")?;
 
         let err = SemanticModelPaths::from_model_dir(dir.path()).unwrap_err();
@@ -3821,110 +3215,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn vector_search_requires_model_marker_match() -> Result<()> {
-        let _lock = lock_test_db();
-        let (dir, db) = make_test_db()?;
-        let conn = open_write_at(&db)?;
-        set_corpus_meta(&conn, "embedding_model_id", EMBEDDING_MODEL_ID)?;
-        drop(conn);
-        let model_sha = "e".repeat(64);
-        let mut manifest = sample_manifest(SUPPORTED_SCHEMA_VERSION, env!("CARGO_PKG_VERSION"));
-        manifest.index_version = "test-marker-readiness".to_string();
-        manifest.model = ModelInfo {
-            id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: model_sha,
-            size: 5,
-            url: "model-bundle.tar.zst".to_string(),
-        };
-
-        with_data_dir(dir.path(), || -> Result<()> {
-            fs::write(
-                installed_manifest_path()?,
-                serde_json::to_vec_pretty(&manifest)?,
-            )?;
-            fs::write(model_path()?, b"model")?;
-            fs::write(model_data_path()?, b"model-data")?;
-            fs::write(tokenizer_path()?, br#"{"version":"1.0"}"#)?;
-            fs::write(live_dir()?.join(".model.sha256"), "wrong-marker")?;
-
-            let conn = open_read()?;
-            let source_id: legal_model::SourceId = TEST_SOURCE_ID.parse()?;
-            let err = ensure_vector_search_ready(&conn, &source_id).unwrap_err();
-            assert!(
-                err.to_string().contains("installed semantic model files"),
-                "expected model marker readiness error, got: {err}"
-            );
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    #[test]
-    fn ann_generation_update_commits_with_one_active_pointer() -> Result<()> {
-        let _lock = lock_test_db();
-        let data = tempdir()?;
-        with_data_dir(data.path(), || -> Result<()> {
-            let staging_root = staging_dir()?.join("generation-promotion-test");
-            fs::create_dir_all(&staging_root)?;
-            let staged_db = staging_root.join(LEGAL_DB_FILENAME);
-            let source_id: legal_model::SourceId = TEST_SOURCE_ID.parse()?;
-            fs::write(&staged_db, b"database-generation")?;
-
-            let model_dir = staging_dir()?.join("generation-model-test");
-            fs::create_dir_all(&model_dir)?;
-            for file in EMBEDDING_MODEL_HF_FILES {
-                fs::write(
-                    model_dir.join(file.output_name),
-                    file.output_name.as_bytes(),
-                )?;
-            }
-            let staged_model = StagedModel {
-                dir: model_dir,
-                marker_value: "model-marker".to_string(),
-            };
-            let mut manifest = sample_manifest(SUPPORTED_SCHEMA_VERSION, "");
-            manifest
-                .ann
-                .insert(source_id.clone(), sample_ann(TEST_SOURCE_ID, "d"));
-            let mut staged_sidecars = BTreeMap::new();
-            for manifest_source in manifest.ann.keys() {
-                let staged_ann = staging_root.join(sidecar_relative_path(manifest_source));
-                fs::create_dir_all(
-                    staged_ann
-                        .parent()
-                        .ok_or_else(|| anyhow!("test ANN sidecar has no parent"))?,
-                )?;
-                fs::write(&staged_ann, format!("{manifest_source}-ann"))?;
-                staged_sidecars.insert(manifest_source.clone(), staged_ann);
-            }
-            promote_staged_update(
-                Some(&staged_model),
-                StagedCorpusUpdate {
-                    staging_root,
-                    staged_db,
-                    staged_ann: staged_sidecars,
-                    stats: UpdateStats::default(),
-                },
-                &manifest,
-            )?;
-
-            let key = active_generation_key()?.expect("generation must be active");
-            assert_eq!(key.len(), 64);
-            assert_eq!(fs::read(db_path()?)?, b"database-generation");
-            for manifest_source in manifest.ann.keys() {
-                assert_eq!(
-                    fs::read(live_dir()?.join(sidecar_relative_path(manifest_source)))?,
-                    format!("{manifest_source}-ann").into_bytes()
-                );
-            }
-            let installed: Manifest =
-                serde_json::from_slice(&fs::read(installed_manifest_path()?)?)?;
-            assert_eq!(installed, manifest);
-            Ok(())
-        })
-    }
-
     // ----- Cleanup: highlight_snippet fallback paths -----
 
     #[test]
@@ -3966,39 +3256,17 @@ mod tests {
         );
     }
 
-    fn sha256_hex(bytes: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(bytes))
-    }
-
-    fn write_test_tar_zst(path: &Path, files: &[(&str, &[u8])]) -> Result<()> {
-        let file = File::create(path)?;
-        let encoder = zstd::stream::write::Encoder::new(file, 3)?;
-        let mut archive = tar::Builder::new(encoder);
-        for (name, bytes) in files {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(bytes.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            archive.append_data(&mut header, *name, Cursor::new(*bytes))?;
-        }
-        let encoder = archive.into_inner()?;
-        encoder.finish()?;
-        Ok(())
-    }
-
-    fn write_test_model_bundle(path: &Path) -> Result<Vec<u8>> {
-        let files: &[(&str, &[u8])] = &[
-            ("model_fp16.onnx", b"dummy onnx bytes"),
-            ("model_fp16.onnx_data", b"dummy external data"),
-            ("tokenizer.json", br#"{"version":"1.0","truncation":null}"#),
-        ];
-        write_test_tar_zst(path, files)?;
-        fs::read(path).map_err(Into::into)
-    }
-
     fn sample_manifest(schema_version: u32, min_client_version: &str) -> Manifest {
-        let source_id: legal_model::SourceId = TEST_SOURCE_ID.parse().expect("valid source id");
-        let frl_source_id: legal_model::SourceId = "frl".parse().expect("valid source id");
+        let ann = source_registry()
+            .source_ids()
+            .into_iter()
+            .map(|source| {
+                (
+                    source.parse().expect("valid registered source id"),
+                    sample_ann(source, "3"),
+                )
+            })
+            .collect();
         Manifest {
             schema_version,
             index_version: "test".to_string(),
@@ -4010,19 +3278,24 @@ mod tests {
             },
             model: ModelInfo {
                 id: EMBEDDING_MODEL_ID.to_string(),
-                sha256: "4".repeat(64),
-                size: 1,
-                url: "model-bundle.tar.zst".to_string(),
+                fingerprint: EMBEDDING_MODEL_FINGERPRINT.to_string(),
+                model: ManifestFile {
+                    path: EMBEDDING_MODEL_FILES[0].output_name.to_string(),
+                    sha256: EMBEDDING_MODEL_FILES[0].sha256.to_string(),
+                    size: EMBEDDING_MODEL_FILES[0].size,
+                },
+                tokenizer: ManifestFile {
+                    path: EMBEDDING_MODEL_FILES[1].output_name.to_string(),
+                    sha256: EMBEDDING_MODEL_FILES[1].sha256.to_string(),
+                    size: EMBEDDING_MODEL_FILES[1].size,
+                },
             },
             db: ManifestDb {
-                url: LEGAL_DB_ARCHIVE_FILENAME.to_string(),
+                path: LEGAL_DB_FILENAME.to_string(),
                 sha256: "5".repeat(64),
                 size: 1,
             },
-            ann: BTreeMap::from([
-                (source_id, sample_ann(TEST_SOURCE_ID, "3")),
-                (frl_source_id, sample_ann("frl", "6")),
-            ]),
+            ann,
         }
     }
 
@@ -4034,7 +3307,7 @@ mod tests {
             format_version: ANN_FORMAT_VERSION,
             library: ANN_LIBRARY.to_string(),
             library_version: ANN_LIBRARY_VERSION.to_string(),
-            url: crate::ann::sidecar_url(&source_id),
+            path: crate::ann::sidecar_manifest_path(&source_id),
             sha256: digest_character.repeat(64),
             size: 1,
             corpus_id: format!("sha256:{}", digest_character.repeat(64)),
@@ -4051,47 +3324,26 @@ mod tests {
         }
     }
 
-    // ----- serve startup: probe + server_instructions -----
+    // ----- serve startup instructions -----
 
     #[test]
-    fn server_instructions_no_db_tells_user_to_run_update() -> Result<()> {
+    fn server_instructions_no_db_requires_local_activation() -> Result<()> {
         let _lock = lock_test_db();
         let data = tempdir()?;
         with_data_dir(data.path(), || {
-            let text = server_instructions(None);
+            let (text, ready) = server_instructions();
+            assert!(!ready);
             assert!(
-                text.contains("not yet installed"),
-                "missing not-installed prefix in: {text}"
+                text.contains("No local corpus generation is active"),
+                "missing no-generation prefix in: {text}"
             );
             assert!(
-                text.contains("legal-mcp update"),
-                "missing install command in: {text}"
-            );
-            assert!(text.contains("1.5 GB"), "missing size hint in: {text}");
-        });
-        Ok(())
-    }
-
-    #[test]
-    fn server_instructions_appends_update_available_notice() -> Result<()> {
-        let _lock = lock_test_db();
-        let data = tempdir()?;
-        with_data_dir(data.path(), || {
-            let notice = UpdateAvailability {
-                available_index_version: "2026.05.20".to_string(),
-            };
-            let text = server_instructions(Some(&notice));
-            assert!(
-                text.contains("updated ATO corpus generation is available"),
-                "missing update notice in: {text}"
+                text.contains("legal-mcp activate"),
+                "missing local activation command in: {text}"
             );
             assert!(
-                text.contains("2026.05.20"),
-                "missing available index_version in: {text}"
-            );
-            assert!(
-                text.contains("legal-mcp update"),
-                "missing update command in: {text}"
+                text.contains("no corpus downloads"),
+                "missing local-only guarantee: {text}"
             );
         });
         Ok(())
@@ -4113,7 +3365,8 @@ mod tests {
                 "static MCP use instructions are too large: {static_words} words"
             );
 
-            let text = server_instructions(None);
+            let (text, ready) = server_instructions();
+            assert!(!ready);
             let boot_chars = text.chars().count();
             assert!(
                 boot_chars <= 1_100,
@@ -4156,116 +3409,6 @@ mod tests {
         assert!(
             total_chars <= 3_000,
             "MCP tool descriptor payload is too large: {total_chars} chars"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn check_for_update_availability_returns_none_when_no_installed_manifest() -> Result<()> {
-        let _lock = lock_test_db();
-        let data = tempdir()?;
-        let result = with_data_dir(data.path(), || {
-            check_for_update_availability("https://example.invalid/manifest.json")
-        });
-        assert!(
-            result?.is_none(),
-            "probe must return None when no installed manifest is present"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn corpus_manifest_discovery_paginates_past_binary_only_releases() -> Result<()> {
-        let first_page = (0..100)
-            .map(|index| {
-                json!({
-                    "tag_name": format!("v0.15.{index}"),
-                    "assets": [{
-                        "name": "legal-mcp-x86_64-unknown-linux-gnu.tar.gz",
-                        "browser_download_url": format!("https://example.test/{index}/binary.tar.gz")
-                    }]
-                })
-            })
-            .collect::<Vec<_>>();
-        let second_page = vec![json!({
-            "tag_name": "corpus",
-            "assets": [{
-                "name": "manifest.json",
-                "browser_download_url": "https://example.test/corpus/manifest.json"
-            }]
-        })];
-        let pages = [
-            serde_json::to_vec(&first_page)?,
-            serde_json::to_vec(&second_page)?,
-        ];
-        let mut fetched_pages = Vec::new();
-        let manifest = source::resolve_corpus_manifest_url_with(|page| {
-            fetched_pages.push(page);
-            pages
-                .get(page - 1)
-                .cloned()
-                .ok_or_else(|| anyhow!("unexpected release page {page}"))
-        })?;
-        assert_eq!(fetched_pages, vec![1, 2]);
-        assert_eq!(manifest, "https://example.test/corpus/manifest.json");
-        Ok(())
-    }
-
-    #[test]
-    fn check_for_update_availability_suppresses_incompatible_schema() -> Result<()> {
-        let _lock = lock_test_db();
-        let data = tempdir()?;
-        prepare_test_generation(data.path())?;
-        let release = tempdir()?;
-        let release_dir = release.path();
-        let manifest_path = release_dir.join("manifest.json");
-
-        let mut installed = sample_manifest(SUPPORTED_SCHEMA_VERSION, env!("CARGO_PKG_VERSION"));
-        installed.index_version = "test-installed".to_string();
-        // Published manifest declares a schema this binary can't ingest.
-        let published = Manifest {
-            schema_version: SUPPORTED_SCHEMA_VERSION + 1,
-            index_version: "test-future".to_string(),
-            ..installed.clone()
-        };
-        fs::write(&manifest_path, serde_json::to_vec_pretty(&published)?)?;
-
-        let result = with_data_dir(data.path(), || -> Result<Option<UpdateAvailability>> {
-            fs::write(
-                installed_manifest_path()?,
-                serde_json::to_vec_pretty(&installed)?,
-            )?;
-            check_for_update_availability(manifest_path.to_str().expect("utf-8 path"))
-        });
-        assert!(
-            result?.is_none(),
-            "probe must suppress the notice when the published index requires a newer binary"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn check_for_update_availability_returns_none_when_already_current() -> Result<()> {
-        let _lock = lock_test_db();
-        let data = tempdir()?;
-        prepare_test_generation(data.path())?;
-        let release = tempdir()?;
-        let release_dir = release.path();
-        let manifest_path = release_dir.join("manifest.json");
-        let mut manifest = sample_manifest(SUPPORTED_SCHEMA_VERSION, env!("CARGO_PKG_VERSION"));
-        manifest.index_version = "test-probe-current".to_string();
-        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
-
-        let result = with_data_dir(data.path(), || -> Result<Option<UpdateAvailability>> {
-            fs::write(
-                installed_manifest_path()?,
-                serde_json::to_vec_pretty(&manifest)?,
-            )?;
-            check_for_update_availability(manifest_path.to_str().expect("utf-8 path"))
-        });
-        assert!(
-            result?.is_none(),
-            "probe must return None when installed corpus already matches the published manifest"
         );
         Ok(())
     }
@@ -4652,7 +3795,7 @@ mod tests {
             "UPDATE documents SET type = 'PAC', title = ?1
              WHERE source_id = ?2 AND native_id = ?3",
             params![
-                "Income Tax Assessment Act 1997 s 203-50",
+                "Completely unrelated provision heading",
                 TEST_SOURCE_ID,
                 "PAC/19970038/203-50"
             ],
@@ -4663,7 +3806,7 @@ mod tests {
             params![
                 TEST_SOURCE_ID,
                 "PAC/19970038/203-50",
-                "Income Tax Assessment Act 1997 s 203-50"
+                "Completely unrelated provision heading"
             ],
         )?;
         insert_doc_full(
@@ -4747,7 +3890,7 @@ mod tests {
             let json_str = get_definition(
                 "corporate tax gross-up rate",
                 GetDefinitionOptions {
-                    source: None,
+                    source: TEST_SOURCE_ID.parse()?,
                     context_document: Some(context),
                     max_defs: 5,
                 },
@@ -4816,7 +3959,7 @@ mod tests {
             let json_str = get_definition(
                 "car",
                 GetDefinitionOptions {
-                    source: None,
+                    source: TEST_SOURCE_ID.parse()?,
                     context_document: Some(context),
                     max_defs: 10,
                 },
@@ -4850,7 +3993,7 @@ mod tests {
         let result = get_definition(
             "car",
             GetDefinitionOptions {
-                source: None,
+                source: TEST_SOURCE_ID.parse()?,
                 context_document: None,
                 max_defs: 5,
             },
@@ -5387,134 +4530,6 @@ mod tests {
             "shorter than 8 chars returns None"
         );
         assert!(pit_to_date("abcd0320000000").is_none());
-    }
-
-    #[test]
-    fn ensure_model_rejects_incomplete_bundle_before_marker() -> Result<()> {
-        let _lock = lock_test_db();
-        let data = tempdir()?;
-        prepare_test_generation(data.path())?;
-        let release = tempdir()?;
-        let release_dir = release.path();
-        let model_bundle = release_dir.join("model-bundle.tar.zst");
-        write_test_tar_zst(
-            &model_bundle,
-            &[
-                ("model_fp16.onnx", b"dummy onnx bytes"),
-                ("tokenizer.json", br#"{"version":"1.0","truncation":null}"#),
-            ],
-        )?;
-        let model_bundle_bytes = fs::read(&model_bundle)?;
-        let mut manifest = sample_manifest(SUPPORTED_SCHEMA_VERSION, env!("CARGO_PKG_VERSION"));
-        manifest.index_version = "test-incomplete-model-bundle".to_string();
-        manifest.model = ModelInfo {
-            id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: sha256_hex(&model_bundle_bytes),
-            size: model_bundle_bytes.len() as u64,
-            url: "model-bundle.tar.zst".to_string(),
-        };
-        let context = UrlContext {
-            manifest_dir: Some(release_dir.to_path_buf()),
-            manifest_base_url: None,
-        };
-
-        with_data_dir(data.path(), || -> Result<()> {
-            let err = stage_model(&manifest, &context, &staging_dir()?).unwrap_err();
-            assert!(
-                err.to_string().contains("model_fp16.onnx_data"),
-                "expected missing model data error, got: {err}"
-            );
-            assert!(
-                !live_dir()?.join(".model.sha256").exists(),
-                "incomplete bundle must not mark the model installed"
-            );
-            assert!(
-                !model_data_path()?.exists(),
-                "incomplete bundle must not partially install model data"
-            );
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    #[test]
-    fn stage_model_rejects_insecure_or_unapproved_remote_sources() -> Result<()> {
-        let _lock = lock_test_db();
-        let data = tempdir()?;
-        prepare_test_generation(data.path())?;
-        with_data_dir(data.path(), || -> Result<()> {
-            for (url, expected) in [
-                ("http://github.com/model.tar.zst", "must use HTTPS"),
-                (
-                    "https://example.com/model.tar.zst",
-                    "unapproved acquisition hostname",
-                ),
-                (
-                    "https://127.0.0.1/model.tar.zst",
-                    "unapproved acquisition hostname",
-                ),
-            ] {
-                let mut manifest = sample_manifest(SUPPORTED_SCHEMA_VERSION, "");
-                manifest.model = ModelInfo {
-                    id: EMBEDDING_MODEL_ID.to_string(),
-                    sha256: "0000000000000000000000000000000000000000000000000000000000000000"
-                        .to_string(),
-                    size: 1,
-                    url: url.to_string(),
-                };
-                let context = UrlContext {
-                    manifest_dir: None,
-                    manifest_base_url: None,
-                };
-                let error = stage_model(
-                    &manifest,
-                    &context,
-                    &data.path().join("remote-model-staging"),
-                )
-                .unwrap_err();
-                assert!(
-                    error.to_string().contains(expected),
-                    "expected `{expected}` for {url}, got: {error:#}"
-                );
-            }
-            Ok(())
-        })
-    }
-
-    #[test]
-    fn stage_model_rejects_local_artifacts_outside_manifest_directory() -> Result<()> {
-        let _lock = lock_test_db();
-        let data = tempdir()?;
-        prepare_test_generation(data.path())?;
-        let release = tempdir()?;
-        let outside = tempdir()?;
-        let artifact = outside.path().join("model-bundle.tar.zst");
-        fs::write(&artifact, b"x")?;
-        let mut manifest = sample_manifest(SUPPORTED_SCHEMA_VERSION, "");
-        manifest.model = ModelInfo {
-            id: EMBEDDING_MODEL_ID.to_string(),
-            sha256: sha256_hex(b"x"),
-            size: 1,
-            url: artifact.display().to_string(),
-        };
-        let context = UrlContext {
-            manifest_dir: Some(release.path().to_path_buf()),
-            manifest_base_url: None,
-        };
-
-        with_data_dir(data.path(), || -> Result<()> {
-            let error = stage_model(
-                &manifest,
-                &context,
-                &data.path().join("local-model-staging"),
-            )
-            .unwrap_err();
-            assert!(
-                error.to_string().contains("model artifact escaped"),
-                "unexpected error: {error:#}"
-            );
-            Ok(())
-        })
     }
 
     // ===== Slim Search Surface ============================================

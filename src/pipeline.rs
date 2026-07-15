@@ -5,35 +5,67 @@
 //! derivation, metadata refresh, and per-source ANN finalisation.
 
 use crate::ann::{self, ManifestAnn};
-use crate::chunker::{chunk_html_with_token_count, Chunk, EMBED_MAX_TOKENS};
-use crate::db::{
-    compress_text, decompress_text, get_corpus_meta, get_source_meta, set_corpus_meta,
-    set_source_meta,
+use crate::chunker::{chunk_fragment_with_prepared_tokens, Chunk, EMBED_MAX_TOKENS};
+use crate::db::{get_corpus_meta, get_source_meta, set_corpus_meta, set_source_meta};
+use crate::extract::{
+    extract_anchors_from_document, extract_currency_from_document, extract_definitions, AnchorRef,
+    CurrencyInfo, Definition, DefinitionChunk,
 };
+use crate::semantic::EMBEDDING_BATCH_SIZE;
 use crate::{ServerState, EMBEDDING_DIM, EMBEDDING_MODEL_ID};
 use anyhow::{anyhow, bail, Context, Result};
-use legal_model::{DocumentId, SourceDescriptor, SourceId};
+#[cfg(test)]
+use legal_model::DocumentId;
+use legal_model::{SourceDescriptor, SourceId};
 use legal_source_sdk::{sha256_bytes, NormalizedDocument};
-use regex::Regex;
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rayon::prelude::*;
+use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::OnceLock;
 
-const EMBEDDING_BATCH_SIZE: usize = 32;
+const EMBEDDING_CACHE_LOOKUP_BATCH_SIZE: usize = 500;
+const PRODUCTION_EMBEDDING_FLUSH_SIZE: usize = 8_192;
+const EMBEDDING_FLUSH_SIZE: usize = PRODUCTION_EMBEDDING_FLUSH_SIZE;
+const DOCUMENT_PREPARATION_BATCH_SIZE: usize = 256;
+
+pub(crate) struct PreparedEmbeddingText {
+    text: String,
+    token_count: usize,
+    token_ids: Option<Vec<i64>>,
+}
 
 /// The only embedding capability the final-schema pipeline needs.
 ///
 /// Implementations encode unprefixed chunk text. The production semantic runtime applies its
 /// configured document prefix itself, exactly as it does for the existing corpus builder.
-pub(crate) trait EmbeddingProvider {
+pub(crate) trait EmbeddingProvider: Sync {
     fn model_id(&self) -> &str;
 
     fn count_tokens(&self, text: &str) -> Result<usize>;
 
     fn encode(&self, texts: &[String]) -> Result<Vec<[i8; EMBEDDING_DIM]>>;
+
+    fn prepare_document_tokens(&self, _text: &str) -> Result<Option<Vec<i64>>> {
+        Ok(None)
+    }
+
+    fn prepare_embedding_tokens_exact(&self, _text: &str) -> Result<Option<Vec<i64>>> {
+        Ok(None)
+    }
+
+    fn encode_prepared(
+        &self,
+        inputs: &[&PreparedEmbeddingText],
+    ) -> Result<Vec<[i8; EMBEDDING_DIM]>> {
+        self.encode(
+            &inputs
+                .iter()
+                .map(|input| input.text.clone())
+                .collect::<Vec<_>>(),
+        )
+    }
 }
 
 impl EmbeddingProvider for ServerState {
@@ -46,7 +78,31 @@ impl EmbeddingProvider for ServerState {
     }
 
     fn encode(&self, texts: &[String]) -> Result<Vec<[i8; EMBEDDING_DIM]>> {
-        self.encode_query_embeddings(texts)
+        self.encode_document_embeddings(texts)
+    }
+
+    fn prepare_document_tokens(&self, text: &str) -> Result<Option<Vec<i64>>> {
+        self.prepare_document_embedding_tokens(text).map(Some)
+    }
+
+    fn prepare_embedding_tokens_exact(&self, text: &str) -> Result<Option<Vec<i64>>> {
+        self.prepare_embedding_tokens_exact(text).map(Some)
+    }
+
+    fn encode_prepared(
+        &self,
+        inputs: &[&PreparedEmbeddingText],
+    ) -> Result<Vec<[i8; EMBEDDING_DIM]>> {
+        let token_ids = inputs
+            .iter()
+            .map(|input| {
+                input
+                    .token_ids
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("production embedding input is missing prepared tokens"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.encode_document_token_embeddings(&token_ids)
     }
 }
 
@@ -65,21 +121,43 @@ pub(crate) struct SourceIngestReport {
     pub(crate) source_index_sha256: String,
 }
 
-struct ValidatedDocument {
-    document: NormalizedDocument,
-    content_hash: String,
-}
-
 struct PreparedDocument {
     document: NormalizedDocument,
     content_hash: String,
     headings: String,
     chunks: Vec<Chunk>,
+    currency: CurrencyInfo,
+    anchor_refs: Vec<AnchorRef>,
+    definitions: Vec<Definition>,
 }
 
 struct PendingEmbedding {
     chunk_id: i64,
     text_sha256: String,
+}
+
+#[derive(Default)]
+struct IngestBuffers {
+    seen_asset_ids: HashSet<String>,
+    pending_embeddings: Vec<PendingEmbedding>,
+    text_by_sha256: BTreeMap<String, PreparedEmbeddingText>,
+}
+
+struct RawEmbeddingJob {
+    pending: Vec<PendingEmbedding>,
+    text_by_sha256: BTreeMap<String, PreparedEmbeddingText>,
+}
+
+struct ResolvedEmbeddingJob {
+    pending: Vec<PendingEmbedding>,
+    vectors: HashMap<String, Vec<u8>>,
+    missing: Vec<(String, PreparedEmbeddingText)>,
+}
+
+struct EncodedEmbeddingJob {
+    pending: Vec<PendingEmbedding>,
+    vectors: HashMap<String, Vec<u8>>,
+    new_hashes: Vec<String>,
 }
 
 /// Reconcile one complete, authoritative source snapshot into an existing final-schema database.
@@ -89,6 +167,7 @@ struct PendingEmbedding {
 /// every normalized document must carry that source. All SQLite changes occur in one immediate
 /// transaction; source-specific normalization and ANN publication deliberately remain outside this
 /// function.
+#[cfg(test)]
 pub(crate) fn ingest_source<P, I>(
     conn: &mut Connection,
     source_id: &SourceId,
@@ -100,9 +179,28 @@ where
     P: EmbeddingProvider + ?Sized,
     I: IntoIterator<Item = NormalizedDocument>,
 {
+    ingest_source_results(
+        conn,
+        source_id,
+        descriptor,
+        documents.into_iter().map(Ok),
+        embeddings,
+    )
+}
+
+/// Stream a source workspace without hydrating its document bodies in memory.
+pub(crate) fn ingest_source_results<P, I>(
+    conn: &mut Connection,
+    source_id: &SourceId,
+    descriptor: &SourceDescriptor,
+    documents: I,
+    embeddings: &P,
+) -> Result<SourceIngestReport>
+where
+    P: EmbeddingProvider + ?Sized,
+    I: IntoIterator<Item = Result<NormalizedDocument>>,
+{
     validate_source_input(source_id, descriptor, embeddings.model_id())?;
-    let documents = collect_source_documents(source_id, documents)?;
-    let source_index_sha256 = source_snapshot_sha256(source_id, &documents);
 
     // Cascades are part of the final schema contract. Enabling this before beginning the
     // transaction also avoids SQLite's no-op behaviour for PRAGMA foreign_keys inside a txn.
@@ -113,14 +211,7 @@ where
     }
 
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let report = ingest_source_transaction(
-        &tx,
-        source_id,
-        descriptor,
-        documents,
-        embeddings,
-        source_index_sha256,
-    )?;
+    let report = ingest_source_transaction(&tx, source_id, descriptor, documents, embeddings)?;
     tx.commit()?;
     Ok(report)
 }
@@ -148,50 +239,13 @@ fn validate_source_input(
     Ok(())
 }
 
-fn collect_source_documents<I>(
-    source_id: &SourceId,
-    documents: I,
-) -> Result<BTreeMap<String, ValidatedDocument>>
-where
-    I: IntoIterator<Item = NormalizedDocument>,
-{
-    let mut collected = BTreeMap::new();
-    for document in documents {
-        document
-            .validate()
-            .with_context(|| format!("validating normalized document for source `{source_id}`"))?;
-        let identity = &document.inventory.document;
-        if &identity.source != source_id {
-            bail!(
-                "normalized document `{identity}` belongs to source `{}`, expected `{source_id}`",
-                identity.source
-            );
-        }
-        let native_id = identity.native_id.clone();
-        let content_hash = document
-            .normalized_sha256()
-            .with_context(|| format!("hashing normalized document `{identity}`"))?;
-        let validated = ValidatedDocument {
-            document,
-            content_hash,
-        };
-        if collected.insert(native_id.clone(), validated).is_some() {
-            bail!("duplicate normalized document `{source_id}/{native_id}`");
-        }
-    }
-    Ok(collected)
-}
-
-fn source_snapshot_sha256(
-    source_id: &SourceId,
-    documents: &BTreeMap<String, ValidatedDocument>,
-) -> String {
+fn source_snapshot_sha256(source_id: &SourceId, documents: &BTreeMap<String, String>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"australian-legal-mcp-source-snapshot-v1\0");
     hash_field(&mut hasher, source_id.as_str().as_bytes());
-    for (native_id, document) in documents {
+    for (native_id, content_hash) in documents {
         hash_field(&mut hasher, native_id.as_bytes());
-        hash_field(&mut hasher, document.content_hash.as_bytes());
+        hash_field(&mut hasher, content_hash.as_bytes());
     }
     format!("{:x}", hasher.finalize())
 }
@@ -205,9 +259,8 @@ fn ingest_source_transaction<P>(
     tx: &Transaction<'_>,
     source_id: &SourceId,
     descriptor: &SourceDescriptor,
-    documents: BTreeMap<String, ValidatedDocument>,
+    documents: impl IntoIterator<Item = Result<NormalizedDocument>>,
     embeddings: &P,
-    source_index_sha256: String,
 ) -> Result<SourceIngestReport>
 where
     P: EmbeddingProvider + ?Sized,
@@ -215,90 +268,181 @@ where
     validate_embedding_model(tx, embeddings.model_id())?;
 
     let existing = existing_source_hashes(tx, source_id)?;
-    let incoming_ids = documents.keys().cloned().collect::<BTreeSet<_>>();
-    let absent_ids = existing
-        .keys()
-        .filter(|native_id| !incoming_ids.contains(*native_id))
-        .cloned()
-        .collect::<Vec<_>>();
-
     let mut unchanged_documents = 0usize;
     let mut inserted_documents = 0usize;
     let mut changed_documents = 0usize;
-    let mut prepared = Vec::new();
-    for (_, validated) in documents {
-        let ValidatedDocument {
-            document,
-            content_hash,
-        } = validated;
-        let inventory = &document.inventory;
-        let native_id = &inventory.document.native_id;
-        match existing.get(native_id) {
-            Some(stored_hash) if stored_hash == &content_hash => {
-                unchanged_documents += 1;
-            }
-            stored_hash => {
-                if stored_hash.is_some() {
-                    changed_documents += 1;
-                } else {
-                    inserted_documents += 1;
-                }
-                let headings = headings_text(&document.html)?;
-                let chunks = chunk_html_with_token_count(
-                    &document.html,
-                    Some(inventory.title.as_str()),
-                    EMBED_MAX_TOKENS,
-                    |text| embeddings.count_tokens(text),
-                )?;
-                prepared.push(PreparedDocument {
-                    document,
-                    content_hash,
-                    headings,
-                    chunks,
-                });
-            }
-        }
-    }
-
     tx.execute(
         "INSERT INTO sources(source_id, display_name) VALUES (?1, ?2)
          ON CONFLICT(source_id) DO UPDATE SET display_name = excluded.display_name",
         params![source_id.as_str(), descriptor.display_name],
     )?;
 
-    for native_id in absent_ids.iter().chain(
-        prepared
-            .iter()
-            .filter(|document| {
-                existing.contains_key(&document.document.inventory.document.native_id)
-            })
-            .map(|document| &document.document.inventory.document.native_id),
-    ) {
+    let downloaded_at = chrono::Utc::now().to_rfc3339();
+    let mut inserted_chunks = 0usize;
+    let mut encoded_texts = 0usize;
+    let mut reused_embeddings = 0usize;
+    let mut buffers = IngestBuffers::default();
+    let mut incoming_hashes = BTreeMap::new();
+    let mut text_compressor =
+        zstd::bulk::Compressor::new(3).context("creating reusable corpus text compressor")?;
+
+    std::thread::scope(|scope| -> Result<()> {
+        let mut documents = documents.into_iter();
+        let size_hint = documents.size_hint();
+        let expected_documents = (size_hint.1 == Some(size_hint.0)).then_some(size_hint.0);
+        let progress_started = std::time::Instant::now();
+        let mut processed_documents = 0usize;
+        let mut queued_jobs = VecDeque::<RawEmbeddingJob>::new();
+        let mut active_job: Option<std::thread::ScopedJoinHandle<'_, Result<EncodedEmbeddingJob>>> =
+            None;
+
+        loop {
+            let batch = documents
+                .by_ref()
+                .take(DOCUMENT_PREPARATION_BATCH_SIZE)
+                .collect::<Vec<_>>();
+            if batch.is_empty() {
+                break;
+            }
+            let prepared = batch
+                .into_par_iter()
+                .map(|document| prepare_source_document(document, source_id, &existing, embeddings))
+                .collect::<Vec<_>>();
+            for prepared in prepared {
+                let (native_id, content_hash, prepared_document) = prepared?;
+                if incoming_hashes
+                    .insert(native_id.clone(), content_hash)
+                    .is_some()
+                {
+                    bail!("duplicate normalized document `{source_id}/{native_id}`");
+                }
+                processed_documents += 1;
+                if processed_documents.is_multiple_of(1_000) {
+                    let elapsed = progress_started.elapsed().as_secs_f64().max(0.001);
+                    let rate = processed_documents as f64 / elapsed;
+                    let eta = expected_documents
+                        .map(|total| total.saturating_sub(processed_documents) as f64 / rate);
+                    eprintln!(
+                        "legal-mcp build: {source_id} prepared {processed_documents}/{} documents ({rate:.1}/s, {} chunks, {} embeddings encoded, eta {})",
+                        expected_documents
+                            .map(|total| total.to_string())
+                            .unwrap_or_else(|| "?".to_string()),
+                        inserted_chunks,
+                        encoded_texts,
+                        eta.map(|seconds| format!("{seconds:.0}s"))
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    );
+                }
+                let Some(prepared_document) = prepared_document else {
+                    unchanged_documents += 1;
+                    continue;
+                };
+                if existing.contains_key(&native_id) {
+                    changed_documents += 1;
+                    delete_source_document(tx, source_id, &native_id)?;
+                } else {
+                    inserted_documents += 1;
+                }
+                insert_document(
+                    tx,
+                    source_id,
+                    &prepared_document,
+                    &downloaded_at,
+                    &mut buffers,
+                    &mut text_compressor,
+                )?;
+                inserted_chunks += prepared_document.chunks.len();
+                if buffers.pending_embeddings.len() >= EMBEDDING_FLUSH_SIZE {
+                    queued_jobs.push_back(RawEmbeddingJob {
+                        pending: std::mem::take(&mut buffers.pending_embeddings),
+                        text_by_sha256: std::mem::take(&mut buffers.text_by_sha256),
+                    });
+                }
+            }
+
+            if active_job
+                .as_ref()
+                .is_some_and(std::thread::ScopedJoinHandle::is_finished)
+            {
+                let job = active_job
+                    .take()
+                    .expect("finished embedding job is present")
+                    .join()
+                    .map_err(|_| anyhow!("embedding worker panicked"))??;
+                if let Some(raw) = queued_jobs.pop_front() {
+                    let resolved = resolve_embedding_job(tx, embeddings, raw, Some(&job.vectors))?;
+                    active_job =
+                        Some(scope.spawn(move || encode_embedding_job(embeddings, resolved)));
+                }
+                let (encoded, reused) = persist_embedding_job(tx, embeddings.model_id(), job)?;
+                encoded_texts += encoded;
+                reused_embeddings += reused;
+            }
+            if active_job.is_none() {
+                if let Some(raw) = queued_jobs.pop_front() {
+                    let resolved = resolve_embedding_job(tx, embeddings, raw, None)?;
+                    active_job =
+                        Some(scope.spawn(move || encode_embedding_job(embeddings, resolved)));
+                }
+            }
+
+            // Bound prepared-but-not-embedded text while leaving enough work
+            // queued to keep CUDA busy across document preparation and SQLite writes.
+            if queued_jobs.len() >= 2 {
+                let raw = queued_jobs
+                    .pop_front()
+                    .expect("embedding queue backpressure requires queued work");
+                let job = active_job
+                    .take()
+                    .expect("embedding queue backpressure requires an active job")
+                    .join()
+                    .map_err(|_| anyhow!("embedding worker panicked"))??;
+                let resolved = resolve_embedding_job(tx, embeddings, raw, Some(&job.vectors))?;
+                active_job = Some(scope.spawn(move || encode_embedding_job(embeddings, resolved)));
+                let (encoded, reused) = persist_embedding_job(tx, embeddings.model_id(), job)?;
+                encoded_texts += encoded;
+                reused_embeddings += reused;
+            }
+        }
+
+        if !buffers.pending_embeddings.is_empty() {
+            queued_jobs.push_back(RawEmbeddingJob {
+                pending: std::mem::take(&mut buffers.pending_embeddings),
+                text_by_sha256: std::mem::take(&mut buffers.text_by_sha256),
+            });
+        }
+        while active_job.is_some() || !queued_jobs.is_empty() {
+            if let Some(handle) = active_job.take() {
+                let next_raw = queued_jobs.pop_front();
+                let job = handle
+                    .join()
+                    .map_err(|_| anyhow!("embedding worker panicked"))??;
+                if let Some(raw) = next_raw {
+                    let resolved = resolve_embedding_job(tx, embeddings, raw, Some(&job.vectors))?;
+                    active_job =
+                        Some(scope.spawn(move || encode_embedding_job(embeddings, resolved)));
+                }
+                let (encoded, reused) = persist_embedding_job(tx, embeddings.model_id(), job)?;
+                encoded_texts += encoded;
+                reused_embeddings += reused;
+            } else if let Some(raw) = queued_jobs.pop_front() {
+                let resolved = resolve_embedding_job(tx, embeddings, raw, None)?;
+                active_job = Some(scope.spawn(move || encode_embedding_job(embeddings, resolved)));
+            }
+        }
+        Ok(())
+    })?;
+
+    let absent_ids = existing
+        .keys()
+        .filter(|native_id| !incoming_hashes.contains_key(*native_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    for native_id in &absent_ids {
         delete_source_document(tx, source_id, native_id)?;
     }
-
-    let downloaded_at = chrono::Utc::now().to_rfc3339();
-    let mut pending_embeddings = Vec::new();
-    let mut text_by_sha256 = BTreeMap::new();
-    let mut inserted_chunks = 0usize;
-    let mut seen_asset_ids = source_asset_ids(tx, source_id)?;
-
-    for prepared_document in &prepared {
-        insert_document(
-            tx,
-            source_id,
-            prepared_document,
-            &downloaded_at,
-            &mut seen_asset_ids,
-            &mut pending_embeddings,
-            &mut text_by_sha256,
-        )?;
-        inserted_chunks += prepared_document.chunks.len();
-    }
-
-    let (encoded_texts, reused_embeddings) =
-        install_embeddings(tx, embeddings, &pending_embeddings, &text_by_sha256)?;
-    derive_source_citations(tx, source_id)?;
+    let source_index_sha256 = source_snapshot_sha256(source_id, &incoming_hashes);
+    crate::retrieval::derive_citations(tx, source_id)?;
     refresh_metadata(
         tx,
         source_id,
@@ -318,6 +462,94 @@ where
         reused_embeddings,
         source_index_sha256,
     })
+}
+
+fn prepare_source_document<P>(
+    document: Result<NormalizedDocument>,
+    source_id: &SourceId,
+    existing: &BTreeMap<String, String>,
+    embeddings: &P,
+) -> Result<(String, String, Option<PreparedDocument>)>
+where
+    P: EmbeddingProvider + ?Sized,
+{
+    let document = document?;
+    document
+        .validate()
+        .with_context(|| format!("validating normalized document for source `{source_id}`"))?;
+    let identity = &document.inventory.document;
+    if &identity.source != source_id {
+        bail!(
+            "normalized document `{identity}` belongs to source `{}`, expected `{source_id}`",
+            identity.source
+        );
+    }
+    let native_id = identity.native_id.clone();
+    let content_hash = document
+        .normalized_sha256()
+        .with_context(|| format!("hashing normalized document `{identity}`"))?;
+    if existing.get(&native_id) == Some(&content_hash) {
+        return Ok((native_id, content_hash, None));
+    }
+    let fragment = scraper::Html::parse_fragment(&document.html);
+    let headings = headings_text(&fragment)?;
+    let mut chunks = chunk_fragment_with_prepared_tokens(
+        &fragment,
+        Some(document.inventory.title.as_str()),
+        EMBED_MAX_TOKENS,
+        |text| {
+            if let Some(token_ids) = embeddings.prepare_embedding_tokens_exact(text)? {
+                Ok((token_ids.len(), Some(token_ids)))
+            } else {
+                Ok((embeddings.count_tokens(text)?, None))
+            }
+        },
+    )?;
+    for chunk in &mut chunks {
+        if chunk.embedding_token_ids.is_none() {
+            chunk.embedding_token_ids = embeddings.prepare_document_tokens(&chunk.text)?;
+        }
+        if let Some(token_ids) = &chunk.embedding_token_ids {
+            if token_ids.len() != chunk.token_count {
+                bail!(
+                    "prepared token count changed for `{identity}` chunk {}: counted {}, prepared {}",
+                    chunk.ord,
+                    chunk.token_count,
+                    token_ids.len()
+                );
+            }
+        }
+    }
+    let page = scraper::Html::parse_document(&document.html);
+    let currency = extract_currency_from_document(&page);
+    let anchor_refs = extract_anchors_from_document(&page, &native_id);
+    let definition_chunks = chunks
+        .iter()
+        .map(|chunk| DefinitionChunk {
+            ord: chunk.ord,
+            anchor: chunk.anchor.clone(),
+            text: chunk.text.clone(),
+        })
+        .collect::<Vec<_>>();
+    let definitions = extract_definitions(
+        &native_id,
+        &document.inventory.title,
+        &document.inventory.document_type,
+        &definition_chunks,
+    );
+    Ok((
+        native_id,
+        content_hash.clone(),
+        Some(PreparedDocument {
+            document,
+            content_hash,
+            headings,
+            chunks,
+            currency,
+            anchor_refs,
+            definitions,
+        }),
+    ))
 }
 
 fn validate_embedding_model(conn: &Connection, model_id: &str) -> Result<()> {
@@ -350,17 +582,6 @@ fn existing_source_hashes(
     Ok(hashes)
 }
 
-fn source_asset_ids(conn: &Connection, source_id: &SourceId) -> Result<HashSet<String>> {
-    let mut statement = conn
-        .prepare("SELECT asset_id FROM document_assets WHERE source_id = ?1 ORDER BY asset_id")?;
-    let rows = statement.query_map([source_id.as_str()], |row| row.get::<_, String>(0))?;
-    let mut ids = HashSet::new();
-    for row in rows {
-        ids.insert(row?);
-    }
-    Ok(ids)
-}
-
 fn delete_source_document(conn: &Connection, source_id: &SourceId, native_id: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM chunks_fts WHERE rowid IN (
@@ -379,8 +600,7 @@ fn delete_source_document(conn: &Connection, source_id: &SourceId, native_id: &s
     Ok(())
 }
 
-fn headings_text(html: &str) -> Result<String> {
-    let fragment = scraper::Html::parse_fragment(html);
+fn headings_text(fragment: &scraper::Html) -> Result<String> {
     let selector = scraper::Selector::parse("h1, h2, h3, h4, h5, h6")
         .map_err(|error| anyhow!("parsing heading selector: {error:?}"))?;
     Ok(fragment
@@ -402,56 +622,74 @@ fn insert_document(
     source_id: &SourceId,
     prepared: &PreparedDocument,
     downloaded_at: &str,
-    seen_asset_ids: &mut HashSet<String>,
-    pending_embeddings: &mut Vec<PendingEmbedding>,
-    text_by_sha256: &mut BTreeMap<String, String>,
+    buffers: &mut IngestBuffers,
+    text_compressor: &mut zstd::bulk::Compressor<'_>,
 ) -> Result<()> {
     let document = &prepared.document;
     let inventory = &document.inventory;
     let native_id = &inventory.document.native_id;
-    let has_in_doc_links = prepared.chunks.iter().any(|chunk| {
-        chunk
-            .anchor
-            .as_deref()
-            .is_some_and(|anchor| !anchor.is_empty())
-    });
-    conn.execute(
+    let has_in_doc_links = prepared
+        .anchor_refs
+        .iter()
+        .any(|reference| reference.kind == "in_doc");
+    let has_related_docs = prepared
+        .anchor_refs
+        .iter()
+        .any(|reference| reference.kind == "sister");
+    let has_history = prepared
+        .anchor_refs
+        .iter()
+        .any(|reference| reference.kind == "history");
+    conn.prepare_cached(
         "INSERT INTO documents
             (source_id, native_id, type, title, date, canonical_url, upstream_version,
              downloaded_at, content_hash, html, withdrawn_date, superseded_by, replaces,
              has_in_doc_links, has_related_docs, has_history, headings)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                 NULL, NULL, NULL, ?11, 0, 0, ?12)",
-        params![
-            source_id.as_str(),
-            native_id,
-            inventory.document_type,
-            inventory.title,
-            inventory.date,
-            inventory.canonical_url,
-            inventory.upstream_version,
-            downloaded_at,
-            prepared.content_hash,
-            compress_text(&document.html)?,
-            i64::from(has_in_doc_links),
-            prepared.headings,
-        ],
-    )
+                 ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+    )?
+    .execute(params![
+        source_id.as_str(),
+        native_id,
+        inventory.document_type,
+        inventory.title,
+        inventory.date,
+        inventory.canonical_url,
+        inventory.upstream_version,
+        downloaded_at,
+        prepared.content_hash,
+        text_compressor.compress(document.html.as_bytes())?,
+        prepared.currency.withdrawn_date,
+        prepared.currency.superseded_by,
+        prepared.currency.replaces,
+        i64::from(has_in_doc_links),
+        i64::from(has_related_docs),
+        i64::from(has_history),
+        prepared.headings,
+    ])
     .with_context(|| format!("inserting document `{source_id}/{native_id}`"))?;
 
-    let mut anchor_ord = 0_i64;
+    let mut chunk_ids = Vec::with_capacity(prepared.chunks.len());
+    let mut insert_chunk = conn.prepare_cached(
+        "INSERT INTO chunks(source_id, native_id, ord, anchor, text)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         RETURNING chunk_id",
+    )?;
+    let mut insert_chunk_fts =
+        conn.prepare_cached("INSERT INTO chunks_fts(rowid, text) VALUES (?1, ?2)")?;
+    #[cfg(test)]
+    let skip_chunk_fts = std::env::var_os("LEGAL_MCP_BENCH_SKIP_CHUNK_FTS").is_some();
+    #[cfg(not(test))]
+    let skip_chunk_fts = false;
     for chunk in &prepared.chunks {
-        let chunk_id: i64 = conn
+        let chunk_id: i64 = insert_chunk
             .query_row(
-                "INSERT INTO chunks(source_id, native_id, ord, anchor, text)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 RETURNING chunk_id",
                 params![
                     source_id.as_str(),
                     native_id,
                     chunk.ord,
                     chunk.anchor,
-                    compress_text(&chunk.text)?,
+                    text_compressor.compress(chunk.text.as_bytes())?,
                 ],
                 |row| row.get(0),
             )
@@ -461,58 +699,121 @@ fn insert_document(
                     chunk.ord
                 )
             })?;
-        conn.execute(
-            "INSERT INTO chunks_fts(rowid, text) VALUES (?1, ?2)",
-            params![chunk_id, chunk.text],
-        )?;
-        if let Some(anchor) = chunk.anchor.as_deref().filter(|anchor| !anchor.is_empty()) {
-            conn.execute(
-                "INSERT INTO doc_anchors(
-                    source_id, native_id, ord, kind, label,
-                    target_source_id, target_native_id, target_chunk_id
-                 ) VALUES (?1, ?2, ?3, 'in_doc', ?4, ?1, ?2, ?5)",
-                params![source_id.as_str(), native_id, anchor_ord, anchor, chunk_id],
-            )?;
-            anchor_ord += 1;
+        if !skip_chunk_fts {
+            insert_chunk_fts.execute(params![chunk_id, chunk.text])?;
         }
+        chunk_ids.push((chunk_id, chunk.text.clone(), chunk.anchor.clone()));
 
         let text_sha256 = sha256_bytes(chunk.text.as_bytes());
-        match text_by_sha256.entry(text_sha256.clone()) {
+        match buffers.text_by_sha256.entry(text_sha256.clone()) {
             std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(chunk.text.clone());
+                entry.insert(PreparedEmbeddingText {
+                    text: chunk.text.clone(),
+                    token_count: chunk.token_count,
+                    token_ids: chunk.embedding_token_ids.clone(),
+                });
             }
-            std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &chunk.text => {
-                bail!("distinct chunk texts produced the same SHA-256 digest");
+            std::collections::btree_map::Entry::Occupied(entry)
+                if entry.get().text != chunk.text
+                    || entry.get().token_count != chunk.token_count
+                    || entry.get().token_ids != chunk.embedding_token_ids =>
+            {
+                bail!("distinct chunk texts or token counts produced the same SHA-256 digest");
             }
             std::collections::btree_map::Entry::Occupied(_) => {}
         }
-        pending_embeddings.push(PendingEmbedding {
+        buffers.pending_embeddings.push(PendingEmbedding {
             chunk_id,
             text_sha256,
         });
     }
 
-    conn.execute(
-        "INSERT INTO title_fts(source_id, native_id, title, headings)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![
+    drop(insert_chunk);
+    drop(insert_chunk_fts);
+    let mut insert_anchor = conn.prepare_cached(
+        "INSERT INTO doc_anchors(
+            source_id, native_id, ord, kind, label, target_chunk_id,
+            target_source_id, target_native_id, target_pit
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
+    for (anchor_ord, reference) in (0_i64..).zip(prepared.anchor_refs.iter()) {
+        let target_chunk_id = if reference.kind == "in_doc" {
+            reference.target_anchor.as_deref().and_then(|name| {
+                let marker = format!("[anchor:{name}]");
+                chunk_ids
+                    .iter()
+                    .find(|(_, text, anchor)| {
+                        anchor.as_deref() == Some(name) || text.contains(&marker)
+                    })
+                    .map(|(chunk_id, _, _)| *chunk_id)
+            })
+        } else {
+            None
+        };
+        let target_native_id = if reference.kind == "in_doc" {
+            Some(native_id.as_str())
+        } else {
+            reference.target_doc_id.as_deref()
+        };
+        let target_source_id = target_native_id.map(|_| source_id.as_str());
+        insert_anchor.execute(params![
             source_id.as_str(),
             native_id,
-            inventory.title,
-            prepared.headings
-        ],
-    )?;
+            anchor_ord,
+            reference.kind,
+            reference.label,
+            target_chunk_id,
+            target_source_id,
+            target_native_id,
+            reference.target_pit,
+        ])?;
+    }
 
+    let mut insert_definition = conn.prepare_cached(
+        "INSERT INTO definitions(
+            source_id, definition_id, term, norm_term, native_id, source_title,
+            source_type, scope, anchor, ord, body
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    )?;
+    for definition in &prepared.definitions {
+        insert_definition.execute(params![
+            source_id.as_str(),
+            definition.definition_id,
+            definition.term,
+            definition.norm_term,
+            native_id,
+            definition.source_title,
+            definition.source_type,
+            definition.scope,
+            definition.anchor,
+            definition.ord,
+            definition.body,
+        ])?;
+    }
+
+    conn.prepare_cached(
+        "INSERT INTO title_fts(source_id, native_id, title, headings)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?
+    .execute(params![
+        source_id.as_str(),
+        native_id,
+        inventory.title,
+        prepared.headings
+    ])?;
+
+    let mut insert_asset = conn.prepare_cached(
+        "INSERT INTO document_assets
+            (source_id, asset_id, native_id, media_type, alt, title, sha256, data)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?;
     for asset in &document.assets {
         let asset_id = &asset.asset.asset_id;
-        if !seen_asset_ids.insert(asset_id.clone()) {
+        if !buffers.seen_asset_ids.insert(asset_id.clone()) {
             bail!("duplicate asset id `{asset_id}` while ingesting `{source_id}/{native_id}`");
         }
-        conn.execute(
-            "INSERT INTO document_assets
-                (source_id, asset_id, native_id, media_type, alt, title, sha256, data)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
+        insert_asset
+            .execute(params![
                 source_id.as_str(),
                 asset_id,
                 native_id,
@@ -521,91 +822,157 @@ fn insert_document(
                 asset.title,
                 asset.sha256,
                 asset.data,
-            ],
-        )
-        .with_context(|| format!("inserting asset `{asset_id}` for `{source_id}/{native_id}`"))?;
+            ])
+            .with_context(|| {
+                format!("inserting asset `{asset_id}` for `{source_id}/{native_id}`")
+            })?;
     }
     Ok(())
 }
 
-fn install_embeddings<P>(
+fn resolve_embedding_job<P>(
     conn: &Connection,
     provider: &P,
-    pending: &[PendingEmbedding],
-    text_by_sha256: &BTreeMap<String, String>,
-) -> Result<(usize, usize)>
+    raw: RawEmbeddingJob,
+    available_vectors: Option<&HashMap<String, Vec<u8>>>,
+) -> Result<ResolvedEmbeddingJob>
 where
     P: EmbeddingProvider + ?Sized,
 {
-    if pending.is_empty() {
-        return Ok((0, 0));
+    if raw.pending.is_empty() {
+        return Ok(ResolvedEmbeddingJob {
+            pending: Vec::new(),
+            vectors: HashMap::new(),
+            missing: Vec::new(),
+        });
     }
 
     let mut vectors = HashMap::<String, Vec<u8>>::new();
-    let mut missing_hashes = Vec::new();
-    let mut missing_texts = Vec::new();
-    let mut select = conn.prepare(
-        "SELECT embedding FROM embedding_cache WHERE model_id = ?1 AND text_sha256 = ?2",
-    )?;
-    for (text_sha256, text) in text_by_sha256 {
-        let cached = select
-            .query_row(params![provider.model_id(), text_sha256], |row| {
-                row.get::<_, Vec<u8>>(0)
-            })
-            .optional()?;
-        if let Some(cached) = cached {
-            validate_embedding_bytes(&cached, provider.model_id(), text_sha256)?;
-            vectors.insert(text_sha256.clone(), cached);
-        } else {
-            missing_hashes.push(text_sha256.clone());
-            missing_texts.push(text.clone());
+    if let Some(available) = available_vectors {
+        for text_sha256 in raw.text_by_sha256.keys() {
+            if let Some(vector) = available.get(text_sha256) {
+                vectors.insert(text_sha256.clone(), vector.clone());
+            }
         }
     }
-    drop(select);
+    let hashes = raw
+        .text_by_sha256
+        .keys()
+        .filter(|text_sha256| !vectors.contains_key(*text_sha256))
+        .collect::<Vec<_>>();
+    for batch in hashes.chunks(EMBEDDING_CACHE_LOOKUP_BATCH_SIZE) {
+        let placeholders = (2..batch.len() + 2)
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT text_sha256, embedding FROM embedding_cache
+             WHERE model_id = ?1 AND text_sha256 IN ({placeholders})"
+        );
+        let values = std::iter::once(provider.model_id())
+            .chain(batch.iter().map(|value| value.as_str()))
+            .collect::<Vec<_>>();
+        let mut select = conn.prepare_cached(&sql)?;
+        let rows = select.query_map(rusqlite::params_from_iter(values), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        for row in rows {
+            let (text_sha256, cached) = row?;
+            validate_embedding_bytes(&cached, provider.model_id(), &text_sha256)?;
+            vectors.insert(text_sha256, cached);
+        }
+    }
+    let mut missing = raw
+        .text_by_sha256
+        .into_iter()
+        .filter(|(text_sha256, _)| !vectors.contains_key(text_sha256))
+        .collect::<Vec<_>>();
+    missing.sort_by(|left, right| {
+        left.1
+            .token_count
+            .cmp(&right.1.token_count)
+            .then_with(|| left.0.cmp(&right.0))
+    });
 
-    for (hash_batch, text_batch) in missing_hashes
-        .chunks(EMBEDDING_BATCH_SIZE)
-        .zip(missing_texts.chunks(EMBEDDING_BATCH_SIZE))
-    {
+    Ok(ResolvedEmbeddingJob {
+        pending: raw.pending,
+        vectors,
+        missing,
+    })
+}
+
+fn encode_embedding_job<P>(
+    provider: &P,
+    mut job: ResolvedEmbeddingJob,
+) -> Result<EncodedEmbeddingJob>
+where
+    P: EmbeddingProvider + ?Sized,
+{
+    let mut new_hashes = Vec::with_capacity(job.missing.len());
+    for batch in job.missing.chunks(EMBEDDING_BATCH_SIZE) {
+        let prepared_batch = batch.iter().map(|(_, input)| input).collect::<Vec<_>>();
         let encoded = provider
-            .encode(text_batch)
-            .with_context(|| format!("encoding {} unique chunk texts", text_batch.len()))?;
-        if encoded.len() != text_batch.len() {
+            .encode_prepared(&prepared_batch)
+            .with_context(|| format!("encoding {} unique chunk texts", prepared_batch.len()))?;
+        if encoded.len() != prepared_batch.len() {
             bail!(
                 "embedding provider returned {} vectors for {} texts",
                 encoded.len(),
-                text_batch.len()
+                prepared_batch.len()
             );
         }
-        for (text_sha256, embedding) in hash_batch.iter().zip(encoded) {
+        for ((text_sha256, _), embedding) in batch.iter().zip(encoded) {
             let bytes = embedding
                 .iter()
                 .map(|value| *value as u8)
                 .collect::<Vec<_>>();
-            conn.execute(
-                "INSERT INTO embedding_cache(model_id, text_sha256, embedding)
-                 VALUES (?1, ?2, ?3)",
-                params![provider.model_id(), text_sha256, bytes],
-            )?;
-            vectors.insert(text_sha256.clone(), bytes);
+            new_hashes.push(text_sha256.clone());
+            job.vectors.insert(text_sha256.clone(), bytes);
         }
     }
 
-    for item in pending {
-        let embedding = vectors.get(&item.text_sha256).ok_or_else(|| {
+    Ok(EncodedEmbeddingJob {
+        pending: job.pending,
+        vectors: job.vectors,
+        new_hashes,
+    })
+}
+
+fn persist_embedding_job(
+    conn: &Connection,
+    model_id: &str,
+    job: EncodedEmbeddingJob,
+) -> Result<(usize, usize)> {
+    let encoded_texts = job.new_hashes.len();
+    let mut insert_cache = conn.prepare_cached(
+        "INSERT INTO embedding_cache(model_id, text_sha256, embedding)
+         VALUES (?1, ?2, ?3)",
+    )?;
+    for text_sha256 in &job.new_hashes {
+        let bytes = job
+            .vectors
+            .get(text_sha256)
+            .ok_or_else(|| anyhow!("encoded embedding job omitted chunk text {text_sha256}"))?;
+        insert_cache.execute(params![model_id, text_sha256, bytes])?;
+    }
+    drop(insert_cache);
+
+    let mut insert_chunk =
+        conn.prepare_cached("INSERT INTO chunk_embeddings(chunk_id, embedding) VALUES (?1, ?2)")?;
+    for item in &job.pending {
+        let embedding = job.vectors.get(&item.text_sha256).ok_or_else(|| {
             anyhow!(
                 "embedding resolution omitted chunk text {}",
                 item.text_sha256
             )
         })?;
-        conn.execute(
-            "INSERT INTO chunk_embeddings(chunk_id, embedding) VALUES (?1, ?2)",
-            params![item.chunk_id, embedding],
-        )?;
+        insert_chunk.execute(params![item.chunk_id, embedding])?;
     }
 
-    let encoded_texts = missing_hashes.len();
-    Ok((encoded_texts, pending.len().saturating_sub(encoded_texts)))
+    Ok((
+        encoded_texts,
+        job.pending.len().saturating_sub(encoded_texts),
+    ))
 }
 
 fn validate_embedding_bytes(bytes: &[u8], model_id: &str, text_sha256: &str) -> Result<()> {
@@ -614,70 +981,6 @@ fn validate_embedding_bytes(bytes: &[u8], model_id: &str, text_sha256: &str) -> 
             "cached embedding for model `{model_id}` and text `{text_sha256}` has {} bytes; expected {EMBEDDING_DIM}",
             bytes.len()
         );
-    }
-    Ok(())
-}
-
-fn citation_marker_regex() -> Result<&'static Regex> {
-    static REGEX: OnceLock<Result<Regex, String>> = OnceLock::new();
-    match REGEX.get_or_init(|| {
-        Regex::new(r"\[doc:([^\s\]@]+)(?:[^\]]*)\]").map_err(|error| error.to_string())
-    }) {
-        Ok(regex) => Ok(regex),
-        Err(error) => Err(anyhow!("compiling document citation marker regex: {error}")),
-    }
-}
-
-fn derive_source_citations(conn: &Connection, source_id: &SourceId) -> Result<()> {
-    conn.execute(
-        "DELETE FROM citations WHERE source_id = ?1",
-        [source_id.as_str()],
-    )?;
-    let mut select = conn.prepare(
-        "SELECT chunk_id, native_id, text FROM chunks
-         WHERE source_id = ?1 ORDER BY chunk_id",
-    )?;
-    let rows = select.query_map([source_id.as_str()], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Vec<u8>>(2)?,
-        ))
-    })?;
-    let mut source_chunks = Vec::new();
-    for row in rows {
-        source_chunks.push(row?);
-    }
-    drop(select);
-
-    let mut insert = conn.prepare(
-        "INSERT OR IGNORE INTO citations(
-             source_chunk_id, source_id, source_native_id,
-             target_source_id, target_native_id
-         ) VALUES (?1, ?2, ?3, ?4, ?5)",
-    )?;
-    for (chunk_id, native_id, compressed) in source_chunks {
-        let source_document = DocumentId::new(source_id.clone(), native_id.clone())?;
-        let text = decompress_text(compressed)?;
-        let mut seen = HashSet::new();
-        for captures in citation_marker_regex()?.captures_iter(&text) {
-            let target: DocumentId = captures[1].parse().with_context(|| {
-                format!(
-                    "invalid source-qualified document marker `[doc:{}]` in chunk {chunk_id}",
-                    &captures[1]
-                )
-            })?;
-            if target == source_document || !seen.insert(target.clone()) {
-                continue;
-            }
-            insert.execute(params![
-                chunk_id,
-                source_id.as_str(),
-                native_id,
-                target.source.as_str(),
-                target.native_id,
-            ])?;
-        }
     }
     Ok(())
 }
@@ -882,32 +1185,36 @@ pub(crate) fn finalise_source_ann(
 mod tests {
     use super::*;
     use crate::db::init_db;
+    use crate::semantic::SemanticEncodeStats;
     use anyhow::anyhow;
     use legal_source_sdk::SourceInventoryRecord;
-    use std::cell::{Cell, RefCell};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Mutex,
+    };
     use tempfile::tempdir;
 
     struct FakeEmbeddings {
-        fail: Cell<bool>,
-        batches: Cell<usize>,
-        texts: RefCell<Vec<String>>,
+        fail: AtomicBool,
+        batches: AtomicUsize,
+        texts: Mutex<Vec<String>>,
     }
 
     impl FakeEmbeddings {
         fn new() -> Self {
             Self {
-                fail: Cell::new(false),
-                batches: Cell::new(0),
-                texts: RefCell::new(Vec::new()),
+                fail: AtomicBool::new(false),
+                batches: AtomicUsize::new(0),
+                texts: Mutex::new(Vec::new()),
             }
         }
 
         fn fail(&self) {
-            self.fail.set(true);
+            self.fail.store(true, Ordering::Relaxed);
         }
 
         fn encoded_texts(&self) -> usize {
-            self.texts.borrow().len()
+            self.texts.lock().expect("fake embedding texts").len()
         }
     }
 
@@ -924,9 +1231,12 @@ mod tests {
             if texts.is_empty() {
                 return Ok(Vec::new());
             }
-            self.batches.set(self.batches.get() + 1);
-            self.texts.borrow_mut().extend(texts.iter().cloned());
-            if self.fail.get() {
+            self.batches.fetch_add(1, Ordering::Relaxed);
+            self.texts
+                .lock()
+                .expect("fake embedding texts")
+                .extend(texts.iter().cloned());
+            if self.fail.load(Ordering::Relaxed) {
                 return Err(anyhow!("deterministic fake embedding failure"));
             }
             Ok(texts
@@ -1254,6 +1564,42 @@ mod tests {
     }
 
     #[test]
+    fn streaming_workspace_failure_rolls_back_the_complete_source() -> Result<()> {
+        let mut conn = connection()?;
+        let source_id = source("stream");
+        let provider = FakeEmbeddings::new();
+        let result = ingest_source_results(
+            &mut conn,
+            &source_id,
+            &descriptor(&source_id),
+            vec![
+                Ok(document(&source_id, "one", "<p>complete</p>")),
+                Err(anyhow!("corrupt normalized cache entry")),
+            ],
+            &provider,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM documents WHERE source_id = ?1",
+                &source_id,
+            )?,
+            0
+        );
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM chunks WHERE source_id = ?1",
+                &source_id,
+            )?,
+            0
+        );
+        assert!(get_source_meta(&conn, source_id.as_str(), "source_index_sha256")?.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn ann_finalisation_binds_each_sidecar_to_its_source() -> Result<()> {
         let mut conn = connection()?;
         let alpha = source("ann-alpha");
@@ -1277,6 +1623,429 @@ mod tests {
         assert_ne!(alpha_ann.corpus_id, beta_ann.corpus_id);
         assert!(output.path().join("ann/ann-alpha.ann").is_file());
         assert!(output.path().join("ann/ann-beta.ann").is_file());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires LEGAL_MCP_BENCH_WORKSPACE and LEGAL_MCP_TEST_MODEL_DIR"]
+    fn benchmark_source_document_preparation() -> Result<()> {
+        let workspace = std::env::var("LEGAL_MCP_BENCH_WORKSPACE")
+            .or_else(|_| std::env::var("LEGAL_MCP_ATO_PAGES_DIR"))?;
+        let model = std::env::var("LEGAL_MCP_TEST_MODEL_DIR")?;
+        let requested = std::env::var("LEGAL_MCP_BENCH_SAMPLES")
+            .ok()
+            .map(|value| value.parse::<usize>())
+            .transpose()?
+            .unwrap_or(10_000);
+        let source_id = SourceId::new(
+            std::env::var("LEGAL_MCP_BENCH_SOURCE").unwrap_or_else(|_| "ato".to_string()),
+        )?;
+        let provider = ServerState::with_model_paths(
+            crate::semantic::SemanticModelPaths::from_model_dir(std::path::Path::new(&model))?,
+        );
+        let mut documents = crate::source_catalog::normalized_document_results(
+            &source_id,
+            std::path::Path::new(&workspace),
+        )?
+        .take(requested);
+        let existing = BTreeMap::new();
+        let started = std::time::Instant::now();
+        let mut prepared_documents = 0usize;
+        let mut chunks = 0usize;
+        let mut token_counts = Vec::new();
+        loop {
+            let batch = documents
+                .by_ref()
+                .take(DOCUMENT_PREPARATION_BATCH_SIZE)
+                .collect::<Vec<_>>();
+            if batch.is_empty() {
+                break;
+            }
+            let prepared = batch
+                .into_par_iter()
+                .map(|document| prepare_source_document(document, &source_id, &existing, &provider))
+                .collect::<Result<Vec<_>>>()?;
+            for (_, _, document) in prepared {
+                if let Some(document) = document {
+                    prepared_documents += 1;
+                    chunks += document.chunks.len();
+                    token_counts.extend(document.chunks.iter().map(|chunk| chunk.token_count));
+                }
+            }
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        let mut padded_tokens = 0usize;
+        for job in token_counts.chunks_mut(PRODUCTION_EMBEDDING_FLUSH_SIZE) {
+            job.sort_unstable();
+            padded_tokens += job
+                .chunks(EMBEDDING_BATCH_SIZE)
+                .map(|batch| batch.last().copied().unwrap_or(0) * batch.len())
+                .sum::<usize>();
+        }
+        let active_tokens = token_counts.iter().sum::<usize>();
+        eprintln!(
+            "SOURCE_PREPARE_BENCH source={source_id} documents={prepared_documents} chunks={chunks} active_tokens={active_tokens} elapsed_s={elapsed:.3} documents_per_s={:.1} chunks_per_s={:.1} predicted_padding_efficiency={:.3}",
+            prepared_documents as f64 / elapsed,
+            chunks as f64 / elapsed,
+            active_tokens as f64 / padded_tokens as f64,
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires LEGAL_MCP_BENCH_WORKSPACE, LEGAL_MCP_BENCH_SOURCE, and LEGAL_MCP_TEST_MODEL_DIR"]
+    fn validate_specialized_tokenizer_on_source() -> Result<()> {
+        let workspace = std::env::var("LEGAL_MCP_BENCH_WORKSPACE")?;
+        let source_id = SourceId::new(std::env::var("LEGAL_MCP_BENCH_SOURCE")?)?;
+        let model = std::env::var("LEGAL_MCP_TEST_MODEL_DIR")?;
+        let requested = std::env::var("LEGAL_MCP_BENCH_SAMPLES")
+            .ok()
+            .map(|value| value.parse::<usize>())
+            .transpose()?
+            .unwrap_or(1_000);
+        let offset = std::env::var("LEGAL_MCP_BENCH_OFFSET")
+            .ok()
+            .map(|value| value.parse::<usize>())
+            .transpose()?
+            .unwrap_or(0);
+        let provider = ServerState::with_model_paths(
+            crate::semantic::SemanticModelPaths::from_model_dir(std::path::Path::new(&model))?,
+        );
+        let mut reference =
+            tokenizers::Tokenizer::from_file(std::path::Path::new(&model).join("tokenizer.json"))
+                .map_err(|error| anyhow!("loading reference tokenizer: {error}"))?;
+        reference
+            .with_truncation(None)
+            .map_err(|error| anyhow!("disabling reference truncation: {error}"))?;
+        reference.with_padding(None);
+        let existing = std::collections::BTreeMap::new();
+        let mut chunks = 0usize;
+        for document in crate::source_catalog::normalized_document_results(
+            &source_id,
+            std::path::Path::new(&workspace),
+        )?
+        .skip(offset)
+        .take(requested)
+        {
+            let (_, _, prepared) =
+                prepare_source_document(document, &source_id, &existing, &provider)?;
+            let Some(prepared) = prepared else {
+                continue;
+            };
+            for chunk in prepared.chunks {
+                let expected = reference
+                    .encode(chunk.text.as_str(), true)
+                    .map_err(|error| anyhow!("reference tokenization failed: {error}"))?;
+                let actual = chunk
+                    .embedding_token_ids
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("prepared chunk has no token IDs"))?;
+                let expected = expected
+                    .get_ids()
+                    .iter()
+                    .map(|id| i64::from(*id))
+                    .collect::<Vec<_>>();
+                if actual != expected {
+                    bail!(
+                        "specialized tokenizer mismatch for source {source_id}, native ID {}, chunk {}: actual {:?}, expected {:?}, text {:?}",
+                        prepared.document.inventory.document.native_id,
+                        chunk.ord,
+                        actual,
+                        expected,
+                        chunk.text
+                    );
+                }
+                chunks += 1;
+            }
+        }
+        eprintln!(
+            "TOKENIZER_EQUIVALENCE source={source_id} offset={offset} documents={requested} chunks={chunks}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires LEGAL_MCP_BENCH_WORKSPACE and LEGAL_MCP_TEST_MODEL_DIR"]
+    fn benchmark_source_ingest_without_model_inference() -> Result<()> {
+        struct TokenizerOnlyEmbeddings {
+            tokenizer: crate::bert_tokenizer::BertWordPieceTokenizer,
+        }
+
+        impl EmbeddingProvider for TokenizerOnlyEmbeddings {
+            fn model_id(&self) -> &str {
+                EMBEDDING_MODEL_ID
+            }
+
+            fn count_tokens(&self, text: &str) -> Result<usize> {
+                Ok(self.tokenizer.encode(text)?.len())
+            }
+
+            fn encode(&self, texts: &[String]) -> Result<Vec<[i8; EMBEDDING_DIM]>> {
+                Ok(vec![[0_i8; EMBEDDING_DIM]; texts.len()])
+            }
+
+            fn prepare_document_tokens(&self, text: &str) -> Result<Option<Vec<i64>>> {
+                Ok(Some(self.tokenizer.encode(text)?))
+            }
+
+            fn prepare_embedding_tokens_exact(&self, text: &str) -> Result<Option<Vec<i64>>> {
+                self.prepare_document_tokens(text)
+            }
+        }
+
+        let workspace = std::env::var("LEGAL_MCP_BENCH_WORKSPACE")
+            .or_else(|_| std::env::var("LEGAL_MCP_ATO_PAGES_DIR"))?;
+        let model = std::env::var("LEGAL_MCP_TEST_MODEL_DIR")?;
+        let requested = std::env::var("LEGAL_MCP_BENCH_SAMPLES")
+            .ok()
+            .map(|value| value.parse::<usize>())
+            .transpose()?
+            .unwrap_or(10_000);
+        let source_id = SourceId::new(
+            std::env::var("LEGAL_MCP_BENCH_SOURCE").unwrap_or_else(|_| "ato".to_string()),
+        )?;
+        let tokenizer = crate::bert_tokenizer::BertWordPieceTokenizer::from_file(
+            &std::path::Path::new(&model).join("tokenizer.json"),
+        )?;
+        let provider = TokenizerOnlyEmbeddings { tokenizer };
+        let root = if let Ok(parent) = std::env::var("LEGAL_MCP_BENCH_TEMP_ROOT") {
+            tempfile::Builder::new()
+                .prefix("ato-ingest-")
+                .tempdir_in(parent)?
+        } else {
+            tempdir()?
+        };
+        let mut connection = crate::db::open_write_at(&root.path().join("legal.db"))?;
+        init_db(&connection)?;
+        let documents = crate::source_catalog::normalized_document_results(
+            &source_id,
+            std::path::Path::new(&workspace),
+        )?
+        .take(requested);
+        let started = std::time::Instant::now();
+        let report = ingest_source_results(
+            &mut connection,
+            &source_id,
+            &descriptor(&source_id),
+            documents,
+            &provider,
+        )?;
+        let elapsed = started.elapsed().as_secs_f64();
+        eprintln!(
+            "SOURCE_INGEST_BENCH source={source_id} documents={} chunks={} elapsed_s={elapsed:.3} documents_per_s={:.1} chunks_per_s={:.1}",
+            report.inserted_documents,
+            report.inserted_chunks,
+            report.inserted_documents as f64 / elapsed,
+            report.inserted_chunks as f64 / elapsed,
+        );
+        if let Ok(output) = std::env::var("LEGAL_MCP_BENCH_OUTPUT_DB") {
+            connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            std::fs::copy(root.path().join("legal.db"), output)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires LEGAL_MCP_BENCH_WORKSPACE, LEGAL_MCP_BENCH_SOURCE, LEGAL_MCP_TEST_MODEL_DIR, and CUDA"]
+    fn benchmark_source_ingest_with_model_inference() -> Result<()> {
+        let workspace = std::env::var("LEGAL_MCP_BENCH_WORKSPACE")?;
+        let source_id = SourceId::new(std::env::var("LEGAL_MCP_BENCH_SOURCE")?)?;
+        let model = std::env::var("LEGAL_MCP_TEST_MODEL_DIR")?;
+        let requested = std::env::var("LEGAL_MCP_BENCH_SAMPLES")
+            .ok()
+            .map(|value| value.parse::<usize>())
+            .transpose()?
+            .unwrap_or(5_000);
+        let provider = ServerState::with_model_paths(
+            crate::semantic::SemanticModelPaths::from_model_dir(std::path::Path::new(&model))?,
+        );
+        let root = tempdir()?;
+        let mut connection = crate::db::open_write_at(&root.path().join("legal.db"))?;
+        init_db(&connection)?;
+        let descriptor = crate::legal_source::source_registry()
+            .source(&source_id)?
+            .descriptor()
+            .clone();
+        let started = std::time::Instant::now();
+        let documents = crate::source_catalog::normalized_document_results(
+            &source_id,
+            std::path::Path::new(&workspace),
+        )?
+        .take(requested);
+        let report = ingest_source_results(
+            &mut connection,
+            &source_id,
+            &descriptor,
+            documents,
+            &provider,
+        )?;
+        let elapsed = started.elapsed().as_secs_f64();
+        eprintln!(
+            "SOURCE_INGEST_MODEL_BENCH source={source_id} documents={} chunks={} embeddings={} elapsed_s={elapsed:.3} documents_per_s={:.1} chunks_per_s={:.1}",
+            report.inserted_documents,
+            report.inserted_chunks,
+            report.encoded_texts,
+            report.inserted_documents as f64 / elapsed,
+            report.inserted_chunks as f64 / elapsed,
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires LEGAL_MCP_BENCH_WORKSPACE, LEGAL_MCP_TEST_MODEL_DIR, and CUDA"]
+    fn benchmark_source_embedding_throughput() -> Result<()> {
+        let workspace = std::env::var("LEGAL_MCP_BENCH_WORKSPACE")
+            .or_else(|_| std::env::var("LEGAL_MCP_ATO_PAGES_DIR"))?;
+        let model = std::env::var("LEGAL_MCP_TEST_MODEL_DIR")?;
+        let requested = std::env::var("LEGAL_MCP_BENCH_SAMPLES")
+            .ok()
+            .map(|value| value.parse::<usize>())
+            .transpose()?
+            .unwrap_or(10_000);
+        let source_id = SourceId::new(
+            std::env::var("LEGAL_MCP_BENCH_SOURCE").unwrap_or_else(|_| "ato".to_string()),
+        )?;
+        let provider = ServerState::with_model_paths(
+            crate::semantic::SemanticModelPaths::from_model_dir(std::path::Path::new(&model))?,
+        );
+        let mut documents = crate::source_catalog::normalized_document_results(
+            &source_id,
+            std::path::Path::new(&workspace),
+        )?
+        .take(requested);
+        let existing = BTreeMap::new();
+        let mut texts = Vec::new();
+        loop {
+            let batch = documents
+                .by_ref()
+                .take(DOCUMENT_PREPARATION_BATCH_SIZE)
+                .collect::<Vec<_>>();
+            if batch.is_empty() {
+                break;
+            }
+            let prepared = batch
+                .into_par_iter()
+                .map(|document| prepare_source_document(document, &source_id, &existing, &provider))
+                .collect::<Result<Vec<_>>>()?;
+            for (_, _, document) in prepared {
+                if let Some(document) = document {
+                    texts.extend(document.chunks.into_iter().map(|chunk| {
+                        (
+                            chunk.token_count,
+                            chunk.text,
+                            chunk
+                                .embedding_token_ids
+                                .expect("production provider prepares token ids"),
+                        )
+                    }));
+                }
+            }
+        }
+        for job in texts.chunks_mut(PRODUCTION_EMBEDDING_FLUSH_SIZE) {
+            job.sort_by(|left, right| {
+                left.0
+                    .cmp(&right.0)
+                    .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
+            });
+        }
+        let sessions = std::env::var("LEGAL_MCP_BENCH_SESSIONS")
+            .ok()
+            .map(|value| value.parse::<usize>())
+            .transpose()?
+            .unwrap_or(1);
+        if !(1..=2).contains(&sessions) {
+            bail!("LEGAL_MCP_BENCH_SESSIONS must be 1 or 2");
+        }
+        let providers = (0..sessions)
+            .map(|_| {
+                crate::semantic::SemanticModelPaths::from_model_dir(std::path::Path::new(&model))
+                    .map(ServerState::with_model_paths)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let started = std::time::Instant::now();
+        let results = std::thread::scope(|scope| {
+            providers
+                .iter()
+                .enumerate()
+                .map(|(worker, provider)| {
+                    let texts = &texts;
+                    scope.spawn(move || -> Result<(usize, SemanticEncodeStats)> {
+                        let mut encoded = 0usize;
+                        let mut combined = SemanticEncodeStats::default();
+                        for (job_index, job) in texts
+                            .chunks(PRODUCTION_EMBEDDING_FLUSH_SIZE)
+                            .enumerate()
+                            .filter(|(job_index, _)| job_index % sessions == worker)
+                        {
+                            let _ = job_index;
+                            for batch in job.chunks(EMBEDDING_BATCH_SIZE) {
+                                let token_ids = batch
+                                    .iter()
+                                    .map(|(_, _, token_ids)| token_ids.as_slice())
+                                    .collect::<Vec<_>>();
+                                let (embeddings, stats) = provider
+                                    .encode_document_token_embeddings_with_stats(&token_ids)?;
+                                encoded += embeddings.len();
+                                combined.tokenize += stats.tokenize;
+                                combined.prepare += stats.prepare;
+                                combined.run += stats.run;
+                                combined.postprocess += stats.postprocess;
+                                combined.batches += stats.batches;
+                                combined.inputs += stats.inputs;
+                                combined.active_tokens += stats.active_tokens;
+                                combined.padded_tokens += stats.padded_tokens;
+                                combined.max_batch = combined.max_batch.max(stats.max_batch);
+                                combined.max_seq_len = combined.max_seq_len.max(stats.max_seq_len);
+                            }
+                        }
+                        Ok((encoded, combined))
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| anyhow!("embedding benchmark worker panicked"))?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        let elapsed = started.elapsed().as_secs_f64();
+        let encoded = results.iter().map(|(encoded, _)| *encoded).sum::<usize>();
+        let active_tokens = results
+            .iter()
+            .map(|(_, stats)| stats.active_tokens)
+            .sum::<usize>();
+        let padded_tokens = results
+            .iter()
+            .map(|(_, stats)| stats.padded_tokens)
+            .sum::<usize>();
+        let tokenize = results
+            .iter()
+            .map(|(_, stats)| stats.tokenize)
+            .sum::<std::time::Duration>();
+        let prepare = results
+            .iter()
+            .map(|(_, stats)| stats.prepare)
+            .sum::<std::time::Duration>();
+        let run = results
+            .iter()
+            .map(|(_, stats)| stats.run)
+            .sum::<std::time::Duration>();
+        let postprocess = results
+            .iter()
+            .map(|(_, stats)| stats.postprocess)
+            .sum::<std::time::Duration>();
+        eprintln!(
+            "SOURCE_EMBED_BENCH source={source_id} sessions={sessions} texts={encoded} active_tokens={active_tokens} elapsed_s={elapsed:.3} tokenize_s={:.3} prepare_s={:.3} run_s={:.3} postprocess_s={:.3} texts_per_s={:.1} active_tokens_per_s={:.0} padding_efficiency={:.3}",
+            tokenize.as_secs_f64(),
+            prepare.as_secs_f64(),
+            run.as_secs_f64(),
+            postprocess.as_secs_f64(),
+            encoded as f64 / elapsed,
+            active_tokens as f64 / elapsed,
+            active_tokens as f64 / padded_tokens as f64,
+        );
         Ok(())
     }
 }

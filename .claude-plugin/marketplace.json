@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
   "name": "australian-legal-mcp",
-  "description": "Local marketplace for the australian-legal-mcp plugin.",
+  "description": "Package marketplace for the australian-legal-mcp plugin.",
   "owner": {
     "name": "gunba",
     "url": "https://github.com/gunba/australian-legal-mcp"
@@ -10,7 +10,7 @@
     {
       "name": "australian-legal-mcp",
       "version": "0.17.0",
-      "description": "Local search and retrieval across Australian legal sources.",
+      "description": "Source-grounded search and retrieval across Australian legal sources.",
       "source": "./",
       "category": "research",
       "homepage": "https://github.com/gunba/australian-legal-mcp"

@@ -10,11 +10,28 @@ use std::path::Path;
 
 pub(crate) fn open_read() -> Result<Connection> {
     let path = db_path()?;
-    if !path.exists() {
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!(
+                "no live DB found at {}; activate a corpus generation first",
+                path.display()
+            )
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
         bail!(
-            "no live DB found at {}; install a corpus generation first",
+            "live DB must be a regular non-symlink file at {}",
             path.display()
         );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            bail!("live DB must not be hard-linked: {}", path.display());
+        }
     }
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .context("opening local corpus database")?;
@@ -34,9 +51,14 @@ pub(crate) fn open_write_at(path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     validate_existing_database(&conn)?;
-    // Write handles enable WAL + synchronous=NORMAL before mutation.
-    conn.pragma_update(None, "journal_mode", "WAL")?;
+    // Corpus builds use a rollback journal so millions of updates to the same FTS and
+    // index pages remain in the page cache instead of becoming repeated WAL frames.
+    // Each source transaction is still atomic and resumable after interruption.
+    conn.pragma_update(None, "journal_mode", "TRUNCATE")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "cache_size", -1_048_576_i64)?;
+    conn.pragma_update(None, "mmap_size", 8_589_934_592_i64)?;
+    conn.pragma_update(None, "journal_size_limit", 0_i64)?;
     Ok(conn)
 }
 
@@ -88,7 +110,7 @@ pub(crate) fn enforce_db_schema_version(conn: &Connection) -> Result<()> {
 
 pub(crate) fn init_db(conn: &Connection) -> Result<()> {
     validate_existing_database(conn)?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "journal_mode", "TRUNCATE")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
 
@@ -239,7 +261,7 @@ pub(crate) fn init_db(conn: &Connection) -> Result<()> {
             ),
             embedding   BLOB NOT NULL CHECK(length(embedding) = 256),
             PRIMARY KEY (model_id, text_sha256)
-        );
+        ) WITHOUT ROWID;
 
         CREATE TABLE IF NOT EXISTS chunk_embeddings (
             chunk_id  INTEGER PRIMARY KEY REFERENCES chunks(chunk_id) ON DELETE CASCADE,
@@ -318,6 +340,7 @@ pub(crate) fn decompress_text(blob: Vec<u8>) -> Result<String> {
     Ok(String::from_utf8(bytes)?)
 }
 
+#[cfg(test)]
 pub(crate) fn compress_text(text: &str) -> Result<Vec<u8>> {
     Ok(zstd::stream::encode_all(Cursor::new(text.as_bytes()), 3)?)
 }

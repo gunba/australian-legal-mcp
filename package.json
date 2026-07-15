@@ -2,7 +2,7 @@
   "name": "australian-legal-mcp",
   "version": "0.17.0",
   "private": true,
-  "description": "Local search and retrieval across Australian legal sources.",
+  "description": "Source-grounded search and retrieval across Australian legal sources.",
   "license": "MIT",
   "homepage": "https://github.com/gunba/australian-legal-mcp",
   "keywords": [
@@ -17,7 +17,11 @@
     ".mcp.json",
     "skills/",
     "AGENTS.md",
+    "CURRENT_STATE.md",
+    "DEPLOYMENT.md",
     "LICENSE",
+    "MAINTENANCE.md",
+    "PLAN.md",
     "README.md"
   ],
   "pi": {

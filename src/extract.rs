@@ -320,7 +320,14 @@ pub(crate) fn extract_anchors(html: &str, source_doc_id: &str) -> Vec<AnchorRef>
         return Vec::new();
     }
     let doc = scraper::Html::parse_document(html);
-    let targets = anchors_collect_targets(&doc);
+    extract_anchors_from_document(&doc, source_doc_id)
+}
+
+pub(crate) fn extract_anchors_from_document(
+    doc: &scraper::Html,
+    source_doc_id: &str,
+) -> Vec<AnchorRef> {
+    let targets = anchors_collect_targets(doc);
     let mut refs: Vec<AnchorRef> = Vec::new();
     let mut seen: std::collections::HashSet<(String, String, Option<String>, String)> =
         std::collections::HashSet::new();
@@ -770,8 +777,7 @@ pub(crate) fn currency_extract_self_withdrawn_by(text: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn currency_alert_text(html: &str) -> String {
-    let doc = scraper::Html::parse_document(html);
+fn currency_alert_text_from_document(doc: &scraper::Html) -> String {
     let sel = scraper::Selector::parse("div.alert").unwrap();
     let parts: Vec<String> = doc
         .select(&sel)
@@ -784,8 +790,7 @@ pub(crate) fn currency_alert_text(html: &str) -> String {
     parts.join(" \n ")
 }
 
-pub(crate) fn currency_body_text(html: &str) -> String {
-    let doc = scraper::Html::parse_document(html);
+fn currency_body_text_from_document(doc: &scraper::Html) -> String {
     for sel_str in &["#LawBody", "#LawContent"] {
         let sel = scraper::Selector::parse(sel_str).unwrap();
         if let Some(el) = doc.select(&sel).next() {
@@ -800,8 +805,7 @@ pub(crate) fn currency_body_text(html: &str) -> String {
     String::new()
 }
 
-pub(crate) fn currency_date_from_history_table(html: &str) -> Option<String> {
-    let doc = scraper::Html::parse_document(html);
+fn currency_date_from_history_document(doc: &scraper::Html) -> Option<String> {
     let timeline_sel = scraper::Selector::parse("a[name='LawTimeLine']").unwrap();
     let timeline = doc.select(&timeline_sel).next()?;
     // Walk up to enclosing panel or table — at most 8 hops.
@@ -883,8 +887,7 @@ pub(crate) fn currency_scan_text(text: &str) -> (Option<String>, Option<String>,
     (withdrawn_date, superseded_by, replaces)
 }
 
-pub(crate) fn currency_has_withdrawn_title_suffix(html: &str) -> bool {
-    let doc = scraper::Html::parse_document(html);
+fn currency_has_withdrawn_title_suffix_in_document(doc: &scraper::Html) -> bool {
     let sel = scraper::Selector::parse("h1, h2, h3").unwrap();
     for el in doc.select(&sel) {
         let text = anchors_node_text(el).to_lowercase();
@@ -895,12 +898,9 @@ pub(crate) fn currency_has_withdrawn_title_suffix(html: &str) -> bool {
     false
 }
 
-pub(crate) fn extract_currency(html: &str) -> CurrencyInfo {
-    if html.trim().is_empty() {
-        return CurrencyInfo::default();
-    }
-    let alert_text = currency_alert_text(html);
-    let body_text = currency_body_text(html);
+pub(crate) fn extract_currency_from_document(doc: &scraper::Html) -> CurrencyInfo {
+    let alert_text = currency_alert_text_from_document(doc);
+    let body_text = currency_body_text_from_document(doc);
     let (a_w, a_s, a_r) = currency_scan_text(&alert_text);
     let (p_w, p_s, p_r) = currency_scan_text(&body_text);
 
@@ -909,9 +909,9 @@ pub(crate) fn extract_currency(html: &str) -> CurrencyInfo {
         withdrawn_date = p_w;
     }
     if withdrawn_date.is_none() {
-        withdrawn_date = currency_date_from_history_table(html);
+        withdrawn_date = currency_date_from_history_document(doc);
     }
-    if withdrawn_date.is_none() && currency_has_withdrawn_title_suffix(html) {
+    if withdrawn_date.is_none() && currency_has_withdrawn_title_suffix_in_document(doc) {
         withdrawn_date = Some(CURRENCY_TITLE_SUFFIX_SENTINEL.to_string());
     }
     let mut superseded_by = a_s;

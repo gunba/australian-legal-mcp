@@ -1,204 +1,153 @@
-# Current Implementation State
+# Current state
 
-Updated: 2026-07-12
+Updated 2026-07-15 on branch `codex/unified-australian-legal-mcp`.
 
-## Repository and product
+## Implemented product
 
-- Local checkout: `/home/jordan/Desktop/Projects/australian-legal-mcp`
-- Repository: `https://github.com/gunba/australian-legal-mcp`
-- Package: `australian-legal-mcp`
-- Version: `0.17.0`
-- Executable: `legal-mcp`
-- MCP key: `australian-legal`
-- Configuration prefix: `LEGAL_MCP_*`
-- Data directory name: `australian-legal-mcp`
+- One Rust `legal-mcp` binary and exactly seven MCP tools: `search`,
+  `get_chunks`, `get_asset`, `get_doc_anchors`, `get_definition`, `stats`, and
+  `fetch`.
+- Explicit source selection across ATO, FRL, Federal Court, High Court, NSW
+  Caselaw, and five state-legislation sources.
+- Source-qualified schema 10 with typed document/chunk/asset references,
+  deterministic ranking, lossless continuations, cleaned structural HTML,
+  exact stored official URLs, definitions, links, assets, and point-in-time
+  fetch URIs.
+- BM25 plus mdbr-leaf-ir semantic retrieval. ANN proposes candidates and SQLite
+  normalized int8 first-256-dimension vectors exact-rerank them.
+- Streamable HTTP rejects batches, validates protocol/content/origin/body limits,
+  acknowledges notifications and response objects with 202, uses bounded
+  workers/backpressure, emits structured request logs, exposes `/livez` and
+  generation-aware `/readyz`, and drains on SIGTERM.
+- HTTP transport is loopback-only. The production design is private Tailscale
+  HTTPS in front of a hardened systemd service.
 
-The implementation is one Rust binary. `legal-mcp mcp` provides stdio MCP
-through a shared local loopback backend; the same executable owns end-user
-update and retrieval commands plus maintainer source, build and publication
-commands. Remote public serving and deployment-role separation are roadmap work.
+## Canonical project data
 
-## Public retrieval contract
-
-The MCP server exposes exactly seven tools:
-
-1. `search`
-2. `get_chunks`
-3. `get_asset`
-4. `get_doc_anchors`
-5. `get_definition`
-6. `stats`
-7. `fetch`
-
-Search selects exactly one source and defaults to `ato`. The production source
-registry contains:
-
-- `ato` — Australian Taxation Office legal and guidance material;
-- `frl` — official Commonwealth legislation from the Federal Register of
-  Legislation.
-
-Public document, chunk and asset identities are source-qualified. Chunk
-references also identify the corpus generation. Live fetch uses strict canonical
-`legal://<source>/<percent-encoded-native-id>` parsing; ATO `pit` and `view`
-queries round-trip through the typed URI.
-
-## Storage and retrieval
-
-The corpus schema is source-qualified throughout documents, chunks, definitions,
-anchors, citations, assets, metadata and FTS. A published generation contains:
+All former adjacent data roots were moved without copying into ignored
+`data/`, with the migration recorded in `data/migration-20260715.json`:
 
 ```text
-legal.db
-ann/ato.ann
-ann/frl.ann
+data/sources
+data/source-snapshots
+data/models
+data/builds
+data/runtime
+data/cache
+data/runs
+data/logs
+data/validation
+data/archive
 ```
 
-SQLite signed-int8 embeddings are authoritative. The selected source ANN finds
-semantic candidates, and the runtime exact-reranks them with deterministic
-chunk-reference ties. Hybrid search combines those candidates with source-scoped
-BM25 results.
+Current authoritative source workspaces total 409,528 documents. Legacy and
+rollback stores remain under `source-snapshots`; no destructive source cleanup
+has occurred.
 
-Document bodies are cleaned structural HTML. Search text is derived directly
-from that HTML; heading paths remain metadata, and links/assets use deterministic
-source-qualified references.
+## Acquisition and model
 
-## Source foundation
+- All ten source adapters implement official discovery, adaptive acquisition,
+  strict inventory/quality validation, normalization, source locking, and
+  transactional commit.
+- Federal Court uses ordinary HTTP for discovery and Chrome CDP only for
+  protected documents. UTF-8-first decoding plus official Word fallback repaired
+  three damaged judgments. Federal v5 has 72,981 committed documents and 16
+  authoritative 404 omissions.
+- FRL has 32,771 records; five genuinely textless records retain metadata.
+- The pinned model is `MongoDB/mdbr-leaf-ir` revision
+  `1bb4fc387c49dee1c10c2b22f59db758be87dcaa`.
+- Deterministic model graph: 91,555,023 bytes,
+  `242a1d386f2f63a7daec443399b32d35b4b155b0820ee19b7c81c50436f95e11`.
+- Tokenizer: 711,661 bytes,
+  `da0e79933b9ed51798a3ae27893d3c5fa4a201126cef75586296df9b4d2c62a0`.
+- CPU FP32 and TensorRT FP16 minimum cosine was `0.9999952316`; 98.6023% of
+  quantized components matched.
 
-Shared legal model and source SDK components provide:
+## V19 corpus
 
-- validated `SourceId`, document, chunk and asset identities;
-- source descriptors and exact source resolution;
-- normalized source inventory records and documents;
-- acquisition rate policies, cursors and deterministic hashes;
-- fixtureable source adapters and source-scoped failure results.
+Validated v19 output:
 
-The production registry resolves only `ato` and `frl`, with `ato` as the default.
-Search schema, CLI selection, continuations, statistics and retrieval preserve
-the selected source.
+- 409,528 documents;
+- 6,968,250 chunks and embeddings;
+- 20,170 definitions;
+- 40,000,348,160-byte `legal.db`;
+- approximately 57 GiB including ten ANN sidecars;
+- index `2026.07.14`, schema 10, model
+  `mdbr-leaf-ir-tensorrt-fp16-256d`.
 
-## Acquisition state
+Per-source documents/chunks:
 
-Source updates run concurrently under independent source policies. Outcomes
-distinguish current, updated, partial and failed source runs. Workspaces and run
-directories are stable, distinct paths protected by per-workspace locks. Cursor
-and inventory state advance after durable acquisition.
+| Source | Documents | Chunks |
+|---|---:|---:|
+| ATO | 158,937 | 1,123,777 |
+| NSW Caselaw | 124,443 | 2,830,980 |
+| Federal Court | 72,981 | 1,769,363 |
+| FRL | 32,771 | 441,910 |
+| High Court | 6,169 | 240,797 |
+| SA legislation | 5,094 | 119,414 |
+| Queensland legislation | 3,370 | 211,784 |
+| NSW legislation | 2,231 | 125,585 |
+| Tasmania legislation | 1,961 | 38,400 |
+| WA legislation | 1,571 | 66,240 |
 
-A source failure retains its last publishable state while unrelated sources
-continue. Invalid rate policies fail before acquisition begins, and failed or
-incomplete records remain eligible for the next overlap run.
+Full validation passed SQLite integrity and foreign keys, logical FTS integrity,
+exact manifest/database/source bindings, all model/ANN sizes and hashes, vector
+counts, ordinals, metadata, repaired Federal text, all-source retrieval, source
+isolation, and official HTTPS URLs.
 
-### ATO
+The old remote-release manifest was transformed into a complete local
+`generation.json` candidate using Btrfs reflinks and separately pinned model
+files. After several safely failed/interrupted validation attempts exposed FTS
+and cross-directory rename edge cases, the final lifecycle activated v19 as
+`1a6beead567b55babebbe253b5ae13efcd9ce2e8ab55b60c2de4106e39f180f4` under
+`data/runtime`. Full staging validation took 33m12.76s and exited 0. The exact
+DB/model/ANN tree is read-only, has no hard-linked files, and the source build
+directory was atomically consumed. Strict CUDA/TensorRT `verify` passed in
+29.72s with all counts and `semantic_search_ready=true`; the CPU runtime also
+loaded/encoded successfully. A malformed activation preserved the exact v19
+pointer, idempotent rollback revalidated v19, pruning removed nothing, and the
+76-check installed-corpus smoke suite passed on both CUDA/TensorRT and the
+production CPU build. All-source active retrieval returned three correctly
+source-scoped official-HTTPS hits for every source; canonical live ATO fetch,
+exact-generation readiness, CPU SIGTERM drain, 215 non-ignored Rust unit tests,
+seven HTTP integration tests, strict Clippy, audit/deny, npm allowlisting, and
+workspace packaging also pass.
 
-The ATO adapter directly reuses
-`/home/jordan/Desktop/Projects/ato_pages/index.jsonl` and its integrity-pinned
-payload tree. Routine acquisition runs What's New discovery and fetches changed
-links with a shared 50 ms issue interval, four workers and a 30-second timeout.
-Inventory fingerprints record the JSONL SHA-256 and record count, and selected
-payloads are verified against declared size and SHA-256. Successful refreshes
-write immutable SHA-256-named payloads before committing their inventory record;
-failed refreshes retain the last verified payload and remain retryable.
+## Local lifecycle and hosting cutover
 
-### Federal Register of Legislation
+Implemented hard cut:
 
-The FRL adapter is registered as `frl` and uses the official
-`https://api.prod.legislation.gov.au/v1/` API. Implemented contracts cover:
+- removed runtime `update`, corpus packaging/publication, offline bundle, remote
+  artifact discovery/download, and the GPU corpus-release workflow;
+- added `activate`, `verify`, `rollback`, and `prune-generations`;
+- local builds emit complete `generation.json` directories with pinned model
+  files and no remote URLs;
+- exact generation directories are non-symlink, immutable, same-filesystem,
+  atomically activated, and hash/source/model/ANN bound;
+- `scripts/maintainer-sync.sh` journals pending work, resumes failed builds,
+  builds locally, verifies activation, and atomically exchanges complete full
+  source sets;
+- `scripts/deploy-generation.sh` holds a remote deployment lock, resumes direct
+  rsync, checks disk, strictly verifies before pruning, activates, restarts,
+  checks the exact `/readyz` generation, and rolls back on failure;
+- hardened `systemd/legal-mcp.service` and low-cost private hosting guidance are
+  in [DEPLOYMENT.md](DEPLOYMENT.md).
 
-- deterministic authoritative `Titles` paging by `id`, with pages of at most 100;
-- inclusive overlapping `Versions` discovery ordered by `registeredAt`,
-  `titleId`, `start` and `retrospectiveStart`;
-- a seven-day cursor overlap and stable deduplication;
-- per-version `Documents` rendition enumeration;
-- stable `titleId`, version tuple and `registerId` provenance;
-- authorised EPUB, DOCX and official extracted PDF normalization;
-- two concurrent operations, a 250 ms issue interval, a 30-second timeout and
-  bounded retry;
-- a verified per-title acquisition cache that resumes interrupted full updates;
-- atomic state commits after rendition acquisition;
-- direct deletion from periodic authoritative title reconciliation.
+Initial hosting recommendation: one Sydney 4-vCPU/8-GiB/160-GiB SSD VPS at about
+USD 48/month, two HTTP workers, loopback service, and Tailscale Serve. Azure VM
+plus managed disk remains a future Entra/Microsoft 365 option but is unlikely to
+fit below USD 100/month.
 
-Fixture coverage includes OData paging, enum representations, rendition
-selection, cursor overlap, unchanged and changed inventories, removed titles,
-fetch failures, EPUB/DOCX normalization and PDF text requirements.
-A bounded `legal-mcp frl-probe` validates one current official title, one
-rendition page and one normalized document and returns the content projection.
+## Remaining proof before completion
 
-## Corpus pipeline
+1. Run dependency audit/deny and remaining package/cross-platform CI gates.
+2. Optionally prove a pointer switch between two full valid generations; unit
+   tests already cover two-key activation/pruning and the live v19 CLI covers
+   strict idempotent rollback without duplicating 57 GiB.
+3. Provision the VPS, install binary/CPU ONNX Runtime/systemd/Tailscale, transfer
+   v19, and prove exact readiness, persistence, rollback, and retention.
+4. Commit and push the still-uncommitted acquisition/model/performance/lifecycle/
+   hosting tree.
 
-The source-agnostic pipeline validates normalized documents, derives headings and
-chunks, and reconciles each source in an immediate SQLite transaction. Every
-publication targets a fresh `legal.db`. The pipeline:
-
-- directly deletes source documents absent from an authoritative inventory;
-- replaces changed documents and their dependent rows transactionally;
-- reuses embeddings by approved model and chunk-text SHA-256;
-- batches new embeddings;
-- derives definitions, anchors and citations from normalized content;
-- refreshes source and corpus metadata;
-- finalizes one `ann/<source>.ann` per indexed source;
-- validates shared corpus and vector identities before activation.
-
-A complete generation is immutable and `active-generation` is its atomic commit
-point.
-
-Fresh builds can seed `embedding_cache` from a completed schema-v10 `legal.db`;
-the imported rows remain keyed by the exact approved model and chunk-text hash.
-Builds hold shared locks on every source workspace, while acquisition holds the
-corresponding exclusive lock.
-
-## Validation focus
-
-The repository test suite covers typed source identities, source registry
-resolution, strict `legal://` parsing, tool schemas, source-scoped continuations,
-HTTP MCP transport, source update concurrency, failure isolation, ATO acquisition
-reports, FRL official API fixtures, authoritative deletion, embedding reuse,
-generation identity and ANN behaviour.
-
-The release gate is:
-
-```bash
-cargo fmt --all -- --check
-cargo test --workspace --locked --all-features
-cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
-cargo audit
-cargo deny check advisories
-bash -n scripts/*.sh
-git diff --check
-scripts/smoke.sh
-```
-
-Installed-corpus validation exercises `stats`, source-specific keyword/vector/
-hybrid searches, chunk and asset retrieval, anchors, definitions and strict ATO
-live fetch. Publication also requires per-source ANN recall of at least 0.99 at
-50 results and exact reranking checks.
-
-## Release-readiness work
-
-The next local release gate will:
-
-1. run the ATO What's New update against the existing `ato_pages` workspace;
-2. complete an authoritative FRL inventory and rendition fetch;
-3. build a fresh combined `legal.db`;
-4. build and validate `ann/ato.ann` and `ann/frl.ann`;
-5. verify direct deletion, failure isolation and embedding reuse;
-6. install the generated manifest into a clean
-   `australian-legal-mcp` data directory;
-7. run both source search suites and strict `legal://` fetch checks;
-8. verify package archives contain `legal-mcp` and the matching ONNX Runtime.
-
-After the combined local generation passes, planned work proceeds to High Court
-and NSW Caselaw adapters, local container and OAuth validation, the remote
-Streamable HTTP phase and the measured Azure pilot in [PLAN.md](PLAN.md).
-
-## Operational facts
-
-- Routine ATO work uses the existing `ato_pages` workspace and changed-link
-  acquisition.
-- Authoritative inventories directly remove absent source records.
-- Source acquisition failures remain isolated by source.
-- Corpus publications always construct a fresh `legal.db`.
-- Matching embeddings are reused by model and chunk-text hash.
-- End-user install, update, search and serving use the CPU-safe runtime.
-- Maintainer embedding builds use `cargo build --release --features cuda`.
-- Generation directories are immutable and updates activate atomically.
-- The official FRL live probe normalized the current Acts Interpretation Act
-  1901 EPUB into 254,530 bytes of HTML with one retained asset.
+High Court historical coverage remains bounded by the official site's available
+digitized collection. OALCC is reference-only clean-room research evidence.

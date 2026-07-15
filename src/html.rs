@@ -6,6 +6,41 @@ use legal_model::{DocumentId, SourceId};
 use regex::Regex;
 use std::collections::HashSet;
 
+pub(crate) fn canonical_source_character(character: char) -> Option<char> {
+    Some(match character {
+        '\u{80}' => '€',
+        '\u{82}' => '‚',
+        '\u{83}' => 'ƒ',
+        '\u{84}' => '„',
+        '\u{85}' => '…',
+        '\u{86}' => '†',
+        '\u{87}' => '‡',
+        '\u{88}' => 'ˆ',
+        '\u{89}' => '‰',
+        '\u{8a}' => 'Š',
+        '\u{8b}' => '‹',
+        '\u{8c}' => 'Œ',
+        '\u{8e}' => 'Ž',
+        '\u{91}' => '‘',
+        '\u{92}' => '’',
+        '\u{93}' => '“',
+        '\u{94}' => '”',
+        '\u{95}' => '•',
+        '\u{96}' => '–',
+        '\u{97}' => '—',
+        '\u{98}' => '˜',
+        '\u{99}' => '™',
+        '\u{9a}' => 'š',
+        '\u{9b}' => '›',
+        '\u{9c}' => 'œ',
+        '\u{9e}' => 'ž',
+        '\u{9f}' => 'Ÿ',
+        '\n' | '\r' | '\t' => character,
+        _ if character.is_control() => return None,
+        _ => character,
+    })
+}
+
 // Containers ATO has used over the years. First selector match wins;
 // pick_container_html falls back to <main>/<body> if none match.
 pub(crate) const ATO_CONTAINER_SELECTORS: &[&str] =

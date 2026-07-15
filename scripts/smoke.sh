@@ -10,8 +10,7 @@
 #   5. MCP HTTP transport (serve, initialize, tools/list, all tools)
 #   6. MCP stdio shim (`legal-mcp mcp`) against the same backend
 #
-# Read-only against the live corpus; the HTTP transport tests use a tempdir
-# so they do not collide with the user's running server.
+# Read-only against the active immutable corpus; HTTP tests use a fresh port.
 #
 # Usage:
 #   scripts/smoke.sh
@@ -123,13 +122,20 @@ fi
 help_text="$("$BIN" --help 2>&1)"
 
 # Subcommands that MUST be present.
-for cmd in mcp serve update stats search fetch get-definition build source-update \
-	tree-crawl snapshot-reduce link-download scrape-diff package-corpus \
-	publish-release help; do
+for cmd in mcp serve activate rollback prune-generations stats verify search fetch \
+	get-definition build source-update tree-crawl snapshot-reduce link-download \
+	scrape-diff help; do
 	if grep -qE "^[[:space:]]+${cmd}[[:space:]]" <<<"$help_text"; then
 		ok "subcommand present: $cmd"
 	else
 		bad "subcommand missing: $cmd"
+	fi
+done
+for removed in update package-corpus publish-release; do
+	if grep -qE "^[[:space:]]+${removed}[[:space:]]" <<<"$help_text"; then
+		bad "removed subcommand unexpectedly present: $removed"
+	else
+		ok "removed subcommand absent: $removed"
 	fi
 done
 
@@ -137,7 +143,7 @@ done
 
 section "Section 2: corpus health"
 
-stats_json="$("$BIN" stats 2>&1)"
+stats_json="$("$BIN" stats)"
 if printf '%s' "$stats_json" | jq -e . >/dev/null 2>&1; then
 	ok "stats returns valid JSON"
 else
@@ -147,66 +153,74 @@ assert_jq_count "stats.documents > 0" "$stats_json" '.documents' 1
 assert_jq_count "stats.chunks > 0" "$stats_json" '.chunks' 1
 assert_jq_count "stats.chunk_embeddings > 0" "$stats_json" '.chunk_embeddings' 1
 assert_jq_count "stats.definitions > 0" "$stats_json" '.definitions' 1
-assert_jq_count "stats.prefix_breakdown items" "$stats_json" '.prefix_breakdown | length' 5
+assert_jq_count "stats ATO prefix_breakdown items" "$stats_json" '.source_stats.ato.prefix_breakdown | length' 5
 assert_jq_count "stats ATO documents > 0" "$stats_json" '.source_stats.ato.documents' 1
 assert_jq_count "stats FRL documents > 0" "$stats_json" '.source_stats.frl.documents' 1
-assert_jq "stats.default_source" "$stats_json" '.default_source' 'ato'
 assert_jq_nonempty "stats.index_version" "$stats_json" '.index_version'
+assert_jq_nonempty "stats.active_generation" "$stats_json" '.active_generation'
 assert_jq "stats.semantic_search_ready" "$stats_json" '.semantic_search_ready' 'true'
+verify_json="$("$BIN" verify)"
+assert_jq "verify generation matches stats" "$verify_json" '.active_generation' \
+	"$(printf '%s' "$stats_json" | jq -r '.active_generation')"
 
 # ---------------- Section 3: CLI search ----------------
 
 section "Section 3: CLI search"
 
-# Hybrid with omitted source exercises the canonical ATO default.
-hybrid_json="$("$BIN" search "section 8-1 deductions" --k 3 2>&1)"
+# Source is mandatory; omission must fail rather than silently selecting ATO.
+if "$BIN" search "section 8-1 deductions" --k 1 >/dev/null 2>&1; then
+	bad "search requires source" "omitted source unexpectedly succeeded"
+else
+	ok "search requires source"
+fi
+hybrid_json="$("$BIN" search "section 8-1 deductions" --source ato --k 3)"
 assert_jq_count "hybrid: hits returned" "$hybrid_json" '.hits | length' 1
-assert_jq "hybrid: omitted source resolves to ATO" "$hybrid_json" \
+assert_jq "hybrid: explicit source is ATO" "$hybrid_json" \
 	'(.hits | length > 0) and (.hits | all(.document.source == "ato"))' 'true'
 assert_jq_count "hybrid: hits with canonical_url" "$hybrid_json" '[.hits[].canonical_url] | map(select(. != null and . != "")) | length' 1
 assert_jq_count "hybrid: hits with typed chunk" "$hybrid_json" '[.hits[].chunk] | map(select(. != null)) | length' 1
 assert_jq_count "hybrid: hits with snippet" "$hybrid_json" '[.hits[].snippet] | map(select(. != null and . != "")) | length' 1
 
 # Vector mode.
-vector_json="$("$BIN" search "loss carry-back tax offset" --k 3 --mode vector 2>&1)"
+vector_json="$("$BIN" search "loss carry-back tax offset" --source ato --k 3 --mode vector)"
 assert_jq_count "vector mode: hits returned" "$vector_json" '.hits | length' 1
 
 # Keyword mode.
-keyword_json="$("$BIN" search "research and development tax incentive" --k 3 --mode keyword 2>&1)"
+keyword_json="$("$BIN" search "research and development tax incentive" --source ato --k 3 --mode keyword)"
 assert_jq_count "keyword mode: hits returned" "$keyword_json" '.hits | length' 1
 
 # Federal Register source routing.
-frl_json="$("$BIN" search "income tax assessment act" --source frl --k 3 --mode keyword 2>&1)"
+frl_json="$("$BIN" search "income tax assessment act" --source frl --k 3 --mode keyword)"
 assert_jq_count "FRL keyword mode: hits returned" "$frl_json" '.hits | length' 1
 assert_jq "FRL keyword mode: every hit is FRL" "$frl_json" \
 	'(.hits | length > 0) and (.hits | all(.document.source == "frl"))' 'true'
 
 # Type filter.
-typed_json="$("$BIN" search "GST going concern" --k 5 --types TXR 2>&1)"
+typed_json="$("$BIN" search "GST going concern" --source ato --k 5 --types TXR)"
 assert_jq_count "type filter: hits returned" "$typed_json" '.hits | length' 1
 assert_jq "type filter: every hit is TXR" "$typed_json" '[.hits[].type] | unique | join(",")' 'TXR'
 
 # doc_scope filter (glob).
-scoped_json="$("$BIN" search "income" --k 5 --doc-scope 'PAC/%' 2>&1)"
+scoped_json="$("$BIN" search "income" --source ato --k 5 --doc-scope 'PAC/%')"
 assert_jq_count "doc-scope filter: hits returned" "$scoped_json" '.hits | length' 1
 assert_jq "doc-scope filter: every hit under PAC/" "$scoped_json" \
 	'(.hits | length > 0) and (.hits | all(.document.native_id | startswith("PAC/")))' 'true'
 
 # Recency sort.
-recency_json="$("$BIN" search "small business" --k 5 --sort-by recency 2>&1)"
+recency_json="$("$BIN" search "small business" --source ato --k 5 --sort-by recency)"
 assert_jq_count "recency sort: hits returned" "$recency_json" '.hits | length' 1
 assert_jq "recency sort: dates monotonic descending" "$recency_json" \
 	'[.hits[].date] | (. == (sort | reverse))' 'true'
 
 # Seed-text fast path (vector-only, no title_hits).
 seed_text="A taxpayer who carries on a business may deduct losses or outgoings under section 8-1."
-seed_json="$("$BIN" search "ignored when seed-text set" --k 3 --seed-text "$seed_text" 2>&1)"
+seed_json="$("$BIN" search "ignored when seed-text set" --source ato --k 3 --seed-text "$seed_text")"
 assert_jq_count "seed-text: hits returned" "$seed_json" '.hits | length' 1
 assert_jq "seed-text: title_hits suppressed" "$seed_json" '.title_hits | length' '0'
 
 # include_old.
-current_default="$("$BIN" search "fringe benefits" --k 3 --types FBR 2>&1)"
-historical="$("$BIN" search "fringe benefits" --k 3 --types FBR --include-old 2>&1)"
+current_default="$("$BIN" search "income tax" --source ato --k 3 --mode keyword --types ITR)"
+historical="$("$BIN" search "income tax" --source ato --k 3 --mode keyword --types ITR --include-old)"
 default_count=$(printf '%s' "$current_default" | jq -r '.hits | length' 2>/dev/null || echo 0)
 relaxed_count=$(printf '%s' "$historical" | jq -r '.hits | length' 2>/dev/null || echo 0)
 if [[ "$relaxed_count" -ge "$default_count" ]]; then
@@ -215,13 +229,13 @@ else
 	bad "include_old" "relaxed=$relaxed_count default=$default_count"
 fi
 
-# Direct native document ID query → title hit.
-direct_json="$("$BIN" search "TXR/TR20007/NAT/ATO/00001" --source ato --k 1 2>&1)"
-assert_jq "direct native ID query: title_hit present" "$direct_json" \
+# Direct native document ID query → exact leading title hit.
+direct_json="$("$BIN" search "TXR/TR20007/NAT/ATO/00001" --source ato --k 1)"
+assert_jq "direct native ID query: exact title hit leads" "$direct_json" \
 	'.title_hits[0].document.native_id' 'TXR/TR20007/NAT/ATO/00001'
 
 # meta.next_call appears when results are truncated.
-truncated_json="$("$BIN" search "deductions" --k 2 2>&1)"
+truncated_json="$("$BIN" search "deductions" --source ato --k 2)"
 assert_jq_nonempty "search.meta.next_call present" "$truncated_json" '.meta.next_call'
 
 # ---------------- Section 4: CLI retrieval ----------------
@@ -229,13 +243,13 @@ assert_jq_nonempty "search.meta.next_call present" "$truncated_json" '.meta.next
 section "Section 4: CLI retrieval"
 
 # get-definition.
-defn_json="$("$BIN" get-definition "trading stock" --max-defs 3 2>&1)"
+defn_json="$("$BIN" get-definition "trading stock" --source ato --max-defs 3)"
 assert_jq_count "get-definition: definitions returned" "$defn_json" '.definitions | length' 1
 assert_jq "get-definition: statutory_definition_found" "$defn_json" '.statutory_definition_found' 'true'
 assert_jq_count "get-definition: body carries [doc:...] markers" "$defn_json" \
 	'[.definitions[].body | select(contains("[doc:"))] | length' 1
 
-norm_json="$("$BIN" get-definition "Australian resident" --max-defs 2 2>&1)"
+norm_json="$("$BIN" get-definition "Australian resident" --source ato --max-defs 2)"
 if printf '%s' "$norm_json" | jq -e . >/dev/null 2>&1; then
 	ok "get-definition normaliser: returns valid JSON on multi-word lowercase term"
 else
@@ -245,7 +259,7 @@ fi
 # `fetch` against a known canonical ATO URI (requires network).
 fetch_uri='legal://ato/TXR%2FTR20007%2FNAT%2FATO%2F00001'
 if [[ "$SKIP_NETWORK" != "1" ]]; then
-	fetch_json="$("$BIN" fetch "$fetch_uri" 2>&1)"
+	fetch_json="$("$BIN" fetch "$fetch_uri")"
 	if printf '%s' "$fetch_json" | jq -e . >/dev/null 2>&1; then
 		assert_jq_count "fetch: chunks returned" "$fetch_json" '.chunks | length' 1
 		assert_jq "fetch: canonical_url" "$fetch_json" '.canonical_url' \
@@ -267,28 +281,8 @@ section "Section 5: MCP HTTP transport"
 
 workdir="$(mktemp -d)"
 source_data_dir="$(printf '%s' "$stats_json" | jq -r '.data_dir // empty' 2>/dev/null)"
-if [[ -z "$source_data_dir" ]]; then
-	source_data_dir="${LEGAL_MCP_DATA_DIR:-$HOME/.local/share/australian-legal-mcp}"
-fi
-export LEGAL_MCP_DATA_DIR="$workdir/data"
-
-# Share the live corpus by symlinking the user's live dir into the tempdir.
-live_src="$source_data_dir/live"
-mkdir -p "$LEGAL_MCP_DATA_DIR"
-if [[ -d "$live_src" ]]; then
-	ln -s "$live_src" "$LEGAL_MCP_DATA_DIR/live"
-	if [[ -f "$source_data_dir/installed_manifest.json" ]]; then
-		ln -sf "$source_data_dir/installed_manifest.json" \
-			"$LEGAL_MCP_DATA_DIR/installed_manifest.json"
-	fi
-	ok "linked live corpus into tempdir"
-else
-	bad "live corpus not found at $live_src — install one with the same LEGAL_MCP_DATA_DIR using: legal-mcp update"
-	rm -rf "$workdir"
-	echo ""
-	echo "Summary: $pass passed, $fail failed"
-	exit 1
-fi
+[[ -n "$source_data_dir" ]] || { bad "stats.data_dir missing"; exit 1; }
+export LEGAL_MCP_DATA_DIR="$source_data_dir"
 
 port="$(free_port)"
 url="http://127.0.0.1:$port/mcp"
@@ -297,8 +291,8 @@ log="$workdir/serve.log"
 serve_pid=$!
 trap 'kill '"$serve_pid"' 2>/dev/null; rm -rf "$workdir"' EXIT
 
-# Wait for the readiness line — bounded to ~10 s.
-deadline=$(($(date +%s) + 10))
+# Cold startup verifies all ANN files and prewarms the semantic model.
+deadline=$(($(date +%s) + 120))
 ready=0
 while [[ $(date +%s) -lt $deadline ]]; do
 	if grep -q "listening on $url" "$log" 2>/dev/null; then
@@ -331,6 +325,8 @@ rpc() {
 	fi
 	curl --silent --show-error --max-time 30 -X POST "$url" \
 		-H 'content-type: application/json' \
+		-H 'accept: application/json, text/event-stream' \
+		-H 'mcp-protocol-version: 2025-06-18' \
 		--data-raw "$body"
 }
 

@@ -134,11 +134,14 @@ jobs:
           mkdir -p package
           cp "${{ matrix.binary }}" package/legal-mcp
           chmod 755 package/legal-mcp
-          cp README.md LICENSE package/
+          cp README.md DEPLOYMENT.md LICENSE package/
           if [[ "$RUNNER_OS" == "Linux" ]]; then
             ort="onnxruntime-linux-x64-${{ matrix.ort_version }}"
             cp -L "$ort/lib/libonnxruntime.so" package/libonnxruntime.so
             cp "$ort/LICENSE" package/ONNXRUNTIME-LICENSE
+            mkdir package/systemd
+            cp systemd/legal-mcp.service systemd/legal-mcp.env.example \
+              systemd/README.md package/systemd/
           fi
           package/legal-mcp --version | grep -F "${RELEASE_TAG#v}"
           COPYFILE_DISABLE=1 tar -C package -czf \
@@ -155,7 +158,7 @@ jobs:
           $ort = "${{ matrix.ort_version }}"
           $dll = "onnxruntime/onnxruntime-win-x64-$ort/lib/onnxruntime.dll"
           Copy-Item $dll package/
-          Copy-Item README.md, LICENSE package/
+          Copy-Item README.md, DEPLOYMENT.md, LICENSE package/
           $version = $env:RELEASE_TAG.Substring(1)
           & package/legal-mcp.exe --version | Select-String $version
           Compress-Archive -Path package/* `

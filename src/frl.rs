@@ -1,9 +1,10 @@
 //! Federal Register of Legislation acquisition and normalization.
 
+use crate::adaptive_http::{AdaptiveConcurrency, RequestOutcome, SOURCE_WORKER_CEILING};
 use crate::legal_source::{SourceDescriptor, SourceId};
 use crate::source_update::{
     SourceAcquisition, SourceDiscoveryBatch, SourceFetchReport, SourceInventoryFingerprint,
-    SourceRatePolicy, SourceUpdateContext,
+    SourceRatePolicy, SourceUpdateContext, SourceUpdateMode,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Timelike, Utc};
@@ -31,7 +32,6 @@ const FRL_DISPLAY_NAME: &str = "Federal Register of Legislation";
 const FRL_API_BASE: &str = "https://api.prod.legislation.gov.au/v1/";
 const FRL_PUBLIC_BASE: &str = "https://www.legislation.gov.au/";
 const PAGE_SIZE: usize = 100;
-const FRL_MAX_CONCURRENCY: usize = 2;
 const MAX_TITLE_PAGES: usize = 4_096;
 const MAX_VERSION_PAGES: usize = 16_384;
 const MAX_DOCUMENT_PAGES: usize = 64;
@@ -39,17 +39,19 @@ const MAX_JSON_BODY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RENDITION_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_STATE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 20_000;
-const MAX_ARCHIVE_MEMBER_BYTES: u64 = 32 * 1024 * 1024;
+// Official DOCX judgments can contain very large coordinate schedules.
+const MAX_ARCHIVE_MEMBER_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_ARCHIVE_EXPANDED_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_XML_DEPTH: usize = 256;
-const MAX_XML_NODES: usize = 1_000_000;
+const MAX_XML_NODES: usize = 4_000_000;
+const MIN_FULL_TEXT_ALPHANUMERIC_CHARS: usize = 128;
 const OVERLAP_DAYS: i64 = 7;
 const MAX_HTTP_ATTEMPTS: usize = 4;
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const STATE_SCHEMA_VERSION: u32 = 1;
-const ACQUISITION_CACHE_SCHEMA_VERSION: u32 = 1;
-const STATE_RELATIVE_PATH: &str = "frl/state.json";
-const ACQUISITION_CACHE_DIR: &str = "frl/acquisition-cache";
+const DISCOVERY_SCHEMA_VERSION: u32 = 1;
+const STATE_RELATIVE_PATH: &str = "state.json";
+const STAGING_DIR: &str = "staging";
 const DISCOVERY_FILE_NAME: &str = "frl-discovery.json";
 
 pub(crate) fn frl_descriptor() -> Result<SourceDescriptor> {
@@ -67,8 +69,7 @@ pub(crate) static FRL_ACQUISITION: FrlAcquisition = FrlAcquisition;
 impl SourceAcquisition for FrlAcquisition {
     fn rate_policy(&self) -> SourceRatePolicy {
         SourceRatePolicy {
-            minimum_request_interval_ms: 250,
-            max_concurrency: FRL_MAX_CONCURRENCY,
+            minimum_request_interval_ms: 0,
             request_timeout_seconds: 30,
         }
     }
@@ -78,12 +79,13 @@ impl SourceAcquisition for FrlAcquisition {
         fingerprint_inventory(&state.inventory)
     }
 
-    fn discover_incremental(&self, context: &SourceUpdateContext) -> Result<SourceDiscoveryBatch> {
+    fn discover(&self, context: &SourceUpdateContext) -> Result<SourceDiscoveryBatch> {
         let api = HttpFrlApi::new(self.rate_policy())?;
         discover_to_run_dir(
             &api,
             &context.workspace,
             &context.run_dir,
+            context.mode,
             Utc::now().naive_utc() + ChronoDuration::hours(14),
             PAGE_SIZE,
         )
@@ -100,6 +102,7 @@ impl SourceAcquisition for FrlAcquisition {
             &context.workspace,
             &context.run_dir,
             discovery,
+            context.mode,
             PAGE_SIZE,
         )
     }
@@ -431,6 +434,13 @@ trait FrlApi: Send + Sync {
         upper_bound: &str,
     ) -> Result<Option<FrlVersion>>;
 
+    fn version_candidates(&self, title_id: &str, upper_bound: &str) -> Result<Vec<FrlVersion>> {
+        Ok(self
+            .authoritative_version(title_id, upper_bound)?
+            .into_iter()
+            .collect())
+    }
+
     fn documents_page(
         &self,
         version: &FrlVersionKey,
@@ -444,6 +454,7 @@ trait FrlApi: Send + Sync {
 struct HttpFrlApi {
     client: Client,
     base: Url,
+    concurrency: AdaptiveConcurrency,
     minimum_interval: Duration,
     last_request: Mutex<Option<Instant>>,
 }
@@ -461,6 +472,7 @@ impl HttpFrlApi {
         Ok(Self {
             client,
             base,
+            concurrency: AdaptiveConcurrency::new(FRL_SOURCE_ID),
             minimum_interval: Duration::from_millis(policy.minimum_request_interval_ms),
             last_request: Mutex::new(None),
         })
@@ -475,7 +487,8 @@ impl HttpFrlApi {
         Ok(url)
     }
 
-    fn wait_for_issue_slot(&self) -> Result<()> {
+    fn wait_for_issue_slot(&self) -> Result<Duration> {
+        let started = Instant::now();
         let mut last = self
             .last_request
             .lock()
@@ -487,19 +500,35 @@ impl HttpFrlApi {
             }
         }
         *last = Some(Instant::now());
-        Ok(())
+        Ok(started.elapsed())
     }
 
     fn get_bounded(&self, url: Url, accept: &str, limit: u64) -> Result<Vec<u8>> {
         validate_api_url(&url)?;
         let mut last_error = None;
         for attempt in 0..MAX_HTTP_ATTEMPTS {
-            self.wait_for_issue_slot()?;
+            let request = self.concurrency.acquire()?;
+            let pacing_wait = self.wait_for_issue_slot()?;
             let response = self.client.get(url.clone()).header(ACCEPT, accept).send();
             match response {
                 Ok(response) if response.status().is_success() => {
-                    return read_bounded_response(response, limit)
+                    let status = response.status();
+                    let result = read_bounded_response(response, limit)
                         .with_context(|| format!("reading FRL response from {url}"));
+                    request.finish(
+                        url.as_str(),
+                        Some(status.as_u16()),
+                        result.as_ref().map_or(0, Vec::len),
+                        attempt + 1,
+                        if result.is_ok() {
+                            RequestOutcome::Success
+                        } else {
+                            RequestOutcome::Transient
+                        },
+                        pacing_wait,
+                        None,
+                    );
+                    return result;
                 }
                 Ok(response) => {
                     let status = response.status();
@@ -519,20 +548,73 @@ impl HttpFrlApi {
                                 MAX_RETRY_DELAY.as_secs()
                             );
                         }
+                        request.finish(
+                            url.as_str(),
+                            Some(status.as_u16()),
+                            0,
+                            attempt + 1,
+                            if status == StatusCode::TOO_MANY_REQUESTS {
+                                RequestOutcome::Congestion
+                            } else {
+                                RequestOutcome::Transient
+                            },
+                            pacing_wait,
+                            Some(delay),
+                        );
                         thread::sleep(delay);
                         last_error = Some(message);
                         continue;
                     }
+                    request.finish(
+                        url.as_str(),
+                        Some(status.as_u16()),
+                        0,
+                        attempt + 1,
+                        if retryable {
+                            if status == StatusCode::TOO_MANY_REQUESTS {
+                                RequestOutcome::Congestion
+                            } else {
+                                RequestOutcome::Transient
+                            }
+                        } else {
+                            RequestOutcome::Neutral
+                        },
+                        pacing_wait,
+                        None,
+                    );
                     bail!(message);
                 }
                 Err(error) => {
                     let retryable = error.is_timeout() || error.is_connect() || error.is_request();
                     let message = format!("FRL request {url} failed: {error}");
                     if retryable && attempt + 1 < MAX_HTTP_ATTEMPTS {
-                        thread::sleep(retry_delay(attempt));
+                        let delay = retry_delay(attempt);
+                        request.finish(
+                            url.as_str(),
+                            None,
+                            0,
+                            attempt + 1,
+                            RequestOutcome::Transient,
+                            pacing_wait,
+                            Some(delay),
+                        );
+                        thread::sleep(delay);
                         last_error = Some(message);
                         continue;
                     }
+                    request.finish(
+                        url.as_str(),
+                        None,
+                        0,
+                        attempt + 1,
+                        if retryable {
+                            RequestOutcome::Transient
+                        } else {
+                            RequestOutcome::Neutral
+                        },
+                        pacing_wait,
+                        None,
+                    );
                     bail!(message);
                 }
             }
@@ -674,6 +756,37 @@ impl FrlApi for HttpFrlApi {
         Ok(selected.into_iter().next())
     }
 
+    fn version_candidates(&self, title_id: &str, upper_bound: &str) -> Result<Vec<FrlVersion>> {
+        validate_native_id(title_id)?;
+        canonical_datetime(upper_bound)?;
+        let mut url = self.entity_url("Versions")?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("$top", &PAGE_SIZE.to_string());
+            query.append_pair(
+                "$orderby",
+                "isCurrent desc,isLatest desc,start desc,retrospectiveStart desc,registeredAt desc",
+            );
+            query.append_pair(
+                "$filter",
+                &format!(
+                    "titleId eq '{}' and registeredAt ne null and registeredAt le {}",
+                    odata_string(title_id),
+                    upper_bound
+                ),
+            );
+            query.append_pair(
+                "$select",
+                "titleId,start,retrospectiveStart,end,retrospectiveEnd,isCurrent,isLatest,name,status,registerId,registeredAt,compilationNumber",
+            );
+        }
+        let page = self.get_json::<ODataPage<FrlVersion>>(url, MAX_JSON_BODY_BYTES)?;
+        page.value
+            .into_iter()
+            .map(|version| canonicalize_version(&version))
+            .collect()
+    }
+
     fn documents_page(
         &self,
         version: &FrlVersionKey,
@@ -741,71 +854,6 @@ impl FrlApi for HttpFrlApi {
             }
         }
     }
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct FrlProbeReport {
-    source: &'static str,
-    title_id: String,
-    title: String,
-    register_id: Option<String>,
-    rendition_format: String,
-    rendition_extension: Option<String>,
-    canonical_url: String,
-    normalized_content_sha256: String,
-    normalized_html_bytes: usize,
-    assets: usize,
-}
-
-pub(crate) fn probe_official_source() -> Result<FrlProbeReport> {
-    const MAX_PROBE_TITLE_PAGES: usize = 10;
-
-    let api = HttpFrlApi::new(FrlAcquisition.rate_policy())?;
-    let upper_bound = api
-        .title_upper_bound()?
-        .ok_or_else(|| anyhow!("FRL probe found no title boundary"))?;
-    let mut after = None;
-    let mut selected_title = None;
-    for _ in 0..MAX_PROBE_TITLE_PAGES {
-        let page = api.titles_page(&upper_bound, after.as_deref(), PAGE_SIZE)?;
-        selected_title = page
-            .iter()
-            .find(|title| title.is_in_force && title.status == "InForce")
-            .cloned();
-        if selected_title.is_some() || page.len() < PAGE_SIZE {
-            break;
-        }
-        after = page.last().map(|title| title.id.clone());
-    }
-    let title = selected_title.ok_or_else(|| {
-        anyhow!("FRL probe found no in-force title within {MAX_PROBE_TITLE_PAGES} bounded pages")
-    })?;
-    validate_title(&title)?;
-    let scan_boundary = format_datetime(Utc::now().naive_utc());
-    let version = api
-        .authoritative_version(&title.id, &scan_boundary)?
-        .ok_or_else(|| anyhow!("FRL probe found no authoritative version for {}", title.id))?;
-    let key = FrlVersionKey::from_version(&version)?;
-    let renditions = api.documents_page(&key, None, PAGE_SIZE)?;
-    if renditions.len() >= PAGE_SIZE {
-        bail!("FRL probe rendition inventory exceeds its one-page bound");
-    }
-    let (rendition, document) =
-        fetch_preferred_normalized_document(&api, &title, &version, &renditions)?;
-    let rendition_format = rendition.format.clone();
-    let rendition_extension = rendition.extension.clone();
-    Ok(FrlProbeReport {
-        source: FRL_SOURCE_ID,
-        title_id: title.id,
-        title: document.title,
-        register_id: version.register_id,
-        rendition_format,
-        rendition_extension,
-        canonical_url: document.canonical_url,
-        normalized_content_sha256: document.content_hash,
-        normalized_html_bytes: document.cleaned_html.len(),
-        assets: document.assets.len(),
-    })
 }
 
 fn validate_api_url(url: &Url) -> Result<()> {
@@ -997,18 +1045,20 @@ struct FrlInventoryEntry {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct FrlAcquisitionCacheEntry {
-    schema_version: u32,
-    entry: FrlInventoryEntry,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FrlDiscoveryPlan {
     authoritative_titles: Vec<FrlTitle>,
     versions: Vec<FrlVersion>,
     proposed_cursor: Option<FrlCursor>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FrlDiscoveryEnvelope {
+    schema_version: u32,
+    source: String,
+    mode: SourceUpdateMode,
+    plan: FrlDiscoveryPlan,
 }
 
 struct VersionScan {
@@ -1021,11 +1071,23 @@ fn discover_to_run_dir(
     api: &dyn FrlApi,
     workspace: &Path,
     run_dir: &Path,
+    mode: SourceUpdateMode,
     scan_started_at: NaiveDateTime,
     page_size: usize,
 ) -> Result<SourceDiscoveryBatch> {
     ensure_real_directory(workspace, "FRL workspace")?;
     ensure_real_directory(run_dir, "FRL run directory")?;
+    let path = confined_path(run_dir, Path::new(DISCOVERY_FILE_NAME))?;
+    if path.exists() {
+        let bytes = read_bounded_file(&path, MAX_STATE_BYTES)?;
+        let envelope: FrlDiscoveryEnvelope =
+            serde_json::from_slice(&bytes).context("decoding saved FRL discovery plan")?;
+        validate_discovery_envelope(&envelope, mode)?;
+        return Ok(SourceDiscoveryBatch {
+            path,
+            records: envelope.plan.versions.len(),
+        });
+    }
     let state = load_state(workspace)?;
     let titles = scan_titles(api, page_size)?;
     let VersionScan {
@@ -1070,8 +1132,14 @@ fn discover_to_run_dir(
         versions: selected_versions,
         proposed_cursor,
     };
-    let path = confined_path(run_dir, Path::new(DISCOVERY_FILE_NAME))?;
-    let mut bytes = serde_json::to_vec(&plan).context("serializing FRL discovery plan")?;
+    validate_discovery_plan(&plan)?;
+    let envelope = FrlDiscoveryEnvelope {
+        schema_version: DISCOVERY_SCHEMA_VERSION,
+        source: FRL_SOURCE_ID.to_owned(),
+        mode,
+        plan,
+    };
+    let mut bytes = serde_json::to_vec(&envelope).context("serializing FRL discovery plan")?;
     bytes.push(b'\n');
     if bytes.len() as u64 > MAX_STATE_BYTES {
         bail!("FRL discovery plan exceeds the bounded plan size");
@@ -1079,7 +1147,7 @@ fn discover_to_run_dir(
     atomic_write_confined(run_dir, Path::new(DISCOVERY_FILE_NAME), &bytes)?;
     Ok(SourceDiscoveryBatch {
         path,
-        records: plan.versions.len(),
+        records: envelope.plan.versions.len(),
     })
 }
 
@@ -1111,7 +1179,10 @@ fn scan_titles(api: &dyn FrlApi, page_size: usize) -> Result<Vec<FrlTitle>> {
                 bail!("FRL Titles page is not ordered by id");
             }
             previous_id = Some(title.id.clone());
-            if title.is_in_force && title.status == "InForce" {
+            if title.is_in_force
+                && title.status == "InForce"
+                && publishable_collection(&title.collection)
+            {
                 titles.insert(title.id.clone(), title.clone());
             }
         }
@@ -1147,6 +1218,19 @@ fn validate_title(title: &FrlTitle) -> Result<()> {
         parse_datetime(date)?;
     }
     Ok(())
+}
+
+fn publishable_collection(collection: &str) -> bool {
+    matches!(
+        collection,
+        "Constitution"
+            | "Act"
+            | "LegislativeInstrument"
+            | "NotifiableInstrument"
+            | "AdministrativeArrangementsOrder"
+            | "PrerogativeInstrument"
+            | "ContinuedLaw"
+    )
 }
 
 fn scan_versions(
@@ -1525,6 +1609,7 @@ fn fetch_discovery(
     workspace: &Path,
     run_dir: &Path,
     discovery: &SourceDiscoveryBatch,
+    mode: SourceUpdateMode,
     page_size: usize,
 ) -> Result<SourceFetchReport> {
     ensure_real_directory(workspace, "FRL workspace")?;
@@ -1544,12 +1629,13 @@ fn fetch_discovery(
     }
     ensure_existing_path_within(run_dir, &discovery.path)?;
     let bytes = read_bounded_file(&discovery.path, MAX_STATE_BYTES)?;
-    let plan: FrlDiscoveryPlan =
+    let envelope: FrlDiscoveryEnvelope =
         serde_json::from_slice(&bytes).context("decoding FRL discovery plan")?;
-    if plan.versions.len() != discovery.records {
+    validate_discovery_envelope(&envelope, mode)?;
+    if envelope.plan.versions.len() != discovery.records {
         bail!("FRL discovery record count changed after discovery");
     }
-    fetch_plan(api, workspace, plan, page_size)
+    fetch_plan(api, workspace, envelope.plan, page_size)
 }
 
 fn fetch_plan(
@@ -1598,7 +1684,7 @@ fn fetch_plan(
         page_size,
     };
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(FRL_MAX_CONCURRENCY)
+        .num_threads(SOURCE_WORKER_CEILING)
         .thread_name(|index| format!("frl-fetch-{index}"))
         .build()
         .context("building FRL fetch pool")?;
@@ -1649,6 +1735,7 @@ fn fetch_plan(
         inventory: reconciled_inventory,
     };
     commit_state(workspace, &next_state)?;
+    clear_staging(workspace)?;
     Ok(SourceFetchReport {
         completed,
         failed: 0,
@@ -1671,14 +1758,14 @@ fn acquire_planned_version(
     version: &FrlVersion,
 ) -> Result<(String, FrlInventoryEntry, bool)> {
     let key = FrlVersionKey::from_version(version)?;
-    let cached = match load_acquisition_cache_entry(context.workspace, title_id) {
-        Ok(cached) => cached,
+    let staged = match load_staging_entry(context.workspace, title_id) {
+        Ok(staged) => staged,
         Err(error) => {
-            eprintln!("FRL acquisition cache for {title_id} is unusable: {error:#}");
+            eprintln!("FRL staged acquisition for {title_id} is unusable: {error:#}");
             None
         }
     };
-    let reusable = cached
+    let reusable = staged
         .filter(|entry| entry.upstream_version == key)
         .or_else(|| {
             context
@@ -1689,36 +1776,87 @@ fn acquire_planned_version(
         });
     if let Some(entry) = reusable {
         match load_inventory_document(context.workspace, context.source, title_id, &entry) {
-            Ok(_) => {
-                commit_acquisition_cache_entry(context.workspace, title_id, &entry)?;
-                return Ok((title_id.to_owned(), entry, true));
-            }
+            Ok(_) => return Ok((title_id.to_owned(), entry, true)),
             Err(error) => {
                 eprintln!(
-                    "FRL cached acquisition for {title_id} failed validation and will be refreshed: {error:#}"
+                    "FRL reusable acquisition for {title_id} failed validation and will be refreshed: {error:#}"
                 );
             }
         }
     }
-    let documents = scan_documents(context.api, &key, context.page_size)
-        .with_context(|| format!("listing FRL renditions for {title_id}"))?;
-    let (_rendition, document) =
-        fetch_preferred_normalized_document(context.api, title, version, &documents)
-            .with_context(|| format!("normalizing FRL title {title_id}"))?;
+    let upper_bound = format_datetime(Utc::now().naive_utc());
+    let mut candidates = vec![version.clone()];
+    candidates.extend(context.api.version_candidates(title_id, &upper_bound)?);
+    let mut seen = BTreeSet::new();
+    let mut deduplicated = Vec::new();
+    for candidate in candidates {
+        if seen.insert(FrlVersionKey::from_version(&candidate)?) {
+            deduplicated.push(candidate);
+        }
+    }
+    let mut failures = Vec::new();
+    let mut selected = None;
+    for candidate in deduplicated {
+        let candidate_key = FrlVersionKey::from_version(&candidate)?;
+        let attempt = scan_documents(context.api, &candidate_key, context.page_size)
+            .with_context(|| format!("listing FRL renditions for {title_id}"))
+            .and_then(|documents| {
+                fetch_preferred_normalized_document(context.api, title, &candidate, &documents)
+            });
+        match attempt {
+            Ok((_rendition, document)) => {
+                selected = Some((candidate, candidate_key, document));
+                break;
+            }
+            Err(error) => failures.push(format!("{}: {error:#}", candidate_key.start)),
+        }
+    }
+    let (selected_version, selected_key, document) = selected.ok_or_else(|| {
+        anyhow!(
+            "all official FRL versions failed for {title_id}: {}",
+            failures.join("; ")
+        )
+    })?;
+    if selected_key != key {
+        eprintln!(
+            "FRL title {title_id}: using verified version {} after the current rendition failed",
+            selected_key.start
+        );
+    }
     let stored = persist_document(context.workspace, &document)?;
-    let cursor = FrlCursor::from_version(version)?
-        .ok_or_else(|| anyhow!("FRL version {} has no registration time", version.title_id))?;
+    let cursor = FrlCursor::from_version(&selected_version)?.ok_or_else(|| {
+        anyhow!(
+            "FRL version {} has no registration time",
+            selected_version.title_id
+        )
+    })?;
     let next_entry = FrlInventoryEntry {
-        native_id: version.title_id.clone(),
-        upstream_version: key,
-        register_id: version.register_id.clone(),
+        native_id: selected_version.title_id.clone(),
+        upstream_version: selected_key,
+        register_id: selected_version.register_id.clone(),
         canonical_url: document.canonical_url.clone(),
         payload_hash: stored.content_hash,
         last_successful_cursor: cursor,
     };
-    commit_acquisition_cache_entry(context.workspace, title_id, &next_entry)?;
+    commit_staging_entry(context.workspace, title_id, &next_entry)?;
     let unchanged = context.previous_inventory.get(title_id) == Some(&next_entry);
     Ok((title_id.to_owned(), next_entry, unchanged))
+}
+
+fn validate_discovery_envelope(
+    envelope: &FrlDiscoveryEnvelope,
+    mode: SourceUpdateMode,
+) -> Result<()> {
+    if envelope.schema_version != DISCOVERY_SCHEMA_VERSION {
+        bail!("FRL discovery plan schema is unsupported");
+    }
+    if envelope.source != FRL_SOURCE_ID {
+        bail!("FRL discovery plan source does not match");
+    }
+    if envelope.mode != mode {
+        bail!("FRL discovery plan mode does not match");
+    }
+    validate_discovery_plan(&envelope.plan)
 }
 
 fn validate_discovery_plan(plan: &FrlDiscoveryPlan) -> Result<()> {
@@ -1813,19 +1951,16 @@ fn commit_state(workspace: &Path, state: &FrlState) -> Result<()> {
     atomic_write_confined(workspace, Path::new(STATE_RELATIVE_PATH), &bytes)
 }
 
-fn acquisition_cache_relative_path(native_id: &str) -> Result<PathBuf> {
+fn staging_relative_path(native_id: &str) -> Result<PathBuf> {
     validate_native_id(native_id)?;
     let digest = format!("{:x}", Sha256::digest(native_id.as_bytes()));
-    Ok(PathBuf::from(ACQUISITION_CACHE_DIR)
+    Ok(PathBuf::from(STAGING_DIR)
         .join(&digest[..2])
         .join(format!("{digest}.json")))
 }
 
-fn load_acquisition_cache_entry(
-    workspace: &Path,
-    native_id: &str,
-) -> Result<Option<FrlInventoryEntry>> {
-    let relative = acquisition_cache_relative_path(native_id)?;
+fn load_staging_entry(workspace: &Path, native_id: &str) -> Result<Option<FrlInventoryEntry>> {
+    let relative = staging_relative_path(native_id)?;
     let path = confined_path(workspace, &relative)?;
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -1833,39 +1968,38 @@ fn load_acquisition_cache_entry(
         Err(error) => return Err(error.into()),
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!("FRL acquisition cache entry must be a real file");
+        bail!("FRL staging entry must be a real file");
     }
     ensure_existing_path_within(workspace, &path)?;
     let bytes = read_bounded_file(&path, MAX_JSON_BODY_BYTES)?;
-    let cached: FrlAcquisitionCacheEntry =
-        serde_json::from_slice(&bytes).context("decoding FRL acquisition cache entry")?;
-    if cached.schema_version != ACQUISITION_CACHE_SCHEMA_VERSION {
-        bail!(
-            "unsupported FRL acquisition cache schema version {}",
-            cached.schema_version
-        );
-    }
-    validate_inventory_entry(native_id, &cached.entry)?;
-    Ok(Some(cached.entry))
+    let staged: FrlInventoryEntry =
+        serde_json::from_slice(&bytes).context("decoding FRL staging entry")?;
+    validate_inventory_entry(native_id, &staged)?;
+    Ok(Some(staged))
 }
 
-fn commit_acquisition_cache_entry(
+fn commit_staging_entry(
     workspace: &Path,
     native_id: &str,
     entry: &FrlInventoryEntry,
 ) -> Result<()> {
     validate_inventory_entry(native_id, entry)?;
-    let cached = FrlAcquisitionCacheEntry {
-        schema_version: ACQUISITION_CACHE_SCHEMA_VERSION,
-        entry: entry.clone(),
-    };
-    let mut bytes = serde_json::to_vec(&cached).context("serializing FRL acquisition cache")?;
+    let mut bytes = serde_json::to_vec(entry).context("serializing FRL staging entry")?;
     bytes.push(b'\n');
-    atomic_write_confined(
-        workspace,
-        &acquisition_cache_relative_path(native_id)?,
-        &bytes,
-    )
+    atomic_write_confined(workspace, &staging_relative_path(native_id)?, &bytes)
+}
+
+fn clear_staging(workspace: &Path) -> Result<()> {
+    let staging = confined_path(workspace, Path::new(STAGING_DIR))?;
+    if !staging.exists() {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(&staging)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("FRL staging path must be a real directory");
+    }
+    ensure_existing_path_within(workspace, &staging)?;
+    fs::remove_dir_all(&staging).context("removing completed FRL staging data")
 }
 
 fn fingerprint_inventory(
@@ -1964,7 +2098,7 @@ fn normalize_document(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("FRL title {} has no display name", title.id))?
         .to_owned();
-    let (cleaned_html, mut assets) = match payload {
+    let (mut cleaned_html, mut assets) = match payload {
         FrlPayload::Epub(bytes) => normalize_epub(&bytes, &title.id)?,
         FrlPayload::Docx(bytes) => normalize_docx(&bytes, &title.id)?,
         FrlPayload::OfficialPdfText(text) => (normalize_official_pdf_text(&text)?, Vec::new()),
@@ -1975,6 +2109,7 @@ fn normalize_document(
             (html, Vec::new())
         }
     };
+    append_low_text_image_ocr(&mut cleaned_html, &assets)?;
     assets.sort_by(|left, right| left.asset_id.cmp(&right.asset_id));
     assets.dedup_by(|left, right| left.asset_id == right.asset_id);
     let document_type = title
@@ -2007,6 +2142,51 @@ fn normalize_document(
     };
     document.content_hash = normalized_content_hash(&document);
     Ok(document)
+}
+
+fn append_low_text_image_ocr(
+    cleaned_html: &mut String,
+    assets: &[FrlNormalizedAsset],
+) -> Result<()> {
+    let visible_characters = scraper::Html::parse_fragment(cleaned_html)
+        .root_element()
+        .text()
+        .flat_map(str::chars)
+        .filter(|character| character.is_alphanumeric())
+        .count();
+    if visible_characters >= MIN_FULL_TEXT_ALPHANUMERIC_CHARS {
+        return Ok(());
+    }
+    let image_assets = assets
+        .iter()
+        .filter(|asset| asset.media_type.starts_with("image/"))
+        .collect::<Vec<_>>();
+    if image_assets.is_empty() {
+        return Ok(());
+    }
+    let mut extracted = Vec::new();
+    for asset in image_assets {
+        if let Ok(text) = crate::official_sources::ocr_image_to_text(&asset.bytes) {
+            extracted.push(text);
+        }
+    }
+    if extracted.is_empty() {
+        return Ok(());
+    }
+    let closing = cleaned_html
+        .rfind("</article>")
+        .ok_or_else(|| anyhow!("normalized FRL HTML has no article boundary"))?;
+    let mut section = String::from("<section><h2>Text extracted from official document image</h2>");
+    for text in extracted {
+        for paragraph in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            section.push_str("<p>");
+            escape_text_into(paragraph, &mut section);
+            section.push_str("</p>");
+        }
+    }
+    section.push_str("</section>");
+    cleaned_html.insert_str(closing, &section);
+    Ok(())
 }
 
 fn normalized_content_hash(document: &FrlNormalizedDocument) -> String {
@@ -2048,10 +2228,7 @@ fn persist_document(
             bail!("FRL normalized asset has an invalid id");
         }
         let digest = format!("{:x}", Sha256::digest(&asset.bytes));
-        let relative = PathBuf::from("frl")
-            .join("assets")
-            .join(&digest[..2])
-            .join(&digest);
+        let relative = PathBuf::from("assets").join(&digest[..2]).join(&digest);
         write_immutable_confined(workspace, &relative, &asset.bytes)?;
         stored_assets.push(StoredAsset {
             asset_id: asset.asset_id.clone(),
@@ -2075,8 +2252,7 @@ fn persist_document(
     };
     let mut bytes = serde_json::to_vec(&stored).context("serializing normalized FRL document")?;
     bytes.push(b'\n');
-    let relative = PathBuf::from("frl")
-        .join("documents")
+    let relative = PathBuf::from("documents")
         .join(&document.content_hash[..2])
         .join(format!("{}.json", document.content_hash));
     write_immutable_confined(workspace, &relative, &bytes)?;
@@ -2085,7 +2261,9 @@ fn persist_document(
     })
 }
 
-pub(crate) fn load_normalized_documents(workspace: &Path) -> Result<Vec<NormalizedDocument>> {
+pub(crate) fn normalized_document_results(
+    workspace: &Path,
+) -> Result<Box<dyn Iterator<Item = Result<NormalizedDocument>>>> {
     ensure_real_directory(workspace, "FRL workspace")?;
     let state_path = confined_path(workspace, Path::new(STATE_RELATIVE_PATH))?;
     if !state_path.is_file() {
@@ -2099,14 +2277,34 @@ pub(crate) fn load_normalized_documents(workspace: &Path) -> Result<Vec<Normaliz
         bail!("FRL committed authoritative inventory is empty");
     }
     let source: SourceId = FRL_SOURCE_ID.parse()?;
-    let mut documents = Vec::with_capacity(state.inventory.len());
-    for (native_id, entry) in state.inventory {
-        documents.push(load_inventory_document(
-            workspace, &source, &native_id, &entry,
-        )?);
-    }
-    documents.sort_by(|left, right| left.inventory.document.cmp(&right.inventory.document));
-    Ok(documents)
+    let link_map = state
+        .inventory
+        .values()
+        .map(|entry| {
+            Ok((
+                Url::parse(&entry.canonical_url)?.to_string(),
+                DocumentId::new(source.clone(), entry.native_id.clone())?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let workspace = workspace.to_path_buf();
+    Ok(Box::new(state.inventory.into_iter().map(
+        move |(native_id, entry)| {
+            let mut document = load_inventory_document(&workspace, &source, &native_id, &entry)?;
+            document.html = crate::official_sources::rewrite_internal_document_links(
+                &document.html,
+                &document.inventory.canonical_url,
+                &link_map,
+            )?;
+            document.validate()?;
+            Ok(document)
+        },
+    )))
+}
+
+#[cfg(test)]
+pub(crate) fn load_normalized_documents(workspace: &Path) -> Result<Vec<NormalizedDocument>> {
+    normalized_document_results(workspace)?.collect()
 }
 
 fn load_inventory_document(
@@ -2116,8 +2314,7 @@ fn load_inventory_document(
     entry: &FrlInventoryEntry,
 ) -> Result<NormalizedDocument> {
     validate_inventory_entry(native_id, entry)?;
-    let relative = PathBuf::from("frl")
-        .join("documents")
+    let relative = PathBuf::from("documents")
         .join(&entry.payload_hash[..2])
         .join(format!("{}.json", entry.payload_hash));
     let path = confined_path(workspace, &relative)?;
@@ -2289,7 +2486,7 @@ fn normalize_epub(bytes: &[u8], native_id: &str) -> Result<(String, Vec<FrlNorma
         .values()
         .map(|item| (item.path.clone(), item.media_type.clone()))
         .collect::<BTreeMap<_, _>>();
-    let mut assets = AssetCollector::new(native_id)?;
+    let mut assets = AssetCollector::new(FRL_SOURCE_ID, native_id)?;
     let mut html = String::from("<article>");
     for (index, path) in spine.iter().enumerate() {
         let source = archive_text(&archive, path, "EPUB spine document")?;
@@ -2523,6 +2720,38 @@ fn rewrite_epub_href(
 }
 
 fn normalize_docx(bytes: &[u8], native_id: &str) -> Result<(String, Vec<FrlNormalizedAsset>)> {
+    normalize_docx_with_source(bytes, FRL_SOURCE_ID, native_id)
+}
+
+pub(crate) fn normalize_docx_for_source(
+    bytes: &[u8],
+    source: &SourceId,
+    native_id: &str,
+) -> Result<(String, Vec<NormalizedAsset>)> {
+    let (html, assets) = normalize_docx_with_source(bytes, source.as_str(), native_id)?;
+    let assets = assets
+        .into_iter()
+        .map(|asset| {
+            let sha256 = format!("{:x}", Sha256::digest(&asset.bytes));
+            NormalizedAsset::new(
+                AssetRef::new(source.clone(), asset.asset_id)?,
+                asset.media_type,
+                None,
+                None,
+                sha256,
+                asset.bytes,
+            )
+            .map_err(Into::into)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((html, assets))
+}
+
+fn normalize_docx_with_source(
+    bytes: &[u8],
+    source_id: &str,
+    native_id: &str,
+) -> Result<(String, Vec<FrlNormalizedAsset>)> {
     let archive = read_zip_archive(bytes, "DOCX")?;
     let document_path = Path::new("word/document.xml");
     let document = archive_text(&archive, document_path, "DOCX document")?;
@@ -2532,7 +2761,7 @@ fn normalize_docx(bytes: &[u8], native_id: &str) -> Result<(String, Vec<FrlNorma
     let body = descendants(&xml)
         .find(|node| local_name(&node.name) == "body")
         .ok_or_else(|| anyhow!("DOCX document has no body"))?;
-    let mut assets = AssetCollector::new(native_id)?;
+    let mut assets = AssetCollector::new(source_id, native_id)?;
     let mut html = String::from("<article>");
     let mut sink = HtmlSink::new(&mut html);
     for child in &body.children {
@@ -2835,14 +3064,17 @@ fn heading_tag(style: Option<&str>) -> Option<&'static str> {
 }
 
 struct AssetCollector {
+    source_id: String,
     native_id: String,
     assets: BTreeMap<String, FrlNormalizedAsset>,
 }
 
 impl AssetCollector {
-    fn new(native_id: &str) -> Result<Self> {
-        validate_native_id(native_id)?;
+    fn new(source_id: &str, native_id: &str) -> Result<Self> {
+        let source = SourceId::new(source_id)?;
+        DocumentId::new(source, native_id.to_owned())?;
         Ok(Self {
+            source_id: source_id.to_owned(),
             native_id: native_id.to_owned(),
             assets: BTreeMap::new(),
         })
@@ -2869,7 +3101,7 @@ impl AssetCollector {
                 media_type,
                 bytes,
             });
-        Ok(format!("{FRL_SOURCE_ID}:{asset_id}"))
+        Ok(format!("{}:{asset_id}", self.source_id))
     }
 
     fn into_vec(self) -> Vec<FrlNormalizedAsset> {
@@ -3991,11 +4223,51 @@ mod tests {
         assert_eq!(
             FRL_ACQUISITION.rate_policy(),
             SourceRatePolicy {
-                minimum_request_interval_ms: 250,
-                max_concurrency: 2,
+                minimum_request_interval_ms: 0,
                 request_timeout_seconds: 30,
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn saved_discovery_plan_is_validated_before_reuse() -> Result<()> {
+        let workspace = tempdir()?;
+        let run_dir = tempdir()?;
+        let selected_version = version("A0001", "2024-01-16T00:00:00");
+        let envelope = FrlDiscoveryEnvelope {
+            schema_version: DISCOVERY_SCHEMA_VERSION,
+            source: FRL_SOURCE_ID.to_owned(),
+            mode: SourceUpdateMode::Full,
+            plan: FrlDiscoveryPlan {
+                authoritative_titles: vec![title("A0001", "One")],
+                versions: vec![selected_version.clone()],
+                proposed_cursor: FrlCursor::from_version(&selected_version)?,
+            },
+        };
+        fs::write(
+            run_dir.path().join(DISCOVERY_FILE_NAME),
+            serde_json::to_vec(&envelope)?,
+        )?;
+        let discovery = discover_to_run_dir(
+            &FakeApi::default(),
+            workspace.path(),
+            run_dir.path(),
+            SourceUpdateMode::Full,
+            Utc::now().naive_utc(),
+            10,
+        )?;
+        assert_eq!(discovery.records, 1);
+        let error = discover_to_run_dir(
+            &FakeApi::default(),
+            workspace.path(),
+            run_dir.path(),
+            SourceUpdateMode::Incremental,
+            Utc::now().naive_utc(),
+            10,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("mode does not match"));
         Ok(())
     }
 
@@ -4259,7 +4531,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_full_update_resumes_from_verified_acquisition_cache() -> Result<()> {
+    fn failed_full_update_resumes_from_verified_staging() -> Result<()> {
         let workspace = tempdir()?;
         let first_version = version("A0001", "2024-01-16T00:00:00");
         let second_version = version("A0002", "2024-01-17T00:00:00");
@@ -4280,7 +4552,7 @@ mod tests {
             .with_payload("Word", Err("fixture interruption".to_owned()));
         assert!(fetch_plan(&first_api, workspace.path(), plan.clone(), 10).is_err());
         assert!(load_state(workspace.path())?.inventory.is_empty());
-        assert!(load_acquisition_cache_entry(workspace.path(), "A0001")?.is_some());
+        assert!(load_staging_entry(workspace.path(), "A0001")?.is_some());
 
         let resumed_api = FakeApi::default()
             .with_document_pages("A0002", vec![vec![rendition("A0002", "Word", ".docx")?]])?
@@ -4328,10 +4600,9 @@ mod tests {
             },
             10,
         )?;
-        assert_eq!(
-            api.max_active_fetches.load(AtomicOrdering::SeqCst),
-            FRL_MAX_CONCURRENCY
-        );
+        let observed = api.max_active_fetches.load(AtomicOrdering::SeqCst);
+        assert_eq!(observed, 2);
+        assert!(observed <= SOURCE_WORKER_CEILING);
         Ok(())
     }
 
@@ -4491,11 +4762,11 @@ mod tests {
         let ann_root = tempdir()?;
         let ann = crate::pipeline::finalise_source_ann(&conn, &source, ann_root.path())?;
         assert_eq!(ann.source_id, source);
-        assert!(ann_root.path().join(ann.url).is_file());
+        assert!(ann_root.path().join(ann.path).is_file());
 
         let stored_path = workspace
             .path()
-            .join("frl/documents")
+            .join("documents")
             .join(&stored_hash[..2])
             .join(format!("{stored_hash}.json"));
         let mut tampered: serde_json::Value = serde_json::from_slice(&fs::read(&stored_path)?)?;
@@ -4509,8 +4780,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the pinned Granite ONNX model bundle"]
-    fn real_ato_and_frl_fixtures_build_one_verified_generation() -> Result<()> {
+    #[ignore = "requires the pinned ONNX embedding model bundle"]
+    fn registered_source_fixtures_build_one_verified_generation() -> Result<()> {
         let model_dir = std::env::var_os("LEGAL_MCP_TEST_MODEL_DIR")
             .map(PathBuf::from)
             .ok_or_else(|| anyhow!("LEGAL_MCP_TEST_MODEL_DIR is required"))?;
@@ -4575,9 +4846,25 @@ mod tests {
 
         let output = root.path().join("generation");
         let database = output.join(crate::config::LEGAL_DB_FILENAME);
+        let mut source_workspaces = BTreeMap::from([
+            (
+                crate::source_catalog::ATO_SOURCE_ID.parse()?,
+                ato_workspace.clone(),
+            ),
+            (FRL_SOURCE_ID.parse()?, frl_workspace.clone()),
+        ]);
+        for source in crate::legal_source::source_registry().source_ids() {
+            if matches!(source, crate::source_catalog::ATO_SOURCE_ID | FRL_SOURCE_ID) {
+                continue;
+            }
+            let source_id: SourceId = source.parse()?;
+            let workspace = root.path().join(source);
+            fs::create_dir_all(&workspace)?;
+            crate::official_sources::seed_test_workspace(&source_id, &workspace)?;
+            source_workspaces.insert(source_id, workspace);
+        }
         crate::build::build_corpus(crate::build::BuildCorpusArgs {
-            pages_dir: &ato_workspace,
-            frl_workspace: &frl_workspace,
+            source_workspaces: &source_workspaces,
             db_path: &database,
             model_dir: &model_dir,
             embedding_cache_db: None,
@@ -4585,18 +4872,16 @@ mod tests {
             zstd_level: 1,
             profile_enabled: false,
         })?;
-        let manifest_path = output.join("manifest.json");
-        let database_artifact = output.join("legal.db.zst");
-        let artifact = crate::build::package_corpus(&database, &database_artifact, 1)?;
-        crate::build::update_manifest_with_db(&manifest_path, &database_artifact, &artifact)?;
+        let manifest_path = output.join(crate::config::GENERATION_MANIFEST_FILENAME);
         let manifest: crate::source::Manifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
         let connection = rusqlite::Connection::open(&database)?;
         crate::source::validate_manifest(&manifest)?;
         crate::source::verify_corpus_manifest_binding(&connection, &manifest)?;
         crate::source::verify_semantic_install(&connection, &manifest)?;
         for (source, ann) in &manifest.ann {
-            crate::ann::verify_sidecar(&output.join(&ann.url), source, ann)?;
+            crate::ann::verify_sidecar(&output.join(&ann.path), source, ann)?;
         }
+        crate::source::validate_generation_dir(&output)?;
         Ok(())
     }
 
@@ -4621,13 +4906,13 @@ mod tests {
     #[test]
     fn asset_identity_binds_media_type_and_bytes() -> Result<()> {
         let bytes = vec![1, 2, 3, 4];
-        let mut assets = AssetCollector::new("A0001")?;
+        let mut assets = AssetCollector::new(FRL_SOURCE_ID, "A0001")?;
         let png = assets.insert(bytes.clone(), "image/png".to_owned())?;
         let jpeg = assets.insert(bytes.clone(), "image/jpeg".to_owned())?;
         assert_ne!(png, jpeg);
         assert_eq!(assets.into_vec().len(), 2);
         let same_asset_in_another_document =
-            AssetCollector::new("A0002")?.insert(bytes, "image/png".to_owned())?;
+            AssetCollector::new(FRL_SOURCE_ID, "A0002")?.insert(bytes, "image/png".to_owned())?;
         assert_ne!(png, same_asset_in_another_document);
         Ok(())
     }

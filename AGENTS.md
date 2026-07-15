@@ -1,51 +1,47 @@
 # AGENTS.md
 
-Instructions for agents developing, installing or operating Australian Legal
-MCP. Read [README.md](./README.md) for the user surface,
-[MAINTENANCE.md](./MAINTENANCE.md) for release operations,
-[CURRENT_STATE.md](./CURRENT_STATE.md) for the implementation snapshot and
-[PLAN.md](./PLAN.md) for planned source and deployment work.
+Instructions for agents developing, installing, or operating Australian Legal
+MCP. Read [README.md](README.md), [MAINTENANCE.md](MAINTENANCE.md),
+[CURRENT_STATE.md](CURRENT_STATE.md), and [DEPLOYMENT.md](DEPLOYMENT.md).
 
-## Canonical product contract
+## Canonical contract
 
-| Concern | Canonical value |
+| Concern | Value |
 |---|---|
-| Product and package | `australian-legal-mcp` |
+| Product/package | `australian-legal-mcp` |
 | Executable | `legal-mcp` |
 | MCP key | `australian-legal` |
-| Environment variables | `LEGAL_MCP_*` |
+| Environment prefix | `LEGAL_MCP_*` |
 | Repository | `gunba/australian-legal-mcp` |
-| Data directory name | `australian-legal-mcp` |
-| Corpus database | `legal.db` |
+| Project data root | `data/` |
+| Runtime selector | `LEGAL_MCP_DATA_DIR` |
+| Corpus DB | `legal.db` |
+| Generation contract | `generation.json` |
 | ANN sidecars | `ann/<source>.ann` |
-| Registered sources | `ato`, `frl` |
-| Live document URI | `legal://<source>/<encoded-native-id>` |
+| Sources | `ato`, `frl`, `federal-court`, `high-court`, `nsw-caselaw`, `nsw-legislation`, `qld-legislation`, `wa-legislation`, `sa-legislation`, `tas-legislation` |
+| Live URI | `legal://<source>/<encoded-native-id>` |
 
-The current implementation is one `legal-mcp` binary. It owns local MCP
-transport, corpus installation, retrieval and maintainer source/build commands.
-Public remote serving, deployment-role separation and Azure are planned work.
+Source acquisition, OCR, embeddings, and corpus construction run on the local
+RTX maintainer host. A complete generation is validated and atomically
+activated, then transferred directly over SSH to a CPU serving host. The serving
+runtime never downloads, scrapes, embeds, packages, or publishes corpus/model
+artifacts. GitHub Releases are binary-only.
 
 ## Design principles
 
-Australian Legal MCP exposes compact, source-grounded retrieval primitives and
-lets agents perform legal reasoning. Prefer deterministic features derived from
-stable official source structure, few parameters and minimal response context.
+Expose compact source-grounded retrieval primitives and let agents reason.
+Prefer deterministic structure from official sources, typed identities, few
+parameters, and minimal response context. Every concern has one path: one
+source-qualified identity model, schema, generation layout, URI syntax, and MCP
+surface. Do not add guessed aliases, hand-maintained Act maps, brittle prose
+interpretation, compatibility shims, or parallel lifecycle paths.
 
-Every public concern has one canonical path: one source-qualified identity
-model, one corpus schema, one generation layout, one URI syntax and one MCP
-surface. Runtime logic follows typed source adapters and structured upstream
-data rather than guessed aliases, hand-maintained Act maps or prose heuristics.
+Preserve cleaned structural HTML. Internal links become deterministic typed
+document references; retained images become typed asset references. Search text
+is source-derived plain text. Builds consume committed workspaces only and
+perform no scraping.
 
-The document surface is cleaned structural HTML. Preserve useful tags and
-attributes so agents can navigate source structure directly. Internal links
-become deterministic source-qualified document references, and retained images
-become compact source-qualified asset references. Search text is plain text
-derived from that HTML; headings remain metadata, while links and images
-contribute useful visible text.
-
-## Public MCP surface
-
-Expose exactly these seven tools:
+## Exactly seven MCP tools
 
 - `search`
 - `get_chunks`
@@ -55,171 +51,128 @@ Expose exactly these seven tools:
 - `stats`
 - `fetch`
 
-A search resolves exactly one registered source; omission selects `ato`. Public
-document, chunk and asset references carry their source, and chunk references
-also carry their corpus generation. Continuations preserve every explicit
-source and filter.
+Every source-scoped request requires exactly one registered source. Public
+`DocumentId`, `ChunkRef`, and `AssetRef` values remain typed; chunk references
+also carry the generation. Continuations preserve all explicit filters.
 
-`fetch` accepts a canonical `legal://` URI. The host is a registered source and
-the native ID is one percent-encoded path segment. Reject whitespace, fragments,
-credentials, ports, noncanonical escapes, extra path segments and unrecognised
-query keys. ATO `pit` and `view` query values are preserved through typed URI
-parsing.
+`fetch` accepts only canonical `legal://SOURCE/PERCENT_ENCODED_NATIVE_ID` with
+allowlisted typed query keys. Reject whitespace, fragments, credentials, ports,
+extra path segments, noncanonical escapes, and unregistered sources. Canonical
+URLs are stored official upstream values and are never reconstructed.
 
-Tool responses contain information a legal-research agent can navigate, quote or
-cite. Keep ranking internals, model identifiers, candidate counts, chunk
-ordinals, query echoes and diagnostic counters out of public payloads. Optional
-empty fields are omitted rather than serialised as `null`.
+Keep ranking internals, model IDs, candidate counts, chunk ordinals, and debug
+counters out of public responses. Omit empty optional fields rather than using
+`null`.
 
-## Source and update invariants
+## Source, build, and activation invariants
 
-Each source owns its descriptor, official upstreams, discovery cursor,
-inventory,
-rate policy, retry policy, normalization hooks and fixtures. Source discovery
-jobs run concurrently under independent limits. A failed source retains its last
-publishable state; successful sources continue to validation and publication.
+Authoritative current workspaces are `data/sources/<source>` and remain flat:
+`state.json`, `documents/`, `assets/`, and temporary `staging/`. Fresh/failed/
+rollback stores belong under `data/source-snapshots`; run state under
+`data/runs`; disposable caches under `data/cache`; evidence under `data/logs`
+and `data/validation`.
 
-Incremental acquisition is the routine path: discover an overlap window, dedupe
-by stable native ID, fetch changed records, normalize, and commit the cursor
-only
-after the source result is durable. A full inventory is authoritative. Reconcile
-it inside one source transaction and directly delete source rows absent from
-that
-inventory.
+Each adapter owns official upstreams, incremental/full discovery, inventory,
+rate/retry policy, normalization, provenance, and fixtures. Concurrent failures
+remain source-isolated, but broad failure aborts. Reject empty/duplicate/unsafe/
+catastrophically shrunken inventories and less than 99% usable full text.
+Authoritative stable 404s and genuinely unavailable renditions may be omitted.
+Do not convert parser, OCR, or network failure into metadata-only content.
 
-Every publication builds a fresh `legal.db`. Rechunk changed documents, reuse
-embeddings by approved model and chunk-text hash, rebuild the affected
-`ann/<source>.ann`, run source and corpus checks, then assemble one immutable
-generation. `active-generation` is the only activation point.
+Full repair uses a fresh complete source set and one atomic same-filesystem set
+exchange after build/activation validation. Never overwrite committed stores in
+place. Embedding reuse is disposable acceleration keyed only by exact
+`(model_id, chunk_text_sha256)`.
 
-### ATO (`ato`)
+Every generation contains exact DB, model, tokenizer, and ten ANN bindings.
+Validation checks hashes, schema, source set, relational integrity, FTS, model,
+and ANN metadata before making the directory read-only. `active-generation` is
+the sole atomic switch. Installed generations are immutable and rollback-capable.
+Never delete the active or last known-good generation before strict verification.
 
-Use `/home/jordan/Desktop/Projects/ato_pages` as the integrity-pinned ATO source
-workspace. Routine runs use its `index.jsonl`, payload tree and What's New
-discovery, then fetch discovered changed links. A full ATO acquisition is an
-explicitly authorised repair operation.
+### ATO
 
-Preserve the proven ATO request policy: one shared 50 ms issue interval, four
-fetch workers and a 30-second request timeout. Validate declared payload sizes
-and SHA-256 values before normalization.
+Use `data/sources/ato`. Preserve What's New behavior, the shared 50 ms issue
+interval, adaptive concurrency under the ten-request ceiling, 30-second timeout,
+exact payload size/hash validation, and pinned normalization fixtures.
 
-Preserve current-guidance search policy:
+Search remains current-guidance-first: `EV` only by explicit type; old
+non-legislation requires `include_old=true`; legislation is exempt; and
+`current_only=true` filters withdrawn/superseded rulings.
 
-- `EV` is selected only through an explicit `types` request;
-- `include_old=true` includes non-legislation dated before `2000-01-01`;
-- legislation is exempt from the date cutoff;
-- `current_only=true` filters withdrawn and superseded rulings.
+### FRL and other official sources
 
-### Federal Register of Legislation (`frl`)
+FRL uses `https://api.prod.legislation.gov.au/v1/`, stable title/version
+ordering, and EPUB → DOCX → PDF preference. The court and state adapters use
+only official publisher surfaces. Shared acquisition enforces HTTPS host and
+redirect allowlists, bounded response/decompression sizes, retries, adaptive
+concurrency, structured audit records, and official provenance.
 
-Use the official API at `https://api.prod.legislation.gov.au/v1/`. Initial
-reconciliation pages `Titles` by stable `id` with `$top` at most 100.
-Incremental
-discovery pages `Versions` from a seven-day overlap boundary, ordered by
-`registeredAt`, `titleId`, `start` and `retrospectiveStart`. Persist the full
-cursor tuple and deduplicate the overlap.
+Federal Court protected document hosts alone use bounded Chrome/Chromium CDP;
+discovery and all other sources use ordinary HTTP. Full text comes from official
+HTML, DOCX, RTF/Word, PDF/OCR, or official extracted text.
 
-Use `titleId` as the stable native document ID, the version tuple as version
-identity and `registerId` as registration provenance. Enumerate `Documents` for
-the selected version and prefer official authorised EPUB, then DOCX, then
-official extracted PDF text. The initial source policy is two concurrent
-operations, a 250 ms issue interval, a 30-second request timeout and bounded
-exponential backoff with jitter.
+## Build/model contract
 
-Periodic authoritative `Titles` reconciliation directly deletes records that
-are absent or outside the selected current corpus.
+Maintainer builds use the pinned unpacked model at
+`data/models/mdbr-leaf-ir-standard`, deterministic FP32 ONNX with TensorRT FP16
+and CUDA fallback, profiles `1x1` through `64x512`, and
+`MALLOC_ARENA_MAX=24`. Documents are unprefixed; queries use exactly
+`Represent this sentence for searching relevant passages: `. Split losslessly
+at 512 tokens; store normalized int8 first-256-dimension vectors.
 
-## Clean-room source development
+ANN proposes candidates; SQLite vectors are authoritative for exact reranking.
+Keep deterministic Arroy construction and source-qualified schema 10.
 
-OALCC is behavioural research evidence for endpoint discovery, pagination, rate
-limits, format selection and browser requirements. Implement adapters from
-official upstream contracts and independently captured fixtures. Record the
-official URL, native identity, pagination, provenance, format selection and
-measured rate policy for every adapter.
+Maintainer dependencies are `unrtf`, `antiword`, `soffice`, `pdftotext`,
+`pdftoppm`, `tesseract`, and Chrome/Chromium for Federal Court. Serving is
+CPU-safe.
 
-Register a source when acquisition, normalization, source-qualified indexing,
-search, assets, links, quality fixtures and update reconciliation work end to
-end. New sources use the shared cleaned-HTML and retrieval syntax rather than
-source-specific public tools.
+## Operate
 
-## Install and operate
-
-Use the release executable and the canonical MCP entry:
-
-```json
-{
-  "mcpServers": {
-    "australian-legal": {
-      "command": "legal-mcp",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-`legal-mcp mcp` starts or reuses one loopback backend for the selected data
-directory. Installer agents choose a stable data directory once and supply the
-same `LEGAL_MCP_DATA_DIR` to every command when overriding the platform default.
-The first corpus install is a large verified download; explain it and obtain
-approval before running `legal-mcp update`.
-
-Verify an installation with:
-
-```bash
-legal-mcp stats
-legal-mcp search "research and development tax incentive eligibility" \
-  --source ato --k 5
-legal-mcp search "income tax assessment act" --source frl --k 5
-```
-
-Inside the MCP host, call `stats` and a source-specific `search`; confirm
-results
-contain exact `canonical_url` values and resolvable source-qualified references.
-
-## Maintainer boundary
-
-Corpus acquisition, builds and publication run from the maintainer checkout.
-Build release binaries and corpus tooling with:
+Local maintainer lifecycle:
 
 ```bash
 cargo build --release --features cuda
+scripts/maintainer-sync.sh             # or --full
+LEGAL_MCP_DATA_DIR="$PWD/data/runtime" legal-mcp verify
+scripts/deploy-generation.sh deploy@example-vps
 ```
 
-The CUDA feature selects the GPU execution provider for maintainer embedding
-work. End-user `update`, `stats`, `search`, `fetch`, `mcp` and `serve` use the
-CPU-safe runtime.
+Manual recovery uses `activate`, `verify`, `rollback`, and
+`prune-generations`. There is no runtime `update`, corpus download, corpus/model
+package, publication, or offline-bundle command.
 
-Treat installed generation directories as immutable. Serialize `legal-mcp
-update` with its data-directory lock and serialize source updates with each
-workspace lock. Keep the ATO source workspace, FRL workspace, run output and
-published data directory as distinct stable paths.
+The hosted service runs `legal-mcp serve` on loopback behind private Tailscale
+HTTPS. Local stdio development may use `legal-mcp mcp`. Never expose port 51235
+publicly or substitute a shared static token for proper private identity/OAuth.
 
 ## Validation
 
-Before publication, run:
+Before activation or direct SSH deployment:
 
 ```bash
 cargo fmt --all -- --check
-cargo test --locked --all-features
-cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --workspace --locked --all-features
+cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
+cargo audit
+cargo deny check advisories
 bash -n scripts/*.sh
 git diff --check
-scripts/smoke.sh
+LEGAL_MCP_DATA_DIR="$PWD/data/runtime" scripts/smoke.sh
 ```
 
-Validate both sources, strict source isolation, canonical URI rejection cases,
-authoritative deletion, source failure isolation, embedding reuse, per-source
-ANN recall, manifest integrity and atomic activation.
+Also prove failed activation preserves the prior pointer, rollback, pruning,
+exact-generation `/readyz`, service restart persistence, all-source retrieval,
+and per-source ANN recall ≥ 0.99 at 50.
 
 ## Troubleshooting
 
-- **`legal-mcp` is not found:** Install the release executable in a stable
-  directory on `PATH`, then verify `legal-mcp --version`.
-- **MCP stdio startup fails:** Confirm `mcpServers.australian-legal` runs
-  `legal-mcp mcp` and inherits the intended `LEGAL_MCP_DATA_DIR`.
-- **Local backend bind fails:** Stop the process holding the port or run
-  `legal-mcp serve --port <port>` for a deliberate local test.
-- **Corpus is unavailable:** Run `legal-mcp update` with approval, restart the
-  MCP host/backend and inspect `legal-mcp stats`.
-- **A source search is empty:** Confirm the source appears in `stats`, inspect
-  its type/date policy and retry with an explicit source.
+- Missing active corpus: do not suggest a download. Locate/build a validated
+  generation, activate it, or roll back.
+- Hosted endpoint failure: check Tailscale, `/livez`, `/readyz`,
+  `systemctl status legal-mcp.service`, and `journalctl -u legal-mcp.service`.
+- Local stdio failure: confirm `legal-mcp mcp` and the intended
+  `LEGAL_MCP_DATA_DIR`.
+- Empty search: require the explicit source, inspect `stats`, and check type/date
+  policy.

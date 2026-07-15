@@ -4,7 +4,7 @@
 
 use crate::config::tokenizer_path;
 use crate::html::{collect_referenced_anchors, render_node};
-use crate::EMBEDDING_TEXT_PREFIX;
+use crate::{DOCUMENT_EMBEDDING_PREFIX, EMBEDDING_INPUT_MAX_TOKENS};
 use regex::Regex;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -21,8 +21,8 @@ use tokenizers::Tokenizer;
 
 // Checkpoints pin CHUNKER_FORMAT_VERSION; changing output shape
 // forces an explicit fresh build instead of resuming stale chunk records.
-pub(crate) const CHUNKER_FORMAT_VERSION: u32 = 3;
-pub(crate) const EMBED_MAX_TOKENS: usize = 1024;
+pub(crate) const CHUNKER_FORMAT_VERSION: u32 = 4;
+pub(crate) const EMBED_MAX_TOKENS: usize = EMBEDDING_INPUT_MAX_TOKENS;
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct Chunk {
@@ -30,6 +30,10 @@ pub(crate) struct Chunk {
     pub(crate) anchor: Option<String>,
     pub(crate) text: String,
     pub(crate) definition_text: Option<String>,
+    #[serde(skip)]
+    pub(crate) token_count: usize,
+    #[serde(skip)]
+    pub(crate) embedding_token_ids: Option<Vec<i64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -653,6 +657,8 @@ pub(crate) fn chunker_pack(blocks: Vec<ChunkBlock>, max_tokens: usize) -> Vec<Ch
             } else {
                 None
             },
+            token_count: 0,
+            embedding_token_ids: None,
         });
         *ord_counter += 1;
         current_text.clear();
@@ -679,6 +685,8 @@ pub(crate) fn chunker_pack(blocks: Vec<ChunkBlock>, max_tokens: usize) -> Vec<Ch
                     anchor: block.anchor.clone(),
                     text: text.clone(),
                     definition_text: if defn != text { Some(defn) } else { None },
+                    token_count: 0,
+                    embedding_token_ids: None,
                 });
                 ord_counter += 1;
             }
@@ -736,10 +744,27 @@ fn chunker_enforce_final_token_limit_result<F>(
 where
     F: Fn(&str) -> anyhow::Result<usize>,
 {
+    chunker_enforce_final_token_limit_prepared(chunks, max_tokens, |text| {
+        token_count(text).map(|count| (count, None))
+    })
+}
+
+fn chunker_enforce_final_token_limit_prepared<F>(
+    chunks: Vec<Chunk>,
+    max_tokens: usize,
+    prepare_tokens: F,
+) -> anyhow::Result<Vec<Chunk>>
+where
+    F: Fn(&str) -> anyhow::Result<(usize, Option<Vec<i64>>)>,
+{
     let mut output = Vec::new();
-    for chunk in chunks {
-        let prefixed_count = |text: &str| token_count(&format!("{EMBEDDING_TEXT_PREFIX}{text}"));
-        if prefixed_count(&chunk.text)? <= max_tokens {
+    for mut chunk in chunks {
+        let prefixed_tokens =
+            |text: &str| prepare_tokens(&format!("{DOCUMENT_EMBEDDING_PREFIX}{text}"));
+        let (chunk_token_count, chunk_token_ids) = prefixed_tokens(&chunk.text)?;
+        if chunk_token_count <= max_tokens {
+            chunk.token_count = chunk_token_count;
+            chunk.embedding_token_ids = chunk_token_ids;
             output.push(chunk);
             continue;
         }
@@ -747,8 +772,9 @@ where
         let mut pieces = Vec::new();
         let mut remaining = chunk.text.as_str();
         while !remaining.is_empty() {
-            if prefixed_count(remaining)? <= max_tokens {
-                pieces.push(remaining.to_string());
+            let (remaining_count, remaining_ids) = prefixed_tokens(remaining)?;
+            if remaining_count <= max_tokens {
+                pieces.push((remaining.to_string(), remaining_count, remaining_ids));
                 break;
             }
             let boundaries = remaining
@@ -761,7 +787,7 @@ where
             let mut high = boundaries.len();
             while low < high {
                 let mid = low + (high - low) / 2;
-                if prefixed_count(&remaining[..boundaries[mid]])? <= max_tokens {
+                if prefixed_tokens(&remaining[..boundaries[mid]])?.0 <= max_tokens {
                     low = mid + 1;
                 } else {
                     high = mid;
@@ -771,11 +797,13 @@ where
                 anyhow::bail!("a single character exceeds the tokenizer limit");
             }
             let split = boundaries[low - 1];
-            pieces.push(remaining[..split].to_string());
+            let piece = remaining[..split].to_string();
+            let (piece_count, piece_ids) = prefixed_tokens(&piece)?;
+            pieces.push((piece, piece_count, piece_ids));
             remaining = &remaining[split..];
         }
 
-        for (piece_index, piece) in pieces.into_iter().enumerate() {
+        for (piece_index, (piece, token_count, token_ids)) in pieces.into_iter().enumerate() {
             output.push(Chunk {
                 ord: output.len() as i64,
                 anchor: chunk.anchor.clone(),
@@ -783,6 +811,8 @@ where
                 definition_text: (piece_index == 0)
                     .then(|| chunk.definition_text.clone())
                     .flatten(),
+                token_count,
+                embedding_token_ids: token_ids,
             });
         }
     }
@@ -805,9 +835,13 @@ fn chunker_apply_live_tokenizer_limit(chunks: Vec<Chunk>, max_tokens: usize) -> 
         if let Some(tokenizer) = cache.get(&path) {
             Arc::clone(tokenizer)
         } else {
-            let Ok(tokenizer) = Tokenizer::from_file(&path) else {
+            let Ok(mut tokenizer) = Tokenizer::from_file(&path) else {
                 return chunks;
             };
+            if tokenizer.with_truncation(None).is_err() {
+                return chunks;
+            }
+            tokenizer.with_padding(None);
             let tokenizer = Arc::new(tokenizer);
             cache.insert(path, Arc::clone(&tokenizer));
             tokenizer
@@ -827,6 +861,7 @@ pub(crate) fn chunk_html(html: &str, root_title: Option<&str>, max_tokens: usize
     chunker_apply_live_tokenizer_limit(chunks, max_tokens)
 }
 
+#[cfg(test)]
 pub(crate) fn chunk_html_with_token_count<F>(
     html: &str,
     root_title: Option<&str>,
@@ -836,8 +871,35 @@ pub(crate) fn chunk_html_with_token_count<F>(
 where
     F: Fn(&str) -> anyhow::Result<usize>,
 {
-    let chunks = chunk_html_packed(html, root_title, max_tokens);
+    let doc = scraper::Html::parse_fragment(html);
+    chunk_fragment_with_token_count(&doc, root_title, max_tokens, token_count)
+}
+
+#[cfg(test)]
+pub(crate) fn chunk_fragment_with_token_count<F>(
+    doc: &scraper::Html,
+    root_title: Option<&str>,
+    max_tokens: usize,
+    token_count: F,
+) -> anyhow::Result<Vec<Chunk>>
+where
+    F: Fn(&str) -> anyhow::Result<usize>,
+{
+    let chunks = chunk_fragment_packed(doc, root_title, max_tokens);
     chunker_enforce_final_token_limit_result(chunks, max_tokens, token_count)
+}
+
+pub(crate) fn chunk_fragment_with_prepared_tokens<F>(
+    doc: &scraper::Html,
+    root_title: Option<&str>,
+    max_tokens: usize,
+    prepare_tokens: F,
+) -> anyhow::Result<Vec<Chunk>>
+where
+    F: Fn(&str) -> anyhow::Result<(usize, Option<Vec<i64>>)>,
+{
+    let chunks = chunk_fragment_packed(doc, root_title, max_tokens);
+    chunker_enforce_final_token_limit_prepared(chunks, max_tokens, prepare_tokens)
 }
 
 fn chunk_html_packed(html: &str, root_title: Option<&str>, max_tokens: usize) -> Vec<Chunk> {
@@ -845,7 +907,15 @@ fn chunk_html_packed(html: &str, root_title: Option<&str>, max_tokens: usize) ->
         return Vec::new();
     }
     let doc = scraper::Html::parse_fragment(html);
-    let referenced = collect_referenced_anchors(&doc);
+    chunk_fragment_packed(&doc, root_title, max_tokens)
+}
+
+fn chunk_fragment_packed(
+    doc: &scraper::Html,
+    root_title: Option<&str>,
+    max_tokens: usize,
+) -> Vec<Chunk> {
+    let referenced = collect_referenced_anchors(doc);
     let root = doc.root_element();
     let mut blocks: Vec<ChunkBlock> = Vec::new();
     // Find the first <body> or fall back to root. parse_fragment wraps
@@ -871,6 +941,8 @@ mod tests {
             anchor: Some("section".to_string()),
             text: "aa bb cc dd".to_string(),
             definition_text: Some("different".to_string()),
+            token_count: 0,
+            embedding_token_ids: None,
         }];
         let chunks = chunker_enforce_final_token_limit(chunks, 5, |text| text.len());
 
@@ -902,6 +974,8 @@ mod tests {
             anchor: None,
             text: "abc".to_string(),
             definition_text: None,
+            token_count: 0,
+            embedding_token_ids: None,
         }];
         let chunks = chunker_enforce_final_token_limit(chunks, 3, |text| text.len());
         assert_eq!(chunks.len(), 1);

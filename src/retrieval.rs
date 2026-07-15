@@ -11,7 +11,7 @@ use crate::html::clean_ato_html;
 use crate::legal_source::source_registry;
 use crate::uri::{parse_doc_uri, DocUri};
 use crate::{
-    fetch_bytes, UrlContext, ATO_FETCH_TIMEOUT, ATO_USER_AGENT, OEWN_2024_SOURCE, OEWN_2024_URL,
+    ATO_FETCH_TIMEOUT, ATO_USER_AGENT, OEWN_2024_SOURCE, OEWN_2024_URL,
     ORDINARY_DICTIONARY_PATH_ENV, STATUTORY_DEFINITION_TYPE_PREFIXES,
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -28,6 +28,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use url::Url;
 use zip::ZipArchive;
 
@@ -79,10 +80,7 @@ pub(crate) fn corpus_doc_id_set(source_id: &SourceId) -> Result<Arc<HashSet<Stri
 }
 
 fn validate_source(source_id: &SourceId) -> Result<()> {
-    let resolved = source_registry().resolve(Some(source_id.as_str()))?;
-    if &resolved != source_id {
-        bail!("legal source `{source_id}` did not resolve canonically");
-    }
+    source_registry().source(source_id)?;
     Ok(())
 }
 
@@ -340,7 +338,7 @@ pub(crate) fn fetch_ato_doc(doc_id: &str, pit: Option<&str>, view: Option<&str>)
 }
 
 pub(crate) struct GetDefinitionOptions {
-    pub(crate) source: Option<SourceId>,
+    pub(crate) source: SourceId,
     pub(crate) context_document: Option<DocumentId>,
     pub(crate) max_defs: usize,
 }
@@ -396,16 +394,16 @@ struct OrdinaryDictionaryIndex {
 }
 
 impl OrdinaryDictionaryIndex {
-    fn parse(raw: &str, default_source: &str) -> Result<Self> {
+    fn parse(raw: &str, fallback_dictionary_source: &str) -> Result<Self> {
         if let Ok(entries) = serde_json::from_str::<Vec<DictionaryEntry>>(raw) {
-            return Ok(Self::from_entries(entries, default_source));
+            return Ok(Self::from_entries(entries, fallback_dictionary_source));
         }
         let jsonl = raw
             .lines()
             .filter_map(|line| serde_json::from_str::<DictionaryEntry>(line.trim()).ok())
             .collect::<Vec<_>>();
         if !jsonl.is_empty() {
-            return Ok(Self::from_entries(jsonl, default_source));
+            return Ok(Self::from_entries(jsonl, fallback_dictionary_source));
         }
 
         let mut definitions: HashMap<String, Vec<OrdinaryDefinition>> = HashMap::new();
@@ -436,13 +434,13 @@ impl OrdinaryDictionaryIndex {
             }
         }
         Ok(Self {
-            source: default_source.to_string(),
+            source: fallback_dictionary_source.to_string(),
             definitions,
         })
     }
 
-    fn from_entries(entries: Vec<DictionaryEntry>, default_source: &str) -> Self {
-        let mut source = default_source.to_string();
+    fn from_entries(entries: Vec<DictionaryEntry>, fallback_dictionary_source: &str) -> Self {
+        let mut source = fallback_dictionary_source.to_string();
         let mut definitions: HashMap<String, Vec<OrdinaryDefinition>> = HashMap::new();
         for entry in entries {
             if let Some(entry_source) = entry.source {
@@ -506,28 +504,18 @@ pub(crate) fn definition_rank(hit: &DefinitionHit, opts: &GetDefinitionOptions) 
 }
 
 pub(crate) fn get_definition(term: &str, opts: GetDefinitionOptions) -> Result<String> {
-    let source_id = match (&opts.source, &opts.context_document) {
-        (Some(source), Some(document)) => {
-            validate_source(source)?;
-            validate_source(&document.source)?;
-            if source != &document.source {
-                bail!(
-                    "definition source `{source}` does not match context document source `{}`",
-                    document.source
-                );
-            }
-            source.clone()
+    validate_source(&opts.source)?;
+    if let Some(document) = &opts.context_document {
+        validate_source(&document.source)?;
+        if opts.source != document.source {
+            bail!(
+                "definition source `{}` does not match context document source `{}`",
+                opts.source,
+                document.source
+            );
         }
-        (Some(source), None) => {
-            validate_source(source)?;
-            source.clone()
-        }
-        (None, Some(document)) => {
-            validate_source(&document.source)?;
-            document.source.clone()
-        }
-        (None, None) => source_registry().resolve(None)?,
-    };
+    }
+    let source_id = opts.source.clone();
     let conn = open_read()?;
     if !table_exists(&conn, "definitions")? {
         let (ordinary, ordinary_error) = ordinary_meaning_or_error(term);
@@ -640,12 +628,23 @@ pub(crate) fn ensure_oewn_ordinary_dictionary() -> Result<PathBuf> {
     if index_path.exists() {
         return Ok(index_path);
     }
-    let context = UrlContext {
-        manifest_dir: None,
-        manifest_base_url: None,
-    };
-    let zip_bytes = fetch_bytes(OEWN_2024_URL, &context)
+    let response = reqwest::blocking::Client::builder()
+        .user_agent(ATO_USER_AGENT)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
+        .build()?
+        .get(OEWN_2024_URL)
+        .send()?
+        .error_for_status()
         .with_context(|| format!("fetching ordinary-meaning source from {OEWN_2024_URL}"))?;
+    const MAX_DICTIONARY_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+    let mut zip_bytes = Vec::new();
+    response
+        .take(MAX_DICTIONARY_ARCHIVE_BYTES + 1)
+        .read_to_end(&mut zip_bytes)?;
+    if zip_bytes.len() as u64 > MAX_DICTIONARY_ARCHIVE_BYTES {
+        bail!("ordinary-meaning archive exceeded the 512 MiB limit");
+    }
     let index = build_oewn_dictionary_index(&zip_bytes)?;
     let tmp_path = index_path.with_extension("tsv.tmp");
     fs::write(&tmp_path, index)?;
@@ -1467,7 +1466,6 @@ pub(crate) fn resolve_in_doc_anchor_chunks(
 /// over the live file; freshly-inserted chunks carry no citation rows, so
 /// every row must be derived here before the swap.
 pub(crate) fn derive_citations(conn: &Connection, source_id: &SourceId) -> Result<()> {
-    validate_source(source_id)?;
     conn.execute(
         "DELETE FROM citations WHERE source_id = ?1",
         [source_id.as_str()],
@@ -1505,7 +1503,6 @@ pub(crate) fn derive_citations(conn: &Connection, source_id: &SourceId) -> Resul
                     &captures[1]
                 )
             })?;
-            validate_source(&target.source)?;
             if target == source_document {
                 continue;
             }

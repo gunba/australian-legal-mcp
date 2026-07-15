@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Stable source-qualified identities for australian-legal-mcp"
+repository = "https://github.com/gunba/australian-legal-mcp"
 
 [dependencies]
 percent-encoding = "2.3"

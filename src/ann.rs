@@ -17,7 +17,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
@@ -50,7 +50,7 @@ pub(crate) fn sidecar_relative_path(source_id: &SourceId) -> PathBuf {
     PathBuf::from(ANN_DIRECTORY).join(format!("{source_id}.ann"))
 }
 
-pub(crate) fn sidecar_url(source_id: &SourceId) -> String {
+pub(crate) fn sidecar_manifest_path(source_id: &SourceId) -> String {
     format!("{ANN_DIRECTORY}/{source_id}.ann")
 }
 
@@ -73,7 +73,7 @@ pub(crate) struct ManifestAnn {
     pub(crate) format_version: u32,
     pub(crate) library: String,
     pub(crate) library_version: String,
-    pub(crate) url: String,
+    pub(crate) path: String,
     pub(crate) sha256: String,
     pub(crate) size: u64,
     pub(crate) corpus_id: String,
@@ -341,7 +341,7 @@ pub(crate) fn build_sidecar(
         format_version: metadata.format_version,
         library: metadata.library.clone(),
         library_version: metadata.library_version.clone(),
-        url: sidecar_url(source_id),
+        path: sidecar_manifest_path(source_id),
         sha256,
         size,
         corpus_id: metadata.corpus_id.clone(),
@@ -423,9 +423,8 @@ pub(crate) fn validate_manifest_ann(source_id: &SourceId, info: &ManifestAnn) ->
             info.source_id
         );
     }
-    if info.url.trim() != info.url || info.url.is_empty() || info.url.chars().any(char::is_control)
-    {
-        bail!("ANN sidecar URL for source `{source_id}` is malformed");
+    if info.path != sidecar_manifest_path(source_id) {
+        bail!("ANN sidecar path for source `{source_id}` is malformed");
     }
     if info.format != ANN_FORMAT
         || info.format_version != ANN_FORMAT_VERSION
@@ -492,8 +491,18 @@ fn validate_sidecar_metadata(path: &Path, expected: &SidecarMetadata) -> Result<
 
 pub(crate) fn verify_sidecar(path: &Path, source_id: &SourceId, info: &ManifestAnn) -> Result<()> {
     validate_manifest_ann(source_id, info)?;
-    let metadata = fs::metadata(path)
+    let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("reading ANN sidecar metadata at {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("ANN sidecar must be a regular non-symlink file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            bail!("ANN sidecar must not be hard-linked");
+        }
+    }
     if metadata.len() != info.size {
         bail!(
             "ANN sidecar size mismatch: manifest {}, installed {}",
@@ -556,44 +565,6 @@ pub(crate) fn sha256_path(path: &Path) -> Result<String> {
         hasher.update(&buffer[..read]);
     }
     Ok(format!("{:x}", hasher.finalize()))
-}
-
-pub(crate) fn copy_verified(
-    input: &mut dyn Read,
-    destination: &Path,
-    expected_size: u64,
-    expected_sha256: &str,
-) -> Result<u64> {
-    if !is_sha256(expected_sha256) {
-        bail!("ANN sidecar SHA-256 is malformed");
-    }
-    let mut output = File::create(destination)?;
-    let mut hasher = Sha256::new();
-    let mut total = 0u64;
-    let mut buffer = [0u8; 1024 * 1024];
-    loop {
-        let read = input.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        total = total
-            .checked_add(read as u64)
-            .ok_or_else(|| anyhow!("ANN sidecar size overflow"))?;
-        if total > expected_size {
-            bail!("ANN sidecar exceeds manifest size {expected_size}");
-        }
-        output.write_all(&buffer[..read])?;
-        hasher.update(&buffer[..read]);
-    }
-    output.sync_all()?;
-    if total != expected_size {
-        bail!("ANN sidecar size mismatch: expected {expected_size}, received {total}");
-    }
-    let digest = format!("{:x}", hasher.finalize());
-    if digest != expected_sha256 {
-        bail!("ANN sidecar SHA-256 mismatch");
-    }
-    Ok(total)
 }
 
 #[cfg(test)]
@@ -722,8 +693,8 @@ mod tests {
             fs::read(&first_primary_path)?,
             fs::read(&second_primary_path)?
         );
-        assert_eq!(first_primary.url, "ann/source-a.ann");
-        assert_eq!(first_secondary.url, "ann/source-b.ann");
+        assert_eq!(first_primary.path, "ann/source-a.ann");
+        assert_eq!(first_secondary.path, "ann/source-b.ann");
         assert_eq!(first_primary.source_id, primary);
         assert_eq!(first_secondary.source_id, secondary);
         verify_sidecar(&first_primary_path, &primary, &first_primary)?;
@@ -817,7 +788,7 @@ mod tests {
 
         let mut rebound = info.clone();
         rebound.source_id = secondary.clone();
-        rebound.url = sidecar_url(&secondary);
+        rebound.path = sidecar_manifest_path(&secondary);
         let error = verify_sidecar(&path, &secondary, &rebound).unwrap_err();
         assert!(error
             .to_string()
@@ -840,12 +811,12 @@ mod tests {
         let mut unsupported = info.clone();
         unsupported.format_version += 1;
         assert!(validate_manifest_ann(&primary, &unsupported).is_err());
-        let mut remote_url = info.clone();
-        remote_url.url = "https://example.test/source-a.ann".to_string();
-        validate_manifest_ann(&primary, &remote_url)?;
-        let mut malformed_url = info.clone();
-        malformed_url.url = " source-a.ann".to_string();
-        assert!(validate_manifest_ann(&primary, &malformed_url).is_err());
+        let mut remote_path = info.clone();
+        remote_path.path = "https://example.test/source-a.ann".to_string();
+        assert!(validate_manifest_ann(&primary, &remote_path).is_err());
+        let mut malformed_path = info.clone();
+        malformed_path.path = " source-a.ann".to_string();
+        assert!(validate_manifest_ann(&primary, &malformed_path).is_err());
         let mut uppercase_digest = info;
         uppercase_digest.sha256.make_ascii_uppercase();
         assert!(validate_manifest_ann(&primary, &uppercase_digest).is_err());

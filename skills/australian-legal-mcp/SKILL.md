@@ -1,46 +1,39 @@
 ---
 name: australian-legal-mcp
-description: "Use the local Australian Legal MCP tools for Australian legal research. Run for Australian legislation, cases, ATO guidance, rulings, definitions, or when source-grounded retrieval would improve the answer."
+description: "Use Australian Legal MCP for source-grounded Australian legislation, cases, ATO guidance, rulings, definitions, and citations."
 ---
 
-# Australian Legal MCP Research
+# Australian Legal MCP research
 
 Use the `australian-legal` MCP tools before answering Australian legal questions
-where legislation, cases, ATO guidance, definitions, or source citations would
-improve the answer.
+when primary sources or exact citations would improve the answer.
 
-Normal flow:
-
-1. Use `search` first. Prefer the default hybrid mode for natural-language or
-   mixed title/body queries. Route to the appropriate registered source; use
-   source id `ato` for ATO material. If filtering by `types`, use exact codes
-   from the selected source in `stats.source_stats`; judgments and cases use `JUD`.
-2. Use `get_chunks` for source text from search hits.
-3. Use `get_doc_anchors` for in-document navigation, related/history links,
+1. Call `stats` when source/type availability is unclear.
+2. Call `search` first. Always pass exactly one registered `source`; omission is
+   an error. Prefer hybrid mode for natural-language or mixed title/body queries.
+3. Call `get_chunks` for exact source text and bounded neighbouring context.
+4. Call `get_doc_anchors` for in-document navigation, history/related links,
    and cited-by material.
-4. Use `fetch` for canonical live references such as `[fetch:legal://...]`
-   markers or ATO documents outside the corpus.
-5. Cite the source details returned by the tools.
+5. Call `get_asset` when a retained image marker is material.
+6. Call `get_definition` for statutory definitions and clearly labelled
+   ordinary-meaning fallback.
+7. Call `fetch` only for canonical `legal://...` references, including
+   `[fetch:legal://...]` markers.
 
-If the `australian-legal` tools are missing or a call returns a connection error:
+Cite the returned source title, exact stored canonical URL, date/currency
+metadata, and typed document/chunk references. Do not infer federation or use an
+ATO default.
 
-1. Tell the user:
+If the tools are missing or connection fails, tell the user that you are
+checking the Australian legal research service, then load
+`setup-australian-legal-mcp`. Diagnose the configured private HTTPS endpoint and
+serving-host readiness first. `legal-mcp mcp` is valid only for deliberately
+configured local stdio development.
 
-   > This is best answered against the local Australian legal corpus. I am
-   > going to check the local research tool setup and then continue.
+The runtime cannot download or update a corpus. A missing active generation
+requires maintainer build/validation, immutable activation or rollback, and—on
+the hosted service—direct SSH deployment. Never recommend `legal-mcp update`.
 
-2. Load the `setup-australian-legal-mcp` skill and repair the MCP entry. The
-   MCP host should run:
-
-   ```bash
-   legal-mcp mcp
-   ```
-
-3. After the MCP host reconnects, retry the original tool call.
-
-Use the `setup-australian-legal-mcp` skill only for install, first-run handoff,
-timeout diagnosis, missing corpus, corpus update, or repeated startup failures.
-
-Do not silently substitute web search when the local Australian legal corpus
-should be used. If Australian Legal MCP cannot be started, tell the user what
-failed and what you will try next.
+Do not silently substitute general web search when the source-grounded service
+should be used. If recovery is impossible, state the exact failure and the
+bounded next step.

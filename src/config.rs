@@ -16,6 +16,7 @@ use url::Url;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MCP_SERVER_CONFIG_NAME: &str = "australian-legal";
 pub(crate) const LEGAL_DB_FILENAME: &str = "legal.db";
+pub(crate) const GENERATION_MANIFEST_FILENAME: &str = "generation.json";
 
 pub(crate) fn data_dir() -> Result<PathBuf> {
     if let Some(value) = std::env::var_os("LEGAL_MCP_DATA_DIR") {
@@ -60,6 +61,18 @@ pub(crate) fn generation_dir(key: &str) -> Result<PathBuf> {
     Ok(generations_dir()?.join(key))
 }
 
+fn require_real_directory(path: &Path, description: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("reading {description} {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(anyhow!(
+            "{description} must be a real non-symlink directory: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn active_generation_key() -> Result<Option<String>> {
     let path = data_dir()?.join("active-generation");
     if !path.exists() {
@@ -67,36 +80,33 @@ pub(crate) fn active_generation_key() -> Result<Option<String>> {
     }
     let key = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     validate_generation_key(&key)?;
-    if !generation_dir(&key)?.is_dir() {
+    let generation = generation_dir(&key)?;
+    if !generation.exists() {
         return Err(anyhow!(
-            "active corpus generation {key} is missing; run `legal-mcp update`"
+            "active corpus generation {key} is missing; activate a valid local generation"
         ));
     }
+    require_real_directory(&generation, "active corpus generation")?;
     Ok(Some(key))
 }
 
 pub(crate) fn activate_generation(key: &str) -> Result<()> {
     validate_generation_key(key)?;
     let generation = generation_dir(key)?;
-    if !generation.is_dir() {
+    if !generation.exists() {
         return Err(anyhow!(
             "cannot activate missing corpus generation {}",
             generation.display()
         ));
     }
+    require_real_directory(&generation, "corpus generation")?;
     atomic_write(&data_dir()?.join("active-generation"), key.as_bytes())
 }
 
 pub(crate) fn live_dir() -> Result<PathBuf> {
     let key = active_generation_key()?
-        .ok_or_else(|| anyhow!("no active legal corpus generation; run `legal-mcp update`"))?;
+        .ok_or_else(|| anyhow!("no active legal corpus generation; run `legal-mcp activate`"))?;
     generation_dir(&key)
-}
-
-pub(crate) fn staging_dir() -> Result<PathBuf> {
-    let path = data_dir()?.join("staging");
-    fs::create_dir_all(&path)?;
-    Ok(path)
 }
 
 pub(crate) fn db_path() -> Result<PathBuf> {
@@ -107,16 +117,16 @@ pub(crate) fn ann_path(source_id: &SourceId) -> Result<PathBuf> {
     Ok(live_dir()?.join(crate::ann::sidecar_relative_path(source_id)))
 }
 
-pub(crate) fn installed_manifest_path() -> Result<PathBuf> {
-    Ok(live_dir()?.join("installed_manifest.json"))
-}
-
 pub(crate) fn lock_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("LOCK"))
 }
 
 pub(crate) fn server_lock_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("SERVER_LOCK"))
+}
+
+pub(crate) fn lifecycle_lock_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("LIFECYCLE_LOCK"))
 }
 
 pub(crate) fn http_state_path() -> Result<PathBuf> {
@@ -128,11 +138,7 @@ pub(crate) fn server_log_path() -> Result<PathBuf> {
 }
 
 pub(crate) fn model_path() -> Result<PathBuf> {
-    Ok(live_dir()?.join("model_fp16.onnx"))
-}
-
-pub(crate) fn model_data_path() -> Result<PathBuf> {
-    Ok(live_dir()?.join("model_fp16.onnx_data"))
+    Ok(live_dir()?.join("model.onnx"))
 }
 
 pub(crate) fn tokenizer_path() -> Result<PathBuf> {
@@ -162,6 +168,18 @@ pub(crate) fn corpus_read_lock() -> Result<File> {
         .write(true)
         .open(path)?;
     fs2::FileExt::lock_shared(&file)?;
+    Ok(file)
+}
+
+pub(crate) fn lifecycle_lock_file() -> Result<File> {
+    let path = lifecycle_lock_path()?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    file.lock_exclusive()?;
     Ok(file)
 }
 
@@ -588,10 +606,25 @@ mod tests {
             ann_path(&source_id)?,
             generation.join("ann").join("ato.ann")
         );
-        assert_eq!(
-            installed_manifest_path()?,
-            generation.join("installed_manifest.json")
-        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_generation_rejects_directory_symlinks() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir()?;
+        let _environment =
+            crate::TestEnvironment::set(&[("LEGAL_MCP_DATA_DIR", root.path().as_os_str())]);
+        let outside = tempfile::tempdir()?;
+        let key = "c".repeat(64);
+        fs::create_dir_all(generations_dir()?)?;
+        symlink(outside.path(), generation_dir(&key)?)?;
+        fs::write(root.path().join("active-generation"), &key)?;
+
+        assert!(active_generation_key().is_err());
+        assert!(activate_generation(&key).is_err());
         Ok(())
     }
 

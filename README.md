@@ -1,109 +1,95 @@
 # Australian Legal MCP
 
-Australian Legal MCP provides local, source-grounded search and retrieval over
-Australian legal materials. The `australian-legal-mcp` package ships one Rust
-executable, `legal-mcp`, which serves the MCP protocol, manages the local
-corpus,
-and contains the maintainer corpus pipeline.
+Australian Legal MCP provides source-grounded search and retrieval across ten
+official Australian legal sources. One Rust executable, `legal-mcp`, serves MCP,
+searches a prebuilt immutable corpus, and contains the maintainer-only source and
+corpus pipeline.
 
 > Legal research infrastructure, not legal or tax advice. Verify source
-> material,
-status and point-in-time applicability before relying on an answer.
+> material, status, and point-in-time applicability before relying on an answer.
 
-## Current architecture
+## Architecture
 
-The installed service is local-first:
+The production catalogue contains:
 
-- source `ato` contains Australian Taxation Office legal and guidance material;
-- source `frl` contains official Commonwealth legislation from the Federal
-  Register of Legislation;
-- one source-qualified SQLite corpus is stored as `legal.db`;
-- semantic candidates come from `ann/<source>.ann`, then authoritative SQLite
-  embeddings provide exact reranking;
-- document bodies are cleaned structural HTML, while FTS and embeddings use
-  plain source-derived text;
-- `legal-mcp mcp` proxies stdio MCP to one shared loopback backend so each user
-  data directory loads SQLite and the embedding model once.
+- `ato`, `frl`, `federal-court`, `high-court`, and `nsw-caselaw`;
+- `nsw-legislation`, `qld-legislation`, `wa-legislation`,
+  `sa-legislation`, and `tas-legislation`.
 
-`legal-mcp serve` runs that loopback backend directly for local testing. The
-remote Streamable HTTP service and Azure deployment are roadmap work described
-in [PLAN.md](PLAN.md).
+Every request selects exactly one registered source. Omission is an error; the
+server never silently federates or defaults to ATO.
 
-## MCP tools
+The local RTX maintainer PC owns acquisition, OCR, normalization, embedding,
+ANN construction, validation, and rebuilds. It produces a complete generation
+containing:
 
-The MCP surface contains exactly seven tools:
+- one source-qualified SQLite `legal.db`;
+- one deterministic `ann/<source>.ann` per source;
+- the pinned ONNX model and tokenizer;
+- `generation.json`, binding every file, source, vector set, schema, and model.
 
-1. `search` — source-scoped keyword, vector or hybrid search. Omitted `source`
-   resolves to `ato`.
-2. `get_chunks` — read source-qualified chunk references with optional
-   neighbouring chunks and bounded continuations.
-3. `get_asset` — resolve a retained source-qualified asset reference to image
-   bytes and a caption.
-4. `get_doc_anchors` — return in-document anchors, related/history links and
-   reverse citations for a source-qualified document.
-5. `get_definition` — find statutory definitions, with a labelled
-   ordinary-meaning fallback when the corpus has none.
-6. `stats` — report generations, source availability, counts, type codes and
-   search policy.
-7. `fetch` — retrieve a live document from a canonical `legal://` URI.
+A validated generation is activated atomically and transferred directly over
+SSH to a CPU-only serving VM. The serving runtime never downloads, scrapes,
+embeds, packages, or publishes corpus/model artifacts. GitHub Releases are
+binary-only.
 
-Search and retrieval responses preserve exact document, chunk, asset and corpus
-generation references. Internal document links remain deterministic references;
-external or uncatalogued ATO links become `[fetch:legal://…]` markers.
+Semantic search uses mdbr-leaf-ir ANN candidates followed by exact reranking
+from authoritative normalized int8 vectors in SQLite. Bodies remain cleaned
+structural HTML; FTS and embeddings use source-derived plain text.
 
-`fetch` accepts only the canonical form:
+For private production hosting, `legal-mcp.service` binds
+`127.0.0.1:51235` behind Tailscale HTTPS. Local development and compatible MCP
+hosts may instead run `legal-mcp mcp`, which starts or reuses a loopback backend.
+See [DEPLOYMENT.md](DEPLOYMENT.md).
+
+## Exactly seven MCP tools
+
+1. `search` — source-scoped keyword, vector, or hybrid search.
+2. `get_chunks` — read typed chunk references and bounded continuations.
+3. `get_asset` — resolve retained source-qualified image assets.
+4. `get_doc_anchors` — return in-document anchors, history/related links, and
+   reverse citations.
+5. `get_definition` — find statutory definitions, with a labelled ordinary
+   meaning fallback.
+6. `stats` — report generation, source, count, type, and search-policy status.
+7. `fetch` — retrieve a live official document from a canonical legal URI.
+
+Responses preserve typed `DocumentId`, `ChunkRef`, and `AssetRef` identities.
+Internal links remain deterministic references. `fetch` accepts only:
 
 ```text
 legal://<source>/<percent-encoded-native-id>[?pit=<value>&view=<value>]
 ```
 
-The native ID is one percent-encoded path segment and canonical percent escapes
-use uppercase hexadecimal. ATO point-in-time and history requests can therefore
-be expressed as:
+The native ID is one percent-encoded path segment with uppercase hexadecimal
+escapes, for example:
 
 ```text
 legal://ato/PAC%2F1?pit=20200101000000&view=HISTFT
 ```
 
-## Install
+## Client installation
 
-Download the archive for the required platform from the
-[latest release](https://github.com/gunba/australian-legal-mcp/releases/latest),
-verify its entry in `SHA256SUMS`, and install `legal-mcp` together with the
-packaged ONNX Runtime library in one stable directory on `PATH`. A Linux archive
-is named like `legal-mcp-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz`; macOS and
-Windows releases use their corresponding target triples.
+Binary releases contain only the executable, checksums, and the CPU ONNX Runtime
+software library. Verify the archive against `SHA256SUMS`, then keep
+`legal-mcp` and its ONNX Runtime library together in a stable directory on
+`PATH`.
 
-For a Linux per-user install:
-
-```bash
-archive=legal-mcp-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz
-grep " $archive$" SHA256SUMS | sha256sum -c -
-tmp=$(mktemp -d)
-tar -C "$tmp" -xzf "$archive"
-install -Dm0755 "$tmp/legal-mcp" "$HOME/.local/bin/legal-mcp"
-install -Dm0644 "$tmp/libonnxruntime.so" "$HOME/.local/bin/libonnxruntime.so"
-legal-mcp --version
-```
-
-On Windows, keep `legal-mcp.exe` and `onnxruntime.dll` together in a stable
-directory on the user `PATH`.
-
-Clone the package when installing its MCP/plugin metadata:
+For local stdio development, clone and install the package metadata:
 
 ```bash
 git clone https://github.com/gunba/australian-legal-mcp.git
 claude plugin install ./australian-legal-mcp
 ```
 
-Pi uses the same MCP command through `pi-mcp-adapter`:
+Pi can use the same local adapter:
 
 ```bash
 pi install npm:pi-mcp-adapter
 pi install ./australian-legal-mcp
 ```
 
-The canonical MCP registration is:
+The local registration is:
 
 ```json
 {
@@ -116,126 +102,127 @@ The canonical MCP registration is:
 }
 ```
 
-For a project-local client, the repository `.mcp.json` supplies this entry. A
-user-global Pi installation can place the same `mcpServers.australian-legal`
-entry in `~/.config/mcp/mcp.json` or `~/.pi/agent/mcp.json`.
-
-## Install and verify the corpus
-
-The corpus is a separate, integrity-checked download. Obtain approval before a
-large first install, then run:
-
-```bash
-legal-mcp update
-legal-mcp stats
-legal-mcp search "research and development tax incentive eligibility" \
-  --source ato --k 5
-legal-mcp search "income tax assessment act" --source frl --k 5
-```
-
-Restart the MCP host or local backend after an update so it opens the activated
-generation. The binary location and corpus location are independent; every
-command must resolve the same data directory.
+A production client should instead use the private HTTPS `/mcp` endpoint
+provisioned by the serving host. Do not publicly expose the loopback service or
+replace OAuth/device identity with a shared static token.
 
 ## Search policy
 
-Search resolves exactly one source per request. `mode=hybrid` combines BM25 and
-Granite vector retrieval, `mode=keyword` uses BM25, and `mode=vector` uses the
-semantic index. Semantic modes fail clearly when the model or selected source
-ANN sidecar cannot be validated.
+`mode=hybrid` combines BM25 and vector retrieval; `mode=keyword` uses BM25;
+`mode=vector` uses the semantic index. Semantic modes fail clearly when model or
+ANN validation fails.
 
-ATO defaults remain current-guidance-first:
+The ATO policy is current-guidance-first:
 
-- edited private advice (`EV`) is selected only when `types` explicitly includes
-  it;
-- non-legislation material dated before `2000-01-01` is selected when
-  `include_old=true`;
+- edited private advice (`EV`) is included only when explicitly requested;
+- non-legislation material before `2000-01-01` requires `include_old=true`;
 - legislation is exempt from that date cutoff;
-- `current_only=true` filters withdrawn and superseded rulings.
+- `current_only=true` excludes withdrawn and superseded rulings.
 
-`types` accepts exact source type codes or `*` globs. Discover available codes
-and source status with `legal-mcp stats`. Judgments and cases use `JUD` where
-that code is present in the selected source.
+`types` accepts exact source type codes or `*` globs. Use `stats` to discover
+available source/type values. The ordinary-meaning fallback uses Open English
+WordNet 2024 under CC-BY 4.0; `LEGAL_MCP_DICTIONARY_PATH` may select another
+approved JSON, JSONL, or TSV dictionary.
 
-The ordinary-meaning fallback uses Open English WordNet 2024 under CC-BY 4.0.
-Set `LEGAL_MCP_DICTIONARY_PATH` to a JSON, JSONL or TSV dictionary when a
-different approved source is required.
+## Immutable runtime generations
 
-## Data directory
-
-Platform defaults are:
+`LEGAL_MCP_DATA_DIR` selects only a runtime root. A serving root has this shape:
 
 ```text
-Linux:   ~/.local/share/australian-legal-mcp
-macOS:   ~/Library/Application Support/australian-legal-mcp
-Windows: %APPDATA%\australian-legal-mcp
-```
-
-`LEGAL_MCP_DATA_DIR` selects a stable portable or offline location. Supply the
-same value to `update`, `mcp`, `serve`, `stats`, searches and verification runs.
-An installed generation has this canonical shape:
-
-```text
-australian-legal-mcp/
+runtime/
 ├── generations/
 │   └── <generation-id>/
+│       ├── generation.json
 │       ├── legal.db
-│       ├── ann/
-│       │   ├── ato.ann
-│       │   └── frl.ann
-│       ├── model_fp16.onnx
-│       ├── model_fp16.onnx_data
-│       ├── tokenizer.json
-│       └── installed_manifest.json
+│       ├── ann/<source>.ann
+│       ├── model.onnx
+│       └── tokenizer.json
 ├── active-generation
-├── http.json
-├── server.log
-└── staging/
+├── LOCK
+├── LIFECYCLE_LOCK
+├── SERVER_LOCK
+└── http.json              # local stdio/backend mode only
 ```
 
-Generation directories are immutable. `active-generation` is the atomic
-activation point; `http.json` records the local backend endpoint used by
-`legal-mcp mcp`.
+Generation directories are real, non-symlink, read-only directories.
+`active-generation` is the atomic switch. Lifecycle commands are:
 
-## Corpus updates
+```bash
+legal-mcp activate --generation-dir /same/filesystem/complete-generation
+legal-mcp verify
+legal-mcp rollback --generation <generation-id>
+legal-mcp prune-generations --keep-inactive 1
+```
 
-`legal-mcp update` discovers the newest release containing `manifest.json`,
-ignores draft and prerelease publications, verifies every declared digest and
-size, assembles a complete immutable generation, and atomically activates it.
-The manifest binds `legal.db`, the embedding model and every required
-`ann/<source>.ann` sidecar to one corpus identity. Publishers make the manifest
-discoverable only after every referenced artifact has been uploaded and
-verified.
+There is no runtime `update`, corpus downloader, offline bundle, corpus package,
+or GitHub corpus-release path.
 
-Maintainer acquisition is incremental, but every published database is a fresh
-`legal.db`. Unchanged embeddings are reused by model and chunk-text hash;
-changed source inventories are reconciled directly, and an authoritative
-inventory deletes absent source documents within that source transaction.
-Independent source failures retain the last publishable state for that source
-while other source jobs complete.
+## Maintainer data and builds
 
-See [MAINTENANCE.md](MAINTENANCE.md) for build and release operations,
-[CURRENT_STATE.md](CURRENT_STATE.md) for the implementation snapshot, and
-[PLAN.md](PLAN.md) for planned source and deployment work.
+All persistent project data is ignored by Git and consolidated beneath
+`data/`:
 
-## Development
+```text
+data/
+├── sources/             # ten current official-source workspaces
+├── source-snapshots/    # rollback, failed refresh, and legacy stores
+├── models/              # pinned unpacked model inputs
+├── builds/              # resumable/inactive generation builds
+├── runtime/             # locally active immutable generations
+├── cache/               # disposable embedding/TensorRT acceleration
+├── runs/                # acquisition state and durable pending work
+├── logs/                # build, activation, and service evidence
+├── validation/          # retained validation-only layouts
+└── archive/             # non-canonical historical diagnostics
+```
+
+Each authoritative source workspace remains flat:
+`state.json`, `documents/`, `assets/`, and temporary `staging/`. Full repairs
+build a fresh complete source set, atomically exchange the whole set, and retain
+the prior set under `source-snapshots/`. Corpus builds never scrape; they consume
+only committed source workspaces.
+
+Routine local build and activation:
+
+```bash
+cargo build --release --features cuda
+scripts/maintainer-sync.sh
+```
+
+Fresh full repair:
+
+```bash
+scripts/maintainer-sync.sh --full
+```
+
+Direct deployment of the locally active generation:
+
+```bash
+scripts/deploy-generation.sh deploy@example-vps
+```
+
+The maintainer pipeline requires the pinned model in
+`data/models/mdbr-leaf-ir-standard`, CUDA/TensorRT ONNX Runtime, Google
+Chrome/Chromium for Federal Court, and `unrtf`, `antiword`, `soffice`,
+`pdftotext`, `pdftoppm`, and `tesseract`. Serving is CPU-safe and requires none
+of the acquisition or GPU tools.
+
+## Development gates
 
 ```bash
 cargo fmt --all -- --check
-cargo test --locked --all-features
+cargo test --locked --workspace --all-features
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo audit
 cargo deny check advisories
-scripts/smoke.sh
+LEGAL_MCP_DATA_DIR="$PWD/data/runtime" scripts/smoke.sh
 ```
 
-Release corpus builds use `cargo build --release --features cuda` on a
-maintainer machine with the approved local embedding model and a CUDA-enabled
-ONNX Runtime. End-user install, update, search and serving remain CPU-safe.
+See [MAINTENANCE.md](MAINTENANCE.md) for maintainer operations,
+[CURRENT_STATE.md](CURRENT_STATE.md) for the implementation snapshot, and
+[DEPLOYMENT.md](DEPLOYMENT.md) for low-cost private hosting.
 
 ## License
 
-The software is MIT licensed. ATO and Federal Register source material remains
-subject to the publishing authority's terms. Granite Embedding Small English R2
-is distributed under Apache-2.0.
-Embedding Small English R2 is distributed under Apache-2.0.
+The software is MIT licensed. Source material remains subject to each official
+publishing authority's terms. MongoDB mdbr-leaf-ir is Apache-2.0 licensed.

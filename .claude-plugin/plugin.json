@@ -1,7 +1,7 @@
 {
   "name": "australian-legal-mcp",
   "version": "0.17.0",
-  "description": "Local search and retrieval across Australian legal sources.",
+  "description": "Source-grounded search and retrieval across Australian legal sources.",
   "author": {
     "name": "gunba",
     "url": "https://github.com/gunba/australian-legal-mcp"

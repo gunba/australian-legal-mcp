@@ -1,55 +1,34 @@
 //! ATO acquisition, corpus statistics, manifest validation, updates and
 //! immutable generation promotion.
 
+use crate::adaptive_http::{AdaptiveConcurrency, RequestOutcome, SOURCE_WORKER_CEILING};
 use crate::config::{
     activate_generation, active_generation_key, data_dir, generation_dir, generations_dir,
-    installed_manifest_path, live_dir, lock_file, staging_dir, LEGAL_DB_FILENAME,
+    lifecycle_lock_file, lock_file, LEGAL_DB_FILENAME,
 };
-use crate::db::{get_corpus_meta, get_source_meta, open_read, open_write_at};
+use crate::db::{get_corpus_meta, get_source_meta, open_read};
 use crate::extract::anchors_node_text;
 use crate::legal_source::{source_registry, SourceId};
 use crate::search::ensure_vector_search_ready;
-use crate::semantic::EMBEDDING_MODEL_HF_FILES;
-use crate::{
-    local_path_from_urlish, resolve_manifest_asset, stage_model, validate_manifest_model_source,
-    UrlContext, ATO_USER_AGENT, DEFAULT_EXCLUDED_TYPES, DEFAULT_RELEASES_API_URL,
-    EDITED_PRIVATE_ADVICE_LABEL, EMBEDDING_MODEL_ID, LEGISLATION_TYPE, LEGISLATION_TYPE_PREFIXES,
-    OLD_CONTENT_CUTOFF, SUPPORTED_SCHEMA_VERSION,
-};
+use crate::semantic::EMBEDDING_MODEL_FILES;
+use crate::{ATO_USER_AGENT, EMBEDDING_MODEL_ID, SUPPORTED_SCHEMA_VERSION};
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::blocking::{Client, Response};
 use reqwest::redirect::Policy;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{BufReader, Cursor, Read, Seek, Write};
+use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_DECOMPRESSED_DB_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_ATO_HTML_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 5;
-#[cfg(test)]
-pub(crate) const LEGAL_DB_ARCHIVE_FILENAME: &str = "legal.db.zst";
-
-fn approved_https_host(host: &str) -> bool {
-    const ROOTS: &[&str] = &[
-        "ato.gov.au",
-        "github.com",
-        "githubusercontent.com",
-        "githubapis.com",
-        "huggingface.co",
-    ];
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    ROOTS
-        .iter()
-        .any(|root| host == *root || host.ends_with(&format!(".{root}")))
-}
 
 fn public_ip(ip: IpAddr) -> bool {
     match ip {
@@ -80,35 +59,34 @@ fn public_ip(ip: IpAddr) -> bool {
     }
 }
 
-fn validate_remote_url(url: &url::Url) -> Result<(String, Vec<SocketAddr>)> {
-    if url.scheme() != "https" {
-        bail!("acquisition URL must use HTTPS: {url}");
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        bail!("acquisition URL must not contain credentials: {url}");
+fn validate_ato_url(url: &url::Url) -> Result<(String, Vec<SocketAddr>)> {
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        bail!("ATO acquisition URL must be uncredentialed HTTPS: {url}");
     }
     if url.port().is_some_and(|port| port != 443) {
-        bail!("acquisition URL must use the default HTTPS port: {url}");
+        bail!("ATO acquisition URL must use the default HTTPS port: {url}");
     }
     let host = url
         .host_str()
-        .ok_or_else(|| anyhow!("acquisition URL has no hostname: {url}"))?;
-    if host.parse::<IpAddr>().is_ok() || !approved_https_host(host) {
-        bail!("unapproved acquisition hostname `{host}`");
+        .ok_or_else(|| anyhow!("ATO acquisition URL has no hostname: {url}"))?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if host.parse::<IpAddr>().is_ok() || !(host == "ato.gov.au" || host.ends_with(".ato.gov.au")) {
+        bail!("unapproved ATO acquisition hostname `{host}`");
     }
-    let addresses: Vec<_> = (host, 443)
+    let addresses = (host.as_str(), 443)
         .to_socket_addrs()
         .with_context(|| format!("resolving {host}"))?
-        .collect();
+        .collect::<Vec<_>>();
     if addresses.is_empty() || addresses.iter().any(|address| !public_ip(address.ip())) {
         bail!("hostname `{host}` resolved to a non-public network address");
     }
-    Ok((host.to_string(), addresses))
+    Ok((host, addresses))
 }
 
 fn secure_get(mut url: url::Url, timeout: Duration) -> Result<Response> {
     for redirect in 0..=MAX_REDIRECTS {
-        let (host, addresses) = validate_remote_url(&url)?;
+        let (host, addresses) = validate_ato_url(&url)?;
         let client = Client::builder()
             .user_agent(ATO_USER_AGENT)
             .connect_timeout(Duration::from_secs(10))
@@ -137,62 +115,6 @@ fn secure_get(mut url: url::Url, timeout: Duration) -> Result<Response> {
     unreachable!()
 }
 
-fn resolved_source(
-    value: &str,
-    context: &UrlContext,
-) -> Result<std::result::Result<PathBuf, url::Url>> {
-    let direct_local = local_path_from_urlish(value);
-    let resolved = resolve_manifest_asset(value, context);
-    if let Some(path) = direct_local.or_else(|| local_path_from_urlish(&resolved)) {
-        let root = context.manifest_dir.as_ref().ok_or_else(|| {
-            anyhow!("a remote manifest cannot reference a local artifact: {value}")
-        })?;
-        let canonical = path
-            .canonicalize()
-            .with_context(|| format!("canonicalizing {}", path.display()))?;
-        let root = root
-            .canonicalize()
-            .with_context(|| format!("canonicalizing manifest root {}", root.display()))?;
-        if !canonical.starts_with(&root) {
-            bail!("manifest asset escaped {}", root.display());
-        }
-        if !canonical.is_file() {
-            bail!(
-                "manifest asset is not a regular file: {}",
-                canonical.display()
-            );
-        }
-        return Ok(Ok(canonical));
-    }
-    Ok(Err(
-        url::Url::parse(&resolved).with_context(|| format!("parsing URL {resolved}"))?
-    ))
-}
-
-fn secure_fetch_bytes_with_timeout(
-    value: &str,
-    context: &UrlContext,
-    limit: u64,
-    timeout: Duration,
-) -> Result<Vec<u8>> {
-    let mut reader: Box<dyn Read> = match resolved_source(value, context)? {
-        Ok(path) => {
-            Box::new(File::open(&path).with_context(|| format!("opening {}", path.display()))?)
-        }
-        Err(url) => Box::new(secure_get(url, timeout)?),
-    };
-    let mut bytes = Vec::new();
-    reader.by_ref().take(limit + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > limit {
-        bail!("acquisition exceeded {limit} byte limit");
-    }
-    Ok(bytes)
-}
-
-fn secure_fetch_bytes(value: &str, context: &UrlContext, limit: u64) -> Result<Vec<u8>> {
-    secure_fetch_bytes_with_timeout(value, context, limit, Duration::from_secs(120))
-}
-
 #[cfg(unix)]
 fn sync_parent(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -201,8 +123,19 @@ fn sync_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
 #[cfg(not(unix))]
 fn sync_parent(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -222,72 +155,6 @@ fn sha256_path(path: &Path) -> Result<String> {
         hasher.update(&buffer[..count]);
     }
     Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn copy_exact_hashed(
-    reader: &mut dyn Read,
-    writer: &mut dyn Write,
-    expected_size: u64,
-    expected_sha256: &str,
-) -> Result<u64> {
-    let mut hasher = Sha256::new();
-    let mut total = 0u64;
-    let mut buffer = [0u8; 128 * 1024];
-    loop {
-        let count = reader.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        total = total
-            .checked_add(count as u64)
-            .ok_or_else(|| anyhow!("artifact byte count overflow"))?;
-        if total > expected_size {
-            bail!("artifact exceeds declared size {expected_size}");
-        }
-        hasher.update(&buffer[..count]);
-        writer.write_all(&buffer[..count])?;
-    }
-    if total != expected_size {
-        bail!("artifact size mismatch: expected {expected_size}, got {total}");
-    }
-    let actual = format!("{:x}", hasher.finalize());
-    if !actual.eq_ignore_ascii_case(expected_sha256) {
-        bail!("artifact sha256 mismatch: expected {expected_sha256}, got {actual}");
-    }
-    Ok(total)
-}
-
-/// Stream one integrity-pinned artifact from the approved HTTPS acquisition
-/// surface into `destination`. Every redirect is re-resolved and revalidated;
-/// the temporary file is promoted only after exact size/hash verification.
-pub(crate) fn download_approved_https_to_file(
-    url: &str,
-    destination: &Path,
-    expected_size: u64,
-    expected_sha256: &str,
-    timeout: Duration,
-) -> Result<u64> {
-    if expected_size == 0
-        || expected_sha256.len() != 64
-        || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        bail!("artifact requires a positive size and 64-digit sha256");
-    }
-    let parsed = url::Url::parse(url).with_context(|| format!("parsing artifact URL {url}"))?;
-    // Validate before touching the destination. `secure_get` repeats this for
-    // the initial request and every redirect after DNS resolution.
-    validate_remote_url(&parsed)?;
-    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
-    let mut response = secure_get(parsed, timeout)?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    let copied = copy_exact_hashed(&mut response, &mut temp, expected_size, expected_sha256)?;
-    temp.as_file().sync_all()?;
-    temp.persist(destination)
-        .map_err(|error| error.error)
-        .with_context(|| format!("atomically promoting {}", destination.display()))?;
-    sync_parent(destination)?;
-    Ok(copied)
 }
 
 // ----- ATO What's New feed ingestion -----
@@ -404,7 +271,7 @@ pub(crate) fn parse_whats_new(html: &str, base_url: &str) -> Result<Vec<WhatsNew
 
 pub(crate) fn stats() -> Result<String> {
     let conn = open_read()?;
-    let installed_manifest = load_installed_manifest()?;
+    let active_manifest = load_active_generation_manifest()?;
     let docs = read_corpus_count_meta(&conn, "documents_count")?
         .unwrap_or(count_table(&conn, "documents")?);
     let chunks =
@@ -423,10 +290,7 @@ pub(crate) fn stats() -> Result<String> {
         );
     }
     let descriptors = registry.descriptors();
-    let default_source = registry.resolve(None)?;
     let mut source_stats = BTreeMap::new();
-    let mut default_types = None;
-    let mut default_prefix_breakdown = None;
     let mut semantic_search_ready = true;
     for descriptor in &descriptors {
         let source_id = descriptor.id.as_str();
@@ -452,10 +316,6 @@ pub(crate) fn stats() -> Result<String> {
             })?,
             None => collect_prefix_breakdown(&conn, source_id)?,
         };
-        if descriptor.id == default_source {
-            default_types = Some(types.clone());
-            default_prefix_breakdown = Some(prefix_breakdown.clone());
-        }
         let source_semantic_search_ready =
             ensure_vector_search_ready(&conn, &descriptor.id).is_ok();
         semantic_search_ready &= source_semantic_search_ready;
@@ -470,7 +330,7 @@ pub(crate) fn stats() -> Result<String> {
                 "chunks": source_chunks,
                 "chunk_embeddings": source_embeddings,
                 "definitions": source_definitions,
-                "ann": installed_manifest
+                "ann": active_manifest
                     .as_ref()
                     .and_then(|manifest| manifest.ann.get(&descriptor.id)),
                 "types": types,
@@ -480,11 +340,11 @@ pub(crate) fn stats() -> Result<String> {
     }
     let payload = json!({
         "data_dir": data_dir()?.display().to_string(),
+        "active_generation": active_generation_key()?,
         "index_version": get_corpus_meta(&conn, "index_version")?,
         "last_update_at": get_corpus_meta(&conn, "last_update_at")?,
         "sources": descriptors,
         "source_stats": source_stats,
-        "default_source": default_source.as_str(),
         "embedding_model_id": get_corpus_meta(&conn, "embedding_model_id")?,
         "semantic_search_ready": semantic_search_ready,
         "search_modes": ["hybrid", "vector", "keyword"],
@@ -493,19 +353,37 @@ pub(crate) fn stats() -> Result<String> {
         "chunks": chunks,
         "chunk_embeddings": embeddings,
         "definitions": definitions,
-        "types": default_types.ok_or_else(|| anyhow!("default source is not registered"))?,
-        "prefix_breakdown": default_prefix_breakdown
-            .ok_or_else(|| anyhow!("default source is not registered"))?,
-        "default_search_policy": {
-            "excluded_types": DEFAULT_EXCLUDED_TYPES,
-            "excluded_type_labels": [EDITED_PRIVATE_ADVICE_LABEL],
-            "old_content_cutoff": OLD_CONTENT_CUTOFF,
-            "old_content_exception_types": LEGISLATION_TYPE_PREFIXES,
-            "old_content_exception_type_labels": [LEGISLATION_TYPE],
-        },
     });
     // JSON outputs use serde_json pretty rendering before return/write.
     Ok(serde_json::to_string_pretty(&payload)?)
+}
+
+pub(crate) fn verify_active_generation() -> Result<String> {
+    let active =
+        active_generation_key()?.ok_or_else(|| anyhow!("no immutable generation is active"))?;
+    ensure_generation_read_only(&generation_dir(&active)?)?;
+    let report = stats()?;
+    let value: JsonValue = serde_json::from_str(&report)?;
+    if value
+        .get("semantic_search_ready")
+        .and_then(JsonValue::as_bool)
+        != Some(true)
+    {
+        let conn = open_read()?;
+        for descriptor in source_registry().descriptors() {
+            ensure_vector_search_ready(&conn, &descriptor.id).with_context(|| {
+                format!(
+                    "active generation is not ready for semantic search in source `{}`",
+                    descriptor.id
+                )
+            })?;
+        }
+        bail!("active generation is not ready for semantic search across every source");
+    }
+    if value.get("active_generation").and_then(JsonValue::as_str) != Some(active.as_str()) {
+        bail!("active generation changed during strict verification");
+    }
+    Ok(report)
 }
 
 fn parse_count_meta(value: Option<String>, label: &str) -> Result<Option<i64>> {
@@ -708,7 +586,7 @@ pub(crate) struct Manifest {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ManifestDb {
-    pub(crate) url: String,
+    pub(crate) path: String,
     pub(crate) sha256: String,
     pub(crate) size: u64,
 }
@@ -717,22 +595,17 @@ pub(crate) struct ManifestDb {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ModelInfo {
     pub(crate) id: String,
+    pub(crate) fingerprint: String,
+    pub(crate) model: ManifestFile,
+    pub(crate) tokenizer: ManifestFile,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManifestFile {
+    pub(crate) path: String,
     pub(crate) sha256: String,
     pub(crate) size: u64,
-    pub(crate) url: String,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct UpdateStats {
-    pub(crate) bytes_downloaded: u64,
-}
-
-pub(crate) fn apply_update(manifest_url: &str) -> Result<UpdateStats> {
-    // apply_update holds the app LOCK around all install/update mutation.
-    let lock = lock_file()?;
-    let result = apply_update_locked(manifest_url);
-    lock.unlock()?;
-    result
 }
 
 pub(crate) fn validate_manifest(manifest: &Manifest) -> Result<()> {
@@ -765,10 +638,24 @@ pub(crate) fn validate_manifest(manifest: &Manifest) -> Result<()> {
             manifest.model.id
         );
     }
-    validate_manifest_model_source(&manifest.model)?;
-    validate_artifact_locator(&manifest.db.url, "database artifact")?;
+    if manifest.model.fingerprint != crate::EMBEDDING_MODEL_FINGERPRINT {
+        bail!("manifest model fingerprint does not match the pinned model");
+    }
+    validate_manifest_file(
+        &manifest.model.model,
+        &EMBEDDING_MODEL_FILES[0],
+        "model graph",
+    )?;
+    validate_manifest_file(
+        &manifest.model.tokenizer,
+        &EMBEDDING_MODEL_FILES[1],
+        "model tokenizer",
+    )?;
+    if manifest.db.path != LEGAL_DB_FILENAME {
+        bail!("manifest database path must be `{LEGAL_DB_FILENAME}`");
+    }
     if manifest.db.size == 0 || !is_lower_sha256(&manifest.db.sha256) {
-        bail!("manifest database artifact metadata is malformed");
+        bail!("manifest database metadata is malformed");
     }
     let expected_sources = registered_source_ids();
     let manifest_sources = manifest.ann.keys().cloned().collect::<BTreeSet<_>>();
@@ -777,13 +664,8 @@ pub(crate) fn validate_manifest(manifest: &Manifest) -> Result<()> {
             "manifest source set does not match this binary: registered={expected_sources:?}, manifest={manifest_sources:?}"
         );
     }
-    let mut artifact_urls = BTreeSet::from([manifest.db.url.clone()]);
     for (source_id, ann) in &manifest.ann {
         crate::ann::validate_manifest_ann(source_id, ann)?;
-        validate_artifact_locator(&ann.url, &format!("ANN artifact for source `{source_id}`"))?;
-        if !artifact_urls.insert(ann.url.clone()) {
-            bail!("manifest artifacts must have distinct URLs");
-        }
         if ann.embedding_model_id != manifest.model.id {
             bail!("ANN sidecar model for source `{source_id}` does not match manifest model");
         }
@@ -791,29 +673,16 @@ pub(crate) fn validate_manifest(manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
-fn validate_artifact_locator(value: &str, label: &str) -> Result<()> {
-    if value.trim() != value || value.is_empty() || value.chars().any(char::is_control) {
-        bail!("manifest {label} URL is malformed");
-    }
-    if let Ok(url) = url::Url::parse(value) {
-        if url.scheme() != "https"
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.fragment().is_some()
-        {
-            bail!("manifest {label} URL must be an uncredentialed HTTPS URL");
-        }
-        return Ok(());
-    }
-    let path = Path::new(value);
-    if path.is_absolute()
-        || value.contains('\\')
-        || path
-            .components()
-            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+fn validate_manifest_file(
+    info: &ManifestFile,
+    expected: &crate::semantic::EmbeddingModelFile,
+    label: &str,
+) -> Result<()> {
+    if info.path != expected.output_name
+        || info.size != expected.size
+        || info.sha256 != expected.sha256
     {
-        bail!("manifest {label} path must be a confined relative path");
+        bail!("manifest {label} metadata does not match the pinned model");
     }
     Ok(())
 }
@@ -882,445 +751,526 @@ pub(crate) fn cmp_dotted_version(a: &str, b: &str) -> std::cmp::Ordering {
     pa.cmp(&pb)
 }
 
-pub(crate) fn apply_update_locked(manifest_url: &str) -> Result<UpdateStats> {
-    // Full corpus replacement every time: rebuilding the live DB wholesale
-    // through a staging file and atomic rename is faster than mutating the
-    // multi-GB live DB and avoids FK cascades wiping the citations table
-    // mid-update.
-    let manifest_context = UrlContext::from_manifest_url(manifest_url);
-    let staging = staging_dir()?;
-    let manifest_bytes = secure_fetch_bytes(manifest_url, &manifest_context, MAX_MANIFEST_BYTES)
-        .with_context(|| format!("fetching manifest from {manifest_url}"))?;
-    let new_manifest: Manifest = serde_json::from_slice(&manifest_bytes)?;
-    validate_manifest(&new_manifest)?;
-    if !new_manifest.model.url.starts_with("hf://") {
-        let _ = resolved_source(&new_manifest.model.url, &manifest_context)
-            .context("validating semantic model artifact source")?;
-    }
-    let update_root = staging.join("update-apply");
-    if update_root.exists() {
-        fs::remove_dir_all(&update_root)?;
-    }
-    fs::create_dir_all(&update_root)?;
-    let staged_model = stage_model(
-        &new_manifest,
-        &manifest_context,
-        &update_root.join("model-stage"),
-    )?;
-    let staged_corpus = stage_live_db_from_db_artifact(
-        &new_manifest,
-        &manifest_context,
-        manifest_bytes.len() as u64,
-        &update_root.join("corpus-rebuild"),
-    )?;
-    let stats = staged_corpus.stats;
-    promote_staged_update(staged_model.as_ref(), staged_corpus, &new_manifest)?;
-    let _ = fs::remove_dir_all(&update_root);
-    Ok(stats)
+#[derive(Debug, Serialize)]
+pub(crate) struct ActivationReport {
+    pub(crate) active_generation: String,
+    pub(crate) previous_generation: Option<String>,
 }
 
-#[derive(Debug)]
-pub(crate) struct StagedModel {
-    pub(crate) dir: PathBuf,
-    pub(crate) marker_value: String,
-}
-
-pub(crate) fn remove_path_if_exists(path: &Path) -> Result<()> {
-    let Ok(meta) = fs::symlink_metadata(path) else {
-        return Ok(());
-    };
-    if meta.is_dir() {
-        fs::remove_dir_all(path)?;
-    } else {
-        fs::remove_file(path)?;
-    }
-    Ok(())
-}
-
-pub(crate) struct StagedCorpusUpdate {
-    pub(crate) staging_root: PathBuf,
-    pub(crate) staged_db: PathBuf,
-    pub(crate) staged_ann: BTreeMap<SourceId, PathBuf>,
-    pub(crate) stats: UpdateStats,
-}
-
-pub(crate) fn promote_staged_update(
-    staged_model: Option<&StagedModel>,
-    staged_corpus: StagedCorpusUpdate,
-    manifest: &Manifest,
-) -> Result<()> {
-    promote_generation(staged_model, staged_corpus, manifest)
-}
-
-fn promote_generation(
-    staged_model: Option<&StagedModel>,
-    staged_corpus: StagedCorpusUpdate,
-    manifest: &Manifest,
-) -> Result<()> {
-    validate_manifest(manifest)?;
-    let manifest_sources = manifest.ann.keys().cloned().collect::<BTreeSet<_>>();
-    let staged_sources = staged_corpus
-        .staged_ann
-        .keys()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    if staged_sources != manifest_sources {
-        bail!(
-            "staged ANN source set does not match manifest: manifest={manifest_sources:?}, staged={staged_sources:?}"
-        );
-    }
-    if !staged_corpus.staged_db.is_file() {
-        bail!(
-            "staged legal database is missing: {}",
-            staged_corpus.staged_db.display()
-        );
-    }
-    for (source_id, path) in &staged_corpus.staged_ann {
-        if !path.is_file() {
-            bail!("staged ANN sidecar for source `{source_id}` is missing");
+fn set_generation_read_only(root: &Path) -> Result<()> {
+    fn visit(path: &Path) -> Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "immutable generation cannot contain symlinks: {}",
+                path.display()
+            );
         }
-    }
-    let key = generation_key(manifest);
-    let final_dir = generation_dir(&key)?;
-
-    cleanup_incomplete_generations()?;
-    if final_dir.exists() {
-        if active_generation_key()?.as_deref() == Some(key.as_str()) {
-            remove_path_if_exists(&staged_corpus.staging_root)?;
-            return Ok(());
-        }
-        bail!(
-            "immutable corpus generation collision at {}; refusing to overwrite it",
-            final_dir.display()
-        );
-    }
-    let installing = generations_dir()?.join(format!(".{key}.installing"));
-    remove_path_if_exists(&installing)?;
-    fs::create_dir_all(&installing)?;
-    let mut committed_final = false;
-    let result = (|| -> Result<()> {
-        fs::rename(&staged_corpus.staged_db, installing.join(LEGAL_DB_FILENAME))
-            .context("placing database in corpus generation")?;
-        let ann_dir = installing.join(crate::ann::ANN_DIRECTORY);
-        fs::create_dir_all(&ann_dir)?;
-        for (source_id, staged_ann) in &staged_corpus.staged_ann {
-            let destination = installing.join(crate::ann::sidecar_relative_path(source_id));
-            fs::rename(staged_ann, &destination).with_context(|| {
-                format!("placing ANN sidecar for source `{source_id}` in corpus generation")
-            })?;
-        }
-        #[cfg(unix)]
-        File::open(&ann_dir)?.sync_all()?;
-
-        if let Some(model) = staged_model {
-            for file in EMBEDDING_MODEL_HF_FILES {
-                copy_synced(
-                    &model.dir.join(file.output_name),
-                    &installing.join(file.output_name),
-                )?;
-            }
-            let marker = installing.join(".model.sha256");
-            write_synced(&marker, model.marker_value.as_bytes())?;
-        } else {
-            let current = live_dir()?;
-            for name in live_model_file_names() {
-                copy_synced(&current.join(name), &installing.join(name)).with_context(|| {
-                    format!("copying installed model file {name} into new corpus generation")
-                })?;
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path)? {
+                visit(&entry?.path())?;
             }
         }
-
-        let installed_manifest = installing.join("installed_manifest.json");
-        write_synced(&installed_manifest, &serde_json::to_vec_pretty(manifest)?)?;
-        #[cfg(unix)]
-        File::open(&installing)?.sync_all()?;
-        fs::rename(&installing, &final_dir)
-            .with_context(|| format!("committing corpus generation {}", final_dir.display()))?;
-        committed_final = true;
-        sync_parent(&final_dir)?;
-        activate_generation(&key)
-    })();
-    if let Err(error) = result {
-        if committed_final && active_generation_key()?.as_deref() != Some(key.as_str()) {
-            remove_path_if_exists(&final_dir).with_context(|| {
-                format!(
-                    "rolling back unactivated generation {}",
-                    final_dir.display()
-                )
-            })?;
-        }
-        let cleanup = remove_path_if_exists(&installing);
-        if let Err(cleanup_error) = cleanup {
-            return Err(error).context(format!(
-                "also failed to clean incomplete generation {}: {cleanup_error}",
-                installing.display()
-            ));
-        }
-        return Err(error);
-    }
-    let _ = fs::remove_dir_all(&staged_corpus.staging_root);
-    if let Err(error) = cleanup_inactive_generations(&key) {
-        eprintln!("legal-mcp update: warning: inactive generation cleanup failed: {error}");
-    }
-    Ok(())
-}
-
-fn generation_key(manifest: &Manifest) -> String {
-    fn field(hasher: &mut Sha256, value: &str) {
-        hasher.update((value.len() as u64).to_le_bytes());
-        hasher.update(value.as_bytes());
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(path, permissions)?;
+        Ok(())
     }
 
-    let mut hasher = Sha256::new();
-    hasher.update(b"australian-legal-mcp-installed-generation-v1\0");
-    field(&mut hasher, &manifest.schema_version.to_string());
-    field(&mut hasher, &manifest.index_version);
-    field(&mut hasher, &manifest.db.sha256);
-    field(&mut hasher, &manifest.db.size.to_string());
-    field(&mut hasher, &manifest.model.id);
-    field(&mut hasher, &manifest.model.sha256);
-    field(&mut hasher, &manifest.model.size.to_string());
-    for (source_id, ann) in &manifest.ann {
-        field(&mut hasher, source_id.as_str());
-        field(&mut hasher, &ann.corpus_id);
-        field(&mut hasher, &ann.embedding_set_sha256);
-        field(&mut hasher, &ann.vector_count.to_string());
-        field(&mut hasher, &ann.sha256);
-        field(&mut hasher, &ann.size.to_string());
-    }
-    format!("{:x}", hasher.finalize())
-}
-
-fn cleanup_incomplete_generations() -> Result<()> {
-    for entry in fs::read_dir(generations_dir()?)? {
-        let entry = entry?;
-        if entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| name.starts_with('.') && name.ends_with(".installing"))
-        {
-            remove_path_if_exists(&entry.path())?;
-        }
-    }
-    Ok(())
-}
-
-fn cleanup_inactive_generations(active_key: &str) -> Result<()> {
-    for entry in fs::read_dir(generations_dir()?)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name == active_key || name.starts_with('.') || !entry.file_type()?.is_dir() {
-            continue;
-        }
-        // An old backend may still hold mappings on Windows. Failure to clean
-        // an inactive generation is harmless and retried after the next update.
-        let _ = fs::remove_dir_all(entry.path());
-    }
-    Ok(())
-}
-
-fn copy_synced(source: &Path, destination: &Path) -> Result<()> {
-    let mut source_file =
-        File::open(source).with_context(|| format!("opening {}", source.display()))?;
-    let mut destination_file =
-        File::create(destination).with_context(|| format!("creating {}", destination.display()))?;
-    std::io::copy(&mut source_file, &mut destination_file)
-        .with_context(|| format!("copying {} to {}", source.display(), destination.display()))?;
-    destination_file.sync_all()?;
-    Ok(())
-}
-
-fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(())
-}
-
-pub(crate) fn live_model_file_names() -> Vec<&'static str> {
-    let mut names: Vec<&'static str> = EMBEDDING_MODEL_HF_FILES
-        .iter()
-        .map(|file| file.output_name)
-        .collect();
-    names.push(".model.sha256");
-    names
-}
-
-/// Download and verify the database artifact, rebuild local FTS indexes,
-/// verify any required ANN sidecar, and return a complete staged generation.
-pub(crate) fn stage_live_db_from_db_artifact(
-    manifest: &Manifest,
-    context: &UrlContext,
-    manifest_bytes: u64,
-    staging_root: &Path,
-) -> Result<StagedCorpusUpdate> {
-    validate_manifest(manifest)?;
-    let db_info = &manifest.db;
-
-    if staging_root.exists() {
-        fs::remove_dir_all(staging_root)?;
-    }
-    fs::create_dir_all(staging_root)?;
-    let staged_db = staging_root.join(LEGAL_DB_FILENAME);
-
-    // Stream archive acquisition to a temporary file while enforcing its
-    // declared byte count and digest. This keeps memory bounded independent
-    // of corpus size and leaves no partially valid archive after a crash.
-    let mut archive = tempfile::NamedTempFile::new_in(staging_root)?;
-    let mut input: Box<dyn Read> = match resolved_source(&db_info.url, context)? {
-        Ok(path) => {
-            Box::new(File::open(&path).with_context(|| format!("opening {}", path.display()))?)
-        }
-        Err(url) => Box::new(secure_get(url, Duration::from_secs(60 * 60))?),
-    };
-    let downloaded = copy_exact_hashed(input.as_mut(), &mut archive, db_info.size, &db_info.sha256)
-        .with_context(|| format!("verifying {}", db_info.url))?;
-    archive.as_file().sync_all()?;
-    let mut bytes_downloaded = manifest_bytes
-        .checked_add(downloaded)
-        .ok_or_else(|| anyhow!("update byte count overflow"))?;
-
-    archive.as_file_mut().rewind()?;
-    let mut decoded = tempfile::NamedTempFile::new_in(staging_root)?;
-    {
-        let mut decoder = zstd::stream::read::Decoder::new(BufReader::new(archive.as_file_mut()))
-            .context("opening corpus zstd stream")?;
-        copy_bounded(
-            &mut decoder,
-            &mut decoded,
-            MAX_DECOMPRESSED_DB_BYTES,
-            "decompressed legal database",
+    visit(root).with_context(|| {
+        format!(
+            "setting immutable generation permissions on {}",
+            root.display()
         )
-        .with_context(|| format!("decompressing into {}", staged_db.display()))?;
-    }
-    decoded.as_file().sync_all()?;
-    if decoded.as_file().metadata()?.len() == 0 {
-        bail!("decompressed corpus DB is empty");
-    }
-    decoded
-        .persist(&staged_db)
-        .map_err(|error| error.error)
-        .with_context(|| format!("persisting {}", staged_db.display()))?;
-
-    // Open writable and rebuild FTS5 indexes. We register a `zstd_decompress`
-    // scalar UDF so the chunks_fts repopulation can run as a single SQL
-    // INSERT … SELECT rather than 467 k Rust↔SQLite round-trips.
-    let conn = open_write_at(&staged_db)?;
-    conn.create_scalar_function(
-        "zstd_decompress",
-        1,
-        rusqlite::functions::FunctionFlags::SQLITE_UTF8
-            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-        |ctx| -> rusqlite::Result<String> {
-            let blob: Vec<u8> = ctx.get(0)?;
-            let bytes = zstd::stream::decode_all(Cursor::new(blob))
-                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-            String::from_utf8(bytes).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))
-        },
-    )
-    .context("registering zstd_decompress scalar function")?;
-
-    conn.execute_batch(
-        r#"
-        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-            text,
-            tokenize = 'porter unicode61 remove_diacritics 2'
-        );
-        CREATE VIRTUAL TABLE IF NOT EXISTS title_fts USING fts5(
-            source_id UNINDEXED,
-            native_id UNINDEXED,
-            title,
-            headings,
-            tokenize = 'porter unicode61 remove_diacritics 2'
-        );
-        DELETE FROM chunks_fts;
-        DELETE FROM title_fts;
-        INSERT INTO chunks_fts(rowid, text)
-            SELECT chunk_id, zstd_decompress(text) FROM chunks;
-        INSERT INTO title_fts(source_id, native_id, title, headings)
-            SELECT source_id, native_id, title, headings FROM documents;
-        "#,
-    )
-    .context("rebuilding FTS5 indexes on staged DB")?;
-
-    verify_corpus_manifest_binding(&conn, manifest)?;
-    verify_semantic_install(&conn, manifest)?;
-    let integrity = {
-        let mut stmt = conn.prepare("PRAGMA integrity_check;")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
-    };
-    if integrity.len() != 1 || integrity[0] != "ok" {
-        bail!("staged corpus failed SQLite integrity_check: {integrity:?}");
-    }
-    let foreign_key_errors: i64 =
-        conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
-            row.get(0)
-        })?;
-    if foreign_key_errors != 0 {
-        bail!("staged corpus has {foreign_key_errors} foreign-key integrity errors");
-    }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
-    let mut staged_ann = BTreeMap::new();
-    for (source_id, ann_info) in &manifest.ann {
-        let staged_path = staging_root.join(crate::ann::sidecar_relative_path(source_id));
-        if let Some(parent) = staged_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut input: Box<dyn Read> = match resolved_source(&ann_info.url, context)? {
-            Ok(path) => {
-                Box::new(File::open(&path).with_context(|| format!("opening {}", path.display()))?)
-            }
-            Err(url) => Box::new(secure_get(url, Duration::from_secs(60 * 60))?),
-        };
-        let downloaded = crate::ann::copy_verified(
-            input.as_mut(),
-            &staged_path,
-            ann_info.size,
-            &ann_info.sha256,
-        )
-        .with_context(|| format!("verifying ANN sidecar for source `{source_id}`"))?;
-        bytes_downloaded = bytes_downloaded
-            .checked_add(downloaded)
-            .ok_or_else(|| anyhow!("update byte count overflow"))?;
-        crate::ann::verify_sidecar(&staged_path, source_id, ann_info)?;
-        staged_ann.insert(source_id.clone(), staged_path);
-    }
-    drop(conn);
-    File::open(&staged_db)?.sync_all()?;
-
-    Ok(StagedCorpusUpdate {
-        staging_root: staging_root.to_path_buf(),
-        staged_db,
-        staged_ann,
-        stats: UpdateStats { bytes_downloaded },
     })
 }
 
-fn copy_bounded(
-    reader: &mut dyn Read,
-    writer: &mut dyn Write,
-    limit: u64,
-    label: &str,
-) -> Result<u64> {
-    let mut total = 0u64;
-    let mut buffer = [0u8; 1024 * 1024];
-    loop {
-        let count = reader.read(&mut buffer)?;
-        if count == 0 {
-            return Ok(total);
+fn set_generation_owner_writable(root: &Path) -> Result<()> {
+    fn visit(path: &Path) -> Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "immutable generation cannot contain symlinks: {}",
+                path.display()
+            );
         }
-        total = total
-            .checked_add(count as u64)
-            .ok_or_else(|| anyhow!("{label} byte count overflow"))?;
-        if total > limit {
-            bail!("{label} exceeded {limit} byte limit");
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path)? {
+                visit(&entry?.path())?;
+            }
         }
-        writer.write_all(&buffer[..count])?;
+        let mut permissions = metadata.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(permissions.mode() | 0o200);
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions)?;
+        Ok(())
     }
+
+    visit(root).with_context(|| {
+        format!(
+            "temporarily enabling immutable-generation removal at {}",
+            root.display()
+        )
+    })
+}
+
+#[cfg(unix)]
+fn ensure_generation_read_only(root: &Path) -> Result<()> {
+    fn visit(path: &Path) -> Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.permissions().readonly() {
+            bail!(
+                "installed generation path is not immutable: {}",
+                path.display()
+            );
+        }
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path)? {
+                visit(&entry?.path())?;
+            }
+        }
+        Ok(())
+    }
+    visit(root)
+}
+
+#[cfg(not(unix))]
+fn ensure_generation_read_only(_root: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn rename_across_directories(source: &Path, destination: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes())?;
+    let destination = CString::new(destination.as_os_str().as_bytes())?;
+    if unsafe { libc::rename(source.as_ptr(), destination.as_ptr()) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().into())
+    }
+}
+
+#[cfg(not(unix))]
+fn rename_across_directories(source: &Path, destination: &Path) -> Result<()> {
+    fs::rename(source, destination)?;
+    Ok(())
+}
+
+pub(crate) fn generation_key(manifest: &Manifest) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"australian-legal-mcp-local-generation-v1\0");
+    hasher.update(serde_json::to_vec(manifest)?);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(unix)]
+fn reject_hard_link(metadata: &fs::Metadata, path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if metadata.nlink() != 1 {
+        bail!(
+            "generation files must not be hard-linked: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn reject_hard_link(_metadata: &fs::Metadata, _path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn verified_regular_file(
+    root: &Path,
+    relative: &str,
+    expected_size: u64,
+    expected_sha: &str,
+) -> Result<PathBuf> {
+    let path = root.join(relative);
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("reading generation file {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "generation file must be a regular non-symlink: {}",
+            path.display()
+        );
+    }
+    reject_hard_link(&metadata, &path)?;
+    if metadata.len() != expected_size {
+        bail!("generation file size mismatch for {}", path.display());
+    }
+    let actual = sha256_path(&path)?;
+    if actual != expected_sha {
+        bail!("generation file SHA-256 mismatch for {}", path.display());
+    }
+    Ok(path)
+}
+
+pub(crate) fn read_generation_manifest(root: &Path) -> Result<Manifest> {
+    let path = root.join(crate::config::GENERATION_MANIFEST_FILENAME);
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("reading generation manifest {}", path.display()))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_MANIFEST_BYTES
+    {
+        bail!("generation manifest must be a bounded regular non-symlink file");
+    }
+    reject_hard_link(&metadata, &path)?;
+    let manifest: Manifest = serde_json::from_slice(&fs::read(&path)?)
+        .with_context(|| format!("parsing generation manifest {}", path.display()))?;
+    validate_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+pub(crate) fn validate_generation_dir(root: &Path) -> Result<(Manifest, String)> {
+    validate_generation_dir_with_mode(root, true)
+}
+
+fn validate_installed_generation_dir(root: &Path) -> Result<(Manifest, String)> {
+    validate_generation_dir_with_mode(root, false)
+}
+
+fn validate_generation_dir_with_mode(
+    root: &Path,
+    full_sqlite_integrity: bool,
+) -> Result<(Manifest, String)> {
+    let metadata = fs::symlink_metadata(root)
+        .with_context(|| format!("reading generation directory {}", root.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("generation path must be a real directory");
+    }
+    let expected_top = BTreeSet::from([
+        crate::ann::ANN_DIRECTORY.to_string(),
+        crate::config::GENERATION_MANIFEST_FILENAME.to_string(),
+        LEGAL_DB_FILENAME.to_string(),
+        manifest_model_path().to_string(),
+        manifest_tokenizer_path().to_string(),
+    ]);
+    let mut actual_top = BTreeSet::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow!("generation contains a non-Unicode path"))?;
+        actual_top.insert(name);
+    }
+    if actual_top != expected_top {
+        bail!("generation contents differ: expected {expected_top:?}, found {actual_top:?}");
+    }
+
+    let manifest = read_generation_manifest(root)?;
+    let db_path = verified_regular_file(
+        root,
+        &manifest.db.path,
+        manifest.db.size,
+        &manifest.db.sha256,
+    )?;
+    verified_regular_file(
+        root,
+        &manifest.model.model.path,
+        manifest.model.model.size,
+        &manifest.model.model.sha256,
+    )?;
+    verified_regular_file(
+        root,
+        &manifest.model.tokenizer.path,
+        manifest.model.tokenizer.size,
+        &manifest.model.tokenizer.sha256,
+    )?;
+
+    let ann_dir = root.join(crate::ann::ANN_DIRECTORY);
+    let ann_metadata = fs::symlink_metadata(&ann_dir)?;
+    if ann_metadata.file_type().is_symlink() || !ann_metadata.is_dir() {
+        bail!("generation ANN path must be a real directory");
+    }
+    let expected_ann = manifest
+        .ann
+        .values()
+        .map(|info| Path::new(&info.path).file_name().unwrap().to_owned())
+        .collect::<BTreeSet<_>>();
+    let actual_ann = fs::read_dir(&ann_dir)?
+        .map(|entry| Ok(entry?.file_name()))
+        .collect::<Result<BTreeSet<_>>>()?;
+    if actual_ann != expected_ann {
+        bail!("generation ANN file set differs from its manifest");
+    }
+    for (source_id, info) in &manifest.ann {
+        let path = root.join(&info.path);
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("reading generation ANN file {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!(
+                "generation ANN file must be a regular non-symlink: {}",
+                path.display()
+            );
+        }
+        reject_hard_link(&metadata, &path)?;
+        crate::ann::verify_sidecar(&path, source_id, info)?;
+    }
+
+    // FTS5's PRAGMA-integrity callback is rejected by a read-only SQLite
+    // connection even though a successful check does not alter the database.
+    // Full validation applies only to a writable staging generation. Installed
+    // generations are immutable and can be revalidated from their exact hashes
+    // plus the read-only relational/binding checks below.
+    let access = if full_sqlite_integrity {
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+    } else {
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+    };
+    let conn = Connection::open_with_flags(&db_path, access | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    conn.busy_timeout(Duration::from_secs(30))?;
+    conn.execute_batch("PRAGMA query_only=ON; PRAGMA cell_size_check=ON;")?;
+    crate::db::enforce_db_schema_version(&conn)?;
+    verify_corpus_manifest_binding(&conn, &manifest)?;
+    verify_semantic_install(&conn, &manifest)?;
+    if full_sqlite_integrity {
+        // Bundled SQLite asks FTS5 virtual tables to perform a write-shaped
+        // callback during a global integrity_check. Run SQLite's native check
+        // over every ordinary/shadow-free table, then use FTS5's documented
+        // integrity command explicitly in a rolled-back transaction.
+        let tables = {
+            let mut stmt = conn.prepare(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'table'
+                   AND name NOT LIKE 'chunks_fts%'
+                   AND name NOT LIKE 'title_fts%'
+                 ORDER BY name",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if tables.is_empty() {
+            bail!("generation database has no ordinary tables to validate");
+        }
+        for table in tables {
+            let escaped = table.replace('\'', "''");
+            let sql = format!("PRAGMA integrity_check('{escaped}')");
+            let integrity = {
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            if integrity.as_slice() != ["ok"] {
+                bail!(
+                    "generation database table `{table}` failed SQLite integrity_check: {integrity:?}"
+                );
+            }
+        }
+        conn.execute_batch("PRAGMA query_only=OFF")?;
+        let fts_check = conn.unchecked_transaction()?;
+        fts_check.execute(
+            "INSERT INTO title_fts(title_fts) VALUES('integrity-check')",
+            [],
+        )?;
+        fts_check.execute(
+            "INSERT INTO chunks_fts(chunks_fts) VALUES('integrity-check')",
+            [],
+        )?;
+        fts_check.rollback()?;
+    }
+    let foreign_keys: i64 =
+        conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if foreign_keys != 0 {
+        bail!("generation database has {foreign_keys} foreign-key violations");
+    }
+    for (table, expected) in [("chunks_fts", "chunks"), ("title_fts", "documents")] {
+        let indexed: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })?;
+        let source: i64 =
+            conn.query_row(&format!("SELECT COUNT(*) FROM {expected}"), [], |row| {
+                row.get(0)
+            })?;
+        if indexed != source {
+            bail!("generation FTS table `{table}` has {indexed} rows; expected {source}");
+        }
+    }
+    drop(conn);
+    if full_sqlite_integrity {
+        verified_regular_file(
+            root,
+            &manifest.db.path,
+            manifest.db.size,
+            &manifest.db.sha256,
+        )
+        .context("generation database changed during integrity validation")?;
+    }
+    let key = generation_key(&manifest)?;
+    Ok((manifest, key))
+}
+
+fn manifest_model_path() -> &'static str {
+    EMBEDDING_MODEL_FILES[0].output_name
+}
+
+fn manifest_tokenizer_path() -> &'static str {
+    EMBEDDING_MODEL_FILES[1].output_name
+}
+
+pub(crate) fn activate_local_generation(source: &Path) -> Result<ActivationReport> {
+    let lifecycle_lock = lifecycle_lock_file()?;
+    let result = activate_local_generation_locked(source);
+    fs2::FileExt::unlock(&lifecycle_lock)?;
+    result
+}
+
+fn activate_local_generation_locked(source: &Path) -> Result<ActivationReport> {
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("canonicalizing generation {}", source.display()))?;
+    let (_, key) = validate_generation_dir(&source)?;
+    validate_installed_generation_dir(&source)
+        .and_then(|(_, sealed_key)| {
+            if sealed_key != key {
+                bail!("generation changed while it was being sealed");
+            }
+            Ok(())
+        })
+        .context("revalidating generation immediately before sealing")?;
+    commit_validated_generation(&source, &key)
+}
+
+fn commit_validated_generation(source: &Path, key: &str) -> Result<ActivationReport> {
+    let corpus_lock = lock_file()?;
+    let result = commit_validated_generation_locked(source, key);
+    fs2::FileExt::unlock(&corpus_lock)?;
+    result
+}
+
+fn commit_validated_generation_locked(source: &Path, key: &str) -> Result<ActivationReport> {
+    let previous = active_generation_key()?;
+    let final_dir = generation_dir(key)?;
+    if final_dir.exists() {
+        if previous.as_deref() == Some(key) {
+            return Ok(ActivationReport {
+                active_generation: key.to_string(),
+                previous_generation: None,
+            });
+        }
+        bail!(
+            "immutable generation collision at {}; refusing to overwrite it",
+            final_dir.display()
+        );
+    }
+    let source_parent = source
+        .parent()
+        .ok_or_else(|| anyhow!("generation has no parent directory"))?
+        .to_path_buf();
+    let generation_root = generations_dir()?;
+    rename_across_directories(source, &final_dir).with_context(|| {
+        format!(
+            "committing immutable generation; build and runtime must share one filesystem: {} -> {}",
+            source.display(),
+            final_dir.display()
+        )
+    })?;
+    let durability = sync_directory(&source_parent).and_then(|()| sync_directory(&generation_root));
+    set_generation_read_only(&final_dir)?;
+    sync_directory(&final_dir)?;
+    durability.with_context(|| {
+        format!(
+            "generation was sealed safely at {} but its directory rename was not confirmed durable; recover with `legal-mcp rollback --generation {key}`",
+            final_dir.display()
+        )
+    })?;
+    if let Err(error) = activate_generation(key) {
+        if active_generation_key()?.as_deref() == Some(key) {
+            sync_directory(&data_dir()?)?;
+            return Ok(ActivationReport {
+                active_generation: key.to_string(),
+                previous_generation: previous,
+            });
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "generation was installed safely at {} but its active pointer was not changed; retry with `legal-mcp rollback --generation {key}`",
+                final_dir.display()
+            )
+        });
+    }
+    Ok(ActivationReport {
+        active_generation: key.to_string(),
+        previous_generation: previous,
+    })
+}
+
+pub(crate) fn rollback_generation(key: &str) -> Result<ActivationReport> {
+    let lifecycle_lock = lifecycle_lock_file()?;
+    let result = (|| {
+        let previous = active_generation_key()?;
+        let target = generation_dir(key)?;
+        let (_, actual_key) = validate_installed_generation_dir(&target)?;
+        if actual_key != key {
+            bail!("generation directory name does not match its immutable content");
+        }
+        set_generation_read_only(&target)?;
+        ensure_generation_read_only(&target)?;
+        let corpus_lock = lock_file()?;
+        activate_generation(key)?;
+        fs2::FileExt::unlock(&corpus_lock)?;
+        Ok(ActivationReport {
+            active_generation: key.to_string(),
+            previous_generation: previous,
+        })
+    })();
+    fs2::FileExt::unlock(&lifecycle_lock)?;
+    result
+}
+
+pub(crate) fn prune_inactive_generations(keep: usize) -> Result<Vec<String>> {
+    let lifecycle_lock = lifecycle_lock_file()?;
+    let corpus_lock = lock_file()?;
+    let result = (|| {
+        let active = active_generation_key()?
+            .ok_or_else(|| anyhow!("cannot prune generations without an active generation"))?;
+        let mut inactive = Vec::new();
+        for entry in fs::read_dir(generations_dir()?)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name == active || name.starts_with('.') || !entry.file_type()?.is_dir() {
+                continue;
+            }
+            if name.len() != 64
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                bail!(
+                    "unexpected directory in generations: {}",
+                    entry.path().display()
+                );
+            }
+            let modified = entry.metadata()?.modified()?;
+            inactive.push((modified, name.to_string(), entry.path()));
+        }
+        inactive.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        let mut removed = Vec::new();
+        for (_, name, path) in inactive.into_iter().skip(keep) {
+            set_generation_owner_writable(&path)?;
+            fs::remove_dir_all(&path)
+                .with_context(|| format!("removing inactive generation {}", path.display()))?;
+            removed.push(name);
+        }
+        sync_directory(&generations_dir()?)?;
+        Ok(removed)
+    })();
+    fs2::FileExt::unlock(&corpus_lock)?;
+    fs2::FileExt::unlock(&lifecycle_lock)?;
+    result
 }
 
 fn required_corpus_meta(conn: &Connection, key: &str) -> Result<String> {
@@ -1420,161 +1370,13 @@ pub(crate) fn chunk_embedding_count(conn: &Connection, source_id: &SourceId) -> 
     count_source_table(conn, source_id.as_str(), "chunk_embeddings")
 }
 
-pub(crate) fn load_installed_manifest() -> Result<Option<Manifest>> {
-    let path = installed_manifest_path()?;
+pub(crate) fn load_active_generation_manifest() -> Result<Option<Manifest>> {
+    let root = crate::config::live_dir()?;
+    let path = root.join(crate::config::GENERATION_MANIFEST_FILENAME);
     if !path.exists() {
         return Ok(None);
     }
-    let manifest: Manifest = serde_json::from_slice(&fs::read(&path)?)
-        .with_context(|| format!("parsing installed manifest {}", path.display()))?;
-    validate_manifest(&manifest)
-        .with_context(|| format!("validating installed manifest {}", path.display()))?;
-    Ok(Some(manifest))
-}
-
-/// Notice surfaced to the agent via `server_instructions` when the
-/// published corpus is newer than the installed one. Carries the published
-/// `index_version` so the agent can mention it to the user when suggesting
-/// `legal-mcp update`.
-pub(crate) struct UpdateAvailability {
-    pub(crate) available_index_version: String,
-}
-
-#[derive(Deserialize)]
-struct GithubReleaseAsset {
-    name: String,
-    browser_download_url: String,
-}
-
-#[derive(Deserialize)]
-struct GithubRelease {
-    #[serde(default)]
-    draft: bool,
-    #[serde(default)]
-    prerelease: bool,
-    assets: Vec<GithubReleaseAsset>,
-}
-
-const RELEASES_PER_PAGE: usize = 100;
-const MAX_RELEASE_PAGES: usize = 100;
-
-pub(crate) fn fetch_bytes_probe(url_or_path: &str, context: &UrlContext) -> Result<Vec<u8>> {
-    secure_fetch_bytes_with_timeout(
-        url_or_path,
-        context,
-        MAX_MANIFEST_BYTES,
-        Duration::from_secs(5),
-    )
-}
-
-fn release_page_url(page: usize) -> Result<String> {
-    let mut url = url::Url::parse(DEFAULT_RELEASES_API_URL)?;
-    url.query_pairs_mut()
-        .append_pair("per_page", &RELEASES_PER_PAGE.to_string())
-        .append_pair("page", &page.to_string());
-    Ok(url.into())
-}
-
-fn manifest_from_release_page(bytes: &[u8]) -> Result<(Option<String>, usize)> {
-    let releases: Vec<GithubRelease> = serde_json::from_slice(bytes)?;
-    let count = releases.len();
-    for release in releases {
-        if release.draft || release.prerelease {
-            continue;
-        }
-        if let Some(asset) = release
-            .assets
-            .into_iter()
-            .find(|asset| asset.name == "manifest.json")
-        {
-            return Ok((Some(asset.browser_download_url), count));
-        }
-    }
-    Ok((None, count))
-}
-
-pub(crate) fn resolve_corpus_manifest_url_with<F>(mut fetch_page: F) -> Result<String>
-where
-    F: FnMut(usize) -> Result<Vec<u8>>,
-{
-    for page in 1..=MAX_RELEASE_PAGES {
-        let bytes = fetch_page(page)?;
-        let (manifest, release_count) = manifest_from_release_page(&bytes)?;
-        if let Some(manifest) = manifest {
-            return Ok(manifest);
-        }
-        if release_count < RELEASES_PER_PAGE {
-            break;
-        }
-    }
-    bail!("no published australian-legal-mcp release with manifest.json was found")
-}
-
-fn resolve_corpus_manifest_url_with_budget(budget: Duration) -> Result<String> {
-    let deadline = Instant::now() + budget;
-    resolve_corpus_manifest_url_with(|page| {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| anyhow!("corpus manifest discovery timed out"))?;
-        let url = release_page_url(page)?;
-        let context = UrlContext::from_manifest_url(&url);
-        secure_fetch_bytes_with_timeout(&url, &context, MAX_MANIFEST_BYTES, remaining)
-    })
-}
-
-pub(crate) fn resolve_latest_corpus_manifest_url() -> Result<String> {
-    resolve_corpus_manifest_url_with_budget(Duration::from_secs(30))
-}
-
-pub(crate) fn resolve_latest_corpus_manifest_url_probe() -> Result<String> {
-    resolve_corpus_manifest_url_with_budget(Duration::from_secs(5))
-}
-
-/// Non-mutating availability probe. Returns `Some(UpdateAvailability)` only
-/// when (a) an installed manifest is present, (b) the published `manifest.json`
-/// is reachable inside the probe timeout, (c) it parses, (d) this binary can
-/// still ingest it, and (e) its `index_version` differs from the installed
-/// corpus. Every other case collapses to `Ok(None)` — no error path that
-/// could stall serve startup. A published index that requires a newer binary
-/// also returns `None` rather than emitting an "update available" notice the
-/// user could not act on; the next manual `legal-mcp update` will surface the
-/// real upgrade-the-binary error.
-pub(crate) fn check_for_update_availability(
-    manifest_url: &str,
-) -> Result<Option<UpdateAvailability>> {
-    if active_generation_key()?.is_none() {
-        return Ok(None);
-    }
-    let Some(installed) = load_installed_manifest()? else {
-        return Ok(None);
-    };
-    let context = UrlContext::from_manifest_url(manifest_url);
-    let manifest_bytes = match fetch_bytes_probe(manifest_url, &context) {
-        Ok(bytes) => bytes,
-        Err(_) => return Ok(None),
-    };
-    let manifest: Manifest = match serde_json::from_slice(&manifest_bytes) {
-        Ok(m) => m,
-        Err(_) => return Ok(None),
-    };
-    if validate_manifest(&manifest).is_err() {
-        return Ok(None);
-    }
-    if installed.index_version == manifest.index_version
-        && installed.schema_version == manifest.schema_version
-        && installed.model.id == manifest.model.id
-        && installed.model.sha256 == manifest.model.sha256
-        && installed.model.size == manifest.model.size
-        && installed.db.sha256 == manifest.db.sha256
-        && installed.db.size == manifest.db.size
-        && installed.ann == manifest.ann
-    {
-        return Ok(None);
-    }
-    Ok(Some(UpdateAvailability {
-        available_index_version: manifest.index_version,
-    }))
+    Ok(Some(read_generation_manifest(&root)?))
 }
 
 // ----- ATO browse-tree crawl and source snapshot -----
@@ -2212,7 +2014,6 @@ pub(crate) struct LinkDownloadArgs {
     pub(crate) out_dir: PathBuf,
     pub(crate) base_url: String,
     pub(crate) request_delay_seconds: f64,
-    pub(crate) max_workers: usize,
     pub(crate) timeout_seconds: f64,
     pub(crate) force: bool,
     pub(crate) workspace_lock_held: bool,
@@ -2545,6 +2346,7 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<LinkDownloadReport
             .unwrap_or_else(std::time::Instant::now),
     ));
     let request_delay = args.request_delay_seconds;
+    let concurrency = Arc::new(AdaptiveConcurrency::new("ato"));
 
     // Link-download fans out over worker threads with a shared queue,
     // shared client, shared index writer, and shared request-delay lock.
@@ -2560,8 +2362,8 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<LinkDownloadReport
             .open(&index_path)?,
     ));
 
-    let mut handles = Vec::with_capacity(args.max_workers);
-    for worker_id in 0..args.max_workers {
+    let mut handles = Vec::with_capacity(SOURCE_WORKER_CEILING);
+    for worker_id in 0..SOURCE_WORKER_CEILING {
         let work_queue = Arc::clone(&work_queue);
         let last_request = Arc::clone(&last_request);
         let index = Arc::clone(&index);
@@ -2569,6 +2371,7 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<LinkDownloadReport
         let stats_completed = Arc::clone(&stats_completed);
         let stats_errors = Arc::clone(&stats_errors);
         let stats_skipped = Arc::clone(&stats_skipped);
+        let concurrency = Arc::clone(&concurrency);
         let base_url = args.base_url.clone();
         let out_dir = out_dir.clone();
         let payload_dir = payload_dir.clone();
@@ -2608,19 +2411,6 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<LinkDownloadReport
                     }
                 }
 
-                // Rate limit.
-                if request_delay > 0.0 {
-                    let mut last = last_request.lock().unwrap();
-                    let now = std::time::Instant::now();
-                    let earliest = *last + Duration::from_secs_f64(request_delay);
-                    if earliest > now {
-                        std::thread::sleep(earliest - now);
-                        *last = earliest;
-                    } else {
-                        *last = now;
-                    }
-                }
-
                 let url = match href.as_deref() {
                     Some(h) if h.starts_with('/') => {
                         format!("{}{}", base_url.trim_end_matches('/'), h)
@@ -2632,6 +2422,21 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<LinkDownloadReport
                         continue;
                     }
                 };
+
+                let request = concurrency.acquire()?;
+                let pacing_started = Instant::now();
+                if request_delay > 0.0 {
+                    let mut last = last_request.lock().unwrap();
+                    let now = std::time::Instant::now();
+                    let earliest = *last + Duration::from_secs_f64(request_delay);
+                    if earliest > now {
+                        std::thread::sleep(earliest - now);
+                        *last = earliest;
+                    } else {
+                        *last = now;
+                    }
+                }
+                let pacing_wait = pacing_started.elapsed();
 
                 let parsed_url =
                     url::Url::parse(&url).with_context(|| format!("parsing acquisition URL {url}"));
@@ -2648,9 +2453,27 @@ pub(crate) fn link_download(args: LinkDownloadArgs) -> Result<LinkDownloadReport
                         }
                         let html =
                             String::from_utf8(bytes).context("ATO response was not UTF-8")?;
+                        request.finish(
+                            &url,
+                            Some(status.as_u16()),
+                            html.len(),
+                            1,
+                            RequestOutcome::Success,
+                            pacing_wait,
+                            None,
+                        );
                         (status.as_u16(), html)
                     }
                     Err(e) => {
+                        request.finish(
+                            &url,
+                            None,
+                            0,
+                            1,
+                            RequestOutcome::Transient,
+                            pacing_wait,
+                            None,
+                        );
                         eprintln!("link-download w{worker_id}: failed {canonical_id}: {e}");
                         stats_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let now = chrono::Utc::now().to_rfc3339();
@@ -3043,27 +2866,6 @@ mod security_tests {
     use super::*;
 
     #[test]
-    fn approved_hosts_require_dns_label_boundaries() {
-        for host in [
-            "ato.gov.au",
-            "www.ato.gov.au",
-            "api.github.com",
-            "release-assets.githubusercontent.com",
-            "huggingface.co",
-        ] {
-            assert!(approved_https_host(host), "rejected {host}");
-        }
-        for host in [
-            "evilato.gov.au",
-            "ato.gov.au.evil.test",
-            "github.com.evil.test",
-            "huggingface.co.evil.test",
-        ] {
-            assert!(!approved_https_host(host), "accepted {host}");
-        }
-    }
-
-    #[test]
     fn private_and_special_networks_are_rejected() {
         for address in [
             "127.0.0.1",
@@ -3084,97 +2886,40 @@ mod security_tests {
         assert!(public_ip("2606:4700:4700::1111".parse().unwrap()));
     }
 
-    #[test]
-    fn streaming_integrity_rejects_short_long_and_corrupt_inputs() {
-        let bytes = b"bounded stream";
-        let digest = format!("{:x}", Sha256::digest(bytes));
-        let mut output = Vec::new();
-        assert_eq!(
-            copy_exact_hashed(
-                &mut bytes.as_slice(),
-                &mut output,
-                bytes.len() as u64,
-                &digest
-            )
-            .unwrap(),
-            bytes.len() as u64
-        );
-        assert_eq!(output, bytes);
-
-        for (input, size, sha) in [
-            (
-                &bytes[..bytes.len() - 1],
-                bytes.len() as u64,
-                digest.as_str(),
-            ),
-            (bytes.as_slice(), bytes.len() as u64 - 1, digest.as_str()),
-            (bytes.as_slice(), bytes.len() as u64, "00"),
-        ] {
-            let mut reader = input;
-            assert!(copy_exact_hashed(&mut reader, &mut Vec::new(), size, sha).is_err());
-        }
-    }
-
-    #[test]
-    fn remote_manifests_cannot_resolve_local_artifacts() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let artifact = root.path().join("legal.db.zst");
-        fs::write(&artifact, b"artifact")?;
-        let context = UrlContext {
-            manifest_dir: None,
-            manifest_base_url: Some("https://github.com/example/release".to_string()),
-        };
-        for value in [
-            artifact.display().to_string(),
-            url::Url::from_file_path(&artifact)
-                .expect("absolute artifact path")
-                .to_string(),
-        ] {
-            let error = resolved_source(&value, &context).unwrap_err();
-            assert!(error.to_string().contains("remote manifest"));
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn decompression_output_is_bounded() -> Result<()> {
-        let compressed = zstd::stream::encode_all(Cursor::new(b"bounded output"), 1)?;
-        let mut reader = zstd::stream::read::Decoder::new(Cursor::new(compressed))?;
-        let error = copy_bounded(&mut reader, &mut Vec::new(), 4, "test output").unwrap_err();
-        assert!(error.to_string().contains("exceeded 4 byte limit"));
-        Ok(())
-    }
-
     fn sample_manifest() -> Manifest {
-        let source_id: SourceId = "ato".parse().expect("valid source id");
-        let frl_source_id: SourceId = "frl".parse().expect("valid source id");
-        let ann = crate::ann::ManifestAnn {
-            source_id: source_id.clone(),
-            format: crate::ann::ANN_FORMAT.to_string(),
-            format_version: crate::ann::ANN_FORMAT_VERSION,
-            library: crate::ann::ANN_LIBRARY.to_string(),
-            library_version: crate::ann::ANN_LIBRARY_VERSION.to_string(),
-            url: "ann/ato.ann".to_string(),
-            sha256: "1".repeat(64),
-            size: 1,
-            corpus_id: format!("sha256:{}", "2".repeat(64)),
-            embedding_model_id: EMBEDDING_MODEL_ID.to_string(),
-            embedding_dimension: crate::EMBEDDING_DIM as u32,
-            embedding_set_sha256: "3".repeat(64),
-            vector_count: 1,
-            seed: crate::ann::ANN_SEED,
-            rng: crate::ann::ANN_RNG.to_string(),
-            trees: crate::ann::ANN_TREES as u32,
-            split_after: crate::ann::ANN_SPLIT_AFTER as u32,
-            id_encoding: crate::ann::ANN_ID_ENCODING.to_string(),
-            metric: crate::ann::ANN_METRIC.to_string(),
-        };
-        let mut frl_ann = ann.clone();
-        frl_ann.source_id = frl_source_id.clone();
-        frl_ann.url = "ann/frl.ann".to_string();
-        frl_ann.sha256 = "6".repeat(64);
-        frl_ann.corpus_id = format!("sha256:{}", "7".repeat(64));
-        frl_ann.embedding_set_sha256 = "8".repeat(64);
+        let ann = crate::legal_source::source_registry()
+            .source_ids()
+            .into_iter()
+            .enumerate()
+            .map(|(index, source)| {
+                let source_id: SourceId = source.parse().expect("valid registered source id");
+                let digit = char::from_digit((index % 10) as u32, 10)
+                    .expect("single decimal digit")
+                    .to_string();
+                let metadata = crate::ann::ManifestAnn {
+                    source_id: source_id.clone(),
+                    format: crate::ann::ANN_FORMAT.to_string(),
+                    format_version: crate::ann::ANN_FORMAT_VERSION,
+                    library: crate::ann::ANN_LIBRARY.to_string(),
+                    library_version: crate::ann::ANN_LIBRARY_VERSION.to_string(),
+                    path: crate::ann::sidecar_manifest_path(&source_id),
+                    sha256: digit.repeat(64),
+                    size: 1,
+                    corpus_id: format!("sha256:{}", digit.repeat(64)),
+                    embedding_model_id: EMBEDDING_MODEL_ID.to_string(),
+                    embedding_dimension: crate::EMBEDDING_DIM as u32,
+                    embedding_set_sha256: digit.repeat(64),
+                    vector_count: 1,
+                    seed: crate::ann::ANN_SEED,
+                    rng: crate::ann::ANN_RNG.to_string(),
+                    trees: crate::ann::ANN_TREES as u32,
+                    split_after: crate::ann::ANN_SPLIT_AFTER as u32,
+                    id_encoding: crate::ann::ANN_ID_ENCODING.to_string(),
+                    metric: crate::ann::ANN_METRIC.to_string(),
+                };
+                (source_id, metadata)
+            })
+            .collect();
         Manifest {
             schema_version: SUPPORTED_SCHEMA_VERSION,
             index_version: "2026.07.11".to_string(),
@@ -3182,16 +2927,24 @@ mod security_tests {
             min_client_version: env!("CARGO_PKG_VERSION").to_string(),
             model: ModelInfo {
                 id: EMBEDDING_MODEL_ID.to_string(),
-                sha256: "4".repeat(64),
-                size: 1,
-                url: "model-bundle.tar.zst".to_string(),
+                fingerprint: crate::EMBEDDING_MODEL_FINGERPRINT.to_string(),
+                model: ManifestFile {
+                    path: EMBEDDING_MODEL_FILES[0].output_name.to_string(),
+                    sha256: EMBEDDING_MODEL_FILES[0].sha256.to_string(),
+                    size: EMBEDDING_MODEL_FILES[0].size,
+                },
+                tokenizer: ManifestFile {
+                    path: EMBEDDING_MODEL_FILES[1].output_name.to_string(),
+                    sha256: EMBEDDING_MODEL_FILES[1].sha256.to_string(),
+                    size: EMBEDDING_MODEL_FILES[1].size,
+                },
             },
             db: ManifestDb {
-                url: LEGAL_DB_ARCHIVE_FILENAME.to_string(),
+                path: LEGAL_DB_FILENAME.to_string(),
                 sha256: "5".repeat(64),
                 size: 1,
             },
-            ann: BTreeMap::from([(source_id, ann), (frl_source_id, frl_ann)]),
+            ann,
         }
     }
 
@@ -3222,144 +2975,6 @@ mod security_tests {
     }
 
     #[test]
-    fn final_manifest_accepts_remote_artifacts_but_rejects_duplicate_urls() -> Result<()> {
-        let mut manifest = sample_manifest();
-        manifest.db.url = "https://downloads.example/legal.db.zst".to_string();
-        for (source, ann) in &mut manifest.ann {
-            ann.url = format!("https://downloads.example/{source}.ann");
-        }
-        validate_manifest(&manifest)?;
-
-        let duplicate = manifest.db.url.clone();
-        manifest
-            .ann
-            .get_mut(&"ato".parse::<SourceId>()?)
-            .expect("ATO manifest entry")
-            .url = duplicate;
-        assert!(validate_manifest(&manifest)
-            .unwrap_err()
-            .to_string()
-            .contains("distinct URLs"));
-
-        let mut escaping = sample_manifest();
-        escaping.db.url = "../legal.db.zst".to_string();
-        assert!(validate_manifest(&escaping).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn generation_promotion_is_atomic_and_requires_every_source() -> Result<()> {
-        let data = tempfile::tempdir()?;
-        let _environment =
-            crate::TestEnvironment::set(&[("LEGAL_MCP_DATA_DIR", data.path().as_os_str())]);
-        let previous_key = "f".repeat(64);
-        fs::create_dir_all(generation_dir(&previous_key)?)?;
-        activate_generation(&previous_key)?;
-
-        let manifest = sample_manifest();
-        let expected_key = generation_key(&manifest);
-        let model_dir = data.path().join("staged-model");
-        fs::create_dir_all(&model_dir)?;
-        for file in EMBEDDING_MODEL_HF_FILES {
-            fs::write(model_dir.join(file.output_name), b"model")?;
-        }
-        let staged_model = StagedModel {
-            dir: model_dir,
-            marker_value: "verified-model".to_string(),
-        };
-
-        let incomplete_root = data.path().join("incomplete-generation");
-        fs::create_dir_all(&incomplete_root)?;
-        let incomplete_db = incomplete_root.join(LEGAL_DB_FILENAME);
-        fs::write(&incomplete_db, b"database")?;
-        let error = promote_staged_update(
-            Some(&staged_model),
-            StagedCorpusUpdate {
-                staging_root: incomplete_root,
-                staged_db: incomplete_db,
-                staged_ann: BTreeMap::new(),
-                stats: UpdateStats::default(),
-            },
-            &manifest,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("source set"));
-        assert_eq!(
-            active_generation_key()?.as_deref(),
-            Some(previous_key.as_str())
-        );
-        assert!(!generation_dir(&expected_key)?.exists());
-
-        let complete_root = data.path().join("complete-generation");
-        fs::create_dir_all(&complete_root)?;
-        let staged_db = complete_root.join(LEGAL_DB_FILENAME);
-        fs::write(&staged_db, b"database")?;
-        let mut staged_sidecars = BTreeMap::new();
-        for source_id in manifest.ann.keys() {
-            let staged_ann = complete_root.join(crate::ann::sidecar_relative_path(source_id));
-            fs::create_dir_all(staged_ann.parent().expect("ANN parent"))?;
-            fs::write(&staged_ann, format!("{source_id}-sidecar"))?;
-            staged_sidecars.insert(source_id.clone(), staged_ann);
-        }
-        let colliding_generation = generation_dir(&expected_key)?;
-        fs::create_dir_all(&colliding_generation)?;
-        fs::write(colliding_generation.join("sentinel"), b"immutable")?;
-        let collision_error = match promote_staged_update(
-            Some(&staged_model),
-            StagedCorpusUpdate {
-                staging_root: complete_root.clone(),
-                staged_db: staged_db.clone(),
-                staged_ann: staged_sidecars.clone(),
-                stats: UpdateStats::default(),
-            },
-            &manifest,
-        ) {
-            Ok(()) => panic!("an inactive immutable generation was overwritten"),
-            Err(error) => error,
-        };
-        assert!(collision_error.to_string().contains("collision"));
-        assert_eq!(
-            fs::read(colliding_generation.join("sentinel"))?,
-            b"immutable"
-        );
-        assert_eq!(
-            active_generation_key()?.as_deref(),
-            Some(previous_key.as_str())
-        );
-        fs::remove_dir_all(&colliding_generation)?;
-        promote_staged_update(
-            Some(&staged_model),
-            StagedCorpusUpdate {
-                staging_root: complete_root,
-                staged_db,
-                staged_ann: staged_sidecars,
-                stats: UpdateStats::default(),
-            },
-            &manifest,
-        )?;
-
-        assert_eq!(
-            active_generation_key()?.as_deref(),
-            Some(expected_key.as_str())
-        );
-        let generation = generation_dir(&expected_key)?;
-        assert_eq!(fs::read(generation.join(LEGAL_DB_FILENAME))?, b"database");
-        for source_id in manifest.ann.keys() {
-            assert_eq!(
-                fs::read(generation.join(crate::ann::sidecar_relative_path(source_id)))?,
-                format!("{source_id}-sidecar").into_bytes()
-            );
-        }
-        let installed: Manifest =
-            serde_json::from_slice(&fs::read(generation.join("installed_manifest.json"))?)?;
-        assert_eq!(installed, manifest);
-        assert!(!generations_dir()?
-            .join(format!(".{expected_key}.installing"))
-            .exists());
-        Ok(())
-    }
-
-    #[test]
     fn payload_paths_remain_beneath_payload_root() {
         let root = tempfile::tempdir().unwrap();
         let link = json!({
@@ -3369,6 +2984,19 @@ mod security_tests {
         let path = build_payload_path(root.path(), &link).unwrap();
         assert!(path.starts_with(root.path().join("payloads")));
         assert!(!path.to_string_lossy().contains(".."));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generation_files_reject_hard_links() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let file = root.path().join("artifact");
+        fs::write(&file, b"immutable bytes")?;
+        fs::hard_link(&file, root.path().join("other-link"))?;
+        let sha = sha256_path(&file)?;
+        let error = verified_regular_file(root.path(), "artifact", 15, &sha).unwrap_err();
+        assert!(error.to_string().contains("hard-linked"));
+        Ok(())
     }
 
     #[test]
@@ -3467,39 +3095,54 @@ mod security_tests {
     }
 
     #[test]
-    fn public_download_api_rejects_unsafe_sources_before_file_creation() {
-        let root = tempfile::tempdir().unwrap();
-        let destination = root.path().join("artifact.part");
-        let sha = "00".repeat(32);
-        for url in [
-            "http://github.com/artifact",
-            "https://127.0.0.1/artifact",
-            "https://evilato.gov.au/artifact",
-            "https://github.com.evil.test/artifact",
-            "https://user:secret@github.com/artifact",
-            "https://github.com:8443/artifact",
-        ] {
-            assert!(
-                download_approved_https_to_file(
-                    url,
-                    &destination,
-                    1,
-                    &sha,
-                    Duration::from_secs(1),
-                )
-                .is_err(),
-                "accepted {url}"
-            );
-            assert!(!destination.exists());
-        }
-        assert!(download_approved_https_to_file(
-            "https://github.com/artifact",
-            &destination,
-            0,
-            &sha,
-            Duration::from_secs(1),
-        )
-        .is_err());
-        assert!(!destination.exists());
+    fn validated_generation_commit_is_immutable_and_prune_keeps_active() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let _environment =
+            crate::TestEnvironment::set(&[("LEGAL_MCP_DATA_DIR", root.path().as_os_str())]);
+
+        let first_key = "a".repeat(64);
+        let first = root.path().join("first-staging");
+        fs::create_dir(&first)?;
+        fs::write(first.join("marker"), b"first")?;
+        let first_report = commit_validated_generation(&first, &first_key)?;
+        assert_eq!(first_report.active_generation, first_key);
+        assert_eq!(first_report.previous_generation, None);
+        assert!(!first.exists());
+        assert_eq!(
+            active_generation_key()?.as_deref(),
+            Some(first_key.as_str())
+        );
+
+        let second_key = "b".repeat(64);
+        let second = root.path().join("second-staging");
+        fs::create_dir(&second)?;
+        fs::write(second.join("marker"), b"second")?;
+        let second_report = commit_validated_generation(&second, &second_key)?;
+        assert_eq!(
+            second_report.previous_generation.as_deref(),
+            Some(first_key.as_str())
+        );
+        assert_eq!(
+            active_generation_key()?.as_deref(),
+            Some(second_key.as_str())
+        );
+
+        let collision = root.path().join("collision-staging");
+        fs::create_dir(&collision)?;
+        let repeated = commit_validated_generation(&collision, &second_key)?;
+        assert_eq!(repeated.active_generation, second_key);
+        assert!(
+            collision.exists(),
+            "an idempotent activation must not consume its duplicate input"
+        );
+
+        let removed = prune_inactive_generations(0)?;
+        assert_eq!(removed, vec![first_key]);
+        assert_eq!(
+            active_generation_key()?.as_deref(),
+            Some(second_key.as_str())
+        );
+        assert!(generation_dir(&second_key)?.is_dir());
+        Ok(())
     }
 }

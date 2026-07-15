@@ -92,6 +92,7 @@ jobs:
           names = {entry["path"] for entry in packed}
           allowed = (
               "package.json", "README.md", "LICENSE", "AGENTS.md", ".mcp.json",
+              "CURRENT_STATE.md", "DEPLOYMENT.md", "MAINTENANCE.md", "PLAN.md",
           )
           roots = (".claude-plugin/", "skills/")
           unexpected = {

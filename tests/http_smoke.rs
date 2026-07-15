@@ -139,6 +139,9 @@ fn post_raw(url: &str, body: &str, content_type: Option<&str>) -> Result<HttpRes
         .timeout(Duration::from_secs(10))
         .build()?;
     let mut request = client.post(url).body(body.to_string());
+    request = request
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2025-06-18");
     if let Some(content_type) = content_type {
         request = request.header("content-type", content_type);
     }
@@ -196,7 +199,7 @@ fn initialize_and_tools_list_over_http() -> Result<()> {
         .iter()
         .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
         .collect();
-    for expected in [
+    let expected = [
         "search",
         "get_chunks",
         "get_asset",
@@ -204,12 +207,15 @@ fn initialize_and_tools_list_over_http() -> Result<()> {
         "get_definition",
         "stats",
         "fetch",
-    ] {
-        assert!(
-            names.iter().any(|n| n == expected),
-            "expected `{expected}` in tool list, got {names:?}"
-        );
-    }
+    ];
+    let mut actual = names.clone();
+    actual.sort();
+    let mut expected = expected.map(str::to_string).to_vec();
+    expected.sort();
+    assert_eq!(
+        actual, expected,
+        "the MCP surface must contain exactly seven tools"
+    );
 
     let schema = |name: &str| {
         listed_tools
@@ -218,7 +224,12 @@ fn initialize_and_tools_list_over_http() -> Result<()> {
             .and_then(|tool| tool.get("inputSchema"))
             .unwrap_or_else(|| panic!("missing schema for {name}"))
     };
-    assert_eq!(schema("search")["properties"]["source"]["default"], "ato");
+    assert!(schema("search")["properties"]["source"]
+        .get("default")
+        .is_none());
+    assert!(schema("search")["required"]
+        .as_array()
+        .is_some_and(|required| required.iter().any(|field| field == "source")));
     assert_eq!(
         schema("search")["properties"]["similar_to_chunk"]["type"],
         "object"
@@ -241,8 +252,14 @@ fn initialize_and_tools_list_over_http() -> Result<()> {
         "object"
     );
     assert_eq!(
-        schema("get_definition")["properties"]["source"]["enum"],
-        json!(["ato", "frl"])
+        schema("get_definition")["properties"]["source"]["type"],
+        "string"
+    );
+    assert!(
+        schema("get_definition")["properties"]["source"]
+            .get("enum")
+            .is_none(),
+        "registered source validation is enforced by the runtime without repeating the registry in every tool schema"
     );
     assert!(listed_tools
         .iter()
@@ -286,7 +303,7 @@ fn rejects_non_mcp_paths_and_methods() -> Result<()> {
 }
 
 #[test]
-fn json_rpc_notifications_batches_and_errors_conform() -> Result<()> {
+fn streamable_http_notifications_batches_and_errors_conform() -> Result<()> {
     let dir = tempdir()?;
     let server = start_server(dir.path())?;
 
@@ -295,8 +312,16 @@ fn json_rpc_notifications_batches_and_errors_conform() -> Result<()> {
         r#"{"jsonrpc":"2.0","method":"ping"}"#,
         Some("application/json; charset=utf-8"),
     )?;
-    assert_eq!(notification.status, 204);
+    assert_eq!(notification.status, 202);
     assert!(notification.body.is_empty());
+
+    let client_response = post_raw(
+        &server.url,
+        r#"{"jsonrpc":"2.0","id":"server-request","result":{}}"#,
+        Some("application/json"),
+    )?;
+    assert_eq!(client_response.status, 202);
+    assert!(client_response.body.is_empty());
 
     let batch = post_raw(
         &server.url,
@@ -306,8 +331,7 @@ fn json_rpc_notifications_batches_and_errors_conform() -> Result<()> {
     assert_eq!(batch.status, 200);
     assert_eq!(batch.content_type.as_deref(), Some("application/json"));
     let batch: Value = serde_json::from_str(&batch.body)?;
-    assert_eq!(batch.as_array().map(Vec::len), Some(1));
-    assert_eq!(batch[0]["id"], 1);
+    assert_eq!(batch["error"]["code"], -32600);
 
     for (request, code) in [
         ("[]", -32600),
@@ -399,6 +423,64 @@ fn enforces_json_content_type_and_body_limit() -> Result<()> {
 }
 
 #[test]
+fn enforces_streamable_http_headers_origins_and_health() -> Result<()> {
+    let dir = tempdir()?;
+    let server = start_server(dir.path())?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+
+    let missing_accept = client
+        .post(&server.url)
+        .header("content-type", "application/json")
+        .header("mcp-protocol-version", "2025-06-18")
+        .body(body)
+        .send()?;
+    assert_eq!(missing_accept.status().as_u16(), 406);
+
+    let wrong_protocol = client
+        .post(&server.url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2024-11-05")
+        .body(body)
+        .send()?;
+    assert_eq!(wrong_protocol.status().as_u16(), 400);
+    let wrong_protocol: Value = serde_json::from_str(&wrong_protocol.text()?)?;
+    assert_eq!(wrong_protocol["error"]["code"], -32600);
+
+    let forbidden_origin = client
+        .post(&server.url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2025-06-18")
+        .header("origin", "https://attacker.example")
+        .body(body)
+        .send()?;
+    assert_eq!(forbidden_origin.status().as_u16(), 403);
+
+    let base = server.url.trim_end_matches("/mcp");
+    assert_eq!(
+        client
+            .get(format!("{base}/livez"))
+            .send()?
+            .status()
+            .as_u16(),
+        200
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/readyz"))
+            .send()?
+            .status()
+            .as_u16(),
+        503
+    );
+    Ok(())
+}
+
+#[test]
 fn rejects_non_loopback_bind() -> Result<()> {
     let dir = tempdir()?;
     let output = Command::new(bin_path())
@@ -407,5 +489,20 @@ fn rejects_non_loopback_bind() -> Result<()> {
         .output()?;
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("loopback-only"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_drains_workers_and_removes_endpoint_state() -> Result<()> {
+    let dir = tempdir()?;
+    let mut server = start_server(dir.path())?;
+    let result = unsafe { libc::kill(server.child.id() as libc::pid_t, libc::SIGTERM) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let status = server.child.wait()?;
+    assert!(status.success(), "graceful server exit was {status}");
+    assert!(!dir.path().join("http.json").exists());
     Ok(())
 }

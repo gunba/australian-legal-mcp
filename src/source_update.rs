@@ -6,10 +6,10 @@
 //! explicit full-source repair crawls.
 
 use crate::legal_source::{source_registry, SourceId, SourceRegistry};
-use crate::source::{link_download, scrape_diff, LinkDownloadArgs};
+use crate::source::{link_download, scrape_diff, snapshot_reduce, tree_crawl, LinkDownloadArgs};
 use anyhow::{anyhow, bail, Context, Result};
 use fs2::FileExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
@@ -20,18 +20,21 @@ const MAX_INVENTORY_LINE_BYTES: usize = 4 * 1024 * 1024;
 const ATO_WHATS_NEW_URL: &str = "https://www.ato.gov.au/law/view/whatsnew.htm?fid=whatsnew";
 const ATO_BASE_URL: &str = "https://www.ato.gov.au";
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SourceUpdateMode {
+    Incremental,
+    Full,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct SourceRatePolicy {
     pub(crate) minimum_request_interval_ms: u64,
-    pub(crate) max_concurrency: usize,
     pub(crate) request_timeout_seconds: u64,
 }
 
 impl SourceRatePolicy {
     fn validate(self, source: &SourceId) -> Result<()> {
-        if self.max_concurrency == 0 {
-            bail!("source `{source}` rate policy requires positive concurrency");
-        }
         if self.request_timeout_seconds == 0 {
             bail!("source `{source}` rate policy requires a positive timeout");
         }
@@ -50,6 +53,7 @@ pub(crate) struct SourceUpdateRequest {
 pub(crate) struct SourceUpdateContext {
     pub(crate) workspace: PathBuf,
     pub(crate) run_dir: PathBuf,
+    pub(crate) mode: SourceUpdateMode,
     _workspace_lock: File,
 }
 
@@ -116,6 +120,7 @@ pub(crate) struct SourceUpdateReport {
     pub(crate) workspace: PathBuf,
     pub(crate) run_dir: PathBuf,
     pub(crate) rate_policy: SourceRatePolicy,
+    pub(crate) mode: SourceUpdateMode,
     pub(crate) discovered: usize,
     pub(crate) completed: usize,
     pub(crate) failed: usize,
@@ -168,7 +173,7 @@ pub(crate) trait SourceAcquisition: Send + Sync {
 
     fn inventory(&self, context: &SourceUpdateContext) -> Result<SourceInventoryFingerprint>;
 
-    fn discover_incremental(&self, context: &SourceUpdateContext) -> Result<SourceDiscoveryBatch>;
+    fn discover(&self, context: &SourceUpdateContext) -> Result<SourceDiscoveryBatch>;
 
     fn fetch(
         &self,
@@ -186,19 +191,41 @@ impl SourceAcquisition for AtoAcquisition {
     fn rate_policy(&self) -> SourceRatePolicy {
         SourceRatePolicy {
             minimum_request_interval_ms: 50,
-            max_concurrency: 4,
             request_timeout_seconds: 30,
         }
     }
 
     fn inventory(&self, context: &SourceUpdateContext) -> Result<SourceInventoryFingerprint> {
-        fingerprint_jsonl(&ato_index_path(context)?)
+        let index_path = context.workspace.join("index.jsonl");
+        if index_path.exists() {
+            fingerprint_jsonl(&ato_index_path(context)?)
+        } else {
+            Ok(empty_inventory_fingerprint())
+        }
     }
 
-    fn discover_incremental(&self, context: &SourceUpdateContext) -> Result<SourceDiscoveryBatch> {
-        let index_path = ato_index_path(context)?;
-        let path = context.run_dir.join("pending.jsonl");
-        scrape_diff(&index_path, None, Some(ATO_WHATS_NEW_URL), None, &path)?;
+    fn discover(&self, context: &SourceUpdateContext) -> Result<SourceDiscoveryBatch> {
+        let path = match context.mode {
+            SourceUpdateMode::Incremental => {
+                let index_path = ato_index_path(context)?;
+                let path = context.run_dir.join("pending.jsonl");
+                scrape_diff(&index_path, None, Some(ATO_WHATS_NEW_URL), None, &path)?;
+                path
+            }
+            SourceUpdateMode::Full => {
+                let snapshot = context.run_dir.join("snapshot");
+                tree_crawl(
+                    "Mode=type&Action=initialise",
+                    &snapshot,
+                    "https://www.ato.gov.au/API/v1/law/lawservices/browse-content/",
+                    30.0,
+                    0.05,
+                    None,
+                )?;
+                snapshot_reduce(&snapshot.join("nodes.jsonl"), Some(&snapshot))?;
+                snapshot.join("deduped_links.jsonl")
+            }
+        };
         let records = fingerprint_jsonl(&path)?.records;
         Ok(SourceDiscoveryBatch { path, records })
     }
@@ -217,9 +244,8 @@ impl SourceAcquisition for AtoAcquisition {
             out_dir: context.workspace.clone(),
             base_url: ATO_BASE_URL.to_string(),
             request_delay_seconds: policy.minimum_request_interval_ms as f64 / 1_000.0,
-            max_workers: policy.max_concurrency,
             timeout_seconds: policy.request_timeout_seconds as f64,
-            force: false,
+            force: context.mode == SourceUpdateMode::Full,
             workspace_lock_held: true,
         })?;
         Ok(SourceFetchReport {
@@ -232,13 +258,15 @@ impl SourceAcquisition for AtoAcquisition {
 
 pub(crate) fn run_source_updates(
     requests: Vec<SourceUpdateRequest>,
+    mode: SourceUpdateMode,
 ) -> Result<Vec<SourceUpdateOutcome>> {
-    run_source_updates_with_registry(source_registry(), requests)
+    run_source_updates_with_registry(source_registry(), requests, mode)
 }
 
 fn run_source_updates_with_registry(
     registry: &SourceRegistry,
     requests: Vec<SourceUpdateRequest>,
+    mode: SourceUpdateMode,
 ) -> Result<Vec<SourceUpdateOutcome>> {
     if requests.is_empty() {
         bail!("source-update requires at least one source workspace");
@@ -255,7 +283,7 @@ fn run_source_updates_with_registry(
             .acquisition()
             .ok_or_else(|| anyhow!("source `{}` has no acquisition adapter", request.source))?;
         acquisition.rate_policy().validate(&request.source)?;
-        let context = prepare_context(&request)?;
+        let context = prepare_context(&request, mode)?;
         jobs.push((request.source, acquisition, context));
     }
 
@@ -265,7 +293,28 @@ fn run_source_updates_with_registry(
             let workspace = context.workspace.clone();
             let run_dir = context.run_dir.clone();
             let worker_source = source.clone();
-            let handle = scope.spawn(move || update_one(worker_source, acquisition, context));
+            let handle = scope.spawn(move || {
+                let result = update_one(worker_source.clone(), acquisition, context);
+                match &result {
+                    Ok(outcome) => {
+                        let status = match outcome {
+                            SourceUpdateOutcome::Current { .. } => "current",
+                            SourceUpdateOutcome::Updated { .. } => "updated",
+                            SourceUpdateOutcome::Partial { .. } => "partial",
+                            SourceUpdateOutcome::Failed { .. } => "failed",
+                        };
+                        eprintln!(
+                            "legal-mcp source-update: {} completed as {status}",
+                            worker_source
+                        );
+                    }
+                    Err(error) => eprintln!(
+                        "legal-mcp source-update: {} failed: {error:#}",
+                        worker_source
+                    ),
+                }
+                result
+            });
             handles.push((source, workspace, run_dir, handle));
         }
 
@@ -298,7 +347,7 @@ fn update_one(
     context: SourceUpdateContext,
 ) -> Result<SourceUpdateOutcome> {
     let inventory_before = acquisition.inventory(&context)?;
-    let discovery = acquisition.discover_incremental(&context)?;
+    let discovery = acquisition.discover(&context)?;
     let fetch = acquisition.fetch(&context, &discovery)?;
     let inventory_after = acquisition.inventory(&context)?;
     let report = SourceUpdateReport {
@@ -306,6 +355,7 @@ fn update_one(
         workspace: context.workspace,
         run_dir: context.run_dir,
         rate_policy: acquisition.rate_policy(),
+        mode: context.mode,
         discovered: discovery.records,
         completed: fetch.completed,
         failed: fetch.failed,
@@ -324,7 +374,21 @@ fn update_one(
     }
 }
 
-fn prepare_context(request: &SourceUpdateRequest) -> Result<SourceUpdateContext> {
+fn prepare_context(
+    request: &SourceUpdateRequest,
+    mode: SourceUpdateMode,
+) -> Result<SourceUpdateContext> {
+    let resume_run = match fs::symlink_metadata(&request.run_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!(
+                "source run path must be a real directory, not a symlink: {}",
+                request.run_dir.display()
+            )
+        }
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error).context("reading source run directory metadata"),
+    };
     let workspace_metadata = fs::symlink_metadata(&request.workspace).with_context(|| {
         format!(
             "reading source workspace metadata {}",
@@ -337,6 +401,16 @@ fn prepare_context(request: &SourceUpdateRequest) -> Result<SourceUpdateContext>
             request.workspace.display()
         );
     }
+    let has_committed_state = request.workspace.join("state.json").exists()
+        || request.workspace.join("index.jsonl").exists();
+    let full_workspace_must_be_empty =
+        mode == SourceUpdateMode::Full && (!resume_run || has_committed_state);
+    if full_workspace_must_be_empty && fs::read_dir(&request.workspace)?.next().is_some() {
+        bail!(
+            "full source refresh requires an empty workspace: {}",
+            request.workspace.display()
+        );
+    }
     let workspace = request.workspace.canonicalize().with_context(|| {
         format!(
             "canonicalizing source workspace {}",
@@ -344,12 +418,6 @@ fn prepare_context(request: &SourceUpdateRequest) -> Result<SourceUpdateContext>
         )
     })?;
 
-    if request.run_dir.exists() {
-        bail!(
-            "source run directory already exists: {}",
-            request.run_dir.display()
-        );
-    }
     let run_parent = request
         .run_dir
         .parent()
@@ -385,19 +453,29 @@ fn prepare_context(request: &SourceUpdateRequest) -> Result<SourceUpdateContext>
             request.run_dir.display()
         );
     }
-    fs::create_dir(&request.run_dir).with_context(|| {
-        format!(
-            "creating source run directory {}",
-            request.run_dir.display()
-        )
-    })?;
+    if !resume_run {
+        fs::create_dir(&request.run_dir).with_context(|| {
+            format!(
+                "creating source run directory {}",
+                request.run_dir.display()
+            )
+        })?;
+    }
     let run_dir = request.run_dir.canonicalize()?;
 
     Ok(SourceUpdateContext {
         workspace,
         run_dir,
+        mode,
         _workspace_lock: workspace_lock,
     })
+}
+
+fn empty_inventory_fingerprint() -> SourceInventoryFingerprint {
+    SourceInventoryFingerprint {
+        records: 0,
+        sha256: format!("{:x}", Sha256::digest([])),
+    }
 }
 
 fn canonicalize_planned_path(path: &Path) -> Result<PathBuf> {
@@ -530,10 +608,7 @@ mod tests {
             })
         }
 
-        fn discover_incremental(
-            &self,
-            context: &SourceUpdateContext,
-        ) -> Result<SourceDiscoveryBatch> {
+        fn discover(&self, context: &SourceUpdateContext) -> Result<SourceDiscoveryBatch> {
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(active, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(60));
@@ -588,33 +663,28 @@ mod tests {
         let max_active = Arc::new(AtomicUsize::new(0));
         let ato_policy = SourceRatePolicy {
             minimum_request_interval_ms: 50,
-            max_concurrency: 4,
             request_timeout_seconds: 30,
         };
         let wa_policy = SourceRatePolicy {
             minimum_request_interval_ms: 250,
-            max_concurrency: 1,
             request_timeout_seconds: 45,
         };
-        let registry = SourceRegistry::try_new(
-            "ato".parse()?,
-            vec![
-                fake_source(
-                    "ato",
-                    ato_policy,
-                    Arc::clone(&active),
-                    Arc::clone(&max_active),
-                    false,
-                ),
-                fake_source(
-                    "wa",
-                    wa_policy,
-                    Arc::clone(&active),
-                    Arc::clone(&max_active),
-                    false,
-                ),
-            ],
-        )?;
+        let registry = SourceRegistry::try_new(vec![
+            fake_source(
+                "ato",
+                ato_policy,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+                false,
+            ),
+            fake_source(
+                "wa",
+                wa_policy,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+                false,
+            ),
+        ])?;
         let ato_workspace = temp.path().join("ato-workspace");
         let wa_workspace = temp.path().join("wa-workspace");
         fs::create_dir_all(&ato_workspace)?;
@@ -633,6 +703,7 @@ mod tests {
                     run_dir: temp.path().join("runs/wa"),
                 },
             ],
+            SourceUpdateMode::Incremental,
         )?;
 
         assert_eq!(max_active.load(Ordering::SeqCst), 2);
@@ -655,28 +726,24 @@ mod tests {
         let max_active = Arc::new(AtomicUsize::new(0));
         let policy = SourceRatePolicy {
             minimum_request_interval_ms: 1,
-            max_concurrency: 1,
             request_timeout_seconds: 1,
         };
-        let registry = SourceRegistry::try_new(
-            "ato".parse()?,
-            vec![
-                fake_source(
-                    "ato",
-                    policy,
-                    Arc::clone(&active),
-                    Arc::clone(&max_active),
-                    false,
-                ),
-                fake_source(
-                    "broken",
-                    policy,
-                    Arc::clone(&active),
-                    Arc::clone(&max_active),
-                    true,
-                ),
-            ],
-        )?;
+        let registry = SourceRegistry::try_new(vec![
+            fake_source(
+                "ato",
+                policy,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+                false,
+            ),
+            fake_source(
+                "broken",
+                policy,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+                true,
+            ),
+        ])?;
         let ato_workspace = temp.path().join("ato-workspace");
         let broken_workspace = temp.path().join("broken-workspace");
         fs::create_dir_all(&ato_workspace)?;
@@ -695,6 +762,7 @@ mod tests {
                     run_dir: temp.path().join("runs/ato"),
                 },
             ],
+            SourceUpdateMode::Incremental,
         )?;
 
         assert!(matches!(outcomes[0], SourceUpdateOutcome::Updated { .. }));
@@ -724,14 +792,68 @@ mod tests {
         let workspace = temp.path().join("workspace");
         fs::create_dir(&workspace)?;
         let run_dir = workspace.join("runs/ato");
-        let error = prepare_context(&SourceUpdateRequest {
-            source: "ato".parse()?,
-            workspace: workspace.clone(),
-            run_dir: run_dir.clone(),
-        })
+        let error = prepare_context(
+            &SourceUpdateRequest {
+                source: "ato".parse()?,
+                workspace: workspace.clone(),
+                run_dir: run_dir.clone(),
+            },
+            SourceUpdateMode::Incremental,
+        )
         .expect_err("overlapping run directory must fail");
         assert!(error.to_string().contains("must not overlap"));
         assert!(!workspace.join("runs").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn full_refresh_requires_a_fresh_workspace() -> Result<()> {
+        let temp = tempdir()?;
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace)?;
+        fs::write(workspace.join("state.json"), b"committed")?;
+        let error = prepare_context(
+            &SourceUpdateRequest {
+                source: "ato".parse()?,
+                workspace,
+                run_dir: temp.path().join("runs/full"),
+            },
+            SourceUpdateMode::Full,
+        )
+        .expect_err("full refresh must not overwrite a committed workspace");
+        assert!(error.to_string().contains("requires an empty workspace"));
+        Ok(())
+    }
+
+    #[test]
+    fn full_refresh_can_resume_its_uncommitted_run_directory() -> Result<()> {
+        let temp = tempdir()?;
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace)?;
+        fs::create_dir(workspace.join("staging"))?;
+        let run_dir = temp.path().join("runs/full");
+        fs::create_dir_all(&run_dir)?;
+        let context = prepare_context(
+            &SourceUpdateRequest {
+                source: "ato".parse()?,
+                workspace: workspace.clone(),
+                run_dir: run_dir.clone(),
+            },
+            SourceUpdateMode::Full,
+        )?;
+        drop(context);
+
+        fs::write(workspace.join("state.json"), b"committed")?;
+        let error = prepare_context(
+            &SourceUpdateRequest {
+                source: "ato".parse()?,
+                workspace,
+                run_dir,
+            },
+            SourceUpdateMode::Full,
+        )
+        .expect_err("full refresh resume must not overwrite committed state");
+        assert!(error.to_string().contains("requires an empty workspace"));
         Ok(())
     }
 
@@ -740,16 +862,22 @@ mod tests {
         let temp = tempdir()?;
         let workspace = temp.path().join("workspace");
         fs::create_dir(&workspace)?;
-        let first = prepare_context(&SourceUpdateRequest {
-            source: "ato".parse()?,
-            workspace: workspace.clone(),
-            run_dir: temp.path().join("runs/first"),
-        })?;
-        let error = prepare_context(&SourceUpdateRequest {
-            source: "ato".parse()?,
-            workspace,
-            run_dir: temp.path().join("runs/second"),
-        })
+        let first = prepare_context(
+            &SourceUpdateRequest {
+                source: "ato".parse()?,
+                workspace: workspace.clone(),
+                run_dir: temp.path().join("runs/first"),
+            },
+            SourceUpdateMode::Incremental,
+        )?;
+        let error = prepare_context(
+            &SourceUpdateRequest {
+                source: "ato".parse()?,
+                workspace,
+                run_dir: temp.path().join("runs/second"),
+            },
+            SourceUpdateMode::Incremental,
+        )
         .expect_err("concurrent update must fail while the first lock is held");
         assert!(error
             .to_string()
@@ -764,11 +892,14 @@ mod tests {
         let workspace = temp.path().join("workspace");
         fs::create_dir(&workspace)?;
         let build_lock = lock_workspace_shared(&workspace)?;
-        let error = prepare_context(&SourceUpdateRequest {
-            source: "ato".parse()?,
-            workspace,
-            run_dir: temp.path().join("runs/update"),
-        })
+        let error = prepare_context(
+            &SourceUpdateRequest {
+                source: "ato".parse()?,
+                workspace,
+                run_dir: temp.path().join("runs/update"),
+            },
+            SourceUpdateMode::Incremental,
+        )
         .expect_err("source update must wait for a build snapshot");
         assert!(error
             .to_string()
@@ -782,20 +913,16 @@ mod tests {
         let temp = tempdir()?;
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
-        let registry = SourceRegistry::try_new(
-            "ato".parse()?,
-            vec![fake_source(
-                "ato",
-                SourceRatePolicy {
-                    minimum_request_interval_ms: 0,
-                    max_concurrency: 0,
-                    request_timeout_seconds: 30,
-                },
-                active,
-                max_active,
-                false,
-            )],
-        )?;
+        let registry = SourceRegistry::try_new(vec![fake_source(
+            "ato",
+            SourceRatePolicy {
+                minimum_request_interval_ms: 0,
+                request_timeout_seconds: 0,
+            },
+            active,
+            max_active,
+            false,
+        )])?;
         let workspace = temp.path().join("workspace");
         fs::create_dir(&workspace)?;
         let error = run_source_updates_with_registry(
@@ -805,9 +932,10 @@ mod tests {
                 workspace,
                 run_dir: temp.path().join("runs/ato"),
             }],
+            SourceUpdateMode::Incremental,
         )
-        .expect_err("zero concurrency must fail before the run directory is created");
-        assert!(error.to_string().contains("positive concurrency"));
+        .expect_err("zero timeout must fail before the run directory is created");
+        assert!(error.to_string().contains("positive timeout"));
         assert!(!temp.path().join("runs").exists());
         Ok(())
     }

@@ -1,158 +1,129 @@
 ---
 name: setup-australian-legal-mcp
-description: "Detailed setup and recovery for australian-legal-mcp. Use only when installing the Australian Legal MCP plugin, repairing MCP startup, diagnosing a 30-second MCP timeout, fixing a missing or stale corpus, or recovering repeated legal-mcp startup failures."
-metadata:
-  parent_skill: australian-legal-mcp
+description: "Install or repair Australian Legal MCP endpoint connectivity, hosted service readiness, immutable generation activation/rollback, or local stdio development setup."
 ---
 
-# Setup Australian Legal MCP
+# Set up or repair Australian Legal MCP
 
-This skill is for setup and failure recovery only. Do not load it for ordinary
-legal research when the `australian-legal` MCP tools are already working.
+Use this skill only for missing tools, endpoint/service failure, inactive or
+invalid generation, direct-deployment recovery, or repeated startup failure.
+The runtime has no corpus downloader or updater.
 
-## User Communication
+## Identify the mode
 
-Do the technical work yourself and keep the user informed. Do not ask legal
-practitioners to choose ports, edit config, or run terminal commands.
-
-Use concise status messages:
-
-> I am checking the local Australian legal research tool setup. The MCP host
-> should start the local service automatically; I will report anything that needs
-> a session restart.
-
-## Server Startup
-
-`legal-mcp mcp` is the MCP host entry point. It is a stdio command that starts
-or reuses one local loopback HTTP backend and proxies MCP messages to that
-backend. `legal-mcp serve` is the backend HTTP server for advanced or manual
-use; do not configure `serve` directly as a stdio MCP command.
-
-Before configuring MCP, resolve one installed executable path and verify it.
-Release archives named `legal-mcp-<version>-<target>` must be checked against
-the release `SHA256SUMS` before extraction. Install the executable into a stable
-per-user `PATH` directory (`~/.local/bin` on Linux/macOS, or a fixed Programs
-directory under local app data on Windows), then confirm `command -v legal-mcp` /
-`Get-Command legal-mcp` resolves that exact file and run `legal-mcp --version`.
-On Linux keep the verified `libonnxruntime.so` beside `legal-mcp`; on Windows
-keep `onnxruntime.dll` beside `legal-mcp.exe`. Never configure an executable
-inside a temporary extraction directory.
-
-The binary path and corpus data directory are separate. Enterprise policy may
-require the binary to live under local app data. That is fine, but the installer
-must choose one corpus data directory and use it consistently.
-
-The default data directories are `%APPDATA%\australian-legal-mcp` on Windows,
-`~/.local/share/australian-legal-mcp` on Linux, and
-`~/Library/Application Support/australian-legal-mcp` on macOS.
-
-Two valid modes:
-
-- Default data dir: leave `LEGAL_MCP_DATA_DIR` unset for `legal-mcp update`,
-  `legal-mcp mcp`, `stats`, and MCP calls.
-- Portable/co-located data dir: set `LEGAL_MCP_DATA_DIR` to a stable data
-  directory next to the binary for every `legal-mcp update`, `legal-mcp mcp`,
-  `stats`, and verification call.
-
-Do not install the corpus under a temporary extraction directory. Do not run
-`legal-mcp update` with a non-default `LEGAL_MCP_DATA_DIR` and later start the
-MCP entry point without that same setting.
-
-MCP startup behavior:
-
-- `.mcp.json` must contain an `australian-legal` server entry with
-  `command: legal-mcp` and `args: ["mcp"]`.
-- `legal-mcp mcp` checks `<data_dir>/http.json` for an existing backend.
-- If that backend answers MCP `initialize` with the same binary version, the
-  stdio command reuses it.
-- Otherwise, `legal-mcp mcp` takes `<data_dir>/SERVER_LOCK`, starts
-  `legal-mcp serve --port <free-port>` in the background, waits for the
-  deterministic readiness line, writes `<data_dir>/http.json`, and proxies the
-  MCP call.
-- `legal-mcp serve --port <N>` is only for manual HTTP testing.
-
-Manual stdio smoke:
+Production mode is a private HTTPS `/mcp` endpoint (normally Tailscale HTTPS) in
+front of `legal-mcp.service`. The service runs:
 
 ```bash
-request='{"jsonrpc":"2.0","id":1,"method":"initialize",'
-request+='"params":{"protocolVersion":"2025-06-18","capabilities":{},'
-request+='"clientInfo":{"name":"smoke","version":"1"}}}'
-printf '%s\n' "$request" | legal-mcp mcp
+legal-mcp serve --bind 127.0.0.1 --port 51235
 ```
 
-If MCP host config changed, ask the user to exit and resume the agent session
-so the host reloads the MCP command. The stdio entry remains stable when the
-backend selects a new loopback port.
+Local development mode may register:
 
-## 30-Second Timeout
+```json
+{
+  "mcpServers": {
+    "australian-legal": {
+      "command": "legal-mcp",
+      "args": ["mcp"]
+    }
+  }
+}
+```
 
-Interpret the timeout from the config state:
+Do not silently replace one mode with the other.
 
-- If `.mcp.json` points at HTTP or `legal-mcp serve`, replace it with the stdio
-  entry running `legal-mcp mcp`, then ask the user to exit and resume the agent
-  session.
-- If `.mcp.json` already runs `legal-mcp mcp`, check `legal-mcp --version`,
-  then run the manual stdio smoke above.
-- If the stdio smoke starts but tool calls fail, check `LEGAL_MCP_DATA_DIR`,
-  `stats`, `<data_dir>/server.log`, and whether the corpus exists in that data
-  directory.
-- For a timeout during update, run `legal-mcp update` separately so progress
-  is visible; do not perform corpus update inside MCP startup.
+## Production endpoint checks
 
-Do not use fixed sleeps. Use command output, process exit, or MCP host health.
+1. Confirm the configured private HTTPS URL ends in `/mcp` and the client can
+   reach the tailnet/private network.
+2. On the serving VM, inspect:
 
-## Missing Corpus
+   ```bash
+   curl -fsS http://127.0.0.1:51235/livez
+   curl -fsS http://127.0.0.1:51235/readyz
+   sudo systemctl status legal-mcp.service
+   sudo journalctl -u legal-mcp.service -n 100 --no-pager
+   sudo -u legal-mcp env \
+     LEGAL_MCP_DATA_DIR=/var/lib/australian-legal-mcp \
+     /usr/local/bin/legal-mcp verify
+   ```
 
-If `stats` or MCP initialize says the corpus is missing, tell the user:
+3. `/readyz` must report `status: ok` and the expected 64-character generation.
+   A live-but-not-ready service is not healthy.
+4. Confirm `/etc/australian-legal-mcp/legal-mcp.env` points to
+   `/var/lib/australian-legal-mcp` and the CPU ONNX Runtime library.
+5. Confirm port 51235 is loopback-only. Do not open it publicly.
 
-> The Australian legal research tool is installed, but its local corpus has not
-> been downloaded yet. It is a large one-time download. I can run it now and
-> then verify the tool before we continue.
-
-On approval:
+If a deployment was interrupted, inspect
+`/var/lib/australian-legal-mcp/.deploy-lock` and `incoming/`. Remove a stale lock
+only after proving no deployment process is running. Re-run from the RTX host:
 
 ```bash
-legal-mcp update
+scripts/deploy-generation.sh deploy@example-vps
 ```
 
-After update, verify `legal-mcp stats`. If the MCP host was already running, ask
-the user to exit and resume after update so it reconnects to a backend using the
-refreshed corpus.
+The script resumes/converges incoming files, strictly verifies before pruning,
+activates atomically, restarts, checks the exact generation, and rolls back on
+failure.
 
-If an earlier setup downloaded the corpus under a temporary or one-shot
-`LEGAL_MCP_DATA_DIR`, fix the install by choosing the intended stable data dir:
-either rerun `legal-mcp update` with `LEGAL_MCP_DATA_DIR` unset, or set
-`LEGAL_MCP_DATA_DIR` to the stable co-located data dir for both update and MCP
-startup. Then restart the MCP host and verify `legal-mcp stats` reports the
-intended `data_dir`.
+## Missing or invalid generation
 
-## Newer Corpus Available
-
-If a newer corpus is available, ask whether to update now or after the current
-answer. If updating:
+Never run or suggest `legal-mcp update`; it does not exist. On the maintainer
+checkout:
 
 ```bash
-legal-mcp update
+cargo build --release --features cuda
+scripts/maintainer-sync.sh             # or --full for a fresh repair
+LEGAL_MCP_DATA_DIR="$PWD/data/runtime" legal-mcp verify
+scripts/deploy-generation.sh deploy@example-vps
 ```
 
-Then restart the MCP host or backend and verify `legal-mcp stats`.
-
-## Verification
-
-Before saying setup is ready:
+Manual local lifecycle:
 
 ```bash
-legal-mcp --version
-legal-mcp stats
-legal-mcp search "research and development tax incentive eligibility" --source ato --k 1
-legal-mcp search "income tax assessment act" --source frl --k 1
+LEGAL_MCP_DATA_DIR="$PWD/data/runtime" legal-mcp activate \
+  --generation-dir "$PWD/data/builds/<generation-directory>"
+LEGAL_MCP_DATA_DIR="$PWD/data/runtime" legal-mcp verify
+LEGAL_MCP_DATA_DIR="$PWD/data/runtime" legal-mcp rollback \
+  --generation <generation-id>
+LEGAL_MCP_DATA_DIR="$PWD/data/runtime" legal-mcp prune-generations \
+  --keep-inactive 1
 ```
 
-If available, run the MCP host health check and confirm the `australian-legal`
-MCP server is connected.
+Do not prune until the active generation passes `verify`. Do not edit files
+inside `generations/` or manually rewrite `active-generation`.
 
-## Do Not
+## Local stdio checks
 
-- Do not make the user run commands or edit config.
-- Do not configure `legal-mcp serve` as a stdio MCP command.
-- Do not run `legal-mcp update` as a hidden background startup task.
+1. Verify `legal-mcp --version` and the CPU ONNX Runtime library are discoverable.
+2. Ensure every local command inherits the same runtime root, normally:
+
+   ```bash
+   export LEGAL_MCP_DATA_DIR=/path/to/australian-legal-mcp/data/runtime
+   legal-mcp verify
+   legal-mcp mcp
+   ```
+
+3. Inspect `http.json` and `SERVER_LOCK` only in local stdio/backend mode. A
+   stale endpoint is safe to remove only after confirming no `legal-mcp serve`
+   process owns it.
+4. For a deliberate foreground test:
+
+   ```bash
+   legal-mcp serve --bind 127.0.0.1 --port 51235
+   ```
+
+## Verification after recovery
+
+Call the MCP `stats` tool and one explicit-source `search` for each relevant
+source. Confirm exact HTTPS `canonical_url` values and resolvable typed
+references. For a full production check run:
+
+```bash
+LEGAL_MCP_DATA_DIR="$PWD/data/runtime" scripts/smoke.sh
+```
+
+If recovery cannot proceed because no validated generation exists, report that
+maintainer build/direct deployment is required. Do not substitute a runtime
+download, GitHub corpus release, offline bundle, or shared public token.

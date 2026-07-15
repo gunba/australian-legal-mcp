@@ -4,14 +4,14 @@
 //! updates use the same registered adapter, preventing retrieval and acquisition
 //! source lists from drifting apart.
 
-use crate::frl::{frl_descriptor, FRL_ACQUISITION};
-use crate::source_update::{SourceAcquisition, ATO_ACQUISITION};
-use anyhow::{bail, Result};
+use crate::source_catalog::production_registrations;
+use crate::source_update::SourceAcquisition;
+#[cfg(test)]
+use anyhow::bail;
+use anyhow::Result;
 pub(crate) use legal_model::{SourceDescriptor, SourceId};
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
-
-pub(crate) const DEFAULT_SOURCE_ID: &str = "ato";
 
 pub(crate) trait LegalSource: Send + Sync {
     fn descriptor(&self) -> &SourceDescriptor;
@@ -21,63 +21,43 @@ pub(crate) trait LegalSource: Send + Sync {
     }
 }
 
-#[derive(Debug)]
-struct AtoSource {
+struct RegisteredSource {
     descriptor: SourceDescriptor,
+    acquisition: &'static dyn SourceAcquisition,
 }
 
-impl LegalSource for AtoSource {
+impl LegalSource for RegisteredSource {
     fn descriptor(&self) -> &SourceDescriptor {
         &self.descriptor
     }
 
     fn acquisition(&self) -> Option<&dyn SourceAcquisition> {
-        Some(&ATO_ACQUISITION)
-    }
-}
-
-#[derive(Debug)]
-struct FrlSource {
-    descriptor: SourceDescriptor,
-}
-
-impl LegalSource for FrlSource {
-    fn descriptor(&self) -> &SourceDescriptor {
-        &self.descriptor
-    }
-
-    fn acquisition(&self) -> Option<&dyn SourceAcquisition> {
-        Some(&FRL_ACQUISITION)
+        Some(self.acquisition)
     }
 }
 
 pub(crate) struct SourceRegistry {
-    default: SourceId,
     sources: BTreeMap<SourceId, Box<dyn LegalSource>>,
 }
 
 impl SourceRegistry {
     fn production() -> Self {
-        let ato: Box<dyn LegalSource> = Box::new(AtoSource {
-            descriptor: SourceDescriptor::new(
-                DEFAULT_SOURCE_ID.parse().expect("valid default source id"),
-                "Australian Taxation Office legal corpus",
-            )
-            .expect("valid ATO source descriptor"),
-        });
-        let frl: Box<dyn LegalSource> = Box::new(FrlSource {
-            descriptor: frl_descriptor().expect("valid FRL source descriptor"),
-        });
-        let default = ato.descriptor().id.clone();
-        let sources = [ato, frl]
+        let sources = production_registrations()
+            .expect("valid production source catalogue")
             .into_iter()
-            .map(|source| (source.descriptor().id.clone(), source))
+            .map(|registration| {
+                let source: Box<dyn LegalSource> = Box::new(RegisteredSource {
+                    descriptor: registration.descriptor,
+                    acquisition: registration.acquisition,
+                });
+                (source.descriptor().id.clone(), source)
+            })
             .collect();
-        Self { default, sources }
+        Self { sources }
     }
 
     #[cfg(test)]
-    pub(crate) fn try_new(default: SourceId, sources: Vec<Box<dyn LegalSource>>) -> Result<Self> {
+    pub(crate) fn try_new(sources: Vec<Box<dyn LegalSource>>) -> Result<Self> {
         let mut registered = BTreeMap::new();
         for source in sources {
             let source_id = source.descriptor().id.clone();
@@ -85,26 +65,9 @@ impl SourceRegistry {
                 bail!("duplicate legal source `{source_id}`");
             }
         }
-        if !registered.contains_key(&default) {
-            bail!("default legal source `{default}` is not registered");
-        }
         Ok(Self {
-            default,
             sources: registered,
         })
-    }
-
-    pub(crate) fn resolve(&self, requested: Option<&str>) -> Result<SourceId> {
-        let requested = requested.unwrap_or(self.default.as_str());
-        let Some((source_id, _)) = self
-            .sources
-            .iter()
-            .find(|(source_id, _)| source_id.as_str() == requested)
-        else {
-            let available = self.source_ids().join(", ");
-            bail!("unknown legal source `{requested}`; available sources: {available}");
-        };
-        Ok(source_id.clone())
     }
 
     pub(crate) fn source(&self, source_id: &SourceId) -> Result<&dyn LegalSource> {
@@ -157,73 +120,55 @@ mod tests {
     }
 
     #[test]
-    fn registry_resolves_one_explicit_source_or_the_default() -> Result<()> {
-        let registry = SourceRegistry::try_new(
-            "ato".parse()?,
-            vec![fake("ato", "ATO"), fake("wa-legislation", "WA legislation")],
-        )?;
-        assert_eq!(registry.resolve(None)?.as_str(), "ato");
-        assert_eq!(
-            registry.resolve(Some("wa-legislation"))?.as_str(),
-            "wa-legislation"
-        );
+    fn registry_resolves_only_explicit_sources() -> Result<()> {
+        let registry = SourceRegistry::try_new(vec![
+            fake("ato", "ATO"),
+            fake("wa-legislation", "WA legislation"),
+        ])?;
+        assert!(registry.source(&"wa-legislation".parse()?).is_ok());
         assert_eq!(registry.source_ids(), vec!["ato", "wa-legislation"]);
         Ok(())
     }
 
     #[test]
-    fn registry_rejects_unknown_duplicate_invalid_and_missing_default_sources() {
-        let duplicate = SourceRegistry::try_new(
-            "ato".parse().expect("valid source"),
-            vec![fake("ato", "ATO"), fake("ato", "duplicate")],
-        );
+    fn registry_rejects_unknown_duplicate_and_invalid_sources() {
+        let duplicate = SourceRegistry::try_new(vec![fake("ato", "ATO"), fake("ato", "duplicate")]);
         assert!(duplicate.is_err());
 
         assert!("WA".parse::<SourceId>().is_err());
 
-        let missing_default =
-            SourceRegistry::try_new("ato".parse().expect("valid source"), vec![fake("wa", "WA")]);
-        assert!(missing_default.is_err());
-
-        let registry = SourceRegistry::try_new(
-            "ato".parse().expect("valid source"),
-            vec![fake("ato", "ATO"), fake("wa", "WA")],
-        )
-        .unwrap_or_else(|error| panic!("creating test registry: {error}"));
-        let error = registry
-            .resolve(Some("sa"))
-            .expect_err("unknown source must fail");
+        let registry = SourceRegistry::try_new(vec![fake("ato", "ATO"), fake("wa", "WA")])
+            .unwrap_or_else(|error| panic!("creating test registry: {error}"));
+        let error = match registry.source(&"sa".parse().expect("valid source")) {
+            Ok(_) => panic!("unknown source must fail"),
+            Err(error) => error,
+        };
         assert!(error.to_string().contains("available sources: ato, wa"));
     }
 
     #[test]
     fn production_registry_contains_the_complete_source_set() -> Result<()> {
         let registry = source_registry();
-        assert_eq!(registry.source_ids(), vec!["ato", "frl"]);
-        assert_eq!(registry.resolve(None)?.as_str(), DEFAULT_SOURCE_ID);
-        let descriptors = registry.descriptors();
-        let descriptor = &descriptors[0];
         assert_eq!(
-            descriptor.display_name,
-            "Australian Taxation Office legal corpus"
+            registry.source_ids(),
+            vec![
+                "ato",
+                "federal-court",
+                "frl",
+                "high-court",
+                "nsw-caselaw",
+                "nsw-legislation",
+                "qld-legislation",
+                "sa-legislation",
+                "tas-legislation",
+                "wa-legislation",
+            ]
         );
-        let ato: SourceId = DEFAULT_SOURCE_ID.parse()?;
-        assert!(registry.source(&ato)?.acquisition().is_some());
-        let frl: SourceId = "frl".parse()?;
-        assert!(registry.source(&frl)?.acquisition().is_some());
-        assert_eq!(
-            serde_json::to_value(registry.descriptors())?,
-            serde_json::json!([
-                {
-                    "id": "ato",
-                    "display_name": "Australian Taxation Office legal corpus"
-                },
-                {
-                    "id": "frl",
-                    "display_name": "Federal Register of Legislation"
-                }
-            ])
-        );
+        assert_eq!(registry.descriptors().len(), 10);
+        for source_id in registry.source_ids() {
+            let source: SourceId = source_id.parse()?;
+            assert!(registry.source(&source)?.acquisition().is_some());
+        }
         Ok(())
     }
 }

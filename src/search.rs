@@ -5,7 +5,7 @@ use crate::config::{active_generation_key, ann_path};
 use crate::db::{decompress_text, get_corpus_meta, get_source_meta, open_read, table_exists};
 use crate::legal_source::source_registry;
 use crate::semantic::{dot_i8, encode_query_embedding};
-use crate::source::load_installed_manifest;
+use crate::source::load_active_generation_manifest;
 use crate::{
     embedding_model_installed_matches, SearchMode, ServerState, SortBy, DEFAULT_EXCLUDED_TYPES,
     EMBEDDING_DIM, EMBEDDING_MODEL_ID, HARD_MAX_PER_DOC, LEGISLATION_TYPE_PREFIXES, MAX_K,
@@ -801,8 +801,8 @@ pub(crate) struct SourceAnn {
 }
 
 fn load_source_ann(source_id: &SourceId) -> Result<SourceAnn> {
-    let installed = load_installed_manifest()?.ok_or_else(|| {
-        anyhow!("semantic search unavailable: installed manifest missing; run `legal-mcp update`")
+    let installed = load_active_generation_manifest()?.ok_or_else(|| {
+        anyhow!("semantic search unavailable: active generation manifest missing")
     })?;
     let info = installed.ann.get(source_id).cloned().ok_or_else(|| {
         anyhow!("semantic search unavailable: manifest has no ANN sidecar for source `{source_id}`")
@@ -867,11 +867,11 @@ fn check_vector_search_ready(
     }
     if !embedding_model_installed_matches(&source_ann.model)? {
         bail!(
-            "semantic search unavailable: installed semantic model files do not match installed_manifest.json; run `legal-mcp update`"
+            "semantic search unavailable: active generation model files do not match generation.json"
         );
     }
     if !table_exists(conn, "chunk_embeddings")? {
-        bail!("semantic search unavailable: installed corpus has no chunk_embeddings table; run `legal-mcp update`");
+        bail!("semantic search unavailable: active generation has no chunk_embeddings table");
     }
     let embeddings: i64 = conn.query_row(
         "SELECT COUNT(*) FROM chunk_embeddings AS e \
@@ -897,7 +897,7 @@ fn check_vector_search_ready(
     }
     crate::ann::verify_sidecar(&source_ann.path, source_id, &source_ann.info).map_err(|error| {
         anyhow!(
-            "semantic search unavailable: required ANN sidecar for source `{source_id}` is not ready: {error}; run `legal-mcp update`"
+            "semantic search unavailable: required ANN sidecar for source `{source_id}` is not ready: {error}"
         )
     })?;
     Ok(())
@@ -1471,6 +1471,9 @@ pub(crate) fn collect_title_hits(
     // query's document filter.
     let k = k.clamp(1, 100);
     let mut hits = Vec::new();
+    if let Some(direct) = query_direct_document_hit(conn, source_id, query.trim(), filter)? {
+        hits.push(direct);
+    }
     let strict_query = fts_strict_query(query);
     if strict_query.is_empty() {
         return Ok(hits);
@@ -1495,6 +1498,71 @@ pub(crate) fn collect_title_hits(
     }
     hits.truncate(k);
     Ok(hits)
+}
+
+fn query_direct_document_hit(
+    conn: &Connection,
+    source_id: &SourceId,
+    native_id: &str,
+    filter: &SqlFilter,
+) -> Result<Option<Hit>> {
+    if native_id.is_empty() {
+        return Ok(None);
+    }
+    let where_filter = if filter.sql.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", filter.sql)
+    };
+    let sql = format!(
+        r#"
+        SELECT d.native_id, d.type, d.title, d.date, d.canonical_url,
+               d.withdrawn_date, d.superseded_by, d.replaces,
+               d.has_in_doc_links, d.has_related_docs, d.has_history
+        FROM documents d
+        WHERE d.native_id = ? {where_filter}
+        LIMIT 1
+        "#
+    );
+    let mut params = vec![Value::Text(native_id.to_string())];
+    params.extend(filter.params.clone());
+    debug_assert_eq!(&filter.source, source_id);
+    conn.query_row(&sql, params_from_iter(params), |row| {
+        let native_id: String = row.get("native_id")?;
+        let title: String = row.get("title")?;
+        Ok(Hit {
+            canonical_url: row.get("canonical_url")?,
+            document: DocumentId {
+                source: source_id.clone(),
+                native_id,
+            },
+            title: title.clone(),
+            doc_type: row.get("type")?,
+            date: row.get("date")?,
+            anchor: None,
+            snippet: Some(title),
+            chunk: None,
+            next_call: None,
+            withdrawn_date: row.get("withdrawn_date")?,
+            superseded_by: row
+                .get::<_, Option<String>>("superseded_by")?
+                .map(|native_id| DocumentId {
+                    source: source_id.clone(),
+                    native_id,
+                }),
+            replaces: row
+                .get::<_, Option<String>>("replaces")?
+                .map(|native_id| DocumentId {
+                    source: source_id.clone(),
+                    native_id,
+                }),
+            has_in_doc_links: (row.get::<_, i64>("has_in_doc_links")? != 0).then_some(true),
+            has_related_docs: (row.get::<_, i64>("has_related_docs")? != 0).then_some(true),
+            has_history: (row.get::<_, i64>("has_history")? != 0).then_some(true),
+        })
+    })
+    .optional()
+    .map_err(Into::into)
 }
 
 fn query_title_fts(

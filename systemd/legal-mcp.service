@@ -1,0 +1,43 @@
+[Unit]
+Description=Australian Legal MCP private HTTP service
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=legal-mcp
+Group=legal-mcp
+EnvironmentFile=/etc/australian-legal-mcp/legal-mcp.env
+ExecStartPre=/usr/local/bin/legal-mcp verify
+ExecStart=/usr/local/bin/legal-mcp serve --bind 127.0.0.1 --port 51235
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=10min
+TimeoutStopSec=45s
+KillSignal=SIGTERM
+UMask=0027
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/australian-legal-mcp
+ReadOnlyPaths=/var/lib/australian-legal-mcp/generations
+TasksMax=64
+LimitNOFILE=8192
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
