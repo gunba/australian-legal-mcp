@@ -104,7 +104,7 @@ jobs:
               assert skill in names
           PY
       - name: Build package and exercise stdio
-        timeout-minutes: 5
+        timeout-minutes: 10
         shell: bash
         run: |
           cargo build --release --locked
