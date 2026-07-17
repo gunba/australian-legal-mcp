@@ -1433,6 +1433,22 @@ mod tests {
         );
         assert_eq!(
             conn.query_row(
+                "SELECT COUNT(*) FROM chunks_fts WHERE rowid = ?1",
+                [removed_chunk_id],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH 'remove'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
+        );
+        assert_eq!(
+            conn.query_row(
                 "SELECT COUNT(*) FROM title_fts
                  WHERE source_id = ?1 AND native_id = 'remove'",
                 [source_id.as_str()],

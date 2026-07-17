@@ -33,14 +33,21 @@ MCP surface remains exactly `search`, `get_chunks`, `get_asset`,
 ## Completed foundation
 
 - Ten official adapters, adaptive acquisition, bounded Federal Chrome CDP,
-  transactional workspaces, strict source quality, schema 10, cleaned HTML,
+  transactional workspaces, strict source quality, schema 11, cleaned HTML,
   links/assets/definitions, deterministic FTS/vector ranking, and ANN recall at
-  least 0.99 at 50.
+  least 0.99 at 50. Schema 11 uses digest-bound contentless-delete chunk FTS.
 - Pinned mdbr-leaf-ir FP32 graph, exact tokenizer, TensorRT FP16/CUDA local build,
   and CPU serving path.
-- Validated/active v19: 409,528 documents, 6,968,250 chunks/embeddings, 20,170
-  definitions, exact DB/model/ten-ANN bindings, all-source retrieval, rollback,
-  pruning, and graceful bounded Streamable HTTP.
+- Validated/active local v20
+  `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`:
+  409,528 documents, 6,968,250 chunks/embeddings, 20,170 definitions, a
+  19,746,840,576-byte schema-11 DB, exact model/ten-ANN bindings, all-source
+  hybrid retrieval, rollback, pruning, and graceful bounded Streamable HTTP.
+  The schema-10 v19 parent and matching v0.18.1 binary/image remain the local
+  fallback; the schema-11 binary deliberately rejects it.
+- Added deterministic schema-10 projection. SQLite tokenizes existing text only
+  to rebuild FTS; acquisition, OCR, rechunking, model tokenization/execution,
+  re-embedding, and ANN reconstruction do not run.
 - Removed runtime corpus download/publication/offline-bundle paths.
 - Added immutable activation, strict verification, lifecycle locks, durable
   maintainer resumption, exact-generation readiness, and hardened systemd.
@@ -48,6 +55,8 @@ MCP surface remains exactly `search`, `get_chunks`, `get_asset`,
   XFS-volume adoption, CoW/rsync delta deployment, narrow publisher/root
   transactions, Caddy, API-key plus Entra auth, signed image provenance/SBOM
   policy, RFC 9728 metadata/challenges, and Copilot templates.
+- Added version-matched bootstrap-host tool upgrade, explicit publisher abort,
+  and fail-closed empty-host image cutover operations for the v20 transition.
 - Preserved Azure Bicep, managed-disk, private Blob, and content-addressed
   transport as a future provider adapter rather than the active deployment.
 
@@ -76,14 +85,16 @@ LEGAL_MCP_DATA_DIR="$PWD/data/runtime" scripts/smoke.sh
 cargo package --workspace --locked --allow-dirty
 ```
 
-Local evidence includes valid/invalid signed-token and API-key tests; resource
-metadata and 401/403 challenges; exact seven descriptors; official Microsoft
-v2.4 schema validation; bridged non-root/read-only container probes; zero fixed
+Local evidence includes full v20 activation/verification, 76 smoke checks,
+all-ten-source hybrid retrieval, valid/invalid signed-token and API-key tests,
+resource metadata and 401/403 challenges, exact seven descriptors, official
+Microsoft v2.4 schema validation; bridged non-root/read-only container probes; zero fixed
 HIGH/CRITICAL image findings; Caddy validation; strict disk/mount guards;
 packaged ONNX loading; and a clean offline Linode provider plan. The live
-instance/volume boundary now also proves Ubuntu 24.04, a signature-free attached
-volume, restricted SSH, and closed public 80/443/51235. Volume initialization,
-host installation, and Microsoft tenant behavior remain in the cloud phases.
+instance/volume boundary now also proves Ubuntu 24.04, XFS/reflink volume
+adoption, restricted SSH, and closed public 80/443/51235. The host is installed
+but has no active generation, auth, application service, active Caddy service,
+or ingress.
 
 ## Phase 2 — disposable Linode infrastructure
 
@@ -91,12 +102,14 @@ host installation, and Microsoft tenant behavior remain in the cloud phases.
    `public_mcp_enabled=false`, distinct administrator/publisher keys, and an
    encrypted 128-GiB volume; verified the attached device is signature-free and
    public 80/443/51235 are closed.
-2. Run the host installer and prove signature-free initialization, exact
-   UUID/marker adoption, XFS reflink, fixed identities, UFW, Quadlet, and
-   digest-pinned runtime verification.
-3. Perform one v19 CoW/rsync upload and bootstrap activation.
-4. Configure API-key and/or Entra auth privately; only then open Cloud Firewall
-   80/443 and run the transactional Caddy cutover.
+2. **Completed:** installed the v0.18.1 host contract and started the first v19
+   upload; it was intentionally stopped with approximately 23 GiB prepared and
+   no active remote generation.
+3. Publish and verify the v0.19.0 bundle and OCI digest. From that exact bundle,
+   run `--upgrade-host-tools`, explicitly abort the prepared v19 transaction,
+   run `update-image.sh --bootstrap-empty-host`, and deploy v20.
+4. Configure API-key and/or Entra auth privately only after v20 activation;
+   then open Cloud Firewall 80/443 and run the transactional Caddy cutover.
 5. Test reboot, changed/unchanged generation deltas, readiness rollback,
    API-key rotation/revocation, image rollback, volume detach/reattach, and VPS
    replacement without another full upload.
@@ -147,7 +160,8 @@ preview paths, not production dependencies.
 
 ## Cleanup gate
 
-Delete historical local builds/snapshots or cloud bootstrap/rollback artifacts
-only after local and Linode activation, VPS replacement, exact readiness,
-Copilot token validation, and rollback are proven, and no surviving item is the
-sole source of source truth or validation evidence.
+Superseded local build/cache cleanup reduced project usage from 298 GiB to 197
+GiB and increased free disk from 76 GiB to 153 GiB. Retain v19 until Linode
+activation, VPS replacement, exact readiness, Copilot token validation, and
+rollback are proven. Delete no cloud bootstrap/rollback artifact or sole source
+of source truth or validation evidence before those gates pass.

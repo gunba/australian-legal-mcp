@@ -126,6 +126,8 @@ jobs:
           grep -Fq 'LimitCORE=0' "$RUNNER_TEMP/generated-quadlet"
       - name: Ubuntu 24.04 host recovery and restricted rsync contracts
         run: |
+          tests/deploy-generation-abort-fixture.sh
+          tests/host-installer-publisher-contract-fixture.sh
           docker run --rm --user 0:0 --entrypoint /bin/bash \
             --volume "$PWD/tests/host-rrsync-options-fixture.sh:/fixture:ro" \
             --volume "$PWD/tests/host-auth-recovery-fixture.sh:/auth-fixture:ro" \
@@ -133,6 +135,28 @@ jobs:
             --volume "$PWD/infra/hosting/update-image.sh:/update-image:ro" \
             ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \
             -ceu 'export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null; apt-get install --yes --no-install-recommends python3 rsync >/dev/null; /fixture; /auth-fixture'
+          docker run --rm --user 0:0 --entrypoint /bin/bash \
+            --volume "$PWD/scripts/legal-mcp-host-deploy:/host-deploy:ro" \
+            --volume "$PWD/tests/host-deploy-abort-fixture.sh:/abort-fixture:ro" \
+            ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \
+            -ceu 'export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null; apt-get install --yes --no-install-recommends acl passwd util-linux >/dev/null; /abort-fixture'
+          docker run --rm --user 0:0 --entrypoint /bin/bash \
+            --volume "$PWD/tests/host-tool-upgrade-fixture.sh:/fixture:ro" \
+            --volume "$PWD/infra/linode/install-host.sh:/fixture-input/install-host.sh:ro" \
+            --volume "$PWD/scripts/legal-mcp-host-deploy:/fixture-input/legal-mcp-host-deploy:ro" \
+            --volume "$PWD/scripts/legal-mcp-publisher-command:/fixture-input/legal-mcp-publisher-command:ro" \
+            --volume "$PWD/Containerfile:/fixture-input/Containerfile:ro" \
+            ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \
+            -ceu 'export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null; apt-get install --yes --no-install-recommends acl passwd python3 rsync sudo util-linux >/dev/null; /fixture'
+          docker run --rm --user 0:0 --entrypoint /bin/bash \
+            --volume "$PWD/tests/bootstrap-empty-host-image-fixture.sh:/fixture:ro" \
+            --volume "$PWD/infra/hosting/update-image.sh:/fixture-input/update-image.sh:ro" \
+            --volume "$PWD/infra/hosting/legal-mcp.container.template:/fixture-input/legal-mcp.container.template:ro" \
+            --volume "$PWD/scripts/legal-mcp-host-deploy:/fixture-input/legal-mcp-host-deploy:ro" \
+            --volume "$PWD/scripts/legal-mcp-publisher-command:/fixture-input/legal-mcp-publisher-command:ro" \
+            --volume "$PWD/Containerfile:/fixture-input/Containerfile:ro" \
+            ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \
+            -ceu 'export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null; apt-get install --yes --no-install-recommends acl passwd python3 rsync sudo util-linux >/dev/null; /fixture'
       - name: Linode OpenTofu contract
         run: |
           mkdir "$RUNNER_TEMP/linode-tofu"

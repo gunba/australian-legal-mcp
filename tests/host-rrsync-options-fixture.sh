@@ -12,7 +12,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 mkdir -p /srv/legal-mcp/uploads
 generation="$(printf '%064d' 0)"
-command="rsync --server -ltrce.iLsfxCIvu --delete-delay --safe-links --inplace . $generation/"
+command="rsync --server -ltrcze.iLsfxCIvu --delete-delay --safe-links --inplace --compress-choice=zstd --compress-level=3 . $generation/"
 set +e
 SSH_ORIGINAL_COMMAND="$command" timeout 5 /usr/bin/rrsync -wo \
   /srv/legal-mcp/uploads </dev/null >/tmp/rrsync.stdout 2>/tmp/rrsync.stderr

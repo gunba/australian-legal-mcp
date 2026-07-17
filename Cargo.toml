@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "australian-legal-mcp"
-version = "0.18.1"
+version = "0.19.0"
 edition = "2021"
 license = "MIT"
 description = "Standalone MCP server for Australian legal sources"
@@ -87,6 +87,10 @@ ort = { version = "2.0.0-rc.12", default-features = false, features = [
   "load-dynamic",
   "api-24",
   "ndarray",
+] }
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

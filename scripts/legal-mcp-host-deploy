@@ -6,10 +6,13 @@ export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 [[ $EUID -eq 0 ]] || { echo 'legal-mcp-host-deploy must run as root' >&2; exit 2; }
-[[ $# -eq 2 ]] || { echo 'usage: legal-mcp-host-deploy prepare|activate GENERATION' >&2; exit 2; }
+[[ $# -eq 2 ]] || { echo 'usage: legal-mcp-host-deploy prepare|activate|abort GENERATION' >&2; exit 2; }
 ACTION="$1"
 GENERATION="$2"
-[[ "$ACTION" = prepare || "$ACTION" = activate ]] || { echo 'invalid deployment action' >&2; exit 2; }
+[[ "$ACTION" = prepare || "$ACTION" = activate || "$ACTION" = abort ]] || {
+  echo 'invalid deployment action' >&2
+  exit 2
+}
 [[ "$GENERATION" =~ ^[0-9a-f]{64}$ ]] || { echo 'generation ID is malformed' >&2; exit 2; }
 
 DATA_ROOT=/srv/legal-mcp
@@ -18,6 +21,7 @@ LIFECYCLE="$DATA_ROOT/lifecycle"
 UPLOADS="$DATA_ROOT/uploads"
 STATE="$DATA_ROOT/state"
 JOURNAL="$LIFECYCLE/.deployment-transaction"
+JOURNAL_PREPARING="$LIFECYCLE/.deployment-transaction.preparing"
 IMAGE_FILE=/etc/legal-mcp/image
 SERVICE=legal-mcp.service
 LOCK_FILE=/run/lock/legal-mcp-host-transaction.lock
@@ -26,9 +30,17 @@ UPLOAD_AUTHORIZATION="$RUNTIME_CONTROL/authorized-upload"
 PUBLISHER=legal-mcp-publisher
 SERVICE_USER=legal-mcp
 
-for command_name in blkid cp curl df findmnt flock getfacl getent podman python3 setfacl stat systemctl xfs_info; do
-  command -v "$command_name" >/dev/null || { echo "missing host dependency: $command_name" >&2; exit 1; }
-done
+require_commands() {
+  local command_name
+  for command_name in "$@"; do
+    command -v "$command_name" >/dev/null || {
+      echo "missing host dependency: $command_name" >&2
+      exit 1
+    }
+  done
+}
+
+require_commands flock getfacl rm stat sync
 
 [[ -f "$LOCK_FILE" && ! -L "$LOCK_FILE" \
   && "$(stat -c '%U:%G:%a:%h' "$LOCK_FILE")" = root:legal-mcp-publisher:640:1 ]] || {
@@ -53,6 +65,38 @@ require_acl() {
     echo "unsafe access ACL for $path" >&2
     exit 1
   }
+}
+
+read_systemctl_activity() {
+  local unit="$1" output status
+  if output="$(systemctl is-active "$unit" 2>/dev/null)"; then
+    status=0
+  else
+    status=$?
+  fi
+  case "$status:$output" in
+    0:active|3:inactive) printf '%s\n' "$output" ;;
+    *)
+      echo "could not determine exact systemd activity for $unit (status $status, state ${output:-<empty>})" >&2
+      return 1
+      ;;
+  esac
+}
+
+podman_image_state() {
+  local image="$1" status
+  if podman image exists "$image"; then
+    printf '%s\n' present
+    return 0
+  else
+    status=$?
+  fi
+  if [[ $status -eq 1 ]]; then
+    printf '%s\n' absent
+    return 0
+  fi
+  echo "could not inspect Podman image state for $image (status $status)" >&2
+  return 1
 }
 
 validate_host_state() {
@@ -119,6 +163,7 @@ validate_host_state() {
 }
 
 read_image() {
+  local image_state
   [[ -f "$IMAGE_FILE" && ! -L "$IMAGE_FILE" ]] || { echo 'pinned image file is missing' >&2; exit 1; }
   require_owner_mode "$IMAGE_FILE" root root 600
   IMAGE="$(<"$IMAGE_FILE")"
@@ -126,7 +171,8 @@ read_image() {
     echo 'image must be the canonical GHCR repository pinned by digest' >&2
     exit 1
   }
-  podman image exists "$IMAGE" || { echo 'pinned legal-mcp image is not present' >&2; exit 1; }
+  image_state="$(podman_image_state "$IMAGE")" || exit 1
+  [[ "$image_state" = present ]] || { echo 'pinned legal-mcp image is not present' >&2; exit 1; }
 }
 
 run_legal() {
@@ -146,7 +192,7 @@ run_legal() {
 
 active_generation() {
   local pointer="$LIFECYCLE/active-generation"
-  if [[ ! -e "$pointer" ]]; then
+  if [[ ! -e "$pointer" && ! -L "$pointer" ]]; then
     printf '%s\n' '-'
     return
   fi
@@ -164,15 +210,18 @@ active_generation() {
 }
 
 write_journal() {
-  local phase="$1" previous="$2" temporary
-  [[ "$phase" =~ ^(preparing|prepared|activating|activated|rolling-back|rolled-back)$ ]] || exit 1
+  local phase="$1" previous="$2"
+  [[ "$phase" =~ ^(preparing|prepared|aborting|activating|activated|rolling-back|rolled-back)$ ]] || exit 1
   [[ "$previous" = - || "$previous" =~ ^[0-9a-f]{64}$ ]] || exit 1
-  temporary="$LIFECYCLE/.deployment-transaction.$$.tmp"
-  printf '%s\n%s\n%s\n' "$GENERATION" "$previous" "$phase" > "$temporary"
-  chown root:root "$temporary"
-  chmod 600 "$temporary"
-  sync -f "$temporary"
-  mv -fT "$temporary" "$JOURNAL"
+  path_is_absent "$JOURNAL_PREPARING" || {
+    echo 'deployment journal preparation was not reconciled' >&2
+    exit 1
+  }
+  printf '%s\n%s\n%s\n' "$GENERATION" "$previous" "$phase" > "$JOURNAL_PREPARING"
+  chown root:root "$JOURNAL_PREPARING"
+  chmod 600 "$JOURNAL_PREPARING"
+  sync -f "$JOURNAL_PREPARING"
+  mv -fT "$JOURNAL_PREPARING" "$JOURNAL"
   sync -f "$LIFECYCLE"
 }
 
@@ -185,7 +234,7 @@ read_journal() {
   [[ ${#transaction[@]} -eq 3 \
     && "${transaction[0]}" =~ ^[0-9a-f]{64}$ \
     && ( "${transaction[1]}" = - || "${transaction[1]}" =~ ^[0-9a-f]{64}$ ) \
-    && "${transaction[2]}" =~ ^(preparing|prepared|activating|activated|rolling-back|rolled-back)$ ]] || {
+    && "${transaction[2]}" =~ ^(preparing|prepared|aborting|activating|activated|rolling-back|rolled-back)$ ]] || {
     echo 'deployment transaction journal is malformed' >&2
     exit 1
   }
@@ -219,7 +268,11 @@ clear_upload_authorization() {
     echo 'runtime upload-control directory is unsafe' >&2
     exit 1
   }
-  rm -f "$UPLOAD_AUTHORIZATION"
+  rm -f -- "$UPLOAD_AUTHORIZATION"
+  [[ ! -e "$UPLOAD_AUTHORIZATION" && ! -L "$UPLOAD_AUTHORIZATION" ]] || {
+    echo 'upload authorization revocation did not complete' >&2
+    exit 1
+  }
   sync -f "$RUNTIME_CONTROL"
 }
 
@@ -238,6 +291,158 @@ authorize_upload() {
   sync -f "$RUNTIME_CONTROL"
 }
 
+path_is_absent() {
+  [[ ! -e "$1" && ! -L "$1" ]]
+}
+
+reconcile_journal_preparation() {
+  path_is_absent "$JOURNAL_PREPARING" && return 0
+  [[ -d "$LIFECYCLE" && ! -L "$LIFECYCLE" \
+    && "$(stat -c '%U:%G:%a' "$LIFECYCLE")" = root:legal-mcp:750 ]] || {
+    echo 'cannot safely reconcile the deployment journal preparation' >&2
+    exit 1
+  }
+  [[ -f "$JOURNAL_PREPARING" || -L "$JOURNAL_PREPARING" ]] || {
+    echo 'deployment journal preparation has an unsafe file type' >&2
+    exit 1
+  }
+  rm -f -- "$JOURNAL_PREPARING"
+  path_is_absent "$JOURNAL_PREPARING" || {
+    echo 'deployment journal preparation cleanup did not complete' >&2
+    exit 1
+  }
+  sync -f "$LIFECYCLE"
+}
+
+reject_foreign_host_transactions() {
+  local transaction
+  [[ -d /etc/legal-mcp && ! -L /etc/legal-mcp \
+    && "$(stat -c '%U:%G:%a' /etc/legal-mcp)" = root:root:755 ]] || {
+    echo 'host transaction directory is not safely visible' >&2
+    exit 1
+  }
+  require_acl /etc/legal-mcp $'user::rwx\ngroup::r-x\nother::r-x'
+  for transaction in \
+    /etc/legal-mcp/.auth-transaction \
+    /etc/legal-mcp/.image-transaction.preparing \
+    /etc/legal-mcp/.image-transaction \
+    /etc/legal-mcp/.image-transaction.retiring \
+    /etc/legal-mcp/.host-tools-transaction.preparing \
+    /etc/legal-mcp/.host-tools-transaction \
+    /etc/legal-mcp/.host-tools-transaction.retiring \
+    /etc/legal-mcp/.host-tools-transaction.rollback-retiring \
+    /etc/legal-mcp/.host-tools-transaction.rollback-retired \
+    /etc/legal-mcp/.host-tools-transaction.publisher-restore; do
+    path_is_absent "$transaction" || {
+      echo 'a foreign host transaction must be recovered before corpus deployment' >&2
+      exit 1
+    }
+  done
+}
+
+require_abort_upload() {
+  local upload="$1" mount_targets mount_target
+  [[ -d "$upload" && ! -L "$upload" ]] || {
+    echo 'abort upload path is not a real directory' >&2
+    exit 1
+  }
+  require_owner_mode "$upload" "$PUBLISHER" "$PUBLISHER" 700
+  require_acl "$upload" $'user::rwx\ngroup::---\nother::---'
+  [[ "$(stat -c '%d' "$upload")" = "$(stat -c '%d' "$UPLOADS")" ]] || {
+    echo 'abort upload is not on the corpus volume' >&2
+    exit 1
+  }
+  mount_targets="$(
+    findmnt --submounts --noheadings --raw --output TARGET --target "$upload"
+  )" || {
+    echo 'could not inspect abort upload mounts' >&2
+    exit 1
+  }
+  [[ -n "$mount_targets" ]] || {
+    echo 'could not locate the abort upload filesystem' >&2
+    exit 1
+  }
+  while IFS= read -r mount_target; do
+    [[ "$mount_target" != "$upload" && "$mount_target" != "$upload/"* ]] || {
+      echo 'abort upload contains a mount point' >&2
+      exit 1
+    }
+  done <<< "$mount_targets"
+}
+
+abort_generation() {
+  local upload="$UPLOADS/$GENERATION"
+  local temporary="$UPLOADS/.$GENERATION.preparing"
+  local installed="$GENERATIONS/$GENERATION"
+  local current
+
+  if path_is_absent "$JOURNAL"; then
+    current="$(active_generation)"
+    if [[ "$current" = "$GENERATION" ]] \
+      || ! path_is_absent "$upload" \
+      || ! path_is_absent "$temporary" \
+      || ! path_is_absent "$installed"; then
+      echo 'generation has unexplained state and is not already aborted' >&2
+      exit 1
+    fi
+    sync -f "$UPLOADS"
+    sync -f "$LIFECYCLE"
+    echo already-aborted
+    exit 0
+  fi
+
+  read_journal
+  [[ "$TX_GENERATION" = "$GENERATION" ]] || {
+    echo 'generation does not match pending transaction' >&2
+    exit 1
+  }
+  [[ "$TX_PHASE" = prepared || "$TX_PHASE" = aborting ]] || {
+    echo 'only a prepared or aborting deployment transaction can be aborted' >&2
+    exit 1
+  }
+  current="$(active_generation)"
+  [[ "$current" = "$TX_PREVIOUS" && "$current" != "$GENERATION" ]] || {
+    echo 'abort transaction does not match the active pointer' >&2
+    exit 1
+  }
+  path_is_absent "$installed" || {
+    echo 'abort target is already installed' >&2
+    exit 1
+  }
+  path_is_absent "$temporary" || {
+    echo 'abort transaction has an unexpected preparation directory' >&2
+    exit 1
+  }
+  if path_is_absent "$upload"; then
+    [[ "$TX_PHASE" = aborting ]] || {
+      echo 'prepared abort upload is missing' >&2
+      exit 1
+    }
+  else
+    require_abort_upload "$upload"
+  fi
+
+  if [[ "$TX_PHASE" = prepared ]]; then
+    write_journal aborting "$TX_PREVIOUS"
+  fi
+  if ! path_is_absent "$upload"; then
+    rm -rf --one-file-system -- "$upload"
+    path_is_absent "$upload" || {
+      echo 'abort upload removal did not complete' >&2
+      exit 1
+    }
+  fi
+  sync -f "$UPLOADS"
+  rm -f -- "$JOURNAL"
+  path_is_absent "$JOURNAL" || {
+    echo 'deployment journal removal did not complete' >&2
+    exit 1
+  }
+  sync -f "$LIFECYCLE"
+  echo aborted
+  exit 0
+}
+
 probe_exact_generation() {
   local expected="$1"
   curl --fail --silent --max-time 5 http://127.0.0.1:51235/readyz 2>/dev/null |
@@ -245,10 +450,11 @@ probe_exact_generation() {
 }
 
 wait_for_exact_generation() {
-  local expected="$1" deadline=$((SECONDS + 180))
+  local expected="$1" deadline=$((SECONDS + 180)) activity
   while (( SECONDS < deadline )); do
     probe_exact_generation "$expected" && return 0
-    systemctl is-active --quiet "$SERVICE" || return 1
+    activity="$(read_systemctl_activity "$SERVICE")" || return 1
+    [[ "$activity" = active ]] || return 1
     sleep 1
   done
   return 1
@@ -270,12 +476,32 @@ rollback_pointer() {
   fi
 }
 
+# The fixed journal preparation belongs only to this lock owner and is always
+# disposable before publication. Reconcile it on every entry; the foreign
+# transaction guard remains the first decision that can affect publisher or
+# corpus state.
+reconcile_journal_preparation
+reject_foreign_host_transactions
+
+if [[ "$ACTION" = abort ]]; then
+  # Revocation is the first mutation after the foreign-transaction guard. It is
+  # durable before any potentially slow volume or journal checks.
+  clear_upload_authorization
+  require_commands blkid chmod chown findmnt getfacl grep id mv xfs_info
+  validate_host_state
+  publisher_uid="$(id -u "$PUBLISHER")"
+  publisher_gid="$(id -g "$PUBLISHER")"
+  [[ "$publisher_uid" = 973 && "$publisher_gid" = 973 \
+    && "$(id -G "$PUBLISHER")" = 973 ]] || {
+    echo 'publisher identity does not match the fixed host contract' >&2
+    exit 1
+  }
+  abort_generation
+fi
+
+require_commands blkid cp curl df find findmnt getfacl getent grep id mv podman python3 setfacl systemctl xfs_info
 validate_host_state
 read_image
-[[ ! -e /etc/legal-mcp/.auth-transaction && ! -e /etc/legal-mcp/.image-transaction ]] || {
-  echo 'a host auth or image transaction must be recovered before corpus deployment' >&2
-  exit 1
-}
 publisher_uid="$(id -u "$PUBLISHER")"
 publisher_gid="$(id -g "$PUBLISHER")"
 [[ "$publisher_uid" = 973 && "$publisher_gid" = 973 ]] || {
@@ -293,10 +519,12 @@ publisher_gid="$(id -g "$PUBLISHER")"
 }
 
 if [[ "$ACTION" = prepare ]]; then
+  service_activity=''
   clear_upload_authorization
   previous="$(active_generation)"
   if [[ ! -e "$JOURNAL" && "$previous" = "$GENERATION" ]]; then
-    if systemctl is-active --quiet "$SERVICE" \
+    service_activity="$(read_systemctl_activity "$SERVICE")" || exit 1
+    if [[ "$service_activity" = active ]] \
       && wait_for_exact_generation "$GENERATION" \
       && running_image_is_pinned; then
       echo already-active
@@ -354,6 +582,10 @@ if [[ "$ACTION" = prepare ]]; then
       preparing)
         rm -rf --one-file-system "$UPLOADS/.$GENERATION.preparing"
         ;;
+      aborting)
+        echo 'deployment transaction is aborting; finish the explicit abort first' >&2
+        exit 1
+        ;;
     esac
     previous="$TX_PREVIOUS"
   else
@@ -396,15 +628,21 @@ clear_upload_authorization
 [[ -e "$JOURNAL" ]] || { echo 'no prepared deployment transaction exists' >&2; exit 1; }
 read_journal
 [[ "$TX_GENERATION" = "$GENERATION" ]] || { echo 'generation does not match pending transaction' >&2; exit 1; }
-[[ "$TX_PHASE" != preparing ]] || {
+[[ "$TX_PHASE" != preparing && "$TX_PHASE" != aborting ]] || {
   echo 'deployment upload has not completed preparation' >&2
   exit 1
 }
 
 was_active=false
-if systemctl is-active --quiet "$SERVICE"; then
+service_activity="$(read_systemctl_activity "$SERVICE")" || exit 1
+if [[ "$service_activity" = active ]]; then
   was_active=true
   systemctl stop "$SERVICE"
+  service_activity="$(read_systemctl_activity "$SERVICE")" || exit 1
+  [[ "$service_activity" = inactive ]] || {
+    echo 'legal-mcp service did not become inactive' >&2
+    exit 1
+  }
 fi
 
 case "$TX_PHASE" in
@@ -525,7 +763,12 @@ if systemctl start "$SERVICE" \
   exit 0
 fi
 
-systemctl stop "$SERVICE" || true
+systemctl stop "$SERVICE"
+service_activity="$(read_systemctl_activity "$SERVICE")" || exit 1
+[[ "$service_activity" = inactive ]] || {
+  echo 'failed legal-mcp service did not become inactive' >&2
+  exit 1
+}
 write_journal rolling-back "$TX_PREVIOUS"
 if [[ "$TX_PREVIOUS" = - ]]; then
   rollback_pointer "$TX_PREVIOUS"

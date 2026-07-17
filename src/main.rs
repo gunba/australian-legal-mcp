@@ -32,6 +32,7 @@ mod config;
 mod db;
 mod extract;
 mod frl;
+mod generation_projection;
 mod html;
 mod http_auth;
 mod legal_source;
@@ -65,7 +66,7 @@ use semantic::{SemanticEncodeStats, SemanticModelPaths, SemanticRuntime};
 use source::{
     activate_local_generation, deactivate_generation, link_download, prune_inactive_generations,
     rollback_generation, scrape_diff, snapshot_reduce, stats, tree_crawl, verify_active_generation,
-    verify_active_generation_quick, LinkDownloadArgs, ModelInfo,
+    verify_active_generation_quick, GenerationId, LinkDownloadArgs, ModelInfo,
 };
 use source_update::{run_source_updates, SourceUpdateMode, SourceUpdateRequest};
 
@@ -100,7 +101,7 @@ pub(crate) const ORDINARY_DICTIONARY_PATH_ENV: &str = "LEGAL_MCP_DICTIONARY_PATH
 /// Single corpus version this binary supports. Stamped into both
 /// `meta.schema_version` in SQLite and `schema_version` in generation.json
 /// move together. Bump on any breaking local generation layout change.
-pub(crate) const SUPPORTED_SCHEMA_VERSION: u32 = 10;
+pub(crate) const SUPPORTED_SCHEMA_VERSION: u32 = 11;
 pub(crate) const EMBEDDING_MODEL_ID: &str = "mdbr-leaf-ir-tensorrt-fp16-256d";
 
 /// Compile-time switch: corpus build and runtime semantic search use the
@@ -336,8 +337,8 @@ enum Command {
         /// onnx/model.onnx.
         #[arg(long)]
         model_dir: PathBuf,
-        /// Optional completed schema-v10 legal.db from which vectors are reused
-        /// only when model ID and chunk-text SHA-256 are identical.
+        /// Optional completed matching-schema legal.db from which vectors are
+        /// reused only when model ID and chunk-text SHA-256 are identical.
         #[arg(long)]
         embedding_cache_db: Option<PathBuf>,
         /// Fresh output directory for generation.json, legal.db, model files,
@@ -349,6 +350,20 @@ enum Command {
         /// Print cumulative build-stage timings to stderr.
         #[arg(long)]
         profile: bool,
+    },
+    /// Derive a fresh schema-11 candidate from one exact immutable schema-10
+    /// generation without acquisition, chunking, model execution, embedding,
+    /// or ANN reconstruction. The source generation is never modified.
+    DeriveSchema11FromSchema10 {
+        /// Exact installed schema-10 generation directory.
+        #[arg(long)]
+        source_generation_dir: PathBuf,
+        /// Required typed generation ID derived from the source generation.json.
+        #[arg(long)]
+        expected_source_generation: GenerationId,
+        /// Nonexistent same-filesystem directory for the complete candidate.
+        #[arg(long)]
+        out_dir: PathBuf,
     },
     /// Refresh one or more source workspaces in parallel. Adapters own their
     /// incremental and full discovery strategies, pacing, and concurrency.
@@ -749,6 +764,21 @@ fn main() -> Result<()> {
                 zstd_level,
                 profile_enabled: profile,
             })
+        }
+        Command::DeriveSchema11FromSchema10 {
+            source_generation_dir,
+            expected_source_generation,
+            out_dir,
+        } => {
+            let report = generation_projection::derive_schema11_from_schema10(
+                generation_projection::DeriveSchema11Args {
+                    source_generation_dir: &source_generation_dir,
+                    expected_source_generation: &expected_source_generation,
+                    out_dir: &out_dir,
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
         }
         Command::SourceUpdate {
             workspaces,
@@ -2639,6 +2669,47 @@ mod tests {
         assert!("ato=".parse::<SourceWorkspaceArg>().is_err());
     }
 
+    #[test]
+    fn schema_projection_cli_requires_a_typed_legacy_generation() {
+        let generation = "a".repeat(64);
+        let cli = Cli::try_parse_from([
+            "legal-mcp",
+            "derive-schema11-from-schema10",
+            "--source-generation-dir",
+            "/data/runtime/generations/legacy",
+            "--expected-source-generation",
+            &generation,
+            "--out-dir",
+            "/data/builds/schema11",
+        ])
+        .expect("valid projection arguments");
+        let Command::DeriveSchema11FromSchema10 {
+            source_generation_dir,
+            expected_source_generation,
+            out_dir,
+        } = cli.command
+        else {
+            panic!("expected schema projection command");
+        };
+        assert_eq!(
+            source_generation_dir,
+            PathBuf::from("/data/runtime/generations/legacy")
+        );
+        assert_eq!(expected_source_generation.as_str(), generation);
+        assert_eq!(out_dir, PathBuf::from("/data/builds/schema11"));
+        assert!(Cli::try_parse_from([
+            "legal-mcp",
+            "derive-schema11-from-schema10",
+            "--source-generation-dir",
+            "/data/runtime/generations/legacy",
+            "--expected-source-generation",
+            "ABC",
+            "--out-dir",
+            "/data/builds/schema11",
+        ])
+        .is_err());
+    }
+
     // ----- W1.1 SIMD parity -----
 
     #[test]
@@ -3702,18 +3773,34 @@ mod tests {
 
     // ===== Wave 2 ===========================================================
 
-    // ----- Schema v10 -----
+    // ----- Schema v11 -----
 
     #[test]
-    fn schema_init_writes_v10_metadata() -> Result<()> {
+    fn schema_init_writes_v11_metadata() -> Result<()> {
         let _lock = lock_test_db();
         let (_dir, db) = make_test_db()?;
         let conn = open_write_at(&db)?;
         let value = get_corpus_meta(&conn, "schema_version")?
             .expect("init_db should have written schema_version");
         assert_eq!(value, SUPPORTED_SCHEMA_VERSION.to_string());
-        assert_eq!(SUPPORTED_SCHEMA_VERSION, 10);
+        assert_eq!(SUPPORTED_SCHEMA_VERSION, 11);
         Ok(())
+    }
+
+    #[test]
+    fn runtime_rejects_legacy_schema10_corpus() -> Result<()> {
+        let _lock = lock_test_db();
+        let (dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
+        set_corpus_meta(&conn, "schema_version", "10")?;
+        drop(conn);
+        with_data_dir(dir.path(), || -> Result<()> {
+            let error = open_read().unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("DB schema version 10 not supported"));
+            Ok(())
+        })
     }
 
     #[test]

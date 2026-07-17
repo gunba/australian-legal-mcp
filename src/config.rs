@@ -528,13 +528,9 @@ fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
 #[cfg(windows)]
 fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-    #[link(name = "Kernel32")]
-    extern "system" {
-        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
-    }
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
 
     let existing: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
     let replacement: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();

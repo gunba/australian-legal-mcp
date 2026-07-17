@@ -359,10 +359,16 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
     };
 
     // Bind corpus-wide immutable metadata only after every source transaction commits.
+    let chunks_fts_index_sha256 = crate::db::chunks_fts_index_sha256(&conn, "chunks_fts")?;
     let binding_tx = conn.unchecked_transaction()?;
     set_corpus_meta(&binding_tx, "index_version", &manifest.index_version)?;
     set_corpus_meta(&binding_tx, "embedding_model_id", &manifest.model.id)?;
     set_corpus_meta(&binding_tx, "last_update_at", &manifest.created_at)?;
+    set_corpus_meta(
+        &binding_tx,
+        "chunks_fts_index_sha256",
+        &chunks_fts_index_sha256,
+    )?;
     let documents_count: i64 =
         binding_tx.query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))?;
     let chunks_count: i64 =

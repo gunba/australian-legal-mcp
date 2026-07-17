@@ -366,7 +366,7 @@ pub(crate) fn verify_active_generation(prewarm: impl FnOnce() -> Result<()>) -> 
         let target = generation_dir(&active)?;
         let (_, validated_key) = validate_installed_generation_dir(&target)
             .context("validating every immutable generation artifact")?;
-        if validated_key != active {
+        if validated_key.as_str() != active {
             bail!("active generation directory name does not match its immutable content");
         }
         ensure_generation_read_only(&target)?;
@@ -644,6 +644,38 @@ pub(crate) struct ManifestFile {
     pub(crate) size: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub(crate) struct GenerationId(String);
+
+impl GenerationId {
+    pub(crate) fn parse(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        if !is_lower_sha256(&value) {
+            bail!("generation ID must be exactly 64 lowercase hexadecimal characters");
+        }
+        Ok(Self(value))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for GenerationId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::str::FromStr for GenerationId {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::parse(value.to_string()).map_err(|error| error.to_string())
+    }
+}
+
 pub(crate) fn validate_manifest(manifest: &Manifest) -> Result<()> {
     if manifest.schema_version != SUPPORTED_SCHEMA_VERSION {
         bail!(
@@ -651,6 +683,10 @@ pub(crate) fn validate_manifest(manifest: &Manifest) -> Result<()> {
             manifest.schema_version
         );
     }
+    validate_manifest_contents(manifest)
+}
+
+pub(crate) fn validate_manifest_contents(manifest: &Manifest) -> Result<()> {
     if manifest.index_version.trim() != manifest.index_version
         || manifest.index_version.is_empty()
         || manifest.index_version.chars().any(char::is_control)
@@ -905,11 +941,11 @@ fn rename_across_directories(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn generation_key(manifest: &Manifest) -> Result<String> {
+pub(crate) fn generation_key(manifest: &Manifest) -> Result<GenerationId> {
     let mut hasher = Sha256::new();
     hasher.update(b"australian-legal-mcp-local-generation-v1\0");
     hasher.update(serde_json::to_vec(manifest)?);
-    Ok(format!("{:x}", hasher.finalize()))
+    GenerationId::parse(format!("{:x}", hasher.finalize()))
 }
 
 #[cfg(unix)]
@@ -972,18 +1008,18 @@ pub(crate) fn read_generation_manifest(root: &Path) -> Result<Manifest> {
     Ok(manifest)
 }
 
-pub(crate) fn validate_generation_dir(root: &Path) -> Result<(Manifest, String)> {
+pub(crate) fn validate_generation_dir(root: &Path) -> Result<(Manifest, GenerationId)> {
     validate_generation_dir_with_mode(root, true)
 }
 
-fn validate_installed_generation_dir(root: &Path) -> Result<(Manifest, String)> {
+fn validate_installed_generation_dir(root: &Path) -> Result<(Manifest, GenerationId)> {
     validate_generation_dir_with_mode(root, false)
 }
 
 fn validate_generation_dir_with_mode(
     root: &Path,
     full_sqlite_integrity: bool,
-) -> Result<(Manifest, String)> {
+) -> Result<(Manifest, GenerationId)> {
     let metadata = fs::symlink_metadata(root)
         .with_context(|| format!("reading generation directory {}", root.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -1071,8 +1107,11 @@ fn validate_generation_dir_with_mode(
     };
     let conn = Connection::open_with_flags(&db_path, access | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
     conn.busy_timeout(Duration::from_secs(30))?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
     conn.execute_batch("PRAGMA query_only=ON; PRAGMA cell_size_check=ON;")?;
     crate::db::enforce_db_schema_version(&conn)?;
+    crate::db::validate_chunks_fts_schema(&conn)?;
+    crate::db::verify_chunks_fts_index_digest(&conn)?;
     verify_corpus_manifest_binding(&conn, &manifest)?;
     verify_semantic_install(&conn, &manifest)?;
     if full_sqlite_integrity {
@@ -1127,18 +1166,7 @@ fn validate_generation_dir_with_mode(
     if foreign_keys != 0 {
         bail!("generation database has {foreign_keys} foreign-key violations");
     }
-    for (table, expected) in [("chunks_fts", "chunks"), ("title_fts", "documents")] {
-        let indexed: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-            row.get(0)
-        })?;
-        let source: i64 =
-            conn.query_row(&format!("SELECT COUNT(*) FROM {expected}"), [], |row| {
-                row.get(0)
-            })?;
-        if indexed != source {
-            bail!("generation FTS table `{table}` has {indexed} rows; expected {source}");
-        }
-    }
+    crate::db::verify_fts_relational_bindings(&conn)?;
     drop(conn);
     if full_sqlite_integrity {
         verified_regular_file(
@@ -1175,12 +1203,17 @@ fn activate_local_generation_locked(
     source: &Path,
     expected_generation: Option<&str>,
 ) -> Result<ActivationReport> {
+    let supplied_metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("reading generation path {}", source.display()))?;
+    if supplied_metadata.file_type().is_symlink() || !supplied_metadata.is_dir() {
+        bail!("generation path must be a real non-symlink directory");
+    }
     let source = source
         .canonicalize()
         .with_context(|| format!("canonicalizing generation {}", source.display()))?;
     let (_, key) = validate_generation_dir(&source)?;
     if let Some(expected) = expected_generation {
-        if expected != key {
+        if expected != key.as_str() {
             bail!(
                 "validated generation key {key} differs from required deployment generation {expected}"
             );
@@ -1194,7 +1227,7 @@ fn activate_local_generation_locked(
             Ok(())
         })
         .context("revalidating generation immediately before sealing")?;
-    commit_validated_generation(&source, &key)
+    commit_validated_generation(&source, key.as_str())
 }
 
 pub(crate) fn deactivate_generation(expected_generation: &str) -> Result<DeactivationReport> {
@@ -1293,7 +1326,7 @@ pub(crate) fn rollback_generation(key: &str) -> Result<ActivationReport> {
         let previous = active_generation_key()?;
         let target = generation_dir(key)?;
         let (_, actual_key) = validate_installed_generation_dir(&target)?;
-        if actual_key != key {
+        if actual_key.as_str() != key {
             bail!("generation directory name does not match its immutable content");
         }
         set_generation_read_only(&target)?;
@@ -1319,7 +1352,7 @@ pub(crate) fn prune_inactive_generations(keep: usize) -> Result<Vec<String>> {
         let active_path = generation_dir(&active)?;
         let (_, validated_key) = validate_installed_generation_dir(&active_path)
             .context("validating active generation before pruning rollback state")?;
-        if validated_key != active {
+        if validated_key.as_str() != active {
             bail!("active generation directory name does not match its immutable content");
         }
         ensure_generation_read_only(&active_path)?;
@@ -3083,6 +3116,24 @@ mod security_tests {
         let sha = sha256_path(&file)?;
         let error = verified_regular_file(root.path(), "artifact", 15, &sha).unwrap_err();
         assert!(error.to_string().contains("hard-linked"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_rejects_a_symlinked_generation_argument() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir()?;
+        let runtime = root.path().join("runtime");
+        let real = root.path().join("real-generation");
+        let linked = root.path().join("linked-generation");
+        fs::create_dir(&real)?;
+        symlink(&real, &linked)?;
+        let _environment =
+            crate::TestEnvironment::set(&[("LEGAL_MCP_DATA_DIR", runtime.as_os_str())]);
+        let error = activate_local_generation(&linked, None).unwrap_err();
+        assert!(error.to_string().contains("real non-symlink directory"));
         Ok(())
     }
 

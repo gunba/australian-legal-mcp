@@ -5,11 +5,13 @@ generations. The package is `australian-legal-mcp`, executable `legal-mcp`, MCP
 key `australian-legal`, and environment prefix `LEGAL_MCP_*`.
 
 Acquisition, OCR, embedding, ANN construction, and builds run on the local RTX
-maintainer host. Validated generations are activated locally, CoW-seeded, and
-rsynced by changed blocks to an external XFS/reflink volume on the current
-Akamai/Linode host. A corpus-free OCI image serves and validates them. The
+maintainer host. Validated generations are activated locally and can be
+CoW-seeded and rsynced by changed blocks to an external XFS/reflink volume on
+the Akamai/Linode host. A corpus-free OCI image serves and validates them. The
 runtime never scrapes, embeds, builds, packages, or publishes corpus/model
-artifacts. GitHub Releases contain software binaries only.
+artifacts. GitHub Releases contain software binaries only. The current remote
+host is not serving and has no active generation, auth, application service,
+active Caddy service, or ingress.
 
 Persistent project data is
 `data/{sources,source-snapshots,models,builds,runtime,cache,runs,logs,validation,archive}`.
@@ -62,7 +64,14 @@ exact model ID and chunk-text hash.
 
 Every generation binds SQLite, the pinned model/tokenizer, and one deterministic
 ANN sidecar per source. ANN finds candidates; SQLite int8 vectors provide exact
-authoritative reranking.
+authoritative reranking. Schema 11 uses contentless-delete `chunks_fts`, keeps
+authoritative text in `chunks`, and digest-binds FTS postings/BM25 metadata.
+
+The one supported schema migration is `derive-schema11-from-schema10`. It uses
+SQLite FTS tokenization over existing chunk text to rebuild only chunk FTS
+storage and creates a fresh validated generation. It performs no acquisition,
+OCR, rechunking, model tokenization, model execution, re-embedding, or ANN
+rebuild; model, tokenizer, and ANN artifacts remain identical.
 
 ## Build and hosting workflow
 
@@ -73,6 +82,17 @@ LEGAL_MCP_DATA_DIR="$PWD/data/runtime" legal-mcp verify
 scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
+
+Software is 0.19.0. Active local v20 is
+`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`;
+retain v19 with the matching v0.18.1 binary/image as its schema-10 fallback.
+The schema-11 binary cannot roll back to schema 10.
+
+For the current empty-host v20 cutover, first verify the version-matched v0.19.0
+bundle and OCI digest, then run `--upgrade-host-tools`, explicitly abort the
+prepared v19 publisher transaction, run
+`update-image.sh --bootstrap-empty-host`, deploy v20, and configure auth last. V0.19.0 is not yet
+released and none of these host mutations has occurred.
 
 The unpacked model is under `data/models/mdbr-leaf-ir-standard`. Maintainer
 builds use deterministic FP32 ONNX, TensorRT FP16, CUDA fallback, lossless

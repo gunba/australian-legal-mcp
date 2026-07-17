@@ -1,6 +1,6 @@
 # Current state
 
-Updated 2026-07-16 on branch `codex/linode-portable-deployment`.
+Updated 2026-07-18 on branch `codex/v20-runtime-projection`.
 
 ## Implemented product
 
@@ -9,10 +9,11 @@ Updated 2026-07-16 on branch `codex/linode-portable-deployment`.
   `fetch`.
 - Explicit source selection across ATO, FRL, Federal Court, High Court, NSW
   Caselaw, and five state-legislation sources.
-- Source-qualified schema 10 with typed document/chunk/asset references,
+- Source-qualified schema 11 with typed document/chunk/asset references,
   deterministic ranking, lossless continuations, cleaned structural HTML,
   exact stored official URLs, definitions, links, assets, and point-in-time
-  fetch URIs.
+  fetch URIs. Chunk FTS is contentless-delete and its postings/BM25 metadata
+  are digest-bound; authoritative text remains in `chunks`.
 - BM25 plus mdbr-leaf-ir semantic retrieval. ANN proposes candidates and SQLite
   normalized int8 first-256-dimension vectors exact-rerank them.
 - Streamable HTTP rejects batches, validates protocol/content/origin/body limits,
@@ -115,7 +116,36 @@ zero. Canonical live ATO fetch, exact-generation readiness, CPU SIGTERM drain,
 252 workspace/HTTP tests (with 11 explicitly ignored hardware/live tests),
 strict Clippy, audit/deny, npm allowlisting, and workspace packaging pass.
 
-## Local lifecycle and portable hosted cutover
+## V20 corpus
+
+The active local generation is
+`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`:
+
+- software 0.19.0, index `2026.07.14`, schema 11, and the unchanged
+  `mdbr-leaf-ir-tensorrt-fp16-256d` model binding;
+- 409,528 documents, 6,968,250 chunks/embeddings, and 20,170 definitions;
+- 19,746,840,576-byte `legal.db`, SHA-256
+  `26143e8908fc879a7e03af158cf014101d846c93f5d48d2b1687e48b2cc5fe90`;
+- approximately 37.42 GiB for the complete generation;
+- zero embedding-cache rows; and
+- index metadata plus model, tokenizer, and all ten ANN manifest bindings
+  identical to v19.
+
+V20 was deterministically projected from the immutable v19 schema-10 parent.
+The projection used SQLite FTS tokenization over existing chunk text to replace
+the contentful chunk index with schema 11 contentless-delete FTS. It performed
+no acquisition, OCR, rechunking, model tokenization, model execution,
+re-embedding, or ANN rebuild. The database is 20,253,507,584 bytes smaller than
+v19. Full activation and verification passed, followed by all 76 smoke checks
+and all-ten-source hybrid retrieval. V19 remains installed as the rollback
+source for a paired v0.18.1 binary/image fallback; the schema-11 binary does not
+accept schema 10.
+
+Post-validation cleanup removed superseded local build/cache material without
+removing source truth or the v19 fallback. Project usage fell from 298 GiB to
+197 GiB and free disk increased from 76 GiB to 153 GiB.
+
+## Local lifecycle and hosted cutover
 
 Implemented hard cut:
 
@@ -172,8 +202,20 @@ Implemented hard cut:
   from the exact seven read-only descriptors. Entra works unchanged on Linode
   and remains the Microsoft 365 identity path.
 
-The production image and its SBOM/provenance-bearing OCI archive were built
-locally, loaded ONNX Runtime, ran as `971:971` with a read-only root and no
+Schema-11 support adds one maintainer-only
+`derive-schema11-from-schema10` command. It requires the exact typed immutable
+schema-10 parent and a fresh same-filesystem output, validates before and after
+projection, rebuilds only chunk FTS storage, clears the disposable cache, and
+writes the new manifest last.
+
+The host deployment contract now also provides a transactional,
+version-matched `--upgrade-host-tools` operation, a publisher-accessible
+explicit and idempotent `abort`, and a fail-closed
+`update-image.sh --bootstrap-empty-host` image cutover. Upload or activation
+failure never triggers abort automatically.
+
+The historical v0.18.1 image and its SBOM/provenance-bearing OCI archive were
+built locally, loaded ONNX Runtime, ran as `971:971` with a read-only root and no
 capabilities, and passed bridged valid/invalid/ambiguous API-key plus exact-path
 HTTP probes while the host mapping remained loopback-only. Skopeo preserved the
 scanned top-level digest, and Trivy 0.65.0 reported zero fixed HIGH/CRITICAL
@@ -184,21 +226,25 @@ publisher/lock, packaged `rrsync -wo`, disabled/API-key/Entra auth recovery,
 incomplete-transaction ingress closure, and API-key image-recovery parsing.
 Provider-neutral Microsoft assets render for custom DNS. On 2026-07-16 the
 reviewed OpenTofu plan created one Sydney `g6-standard-4` instance, one encrypted
-128-GiB Block Storage volume, and one creation-time Cloud Firewall. The instance
-runs Ubuntu 24.04, the attached volume remains signature-free, SSH works only
-from the configured administrator source, and public 80, 443, and 51235 are
-closed. No DNS record, public MCP ingress, registry release, Azure resource, or
-Entra tenant object exists yet. Azure Bicep/Blob work remains preserved as a
-secondary future provider path in
+128-GiB Block Storage volume, and one creation-time Cloud Firewall. The host
+contract was installed with verified v0.18.1 artifacts. A v19 upload was
+intentionally stopped with approximately 23 GiB in its prepared publisher
+transaction. There is no active remote generation, authentication
+configuration, application service, Caddy service, DNS record, or public
+ingress; ports 80, 443, and 51235 remain closed. The v0.19.0 host tools and
+image have not mutated the host because no v0.19.0 release or verified OCI
+digest exists yet. No Azure resource or Entra tenant object exists. Azure
+Bicep/Blob work remains preserved as a secondary future provider path in
 [docs/AZURE_FUTURE.md](docs/AZURE_FUTURE.md).
 
 ## Remaining proof before completion
 
 1. Push the reviewed branch and require its pinned cross-platform CI/release
    contract checks to pass before merge.
-2. Publish and verify the immutable v0.18.1 Linux bundle and GHCR digest, then
-   install the host contract against the validated external volume and perform
-   the initial v19 delta deployment.
+2. Publish and verify the immutable v0.19.0 Linux bundle and GHCR digest. From
+   that exact bundle, upgrade the host tools, explicitly abort the prepared v19
+   transaction, perform the empty-host image cutover, deploy v20, and only then
+   configure authentication.
 3. Prove reboot, rollback, volume detach/reattach, image rollback, authentication
    rotation, and disposable VPS replacement before removing retained evidence.
 4. Create the tenant resource and connector app registrations, exercise a real

@@ -16,6 +16,9 @@ non-replaceable release is created. Linux requires glibc 2.27+; Windows requires
 the Microsoft Visual C++ 2015–2022 Redistributable. Publish and independently
 verify `SHA256SUMS` for every archive.
 
+The software tree is version 0.19.0. No v0.19.0 release or GHCR digest has been
+published yet, so no host mutation may use an unverified substitute.
+
 ## Canonical local data
 
 All persistent project data is beneath `data/`:
@@ -157,9 +160,26 @@ scripts/maintainer-sync.sh --full
 ```
 
 Use `LEGAL_MCP_FORCE_REBUILD=1` for a deliberate schema/chunker/model-only
-rebuild. `LEGAL_MCP_EMBEDDING_CACHE_DB` may point to a completed schema-10 DB;
-only exact `(model_id, chunk_text_sha256)` vectors are reused. This is disposable
-acceleration, never authoritative state.
+rebuild. `LEGAL_MCP_EMBEDDING_CACHE_DB` may point to a completed matching-schema
+DB; only exact `(model_id, chunk_text_sha256)` vectors are reused. This is
+disposable acceleration, never authoritative state.
+
+For the one schema-10 to schema-11 cutover, derive rather than rebuild:
+
+```bash
+target/release/legal-mcp derive-schema11-from-schema10 \
+  --source-generation-dir "$PWD/data/runtime/generations/1a6beead567b55babebbe253b5ae13efcd9ce2e8ab55b60c2de4106e39f180f4" \
+  --expected-source-generation 1a6beead567b55babebbe253b5ae13efcd9ce2e8ab55b60c2de4106e39f180f4 \
+  --out-dir "$PWD/data/builds/<fresh-schema-11-candidate>"
+```
+
+The projection strictly revalidates the immutable parent, reflinks or copies
+its artifacts, rebuilds only the chunk FTS5 storage as contentless-delete,
+removes the disposable embedding cache, writes `generation.json` last, and
+strictly validates the result. SQLite necessarily performs FTS tokenization of
+the already stored chunk text. The path performs no acquisition, OCR,
+rechunking, model tokenization, model execution, re-embedding, or ANN rebuild;
+model, tokenizer, and all ten ANN artifacts remain byte-identical.
 
 The script durably journals pending acquisition/build/activation work in
 `data/runs/pending-generation.json`, resumes the same build output, performs
@@ -185,12 +205,18 @@ scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
 
-The first run uploads the complete generation. Subsequent runs CoW-seed remote
-staging from the active XFS generation and rsync only changed blocks; interrupted
-uploads resume in place. A one-shot copy of the exact OCI image strictly
+The first run uploads the complete generation with negotiated zstd transport
+compression. Subsequent runs CoW-seed remote staging from the active XFS
+generation and rsync only changed blocks; interrupted uploads resume in place.
+A one-shot copy of the exact OCI image strictly
 validates and activates the result. See [DEPLOYMENT.md](DEPLOYMENT.md) for
 OpenTofu, volume identity, authentication, readiness, rollback, and VPS
 replacement; see [MICROSOFT_COPILOT.md](MICROSOFT_COPILOT.md) for Entra/Copilot.
+
+On the current empty Linode host, use only the ordered v20 cutover in
+[DEPLOYMENT.md](DEPLOYMENT.md): verified v0.19.0 bundle, transactional
+`--upgrade-host-tools`, explicit publisher abort of the prepared v19 upload,
+`update-image.sh --bootstrap-empty-host`, v20 deployment, then authentication.
 
 ## Build semantics
 
