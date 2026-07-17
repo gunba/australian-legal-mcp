@@ -21,20 +21,38 @@ install -d -o root -g root -m 0750 /srv/legal-mcp/lifecycle
 printf '%064d\n' 1 > /srv/legal-mcp/lifecycle/active-generation
 log=/tmp/host-actions.log
 : > "$log"
-touch /tmp/caddy-active
+touch /tmp/caddy-active /tmp/caddy-enabled /tmp/ufw-web-open
 
 cat > /usr/bin/systemctl <<'EOF'
 #!/usr/bin/bash
 printf 'systemctl:%s\n' "$*" >> /tmp/host-actions.log
 case "$1" in
   disable)
-    if [[ "$*" == *caddy.service* ]]; then rm -f /tmp/caddy-active; fi
+    if [[ "$*" == *caddy.service* ]]; then rm -f /tmp/caddy-active /tmp/caddy-enabled; fi
+    ;;
+  enable)
+    if [[ "$*" == *caddy.service* ]]; then touch /tmp/caddy-enabled; fi
     ;;
   start)
     if [[ "$*" == *caddy.service* ]]; then touch /tmp/caddy-active; fi
     ;;
+  stop)
+    if [[ "$*" == *caddy.service* ]]; then rm -f /tmp/caddy-active; fi
+    ;;
+  is-enabled)
+    if [[ "$2" = legal-mcp.service ]]; then printf '%s\n' generated; exit 0; fi
+    if [[ -e /tmp/caddy-enabled ]]; then printf '%s\n' enabled; exit 0; fi
+    printf '%s\n' disabled
+    exit 1
+    ;;
   is-active)
-    if [[ "$*" == *caddy.service* ]]; then test -e /tmp/caddy-active; else exit 0; fi
+    if [[ "$*" == *caddy.service* ]]; then
+      if [[ -e /tmp/caddy-active ]]; then printf '%s\n' active; exit 0; fi
+      printf '%s\n' inactive
+      exit 3
+    fi
+    printf '%s\n' active
+    exit 0
     ;;
   *) exit 0 ;;
 esac
@@ -42,15 +60,29 @@ EOF
 cat > /usr/sbin/ufw <<'EOF'
 #!/usr/bin/bash
 printf 'ufw:%s\n' "$*" >> /tmp/host-actions.log
-if [[ "$*" = 'status verbose' ]]; then
+if [[ "$1" = status ]]; then
   cat <<'STATUS'
 Status: active
 Default: deny (incoming), allow (outgoing), disabled (routed)
 22/tcp                     ALLOW IN    192.0.2.1                 # restricted SSH administration
-80/tcp                     ALLOW IN    Anywhere                  # Caddy ACME HTTP
-443/tcp                    ALLOW IN    Anywhere                  # Australian Legal MCP HTTPS
 STATUS
+  if [[ -e /tmp/ufw-web-open ]]; then
+    printf '%s\n' \
+      '80/tcp                     ALLOW IN    Anywhere                  # Caddy ACME HTTP' \
+      '443/tcp                    ALLOW IN    Anywhere                  # Australian Legal MCP HTTPS'
+  fi
+  exit 0
 fi
+if [[ "$*" == '--force delete allow 80/tcp' \
+  || "$*" == '--force delete allow 443/tcp' ]]; then
+  rm -f /tmp/ufw-web-open
+  exit 0
+fi
+if [[ "$1" = allow ]]; then
+  touch /tmp/ufw-web-open
+  exit 0
+fi
+exit 1
 EOF
 cat > /usr/bin/curl <<'EOF'
 #!/usr/bin/bash
@@ -177,6 +209,7 @@ grep -Fq 'ufw:--force delete allow 80/tcp' "$log"
 # API-key-only image recovery must parse its saved mode only after ingress is
 # closed, then reject an incomplete transaction without reaching Podman.
 : > "$log"
+touch /tmp/ufw-web-open
 image_transaction=/etc/legal-mcp/.image-transaction
 install -d -o root -g root -m 0700 "$image_transaction"
 cat > "$image_transaction/runtime.env" <<'EOF'

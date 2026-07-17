@@ -35,6 +35,7 @@ install -d -o root -g legal-mcp-publisher -m 0710 /run/legal-mcp
 install -d -o root -g root -m 0755 /run/lock
 install -o root -g legal-mcp-publisher -m 0640 /dev/null \
   /run/lock/legal-mcp-host-transaction.lock
+install -d -o root -g root -m 0755 /etc/legal-mcp
 install -d -o root -g legal-mcp -m 0750 /srv/legal-mcp
 setfacl --remove-all /srv/legal-mcp
 setfacl --modify user:legal-mcp-publisher:--x /srv/legal-mcp
@@ -46,8 +47,6 @@ install -o root -g legal-mcp -m 0640 /dev/null /srv/legal-mcp/lifecycle/LOCK
 printf 'LEGAL_MCP_VOLUME_V1\nUUID=%s\n' "$volume_uuid" > /srv/legal-mcp/.legal-mcp-volume
 chown root:root /srv/legal-mcp/.legal-mcp-volume
 chmod 444 /srv/legal-mcp/.legal-mcp-volume
-install -d -o root -g root -m 0700 \
-  /etc/legal-mcp/.auth-transaction /etc/legal-mcp/.image-transaction
 
 # Keep real mutation tools behind logging wrappers so durability and deletion
 # ordering can be asserted without weakening their behavior.
@@ -55,20 +54,97 @@ mv /usr/bin/rm /usr/bin/rm.fixture-real
 mv /usr/bin/mv /usr/bin/mv.fixture-real
 /usr/bin/mv.fixture-real /usr/bin/sync /usr/bin/sync.fixture-real
 /usr/bin/mv.fixture-real /usr/bin/flock /usr/bin/flock.fixture-real
+/usr/bin/mv.fixture-real /usr/bin/chown /usr/bin/chown.fixture-real
+/usr/bin/mv.fixture-real /usr/bin/chmod /usr/bin/chmod.fixture-real
 cat > /usr/bin/rm <<'EOF'
 #!/usr/bin/bash
 printf 'rm:%s\n' "$*" >> /tmp/host-deploy-abort.log
-exec /usr/bin/rm.fixture-real "$@"
+point=''
+if [[ -s /tmp/kill-deploy-after ]]; then point="$(</tmp/kill-deploy-after)"; fi
+if [[ "$point" = upload-mid-delete \
+  && "$*" == *'/srv/legal-mcp/uploads/1a6beead567b55babebbe253b5ae13efcd9ce2e8ab55b60c2de4106e39f180f4'* ]]; then
+  directory="${!#}"
+  victim="$(find "$directory" -mindepth 1 -maxdepth 1 -print -quit)"
+  [[ -n "$victim" ]]
+  /usr/bin/rm.fixture-real -rf -- "$victim"
+  kill -KILL "$PPID"
+  sleep 1
+  exit 137
+fi
+/usr/bin/rm.fixture-real "$@"
+status=$?
+if [[ $status -eq 0 && "$point" = journal-removed \
+  && "$*" = '-f -- /srv/legal-mcp/lifecycle/.deployment-transaction' ]]; then
+  kill -KILL "$PPID"
+  sleep 1
+  exit 137
+fi
+exit "$status"
 EOF
 cat > /usr/bin/mv <<'EOF'
 #!/usr/bin/bash
 printf 'mv:%s\n' "$*" >> /tmp/host-deploy-abort.log
-exec /usr/bin/mv.fixture-real "$@"
+/usr/bin/mv.fixture-real "$@"
+status=$?
+if [[ $status -eq 0 && -s /tmp/kill-deploy-after \
+  && "$(</tmp/kill-deploy-after)" = journal-published \
+  && "$*" = '-fT /srv/legal-mcp/lifecycle/.deployment-transaction.preparing /srv/legal-mcp/lifecycle/.deployment-transaction' ]]; then
+  kill -KILL "$PPID"
+  sleep 1
+  exit 137
+fi
+exit "$status"
 EOF
 cat > /usr/bin/sync <<'EOF'
 #!/usr/bin/bash
 printf 'sync:%s\n' "$*" >> /tmp/host-deploy-abort.log
-exec /usr/bin/sync.fixture-real "$@"
+/usr/bin/sync.fixture-real "$@"
+status=$?
+if [[ $status -eq 0 && -s /tmp/kill-deploy-after ]]; then
+  point="$(</tmp/kill-deploy-after)"
+  if { [[ "$point" = journal-synced \
+        && "$*" = '-f /srv/legal-mcp/lifecycle/.deployment-transaction.preparing' ]] \
+      || [[ "$point" = journal-parent-synced \
+        && "$*" = '-f /srv/legal-mcp/lifecycle' ]]; }; then
+    kill -KILL "$PPID"
+    sleep 1
+    exit 137
+  fi
+fi
+exit "$status"
+EOF
+cat > /usr/bin/chown <<'EOF'
+#!/usr/bin/bash
+point=''
+if [[ -s /tmp/kill-deploy-after ]]; then point="$(</tmp/kill-deploy-after)"; fi
+if [[ "$point" = journal-written \
+  && "${!#}" = /srv/legal-mcp/lifecycle/.deployment-transaction.preparing ]]; then
+  kill -KILL "$PPID"
+  sleep 1
+  exit 137
+fi
+/usr/bin/chown.fixture-real "$@"
+status=$?
+if [[ $status -eq 0 && "$point" = journal-chowned \
+  && "${!#}" = /srv/legal-mcp/lifecycle/.deployment-transaction.preparing ]]; then
+  kill -KILL "$PPID"
+  sleep 1
+  exit 137
+fi
+exit "$status"
+EOF
+cat > /usr/bin/chmod <<'EOF'
+#!/usr/bin/bash
+/usr/bin/chmod.fixture-real "$@"
+status=$?
+if [[ $status -eq 0 && -s /tmp/kill-deploy-after \
+  && "$(</tmp/kill-deploy-after)" = journal-chmodded \
+  && "${!#}" = /srv/legal-mcp/lifecycle/.deployment-transaction.preparing ]]; then
+  kill -KILL "$PPID"
+  sleep 1
+  exit 137
+fi
+exit "$status"
 EOF
 cat > /usr/bin/flock <<'EOF'
 #!/usr/bin/bash
@@ -83,7 +159,8 @@ if [[ $status -eq 0 ]]; then
 fi
 exit "$status"
 EOF
-chmod 755 /usr/bin/rm /usr/bin/mv /usr/bin/sync /usr/bin/flock
+/usr/bin/chmod.fixture-real 755 /usr/bin/rm /usr/bin/mv /usr/bin/sync \
+  /usr/bin/flock /usr/bin/chown /usr/bin/chmod
 
 # The fixture is not mounted on XFS. These fakes expose the exact validated host
 # contract and can deterministically report a nested mount for rejection tests.
@@ -111,8 +188,7 @@ EOF
 chmod 755 /usr/bin/findmnt /usr/sbin/blkid /usr/sbin/xfs_info
 
 # Runtime commands are genuinely absent so dependency preflight as well as
-# invocation regressions fail. Abort must also ignore the deliberately present
-# auth/image transaction directories above.
+# invocation regressions fail after the early foreign-transaction guard.
 for forbidden in podman systemctl curl; do
   /usr/bin/rm.fixture-real -f -- "/usr/bin/$forbidden" "/usr/sbin/$forbidden"
   if command -v "$forbidden" >/dev/null; then
@@ -126,6 +202,7 @@ upload=/srv/legal-mcp/uploads/$generation
 temporary=/srv/legal-mcp/uploads/.$generation.preparing
 installed=/srv/legal-mcp/generations/$generation
 journal=/srv/legal-mcp/lifecycle/.deployment-transaction
+journal_preparing=/srv/legal-mcp/lifecycle/.deployment-transaction.preparing
 pointer=/srv/legal-mcp/lifecycle/active-generation
 authorization=/run/legal-mcp/authorized-upload
 
@@ -151,7 +228,8 @@ make_upload() {
 
 reset_prepared() {
   "$real_rm" -rf -- "$upload" "$temporary" "$installed" "$journal" "$pointer" \
-    "$authorization" /tmp/report-abort-submount
+    "$journal_preparing" "$authorization" /tmp/report-abort-submount \
+    /tmp/kill-deploy-after
   make_upload
   write_fixture_journal "$generation" - prepared
   make_authorization
@@ -173,6 +251,51 @@ line_of_first() {
   grep -nF "$1" "$log" | head -n 1 | cut -d: -f1
 }
 
+# Journal preparation cleanup is unconditional under the lock, but a foreign
+# host transaction still blocks authorization and corpus mutation immediately
+# afterward.
+reset_prepared
+printf 'partial\n' > "$journal_preparing"
+install -d -o root -g root -m 0700 /etc/legal-mcp/.auth-transaction
+if /host-deploy abort "$generation" >/tmp/foreign.stdout 2>/tmp/foreign.stderr; then
+  echo 'foreign transaction with journal residue unexpectedly allowed abort' >&2
+  exit 1
+fi
+[[ ! -e "$journal_preparing" && -e "$authorization" && -d "$upload" && -f "$journal" ]]
+"$real_rm" -rf -- /etc/legal-mcp/.auth-transaction
+
+# Every publisher deploy operation rejects durable foreign host transactions
+# before even revoking upload authorization. This includes the two cutover
+# retirement names that can survive SIGKILL before their parent sync.
+for transaction in \
+  /etc/legal-mcp/.auth-transaction \
+  /etc/legal-mcp/.image-transaction.preparing \
+  /etc/legal-mcp/.image-transaction \
+  /etc/legal-mcp/.image-transaction.retiring \
+  /etc/legal-mcp/.host-tools-transaction.preparing \
+  /etc/legal-mcp/.host-tools-transaction \
+  /etc/legal-mcp/.host-tools-transaction.retiring \
+  /etc/legal-mcp/.host-tools-transaction.rollback-retiring \
+  /etc/legal-mcp/.host-tools-transaction.rollback-retired \
+  /etc/legal-mcp/.host-tools-transaction.publisher-restore; do
+  reset_prepared
+  install -d -o root -g root -m 0700 "$transaction"
+  for action in prepare activate abort; do
+    if /host-deploy "$action" "$generation" \
+      >/tmp/foreign.stdout 2>/tmp/foreign.stderr; then
+      echo "foreign transaction unexpectedly allowed $action: $transaction" >&2
+      exit 1
+    fi
+    grep -Fq 'a foreign host transaction must be recovered' /tmp/foreign.stderr
+    [[ -e "$authorization" && -d "$upload" && -f "$journal" ]]
+  done
+  if grep -Fq 'rm:-f -- /run/legal-mcp/authorized-upload' "$log"; then
+    echo 'foreign transaction rejection mutated upload authorization' >&2
+    exit 1
+  fi
+  "$real_rm" -rf -- "$transaction"
+done
+
 # Prepared -> aborting -> removed is ordered durably, removes only the exact
 # upload, and leaves sibling state untouched.
 reset_prepared
@@ -187,8 +310,8 @@ lock_acquired="$(line_of_first 'flock-acquired:-x 9')"
 authorization_rm="$(line_of_first 'rm:-f -- /run/legal-mcp/authorized-upload')"
 authorization_sync="$(line_of_first 'sync:-f /run/legal-mcp')"
 host_validation="$(line_of_first 'findmnt:--noheadings --raw --output TARGET,SOURCE,FSTYPE,OPTIONS --target /srv/legal-mcp')"
-journal_sync="$(line_of_first 'sync:-f /srv/legal-mcp/lifecycle/.deployment-transaction.')"
-journal_move="$(line_of_first 'mv:-fT /srv/legal-mcp/lifecycle/.deployment-transaction.')"
+journal_sync="$(line_of_first 'sync:-f /srv/legal-mcp/lifecycle/.deployment-transaction.preparing')"
+journal_move="$(line_of_first 'mv:-fT /srv/legal-mcp/lifecycle/.deployment-transaction.preparing /srv/legal-mcp/lifecycle/.deployment-transaction')"
 mapfile -t lifecycle_syncs < <(grep -nFx 'sync:-f /srv/legal-mcp/lifecycle' "$log" | cut -d: -f1)
 upload_rm="$(line_of_first "rm:-rf --one-file-system -- $upload")"
 uploads_sync="$(line_of_first 'sync:-f /srv/legal-mcp/uploads')"
@@ -203,6 +326,17 @@ journal_rm="$(line_of_first 'rm:-f -- /srv/legal-mcp/lifecycle/.deployment-trans
   && "$upload_rm" -lt "$uploads_sync" \
   && "$uploads_sync" -lt "$journal_rm" \
   && "$journal_rm" -lt "${lifecycle_syncs[1]}" ]]
+
+# The fixed lock-owned journal preparation is reconciled on entry before any
+# abort mutation, even when SIGKILL left it only partially constructed.
+reset_prepared
+printf 'partial\n' > "$journal_preparing"
+chmod 640 "$journal_preparing"
+output="$(/host-deploy abort "$generation")"
+[[ "$output" = aborted && ! -e "$journal_preparing" ]]
+preparation_rm="$(line_of_first 'rm:-f -- /srv/legal-mcp/lifecycle/.deployment-transaction.preparing')"
+authorization_rm="$(line_of_first 'rm:-f -- /run/legal-mcp/authorized-upload')"
+[[ "$preparation_rm" -lt "$authorization_rm" ]]
 
 # A valid non-bootstrap previous pointer is preserved exactly.
 reset_prepared
@@ -226,6 +360,42 @@ write_fixture_journal "$generation" - aborting
 "$real_rm" -rf -- "$upload"
 output="$(/host-deploy abort "$generation")"
 [[ "$output" = aborted && ! -e "$journal" ]]
+
+kill_abort_at() {
+  local point="$1" status
+  reset_prepared
+  printf '%s\n' "$point" > /tmp/kill-deploy-after
+  set +e
+  /host-deploy abort "$generation" \
+    >/tmp/abort-kill.stdout 2>/tmp/abort-kill.stderr
+  status=$?
+  set -e
+  "$real_rm" -f /tmp/kill-deploy-after
+  [[ $status -ne 0 ]]
+}
+
+# Every journal construction operation is SIGKILL-recoverable. Pre-publish
+# kills retain the old prepared journal plus a disposable fixed temp; later
+# kills retain the complete aborting journal.
+for point in journal-written journal-chowned journal-chmodded journal-synced \
+  journal-published journal-parent-synced; do
+  kill_abort_at "$point"
+  /host-deploy abort "$generation" >/tmp/abort-recovered.stdout
+  grep -Fxq aborted /tmp/abort-recovered.stdout
+  [[ ! -e "$journal" && ! -e "$journal_preparing" && ! -e "$upload" ]]
+done
+
+# SIGKILL after one child is actually deleted leaves the exact upload root and
+# aborting journal recoverable; a kill after journal unlink is idempotent too.
+kill_abort_at upload-mid-delete
+[[ -d "$upload" && -f "$journal" && ! -e "$upload/partial" ]]
+/host-deploy abort "$generation" >/tmp/abort-recovered.stdout
+grep -Fxq aborted /tmp/abort-recovered.stdout
+
+kill_abort_at journal-removed
+[[ ! -e "$upload" && ! -e "$journal" ]]
+/host-deploy abort "$generation" >/tmp/abort-recovered.stdout
+grep -Fxq already-aborted /tmp/abort-recovered.stdout
 
 # Idempotence is allowed only when every generation-specific location is clean.
 reset_prepared

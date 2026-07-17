@@ -12,9 +12,35 @@ original="${SSH_ORIGINAL_COMMAND:-}"
   exit 2
 }
 
+reject_foreign_host_transactions() {
+  local transaction
+  [[ -d /etc/legal-mcp && ! -L /etc/legal-mcp \
+    && "$(stat -c '%U:%G:%a' /etc/legal-mcp)" = root:root:755 ]] || {
+    echo 'host transaction directory is not safely visible' >&2
+    exit 1
+  }
+  for transaction in \
+    /etc/legal-mcp/.auth-transaction \
+    /etc/legal-mcp/.image-transaction.preparing \
+    /etc/legal-mcp/.image-transaction \
+    /etc/legal-mcp/.image-transaction.retiring \
+    /etc/legal-mcp/.host-tools-transaction.preparing \
+    /etc/legal-mcp/.host-tools-transaction \
+    /etc/legal-mcp/.host-tools-transaction.retiring \
+    /etc/legal-mcp/.host-tools-transaction.rollback-retiring \
+    /etc/legal-mcp/.host-tools-transaction.rollback-retired \
+    /etc/legal-mcp/.host-tools-transaction.publisher-restore; do
+    [[ ! -e "$transaction" && ! -L "$transaction" ]] || {
+      echo 'a foreign host transaction must be recovered before publisher mutation' >&2
+      exit 1
+    }
+  done
+}
+
 if [[ "$original" =~ ^(prepare|activate|abort)\ ([0-9a-f]{64})$ ]]; then
   action="${BASH_REMATCH[1]}"
   generation="${BASH_REMATCH[2]}"
+  reject_foreign_host_transactions
   exec /usr/bin/sudo -n /usr/local/sbin/legal-mcp-host-deploy "$action" "$generation"
 fi
 
@@ -33,6 +59,7 @@ if [[ "$original" =~ ^rsync\ --server\ .*\ \.\ ([0-9a-f]{64})/$ ]]; then
   }
   exec 9<"$lock_file"
   flock -x 9
+  reject_foreign_host_transactions
   [[ -f "$authorization" && ! -L "$authorization" \
     && "$(stat -c '%U:%G:%a:%h:%s' "$authorization")" = root:legal-mcp-publisher:440:1:65 ]] || {
     echo 'no safe prepared upload is authorized' >&2

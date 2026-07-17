@@ -15,6 +15,7 @@ generation="$(printf '%064d' 0)"
 other_generation="$(printf '%064d' 1)"
 groupadd --gid 973 legal-mcp-publisher
 useradd --uid 973 --gid 973 --home-dir /nonexistent --no-create-home legal-mcp-publisher
+install -d -o root -g root -m 0755 /etc/legal-mcp
 install -d -o root -g legal-mcp-publisher -m 0710 /run/legal-mcp
 install -o root -g legal-mcp-publisher -m 0640 /dev/null \
   /run/lock/legal-mcp-host-transaction.lock
@@ -63,6 +64,22 @@ expect_rejected "prepare $generation extra"
 expect_rejected "abort $generation extra"
 expect_rejected "Abort $generation"
 expect_rejected 'abort 1'
+
+for transaction in \
+  /etc/legal-mcp/.auth-transaction \
+  /etc/legal-mcp/.image-transaction.preparing \
+  /etc/legal-mcp/.image-transaction \
+  /etc/legal-mcp/.image-transaction.retiring \
+  /etc/legal-mcp/.host-tools-transaction.preparing \
+  /etc/legal-mcp/.host-tools-transaction \
+  /etc/legal-mcp/.host-tools-transaction.retiring \
+  /etc/legal-mcp/.host-tools-transaction.rollback-retiring \
+  /etc/legal-mcp/.host-tools-transaction.rollback-retired \
+  /etc/legal-mcp/.host-tools-transaction.publisher-restore; do
+  install -d -o root -g root -m 0700 "$transaction"
+  expect_rejected "rsync --server -vlogDtpre.iLsfxCIvu . $generation/"
+  rmdir "$transaction"
+done
 
 rm -f /run/legal-mcp/authorized-upload
 expect_rejected "rsync --server -vlogDtpre.iLsfxCIvu . $generation/"
