@@ -380,12 +380,21 @@ printf '{"keys":[],"version":1}\n' > /etc/legal-mcp/api-keys.json
 chown legal-mcp:legal-mcp /etc/legal-mcp/api-keys.json
 chmod 400 /etc/legal-mcp/api-keys.json
 
-install -d -o root -g root -m 0755 /var/lib/legal-mcp-publisher /var/lib/legal-mcp-publisher/.ssh
+install -d -o root -g root -m 0755 /var/lib/legal-mcp-publisher
+install -d -o root -g legal-mcp-publisher -m 0710 /var/lib/legal-mcp-publisher/.ssh
 printf 'restrict,command="/usr/local/sbin/legal-mcp-publisher-command" %s\n' "$publisher_key" \
   > /var/lib/legal-mcp-publisher/.ssh/authorized_keys
-chown -R root:root /var/lib/legal-mcp-publisher
-chmod 700 /var/lib/legal-mcp-publisher/.ssh
-chmod 600 /var/lib/legal-mcp-publisher/.ssh/authorized_keys
+chown root:legal-mcp-publisher /var/lib/legal-mcp-publisher/.ssh/authorized_keys
+chmod 640 /var/lib/legal-mcp-publisher/.ssh/authorized_keys
+if [[ "$(stat -c '%U:%G:%a' /var/lib/legal-mcp-publisher/.ssh)" \
+      != root:legal-mcp-publisher:710 \
+    || "$(stat -c '%U:%G:%a' /var/lib/legal-mcp-publisher/.ssh/authorized_keys)" \
+      != root:legal-mcp-publisher:640 ]] \
+  || ! runuser -u legal-mcp-publisher -- \
+    test -r /var/lib/legal-mcp-publisher/.ssh/authorized_keys; then
+  echo 'publisher authorized key is not safely readable by the restricted account' >&2
+  exit 1
+fi
 [[ -s /root/.ssh/authorized_keys && ! -L /root/.ssh/authorized_keys ]] || {
   echo 'the provisioned root administrator key is missing' >&2
   exit 1
