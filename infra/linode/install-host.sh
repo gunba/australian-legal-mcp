@@ -417,7 +417,7 @@ chmod 440 /etc/sudoers.d/legal-mcp-admin
 visudo -cf /etc/sudoers.d/legal-mcp-admin
 cat > /etc/sudoers.d/legal-mcp-publisher <<'EOF'
 Defaults:legal-mcp-publisher !requiretty
-legal-mcp-publisher ALL=(root) NOPASSWD: /usr/local/sbin/legal-mcp-host-deploy prepare *, /usr/local/sbin/legal-mcp-host-deploy activate *
+legal-mcp-publisher ALL=(root) NOPASSWD: /usr/local/sbin/legal-mcp-host-deploy prepare *, /usr/local/sbin/legal-mcp-host-deploy activate *, /usr/local/sbin/legal-mcp-host-deploy abort *
 EOF
 chmod 440 /etc/sudoers.d/legal-mcp-publisher
 visudo -cf /etc/sudoers.d/legal-mcp-publisher

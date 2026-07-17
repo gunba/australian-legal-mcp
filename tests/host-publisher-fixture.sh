@@ -52,12 +52,17 @@ output="$(run_publisher "prepare $generation")"
 [[ "$output" = "sudo-ok:-n /usr/local/sbin/legal-mcp-host-deploy prepare $generation" ]]
 output="$(run_publisher "activate $generation")"
 [[ "$output" = "sudo-ok:-n /usr/local/sbin/legal-mcp-host-deploy activate $generation" ]]
+output="$(run_publisher "abort $generation")"
+[[ "$output" = "sudo-ok:-n /usr/local/sbin/legal-mcp-host-deploy abort $generation" ]]
 output="$(run_publisher "rsync --server -vlogDtpre.iLsfxCIvu . $generation/")"
 [[ "$output" = 'rrsync-ok:-wo /srv/legal-mcp/uploads' ]]
 
 expect_rejected "rsync --server -vlogDtpre.iLsfxCIvu . $other_generation/"
 expect_rejected 'rsync --server -vlogDtpre.iLsfxCIvu . ../escape/'
 expect_rejected "prepare $generation extra"
+expect_rejected "abort $generation extra"
+expect_rejected "Abort $generation"
+expect_rejected 'abort 1'
 
 rm -f /run/legal-mcp/authorized-upload
 expect_rejected "rsync --server -vlogDtpre.iLsfxCIvu . $generation/"

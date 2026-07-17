@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Forced SSH command for the unprivileged corpus publisher. It can write only
-# resumable upload staging and invoke two exact root transaction operations.
+# resumable upload staging and invoke three exact root transaction operations.
 set -euo pipefail
 umask 077
 export LC_ALL=C
@@ -12,7 +12,7 @@ original="${SSH_ORIGINAL_COMMAND:-}"
   exit 2
 }
 
-if [[ "$original" =~ ^(prepare|activate)\ ([0-9a-f]{64})$ ]]; then
+if [[ "$original" =~ ^(prepare|activate|abort)\ ([0-9a-f]{64})$ ]]; then
   action="${BASH_REMATCH[1]}"
   generation="${BASH_REMATCH[2]}"
   exec /usr/bin/sudo -n /usr/local/sbin/legal-mcp-host-deploy "$action" "$generation"
@@ -51,5 +51,5 @@ if [[ "$original" == 'rsync --server '* ]]; then
   exit 2
 fi
 
-echo 'only prepare, restricted rsync upload, and activate are permitted' >&2
+echo 'only prepare, restricted rsync upload, activate, and abort are permitted' >&2
 exit 2

@@ -4,9 +4,17 @@ use crate::config::db_path;
 use crate::SUPPORTED_SCHEMA_VERSION;
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OpenFlags};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
+
+pub(crate) const CHUNKS_FTS_V11_SQL: &str = r#"CREATE VIRTUAL TABLE chunks_fts USING fts5(
+    text,
+    content = '',
+    contentless_delete = 1,
+    tokenize = "porter unicode61 remove_diacritics 2"
+)"#;
 
 pub(crate) fn open_read() -> Result<Connection> {
     let path = db_path()?;
@@ -276,15 +284,308 @@ pub(crate) fn init_db(conn: &Connection) -> Result<()> {
             tokenize = "porter unicode61 remove_diacritics 2"
         );
 
-        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-            text,
-            tokenize = "porter unicode61 remove_diacritics 2"
-        );
         "#,
     )?;
+    if !table_exists(&tx, "chunks_fts")? {
+        tx.execute_batch(CHUNKS_FTS_V11_SQL)?;
+    }
     set_corpus_meta(&tx, "schema_version", &SUPPORTED_SCHEMA_VERSION.to_string())?;
     tx.commit()?;
     Ok(())
+}
+
+pub(crate) fn validate_chunks_fts_schema(conn: &Connection) -> Result<()> {
+    let actual = conn
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'chunks_fts'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .context("reading chunks_fts schema")?;
+    if normalized_sql(&actual) != normalized_sql(CHUNKS_FTS_V11_SQL) {
+        bail!(
+            "chunks_fts does not match the schema-{SUPPORTED_SCHEMA_VERSION} contentless-delete contract"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_fts_relational_bindings(conn: &Connection) -> Result<()> {
+    for (table, expected) in [("chunks_fts", "chunks"), ("title_fts", "documents")] {
+        let indexed: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })?;
+        let source: i64 =
+            conn.query_row(&format!("SELECT COUNT(*) FROM {expected}"), [], |row| {
+                row.get(0)
+            })?;
+        if indexed != source {
+            bail!("generation FTS table `{table}` has {indexed} rows; expected {source}");
+        }
+    }
+
+    if !ordered_i64_queries_match(
+        conn,
+        "SELECT chunk_id FROM chunks ORDER BY chunk_id",
+        "SELECT rowid FROM chunks_fts ORDER BY rowid",
+    )? {
+        bail!("chunks_fts rowids do not exactly match chunks.chunk_id");
+    }
+
+    if !ordered_text_pair_queries_match(
+        conn,
+        "SELECT source_id, native_id FROM documents ORDER BY source_id, native_id",
+        "SELECT source_id, native_id FROM title_fts ORDER BY source_id, native_id",
+    )? {
+        bail!("title_fts identities do not exactly match documents");
+    }
+    Ok(())
+}
+
+fn ordered_i64_queries_match(conn: &Connection, left: &str, right: &str) -> Result<bool> {
+    let mut left_statement = conn.prepare(left)?;
+    let mut right_statement = conn.prepare(right)?;
+    let mut left_rows = left_statement.query([])?;
+    let mut right_rows = right_statement.query([])?;
+    loop {
+        match (left_rows.next()?, right_rows.next()?) {
+            (Some(left), Some(right)) if left.get::<_, i64>(0)? == right.get::<_, i64>(0)? => {}
+            (None, None) => return Ok(true),
+            _ => return Ok(false),
+        }
+    }
+}
+
+fn ordered_text_pair_queries_match(conn: &Connection, left: &str, right: &str) -> Result<bool> {
+    let mut left_statement = conn.prepare(left)?;
+    let mut right_statement = conn.prepare(right)?;
+    let mut left_rows = left_statement.query([])?;
+    let mut right_rows = right_statement.query([])?;
+    loop {
+        match (left_rows.next()?, right_rows.next()?) {
+            (Some(left), Some(right))
+                if left.get::<_, String>(0)? == right.get::<_, String>(0)?
+                    && left.get::<_, String>(1)? == right.get::<_, String>(1)? => {}
+            (None, None) => return Ok(true),
+            _ => return Ok(false),
+        }
+    }
+}
+
+fn validate_fts_digest_table(conn: &Connection, table: &str) -> Result<()> {
+    if table.is_empty()
+        || !table
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        bail!("FTS digest table name is malformed");
+    }
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_schema
+             WHERE type = 'table' AND name = ?1
+         )",
+        [table],
+        |row| row.get(0),
+    )?;
+    if exists != 1 {
+        bail!("FTS digest table `{table}` does not exist");
+    }
+    Ok(())
+}
+
+pub(crate) fn chunks_fts_logical_sha256(conn: &Connection, table: &str) -> Result<String> {
+    validate_fts_digest_table(conn, table)?;
+
+    let original_query_only: i64 = conn.pragma_query_value(None, "query_only", |row| row.get(0))?;
+    conn.pragma_update(None, "query_only", "OFF")?;
+    let result = (|| -> Result<String> {
+        conn.execute_batch("DROP TABLE IF EXISTS temp.chunks_fts_digest_vocab;")?;
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE temp.chunks_fts_digest_vocab
+             USING fts5vocab(main, {table}, instance);"
+        ))?;
+        let digest = (|| -> Result<String> {
+            // FTS5 vocab consumes ORDER BY term and emits each term's
+            // instances in doc/column/offset order. The monotonic assertion
+            // makes that streaming contract fail closed without a temp sort.
+            let mut statement = conn.prepare(
+                "SELECT term, doc, col, offset
+                 FROM temp.chunks_fts_digest_vocab
+                 ORDER BY term",
+            )?;
+            let mut rows = statement.query([])?;
+            let mut previous_term = String::new();
+            let mut previous_doc = 0_i64;
+            let mut previous_column = String::new();
+            let mut previous_offset = 0_i64;
+            let mut have_previous = false;
+            let mut count = 0_u64;
+            let mut hasher = Sha256::new();
+            hasher.update(b"australian-legal-mcp-chunks-fts-instance-v1\0");
+            while let Some(row) = rows.next()? {
+                let term = row.get_ref(0)?.as_str()?;
+                let doc = row.get::<_, i64>(1)?;
+                let column = row.get_ref(2)?.as_str()?;
+                let offset = row.get::<_, i64>(3)?;
+                if have_previous
+                    && (previous_term.as_str() > term
+                        || (previous_term == term
+                            && (previous_doc, previous_column.as_str(), previous_offset)
+                                >= (doc, column, offset)))
+                {
+                    bail!("FTS vocabulary instances are not strictly ordered");
+                }
+                hash_digest_field(&mut hasher, term.as_bytes());
+                hasher.update(doc.to_le_bytes());
+                hash_digest_field(&mut hasher, column.as_bytes());
+                hasher.update(offset.to_le_bytes());
+                if previous_term != term {
+                    previous_term.clear();
+                    previous_term.push_str(term);
+                }
+                previous_doc = doc;
+                previous_column.clear();
+                previous_column.push_str(column);
+                previous_offset = offset;
+                have_previous = true;
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("FTS vocabulary count overflow"))?;
+            }
+            hasher.update(count.to_le_bytes());
+            hash_fts_bm25_metadata(&mut hasher, conn, table)?;
+            Ok(format!("{:x}", hasher.finalize()))
+        })();
+        let cleanup = conn.execute_batch("DROP TABLE temp.chunks_fts_digest_vocab;");
+        let digest = digest?;
+        cleanup?;
+        Ok(digest)
+    })();
+    let restore = conn.pragma_update(None, "query_only", original_query_only);
+    match (result, restore) {
+        (Ok(digest), Ok(())) => Ok(digest),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Err(error), Err(restore_error)) => Err(error).context(format!(
+            "restoring SQLite query_only after FTS digest also failed: {restore_error}"
+        )),
+    }
+}
+
+pub(crate) fn chunks_fts_index_sha256(conn: &Connection, table: &str) -> Result<String> {
+    validate_fts_digest_table(conn, table)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"australian-legal-mcp-chunks-fts-storage-v1\0");
+
+    hasher.update(b"data\0");
+    let mut data_count = 0_u64;
+    let mut statement = conn.prepare(&format!("SELECT id, block FROM {table}_data ORDER BY id"))?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        hasher.update(row.get::<_, i64>(0)?.to_le_bytes());
+        hash_digest_field(&mut hasher, row.get_ref(1)?.as_blob()?);
+        data_count = data_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("FTS data row count overflow"))?;
+    }
+    hasher.update(data_count.to_le_bytes());
+    drop(rows);
+    drop(statement);
+
+    hasher.update(b"index\0");
+    let mut index_count = 0_u64;
+    let mut statement = conn.prepare(&format!(
+        "SELECT segid, term, pgno FROM {table}_idx ORDER BY segid, term"
+    ))?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        hasher.update(row.get::<_, i64>(0)?.to_le_bytes());
+        hash_digest_field(&mut hasher, row.get_ref(1)?.as_blob()?);
+        hasher.update(row.get::<_, i64>(2)?.to_le_bytes());
+        index_count = index_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("FTS index row count overflow"))?;
+    }
+    hasher.update(index_count.to_le_bytes());
+    drop(rows);
+    drop(statement);
+
+    hash_fts_docsize(&mut hasher, conn, table)?;
+
+    hasher.update(b"config\0");
+    let mut config_count = 0_u64;
+    let mut statement = conn.prepare(&format!(
+        "SELECT k, typeof(v), quote(v) FROM {table}_config ORDER BY k"
+    ))?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        hash_digest_field(&mut hasher, row.get::<_, String>(0)?.as_bytes());
+        hash_digest_field(&mut hasher, row.get::<_, String>(1)?.as_bytes());
+        hash_digest_field(&mut hasher, row.get::<_, String>(2)?.as_bytes());
+        config_count = config_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("FTS config row count overflow"))?;
+    }
+    hasher.update(config_count.to_le_bytes());
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn hash_fts_bm25_metadata(hasher: &mut Sha256, conn: &Connection, table: &str) -> Result<()> {
+    hash_fts_docsize(hasher, conn, table)?;
+    let averages = conn
+        .query_row(
+            &format!("SELECT block FROM {table}_data WHERE id = 1"),
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .context("reading FTS averages record")?;
+    hasher.update(b"averages\0");
+    hash_digest_field(hasher, &averages);
+    Ok(())
+}
+
+fn hash_fts_docsize(hasher: &mut Sha256, conn: &Connection, table: &str) -> Result<()> {
+    hasher.update(b"docsize\0");
+    let mut count = 0_u64;
+    let mut statement = conn.prepare(&format!("SELECT id, sz FROM {table}_docsize ORDER BY id"))?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        hasher.update(row.get::<_, i64>(0)?.to_le_bytes());
+        hash_digest_field(hasher, row.get_ref(1)?.as_blob()?);
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("FTS docsize row count overflow"))?;
+    }
+    hasher.update(count.to_le_bytes());
+    Ok(())
+}
+
+pub(crate) fn verify_chunks_fts_index_digest(conn: &Connection) -> Result<()> {
+    let expected = get_corpus_meta(conn, "chunks_fts_index_sha256")?.ok_or_else(|| {
+        anyhow::anyhow!("database is missing corpus_meta.chunks_fts_index_sha256")
+    })?;
+    if expected.len() != 64
+        || !expected
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("corpus_meta.chunks_fts_index_sha256 is malformed");
+    }
+    let actual = chunks_fts_index_sha256(conn, "chunks_fts")?;
+    if actual != expected {
+        bail!("chunks_fts index storage or BM25 metadata does not match its schema-11 digest");
+    }
+    Ok(())
+}
+
+fn hash_digest_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+pub(crate) fn normalized_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 pub(crate) fn get_corpus_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
@@ -530,6 +831,7 @@ mod tests {
         )?;
         assert!(title_fts_sql.contains("source_id UNINDEXED"));
         assert!(title_fts_sql.contains("native_id UNINDEXED"));
+        validate_chunks_fts_schema(&conn)?;
 
         conn.execute(
             "INSERT INTO sources(source_id, display_name) VALUES ('ato', 'Australian Taxation Office')",
@@ -567,6 +869,176 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(chunk_rowid, 41);
+        let stored_text: Option<String> =
+            conn.query_row("SELECT text FROM chunks_fts WHERE rowid = 41", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(stored_text, None, "chunks_fts must be contentless");
+        conn.execute("DELETE FROM chunks_fts WHERE rowid = 41", [])?;
+        let remaining: i64 =
+            conn.query_row("SELECT COUNT(*) FROM chunks_fts", [], |row| row.get(0))?;
+        assert_eq!(
+            remaining, 0,
+            "contentless-delete must support normal DELETE"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn chunks_fts_schema_rejects_contentful_or_incompatible_tables() -> Result<()> {
+        for ddl in [
+            r#"CREATE VIRTUAL TABLE chunks_fts USING fts5(
+                text,
+                tokenize = "porter unicode61 remove_diacritics 2"
+            )"#,
+            r#"CREATE VIRTUAL TABLE chunks_fts USING fts5(
+                text,
+                content = '',
+                tokenize = "porter unicode61 remove_diacritics 2"
+            )"#,
+            r#"CREATE VIRTUAL TABLE chunks_fts USING fts5(
+                text,
+                content = '',
+                contentless_delete = 1,
+                tokenize = "unicode61"
+            )"#,
+        ] {
+            let conn = Connection::open_in_memory()?;
+            conn.execute_batch(ddl)?;
+            assert!(validate_chunks_fts_schema(&conn).is_err(), "accepted {ddl}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fts_relational_bindings_require_exact_chunk_rowids() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        init_db(&conn)?;
+        conn.execute_batch(
+            "INSERT INTO sources(source_id, display_name) VALUES ('ato', 'ATO');
+             INSERT INTO documents(
+                 source_id, native_id, type, title, canonical_url, downloaded_at,
+                 content_hash, html
+             ) VALUES (
+                 'ato', 'doc', 'ruling', 'Document', 'https://example.invalid/doc',
+                 '2026-01-01T00:00:00Z', 'hash', X'00'
+             );
+             INSERT INTO chunks(chunk_id, source_id, native_id, ord, text)
+             VALUES (1, 'ato', 'doc', 0, X'00');
+             INSERT INTO title_fts(rowid, source_id, native_id, title, headings)
+             VALUES (1, 'ato', 'doc', 'Document', '');
+             INSERT INTO chunks_fts(rowid, text) VALUES (2, 'wrong identity');",
+        )?;
+        let error = verify_fts_relational_bindings(&conn).unwrap_err();
+        assert!(error.to_string().contains("rowids"));
+        Ok(())
+    }
+
+    #[test]
+    fn chunks_fts_integrity_digest_binds_postings_and_bm25_metadata() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        init_db(&conn)?;
+        conn.execute_batch(
+            "INSERT INTO chunks_fts(rowid, text) VALUES
+                 (1, 'research development incentive'),
+                 (2, 'documentary evidence');",
+        )?;
+        let digest = chunks_fts_index_sha256(&conn, "chunks_fts")?;
+        set_corpus_meta(&conn, "chunks_fts_index_sha256", &digest)?;
+        verify_chunks_fts_index_digest(&conn)?;
+
+        conn.execute("DELETE FROM chunks_fts WHERE rowid = 2", [])?;
+        conn.execute(
+            "INSERT INTO chunks_fts(rowid, text) VALUES (2, 'unrelated garbage')",
+            [],
+        )?;
+        let error = verify_chunks_fts_index_digest(&conn).unwrap_err();
+        assert!(error.to_string().contains("index storage"));
+
+        conn.execute("DELETE FROM chunks_fts WHERE rowid = 2", [])?;
+        conn.execute(
+            "INSERT INTO chunks_fts(rowid, text) VALUES (2, 'documentary evidence')",
+            [],
+        )?;
+        let repaired_digest = chunks_fts_index_sha256(&conn, "chunks_fts")?;
+        set_corpus_meta(&conn, "chunks_fts_index_sha256", &repaired_digest)?;
+        verify_chunks_fts_index_digest(&conn)?;
+        let logical_digest = chunks_fts_logical_sha256(&conn, "chunks_fts")?;
+        let baseline_score: f64 = conn.query_row(
+            "SELECT bm25(chunks_fts) FROM chunks_fts
+             WHERE rowid = 1 AND chunks_fts MATCH 'research'",
+            [],
+            |row| row.get(0),
+        )?;
+        let original_docsize: Vec<u8> = conn.query_row(
+            "SELECT sz FROM chunks_fts_docsize WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        conn.execute("UPDATE chunks_fts_docsize SET sz = X'64' WHERE id = 1", [])?;
+        let changed_docsize_score: f64 = conn.query_row(
+            "SELECT bm25(chunks_fts) FROM chunks_fts
+             WHERE rowid = 1 AND chunks_fts MATCH 'research'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_ne!(changed_docsize_score, baseline_score);
+        assert_ne!(
+            chunks_fts_logical_sha256(&conn, "chunks_fts")?,
+            logical_digest
+        );
+        assert!(verify_chunks_fts_index_digest(&conn).is_err());
+        conn.execute(
+            "UPDATE chunks_fts_docsize SET sz = ?1 WHERE id = 1",
+            [original_docsize],
+        )?;
+        assert_eq!(
+            chunks_fts_logical_sha256(&conn, "chunks_fts")?,
+            logical_digest
+        );
+        verify_chunks_fts_index_digest(&conn)?;
+
+        let original_averages: Vec<u8> = conn.query_row(
+            "SELECT block FROM chunks_fts_data WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "UPDATE chunks_fts_data SET block = X'0264' WHERE id = 1",
+            [],
+        )?;
+        let changed_average_score: f64 = conn.query_row(
+            "SELECT bm25(chunks_fts) FROM chunks_fts
+             WHERE rowid = 1 AND chunks_fts MATCH 'research'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_ne!(changed_average_score, baseline_score);
+        assert_ne!(
+            chunks_fts_logical_sha256(&conn, "chunks_fts")?,
+            logical_digest
+        );
+        conn.execute(
+            "INSERT INTO chunks_fts(chunks_fts) VALUES('integrity-check')",
+            [],
+        )?;
+        assert!(verify_chunks_fts_index_digest(&conn).is_err());
+        conn.execute(
+            "UPDATE chunks_fts_data SET block = ?1 WHERE id = 1",
+            [original_averages],
+        )?;
+        assert_eq!(
+            chunks_fts_logical_sha256(&conn, "chunks_fts")?,
+            logical_digest
+        );
+        verify_chunks_fts_index_digest(&conn)?;
+        let storage_before_vacuum = chunks_fts_index_sha256(&conn, "chunks_fts")?;
+        conn.execute_batch("VACUUM")?;
+        assert_eq!(
+            chunks_fts_index_sha256(&conn, "chunks_fts")?,
+            storage_before_vacuum
+        );
+        verify_chunks_fts_index_digest(&conn)?;
         Ok(())
     }
 
