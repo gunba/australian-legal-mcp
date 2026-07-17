@@ -96,7 +96,11 @@ ort = { version = "2.0.0-rc.12", default-features = false, features = [
   "ndarray",
 ] }
 
-[target.'cfg(all(not(windows), not(target_os = "linux")))'.dependencies]
-ort = "2.0.0-rc.12"
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "2.0.0-rc.12", default-features = false, features = [
+  "load-dynamic",
+  "api-24",
+  "ndarray",
+] }
 
 [dev-dependencies]

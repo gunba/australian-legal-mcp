@@ -15,7 +15,6 @@ use ort::session::{
 };
 use ort::value::TensorRef;
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 use std::time::Duration;
 
