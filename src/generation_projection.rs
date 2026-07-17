@@ -56,6 +56,15 @@ enum CopyMethod {
     Copy,
 }
 
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowsFileIdentity {
+    file_attributes: u32,
+    volume_serial_number: u32,
+    file_index: u64,
+    number_of_links: u32,
+}
+
 #[derive(Debug)]
 struct ArtifactSnapshot {
     relative_path: String,
@@ -65,6 +74,8 @@ struct ArtifactSnapshot {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(windows)]
+    windows_identity: WindowsFileIdentity,
 }
 
 #[derive(Debug)]
@@ -73,6 +84,8 @@ struct DirectorySnapshot {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(windows)]
+    windows_identity: WindowsFileIdentity,
 }
 
 #[derive(Debug)]
@@ -860,6 +873,8 @@ fn snapshot_artifact(
 ) -> Result<ArtifactSnapshot> {
     let path = root.join(relative);
     let metadata = validate_regular_file(&path, expected_size, expected_sha256, true)?;
+    #[cfg(windows)]
+    let _ = &metadata;
     let snapshot = ArtifactSnapshot {
         relative_path: relative.to_string(),
         size: expected_size,
@@ -868,8 +883,10 @@ fn snapshot_artifact(
         device: unix_device(&metadata),
         #[cfg(unix)]
         inode: unix_inode(&metadata),
+        #[cfg(windows)]
+        windows_identity: windows_identity_from_path(&path, false)?,
     };
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     drop(metadata);
     Ok(snapshot)
 }
@@ -897,11 +914,17 @@ fn validate_regular_file(
 }
 
 fn read_validated_file(path: &Path, path_metadata: &fs::Metadata) -> Result<Vec<u8>> {
+    #[cfg(windows)]
+    let (path_identity, _) = (windows_identity_from_path(path, false)?, path_metadata);
     let mut file = open_regular_no_follow(path)?;
     let metadata = file.metadata()?;
     reject_hard_links(&metadata, path)?;
     require_read_only(path, &metadata, "legacy generation file")?;
-    if !same_file_identity(path_metadata, &metadata) {
+    #[cfg(not(windows))]
+    let identity_matches = same_file_identity(path_metadata, &metadata);
+    #[cfg(windows)]
+    let identity_matches = windows_identity_from_file(&file)? == path_identity;
+    if !identity_matches {
         bail!(
             "generation file changed while being opened: {}",
             path.display()
@@ -929,6 +952,8 @@ fn snapshot_directory(path: &Path, label: &str) -> Result<DirectorySnapshot> {
         device: unix_device(&metadata),
         #[cfg(unix)]
         inode: unix_inode(&metadata),
+        #[cfg(windows)]
+        windows_identity: windows_identity_from_path(path, true)?,
     })
 }
 
@@ -985,6 +1010,8 @@ fn revalidate_legacy_generation(legacy: &ValidatedLegacyGeneration) -> Result<()
 fn revalidate_snapshot(root: &Path, snapshot: &ArtifactSnapshot) -> Result<()> {
     let path = root.join(&snapshot.relative_path);
     let metadata = validate_regular_file(&path, snapshot.size, &snapshot.sha256, true)?;
+    #[cfg(windows)]
+    let _ = &metadata;
     #[cfg(unix)]
     if unix_device(&metadata) != snapshot.device || unix_inode(&metadata) != snapshot.inode {
         bail!(
@@ -992,7 +1019,14 @@ fn revalidate_snapshot(root: &Path, snapshot: &ArtifactSnapshot) -> Result<()> {
             path.display()
         );
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    if windows_identity_from_path(&path, false)? != snapshot.windows_identity {
+        bail!(
+            "legacy artifact was replaced during projection: {}",
+            path.display()
+        );
+    }
+    #[cfg(not(any(unix, windows)))]
     drop(metadata);
     Ok(())
 }
@@ -1016,6 +1050,13 @@ fn clone_or_copy_validated(
     if unix_device(&source_metadata) != snapshot.device
         || unix_inode(&source_metadata) != snapshot.inode
     {
+        bail!(
+            "legacy artifact was replaced before copy: {}",
+            source_path.display()
+        );
+    }
+    #[cfg(windows)]
+    if windows_identity_from_file(&source)? != snapshot.windows_identity {
         bail!(
             "legacy artifact was replaced before copy: {}",
             source_path.display()
@@ -1067,6 +1108,8 @@ fn clone_or_copy_validated(
 
     let destination_metadata =
         validate_regular_file(destination, snapshot.size, &snapshot.sha256, false)?;
+    #[cfg(windows)]
+    let _ = &destination_metadata;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -1077,7 +1120,18 @@ fn clone_or_copy_validated(
             bail!("projected artifacts must be distinct single-link inodes");
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let destination_identity = windows_identity_from_path(destination, false)?;
+        if destination_identity.number_of_links != 1
+            || (destination_identity.volume_serial_number
+                == snapshot.windows_identity.volume_serial_number
+                && destination_identity.file_index == snapshot.windows_identity.file_index)
+        {
+            bail!("projected artifacts must be distinct single-link files");
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     drop(destination_metadata);
     sync_directory(parent)?;
     Ok(method)
@@ -1092,6 +1146,8 @@ fn open_regular_no_follow(path: &Path) -> Result<File> {
             path.display()
         );
     }
+    #[cfg(windows)]
+    let path_identity = windows_identity_from_path(path, false)?;
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -1099,8 +1155,18 @@ fn open_regular_no_follow(path: &Path) -> Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
     let file = options.open(path)?;
-    if !same_file_identity(&path_metadata, &file.metadata()?) {
+    #[cfg(not(windows))]
+    let identity_matches = same_file_identity(&path_metadata, &file.metadata()?);
+    #[cfg(windows)]
+    let identity_matches = windows_identity_from_file(&file)? == path_identity;
+    if !identity_matches {
         bail!(
             "generation artifact changed while being opened: {}",
             path.display()
@@ -1272,7 +1338,19 @@ fn reject_hard_links(metadata: &fs::Metadata, path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
+#[cfg(not(windows))]
 fn reject_hard_links(_metadata: &fs::Metadata, _path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn reject_hard_links(_metadata: &fs::Metadata, path: &Path) -> Result<()> {
+    if windows_identity_from_path(path, false)?.number_of_links != 1 {
+        bail!(
+            "generation artifacts must have exactly one link: {}",
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -1293,6 +1371,7 @@ fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
 }
 
 #[cfg(not(unix))]
+#[cfg(not(windows))]
 fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     left.len() == right.len()
 }
@@ -1315,8 +1394,71 @@ fn same_directory_identity(left: &DirectorySnapshot, right: &DirectorySnapshot) 
 }
 
 #[cfg(not(unix))]
+#[cfg(not(windows))]
 fn same_directory_identity(_left: &DirectorySnapshot, _right: &DirectorySnapshot) -> bool {
     true
+}
+
+#[cfg(windows)]
+fn same_directory_identity(left: &DirectorySnapshot, right: &DirectorySnapshot) -> bool {
+    left.windows_identity == right.windows_identity
+}
+
+#[cfg(windows)]
+fn windows_identity_from_path(path: &Path, directory: bool) -> Result<WindowsFileIdentity> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(
+        FILE_FLAG_OPEN_REPARSE_POINT
+            | if directory {
+                FILE_FLAG_BACKUP_SEMANTICS
+            } else {
+                0
+            },
+    );
+    let file = options
+        .open(path)
+        .with_context(|| format!("opening Windows identity handle for {}", path.display()))?;
+    let identity = windows_identity_from_file(&file)?;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    if identity.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || (identity.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0) != directory
+    {
+        bail!(
+            "Windows generation path changed type while being opened: {}",
+            path.display()
+        );
+    }
+    Ok(identity)
+}
+
+#[cfg(windows)]
+fn windows_identity_from_file(file: &File) -> Result<WindowsFileIdentity> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    let success =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
+    if success == 0 {
+        return Err(io::Error::last_os_error()).context("reading Windows file identity");
+    }
+    let information = unsafe { information.assume_init() };
+    Ok(WindowsFileIdentity {
+        file_attributes: information.dwFileAttributes,
+        volume_serial_number: information.dwVolumeSerialNumber,
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
+        number_of_links: information.nNumberOfLinks,
+    })
 }
 
 fn sha256_file(file: &mut File) -> Result<String> {
