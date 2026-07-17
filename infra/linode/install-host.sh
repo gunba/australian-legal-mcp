@@ -79,10 +79,14 @@ else
 fi
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+CADDY_DEB_NAME=caddy_2.11.4_linux_amd64.deb
+CADDY_DEB="$REPO_DIR/$CADDY_DEB_NAME"
 for path in \
   "$REPO_DIR/Containerfile" \
   "$REPO_DIR/SOURCE_COMMIT" \
+  "$CADDY_DEB" \
   "$REPO_DIR/infra/hosting/Caddyfile" \
+  "$REPO_DIR/infra/hosting/caddy-artifact.sha512" \
   "$REPO_DIR/infra/hosting/configure-auth.sh" \
   "$REPO_DIR/infra/hosting/update-image.sh" \
   "$REPO_DIR/infra/hosting/legal-mcp.container.template" \
@@ -90,6 +94,10 @@ for path in \
   "$REPO_DIR/scripts/legal-mcp-publisher-command"; do
   [[ -f "$path" && ! -L "$path" ]] || { echo "required install asset missing: $path" >&2; exit 1; }
 done
+(
+  cd "$REPO_DIR"
+  sha512sum --check --strict infra/hosting/caddy-artifact.sha512
+)
 publisher_key="$(<"$PUBLISHER_KEY_FILE")"
 [[ "$publisher_key" =~ ^ssh-(ed25519|rsa)[[:space:]][A-Za-z0-9+/=]+([[:space:]][^[:cntrl:]]+)?$ \
   && "$publisher_key" != *$'\n'* && ${#publisher_key} -le 16384 ]] || {
@@ -434,14 +442,7 @@ sed "s|__IMAGE_DIGEST__|$IMAGE|g" "$REPO_DIR/infra/hosting/legal-mcp.container.t
 chown root:root /etc/containers/systemd/legal-mcp.container
 chmod 644 /etc/containers/systemd/legal-mcp.container
 
-CADDY_VERSION=2.11.4
-CADDY_DEB_SHA512=5e0448ecf73056f091b7583b230b973841653581c9b6f11192acbcc048e19f0034385534ff8b25b4f782b26d7f7a67eb91391c70e3caa53dccf495bece475244
-CADDY_DEB="caddy_${CADDY_VERSION}_linux_amd64.deb"
-curl --fail --location --proto '=https' --tlsv1.2 --retry 5 \
-  --output "/tmp/$CADDY_DEB" "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/$CADDY_DEB"
-echo "$CADDY_DEB_SHA512  /tmp/$CADDY_DEB" | sha512sum --check -
-dpkg --install "/tmp/$CADDY_DEB" || apt-get install --fix-broken --yes
-rm -f "/tmp/$CADDY_DEB"
+dpkg --install "$CADDY_DEB" || apt-get install --fix-broken --yes
 systemctl disable --now caddy.service || true
 sed "s/__PUBLIC_HOST__/$PUBLIC_HOST/g" "$REPO_DIR/infra/hosting/Caddyfile" > /etc/caddy/Caddyfile
 chown root:caddy /etc/caddy/Caddyfile

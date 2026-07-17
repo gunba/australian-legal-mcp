@@ -91,10 +91,12 @@ ghcr.io/gunba/australian-legal-mcp@sha256:...
 ```
 
 Download release bundles and verify them before extracting or copying any host
-tooling:
+tooling. The Linux bundle carries the exact Caddy package and its committed
+SHA-512 manifest; the installer verifies both before package, firewall, or
+volume mutation:
 
 ```bash
-gh release download v0.18.0 --repo gunba/australian-legal-mcp \
+gh release download v0.18.1 --repo gunba/australian-legal-mcp \
   --pattern 'legal-mcp-*' --pattern SHA256SUMS
 sha256sum --check SHA256SUMS
 ```
@@ -201,7 +203,8 @@ The installer:
 - creates fixed service UID/GID 971, publisher UID/GID 973, and break-glass
   administrator UID/GID 974;
 - installs rootful Podman/Quadlet but runs the application as container UID 971;
-- installs checksum-pinned Caddy 2.11.4 but leaves it disabled;
+- installs the release-bundled, checksum-pinned Caddy 2.11.4 package but leaves
+  it disabled;
 - configures UFW for SSH only from the supplied address;
 - pulls and tests the exact image digest;
 - installs the forced publisher command and narrow sudo policy;
@@ -346,7 +349,7 @@ Linux release bundle:
 ```bash
 sudo infra/hosting/update-image.sh \
   --image ghcr.io/gunba/australian-legal-mcp@sha256:NEW_DIGEST \
-  --version 0.18.0 \
+  --version 0.18.1 \
   --template infra/hosting/legal-mcp.container.template
 ```
 
