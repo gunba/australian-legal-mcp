@@ -337,6 +337,8 @@ jobs:
           sudo apt-get install --yes --no-install-recommends skopeo
           printf '%s' "$GH_TOKEN" | skopeo login --username "$GITHUB_ACTOR" \
             --password-stdin ghcr.io
+          printf '%s' "$GH_TOKEN" | docker login --username "$GITHUB_ACTOR" \
+            --password-stdin ghcr.io
       - name: Resolve a restartable immutable candidate
         id: existing
         shell: bash
