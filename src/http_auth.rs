@@ -1102,12 +1102,16 @@ RQIDAQAB
 
     #[test]
     fn jwks_cache_has_a_hard_stale_limit() {
-        let now = Instant::now();
-        assert!(jwks_cache_usable(Some(now), now));
-        let stale = now
-            .checked_sub(JWKS_MAXIMUM_STALE + Duration::from_secs(1))
-            .expect("monotonic clock has sufficient range");
-        assert!(!jwks_cache_usable(Some(stale), now));
-        assert!(!jwks_cache_usable(None, now));
+        let fetched = Instant::now();
+        assert!(jwks_cache_usable(Some(fetched), fetched));
+        let boundary = fetched
+            .checked_add(JWKS_MAXIMUM_STALE)
+            .expect("monotonic clock can represent the cache boundary");
+        assert!(jwks_cache_usable(Some(fetched), boundary));
+        let stale_now = boundary
+            .checked_add(Duration::from_secs(1))
+            .expect("monotonic clock can represent one second past the boundary");
+        assert!(!jwks_cache_usable(Some(fetched), stale_now));
+        assert!(!jwks_cache_usable(None, fetched));
     }
 }
