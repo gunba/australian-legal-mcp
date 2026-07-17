@@ -589,8 +589,8 @@ jobs:
 
           gh release upload "$RELEASE_TAG" legal-mcp-* SHA256SUMS \
             --repo "$REPO" --clobber
-          actual_assets="$(gh api "repos/$REPO/releases/tags/$RELEASE_TAG" \
-            --jq '.assets[].name' | sort)"
+          actual_assets="$(gh release view "$RELEASE_TAG" --repo "$REPO" \
+            --json assets --jq '.assets[].name' | sort)"
           test "$actual_assets" = "$expected_assets"
           verify_release_assets true
           gh release edit "$RELEASE_TAG" --repo "$REPO" --draft=false
