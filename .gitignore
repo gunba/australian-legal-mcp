@@ -17,3 +17,13 @@ target/
 *.onnx_data
 *.bin.zst
 logs/
+__pycache__/
+*.pyc
+infra/azure/*.local.json
+infra/azure/*.bicepparam
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+infra/linode/*.auto.tfvars
+infra/linode/terraform.tfvars

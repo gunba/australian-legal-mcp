@@ -1,6 +1,6 @@
 # Current state
 
-Updated 2026-07-15 on branch `codex/unified-australian-legal-mcp`.
+Updated 2026-07-16 on branch `codex/linode-portable-deployment`.
 
 ## Implemented product
 
@@ -19,8 +19,9 @@ Updated 2026-07-15 on branch `codex/unified-australian-legal-mcp`.
   acknowledges notifications and response objects with 202, uses bounded
   workers/backpressure, emits structured request logs, exposes `/livez` and
   generation-aware `/readyz`, and drains on SIGTERM.
-- HTTP transport is loopback-only. The production design is private Tailscale
-  HTTPS in front of a hardened systemd service.
+- Local HTTP transport is loopback-only. Hosted-container scope binds only
+  inside a bridge, requires hosted authentication, and is published solely on
+  host loopback behind Caddy.
 
 ## Canonical project data
 
@@ -106,48 +107,104 @@ directory was atomically consumed. Strict CUDA/TensorRT `verify` passed in
 29.72s with all counts and `semantic_search_ready=true`; the CPU runtime also
 loaded/encoded successfully. A malformed activation preserved the exact v19
 pointer, idempotent rollback revalidated v19, pruning removed nothing, and the
-76-check installed-corpus smoke suite passed on both CUDA/TensorRT and the
-production CPU build. All-source active retrieval returned three correctly
-source-scoped official-HTTPS hits for every source; canonical live ATO fetch,
-exact-generation readiness, CPU SIGTERM drain, 215 non-ignored Rust unit tests,
-seven HTTP integration tests, strict Clippy, audit/deny, npm allowlisting, and
-workspace packaging also pass.
+83-check installed-corpus smoke suite passed on the production CPU build (the
+prior 76-check suite also passed on CUDA/TensorRT). All-source active retrieval
+returned three correctly source-scoped official-HTTPS hits for every source. A
+fresh post-pivot full v19 CPU verification and all 83 smoke checks also exited
+zero. Canonical live ATO fetch, exact-generation readiness, CPU SIGTERM drain,
+252 workspace/HTTP tests (with 11 explicitly ignored hardware/live tests),
+strict Clippy, audit/deny, npm allowlisting, and workspace packaging pass.
 
-## Local lifecycle and hosting cutover
+## Local lifecycle and portable hosted cutover
 
 Implemented hard cut:
 
 - removed runtime `update`, corpus packaging/publication, offline bundle, remote
   artifact discovery/download, and the GPU corpus-release workflow;
-- added `activate`, `verify`, `rollback`, and `prune-generations`;
-- local builds emit complete `generation.json` directories with pinned model
-  files and no remote URLs;
-- exact generation directories are non-symlink, immutable, same-filesystem,
-  atomically activated, and hash/source/model/ANN bound;
-- `scripts/maintainer-sync.sh` journals pending work, resumes failed builds,
-  builds locally, verifies activation, and atomically exchanges complete full
-  source sets;
-- `scripts/deploy-generation.sh` holds a remote deployment lock, resumes direct
-  rsync, checks disk, strictly verifies before pruning, activates, restarts,
-  checks the exact `/readyz` generation, and rolls back on failure;
-- hardened `systemd/legal-mcp.service` and low-cost private hosting guidance are
-  in [DEPLOYMENT.md](DEPLOYMENT.md).
+- added strict `activate`, `verify`, `rollback`, `prune-generations`, and bounded
+  container `healthcheck` operations;
+- local builds emit complete immutable `generation.json` directories containing
+  exact database, model, tokenizer, and ten source-bound ANN sidecars;
+- `scripts/maintainer-sync.sh` journals/resumes local work and atomically
+  exchanges complete full source sets;
+- `Containerfile` produces a corpus-free linux/amd64 image from digest-pinned
+  Rust/Debian bases with bundled SQLite, Arroy/heed search, tokenizer/reranking
+  code, ONNX Runtime 1.25.0, native runtimes, CA certificates, and fixed
+  unprivileged UID/GID 971;
+- the OCI contract uses a read-only root, zero capabilities,
+  `no-new-privileges`, bounded resources, separate read-only
+  generations/lifecycle and read-write state mounts, and bridge publication only
+  at host `127.0.0.1:51235`;
+- hosted-container network scope cannot start without `--require-http-auth`;
+- HTTP auth supports exact `api-key`, `entra`, and `entra+api-key` modes. API
+  keys have revocable IDs, 256-bit generated secrets, protected digest-only
+  verifier files, constant-time comparison, ambiguity rejection, and structured
+  principal logging;
+- Entra retains exact issuer/audience/tenant/time/scope/caller checks and RFC
+  9728 metadata, while JWKS cache fallback now has a hard 24-hour stale limit;
+- `infra/linode` contains lock-pinned OpenTofu for a Sydney Ubuntu VPS,
+  persistent encrypted 128-GiB reflink volume, creation-time SSH-first Cloud
+  Firewall attachment with essential ICMPv6, and optional DNS. The volume has
+  `prevent_destroy` and public 80/443 default off;
+- the Linode installer accepts only a signature-free new block device or an
+  exact UUID/marker-bound existing XFS/reflink volume. It validates before
+  atomically persisting fstab and requires `noatime,nodev,noexec,nosuid`, exact
+  ACLs, and file-type support. It creates fixed service, publisher, and
+  break-glass administrator identities, disables root/password SSH, installs
+  rootful Podman/Quadlet, and leaves the application and checksum-pinned Caddy
+  disabled;
+- the forced publisher can write only upload staging. Strict local verification,
+  CoW seeding, checksum/block-delta rsync, one-shot image validation, atomic
+  activation, explicit activation/rollback journal phases, exact readiness,
+  durable recovery, and rollback remain separate privileged operations. An
+  execute-only ACL lets the publisher reach staging without exposing generation
+  or lifecycle directories;
+- corpus, auth/ingress, and image-digest changes share one host transaction lock.
+  Auth and image changes close UFW/Caddy during mutation, persist recoverable
+  prior state, enforce the exact administrator/public UFW allowlist, and
+  re-prove the exact generation, challenge/metadata contract, and positive API
+  key where applicable before restoring ingress;
+- release workflows either build once or recover the existing same-revision OCI
+  artifact, scan that exact OCI digest, publish only immutable GHCR version/SHA
+  tags, attach SBOM/max provenance plus GitHub/Sigstore attestation, and deploy
+  by digest rather than tag. Release archives carry the exact `SOURCE_COMMIT`;
+- Copilot Studio Swagger and Microsoft 365 plugin v2.4 templates still render
+  from the exact seven read-only descriptors. Entra works unchanged on Linode
+  and remains the Microsoft 365 identity path.
 
-Initial hosting recommendation: one Sydney 4-vCPU/8-GiB/160-GiB SSD VPS at about
-USD 48/month, two HTTP workers, loopback service, and Tailscale Serve. Azure VM
-plus managed disk remains a future Entra/Microsoft 365 option but is unlikely to
-fit below USD 100/month.
+The production image and its SBOM/provenance-bearing OCI archive were built
+locally, loaded ONNX Runtime, ran as `971:971` with a read-only root and no
+capabilities, and passed bridged valid/invalid/ambiguous API-key plus exact-path
+HTTP probes while the host mapping remained loopback-only. Skopeo preserved the
+scanned top-level digest, and Trivy 0.65.0 reported zero fixed HIGH/CRITICAL
+findings across 92 Debian packages. Podman 4.9.3 generated the final Quadlet;
+actionlint, ShellCheck, Caddy 2.11.4, and the Linode OpenTofu 4.1.0 provider
+contract validate cleanly. Disposable Ubuntu fixtures exercise the forced
+publisher/lock, packaged `rrsync -wo`, disabled/API-key/Entra auth recovery,
+incomplete-transaction ingress closure, and API-key image-recovery parsing.
+Provider-neutral Microsoft assets render for custom DNS. On 2026-07-16 the
+reviewed OpenTofu plan created one Sydney `g6-standard-4` instance, one encrypted
+128-GiB Block Storage volume, and one creation-time Cloud Firewall. The instance
+runs Ubuntu 24.04, the attached volume remains signature-free, SSH works only
+from the configured administrator source, and public 80, 443, and 51235 are
+closed. No DNS record, public MCP ingress, registry release, Azure resource, or
+Entra tenant object exists yet. Azure Bicep/Blob work remains preserved as a
+secondary future provider path in
+[docs/AZURE_FUTURE.md](docs/AZURE_FUTURE.md).
 
 ## Remaining proof before completion
 
-1. Run dependency audit/deny and remaining package/cross-platform CI gates.
-2. Optionally prove a pointer switch between two full valid generations; unit
-   tests already cover two-key activation/pruning and the live v19 CLI covers
-   strict idempotent rollback without duplicating 57 GiB.
-3. Provision the VPS, install binary/CPU ONNX Runtime/systemd/Tailscale, transfer
-   v19, and prove exact readiness, persistence, rollback, and retention.
-4. Commit and push the still-uncommitted acquisition/model/performance/lifecycle/
-   hosting tree.
+1. Push the reviewed branch and require its pinned cross-platform CI/release
+   contract checks to pass before merge.
+2. Publish and verify the immutable v0.18.0 Linux bundle and GHCR digest, then
+   install the host contract, initialize the empty volume, and perform the
+   initial v19 delta deployment.
+3. Prove reboot, rollback, volume detach/reattach, image rollback, authentication
+   rotation, and disposable VPS replacement before removing retained evidence.
+4. Create the tenant resource and connector app registrations, exercise a real
+   delegated token, and test Copilot Studio consent/tool invocation/DLP.
+5. Test the optional direct Microsoft 365 declarative-agent SSO registration in
+   a licensed tenant before any enterprise pilot.
 
 High Court historical coverage remains bounded by the official site's available
 digitized collection. OALCC is reference-only clean-room research evidence.

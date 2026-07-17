@@ -20,6 +20,8 @@ jobs:
   validate:
     name: validate release tag
     runs-on: ubuntu-24.04
+    outputs:
+      commit: ${{ steps.release_commit.outputs.commit }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
@@ -27,13 +29,101 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Match checkout, tag, and Cargo version
+        id: release_commit
         shell: bash
         run: |
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           test "$(git describe --tags --exact-match)" = "$RELEASE_TAG"
+          git fetch origin main --no-tags
+          git merge-base --is-ancestor HEAD origin/main
           version=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "australian-legal-mcp") | .version')
           test "v$version" = "$RELEASE_TAG"
+          test "$(jq -r .version package.json)" = "$version"
+          test "$(jq -r .version .claude-plugin/plugin.json)" = "$version"
+          test "$(jq -r '.plugins[0].version' .claude-plugin/marketplace.json)" = "$version"
+          grep -Fxq "ARG VERSION=$version" Containerfile
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.95.0
+          components: clippy, rustfmt
+      - name: Run the exact tagged software gate
+        run: |
+          cargo fmt --all -- --check
+          cargo test --workspace --locked --all-features
+          cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
+          bash -n scripts/*.sh scripts/legal-mcp-azure-deploy scripts/legal-mcp-host-deploy \
+            scripts/legal-mcp-publisher-command infra/hosting/*.sh infra/linode/*.sh tests/*.sh
+          paths=(scripts/*.sh scripts/legal-mcp-azure-deploy scripts/legal-mcp-host-deploy \
+            scripts/legal-mcp-publisher-command infra/hosting/*.sh infra/linode/*.sh tests/*.sh)
+          container_paths=()
+          for path in "${paths[@]}"; do container_paths+=("/repo/$path"); done
+          docker run --rm -v "$PWD:/repo:ro" \
+            koalaman/shellcheck@sha256:0fa384f2a6171aef8aab2999a531c8c8158727d54a8f20157a5c3c51a734d6b2 \
+            "${container_paths[@]}"
+          awk '
+            /content: \|/ { found=1; next }
+            found && /^      / { sub(/^      /, ""); print; next }
+            found { exit }
+          ' infra/azure/cloud-init.yml > "$RUNNER_TEMP/prepare-data-disk"
+          docker run --rm -v "$RUNNER_TEMP/prepare-data-disk:/script:ro" \
+            koalaman/shellcheck@sha256:0fa384f2a6171aef8aab2999a531c8c8158727d54a8f20157a5c3c51a734d6b2 \
+            /script
+          docker run --rm -v "$PWD:/repo:ro" -w /repo \
+            rhysd/actionlint@sha256:2ef3ed94025747bd876118bfcae405d13532a07904d5ee0d70948110ef32f71d
+          python3 -m unittest \
+            tests/test_azure_generation_transport.py \
+            tests/test_manage_api_keys.py \
+            tests/test_remote_mcp.py \
+            tests/test_render_microsoft_integrations.py
+          az bicep build --file infra/azure/main.bicep --stdout >/dev/null
+          mkdir "$RUNNER_TEMP/linode-tofu"
+          cp -a infra/linode/. "$RUNNER_TEMP/linode-tofu/"
+          tofu_image=ghcr.io/opentofu/opentofu@sha256:6b66d996afc7f043154e33a0420285d0d58c165305ac8f36d32df213a3c4bbd4
+          docker run --rm -v "$RUNNER_TEMP/linode-tofu:/workspace" -w /workspace \
+            "$tofu_image" fmt -check
+          docker run --rm -v "$RUNNER_TEMP/linode-tofu:/workspace" -w /workspace \
+            "$tofu_image" init -backend=false -lockfile=readonly
+          docker run --rm -v "$RUNNER_TEMP/linode-tofu:/workspace" -w /workspace \
+            "$tofu_image" validate
+          ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/linode-admin"
+          cat > "$RUNNER_TEMP/linode-tofu/terraform.tfvars" <<EOF
+          admin_ssh_public_key = "$(cat "$RUNNER_TEMP/linode-admin.pub")"
+          admin_source_cidr    = "203.0.113.10/32"
+          EOF
+          docker run --rm \
+            -e LINODE_TOKEN=0000000000000000000000000000000000000000000000000000000000000000 \
+            -v "$RUNNER_TEMP/linode-tofu:/workspace" -w /workspace \
+            "$tofu_image" plan -refresh=false -input=false -lock=false \
+            -out=/tmp/offline.tfplan
+          sed 's/__PUBLIC_HOST__/legalmcptest.australiaeast.cloudapp.azure.com/' \
+            infra/hosting/Caddyfile > "$RUNNER_TEMP/Caddyfile"
+          docker run --rm \
+            -v "$RUNNER_TEMP/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy@sha256:98eb57d882ccd5213d1688764db10c1ca2c58a1ca3a6717a3411ad798f7a423a \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          mkdir "$RUNNER_TEMP/quadlet"
+          sed 's|__IMAGE_DIGEST__|ghcr.io/gunba/australian-legal-mcp@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|' \
+            infra/hosting/legal-mcp.container.template > "$RUNNER_TEMP/quadlet/legal-mcp.container"
+          docker run --rm --entrypoint /usr/lib/systemd/system-generators/podman-system-generator \
+            -e QUADLET_UNIT_DIRS=/quadlet -v "$RUNNER_TEMP/quadlet:/quadlet:ro" \
+            quay.io/podman/stable@sha256:cc3563b15b511b3e84d23dc04087cf06df5dee8146c3834c652bd217d4ace1cd \
+            -dryrun > "$RUNNER_TEMP/generated-quadlet"
+          grep -Fq -- '--cpus=3.5' "$RUNNER_TEMP/generated-quadlet"
+          grep -Fq 'LimitCORE=0' "$RUNNER_TEMP/generated-quadlet"
+          cargo run --locked -- export-mcp-tools --output "$RUNNER_TEMP/mcp-tools.json"
+          python3 scripts/render-microsoft-integrations.py \
+            --tools "$RUNNER_TEMP/mcp-tools.json" \
+            --public-host legalmcptest.australiaeast.cloudapp.azure.com \
+            --tenant-id 11111111-1111-1111-1111-111111111111 \
+            --server-app-id 22222222-2222-2222-2222-222222222222 \
+            --sso-registration-id release-gate \
+            --output-dir "$RUNNER_TEMP/microsoft"
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo audit
+          cargo deny check advisories
 
   build:
     name: build ${{ matrix.target }}
@@ -48,28 +138,30 @@ jobs:
             archive: tar
             extension: tar.gz
             zig: true
-            ort_version: 1.24.4
+            ort_version: 1.25.0
           - os: macos-14
             target: aarch64-apple-darwin
             binary: target/aarch64-apple-darwin/release/legal-mcp
             archive: tar
             extension: tar.gz
             zig: false
+            ort_version: 1.25.0
           - os: windows-2022
             target: x86_64-pc-windows-msvc
             binary: target/x86_64-pc-windows-msvc/release/legal-mcp.exe
             archive: zip
             extension: zip
             zig: false
-            ort_version: 1.24.4
+            ort_version: 1.25.0
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.validate.outputs.commit }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
+          toolchain: 1.95.0
           targets: ${{ matrix.target }}
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
         if: matrix.zig
@@ -88,27 +180,36 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libtime-piece-perl make
           cargo install cargo-zigbuild --version 0.23.0 --locked
-      - name: Build Linux for glibc 2.17
+      - name: Build Linux for glibc 2.27
         if: matrix.zig
         run: >-
           cargo zigbuild --release --locked --features vendored-openssl
-          --target x86_64-unknown-linux-gnu.2.17
+          --target x86_64-unknown-linux-gnu.2.27
       - name: Build native target
         if: ${{ !matrix.zig }}
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Download and verify ONNX Runtime shared library
-        if: runner.os == 'Linux'
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           version="${{ matrix.ort_version }}"
-          name="onnxruntime-linux-x64-$version.tgz"
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            name="onnxruntime-linux-x64-$version.tgz"
+            checksum=e0a8998e70416801f9a634a8ea1d369a
+            checksum="${checksum}255ff109741469f9d99cf369a46a1492"
+          else
+            name="onnxruntime-osx-arm64-$version.tgz"
+            checksum=65405dc8793c86cadb98b5e07f6d3bdd
+            checksum="${checksum}e84f8300f1b030d4736b41c17610d6c1"
+          fi
           base="https://github.com/microsoft/onnxruntime/releases"
           curl --fail --location --retry 5 \
             --output "$name" "$base/download/v$version/$name"
-          checksum=3a211fbea252c1e66290658f1b735b772
-          checksum="${checksum}056149f28321e71c308942cdb54b747"
-          echo "$checksum  $name" \
-            | sha256sum --check -
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            echo "$checksum  $name" | sha256sum --check -
+          else
+            test "$(shasum -a 256 "$name" | awk '{print $1}')" = "$checksum"
+          fi
           tar -xzf "$name"
       - name: Download and verify ONNX Runtime DLL
         if: runner.os == 'Windows'
@@ -121,8 +222,8 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile onnxruntime.zip
           $hash = Get-FileHash onnxruntime.zip -Algorithm SHA256
           $actual = $hash.Hash.ToLower()
-          $expected = "d2319fddfb6ea4db99ccc4b60c85c517" +
-            "bcd855721f5daa6a06d40d7cb2ee2357"
+          $expected = "da753f762bf2400e7191ec594086b186" +
+            "a7051d5af8dc886f6e2020c2403df738"
           if ($actual -ne $expected) {
             throw "ONNX Runtime checksum mismatch: $actual"
           }
@@ -134,46 +235,298 @@ jobs:
           mkdir -p package
           cp "${{ matrix.binary }}" package/legal-mcp
           chmod 755 package/legal-mcp
-          cp README.md DEPLOYMENT.md LICENSE package/
+          printf '%s\n' '${{ needs.validate.outputs.commit }}' > package/SOURCE_COMMIT
+          cp README.md DEPLOYMENT.md MICROSOFT_COPILOT.md LICENSE package/
           if [[ "$RUNNER_OS" == "Linux" ]]; then
             ort="onnxruntime-linux-x64-${{ matrix.ort_version }}"
             cp -L "$ort/lib/libonnxruntime.so" package/libonnxruntime.so
             cp "$ort/LICENSE" package/ONNXRUNTIME-LICENSE
+            cp "$ort/ThirdPartyNotices.txt" package/ONNXRUNTIME-THIRD-PARTY-NOTICES
             mkdir package/systemd
             cp systemd/legal-mcp.service systemd/legal-mcp.env.example \
               systemd/README.md package/systemd/
+            mkdir -p package/infra/hosting package/infra/linode package/scripts
+            cp Containerfile package/
+            cp infra/hosting/Caddyfile infra/hosting/legal-mcp.container.template \
+              infra/hosting/runtime.env.example infra/hosting/configure-auth.sh \
+              infra/hosting/update-image.sh \
+              package/infra/hosting/
+            cp infra/linode/install-host.sh package/infra/linode/
+            cp scripts/deploy-generation.sh scripts/legal-mcp-host-deploy \
+              scripts/legal-mcp-publisher-command scripts/manage-api-keys.py \
+              package/scripts/
+          else
+            ort="onnxruntime-osx-arm64-${{ matrix.ort_version }}"
+            cp -L "$ort/lib/libonnxruntime.dylib" package/libonnxruntime.dylib
+            cp "$ort/LICENSE" package/ONNXRUNTIME-LICENSE
+            cp "$ort/ThirdPartyNotices.txt" package/ONNXRUNTIME-THIRD-PARTY-NOTICES
           fi
-          package/legal-mcp --version | grep -F "${RELEASE_TAG#v}"
+          package/legal-mcp verify-runtime | grep -F '"onnx_runtime_ready":true'
           COPYFILE_DISABLE=1 tar -C package -czf \
             "${{ steps.archive.outputs.name }}" .
           mkdir verify
           tar -C verify -xzf "${{ steps.archive.outputs.name }}"
-          verify/legal-mcp --version | grep -F "${RELEASE_TAG#v}"
+          test "$(cat verify/SOURCE_COMMIT)" = '${{ needs.validate.outputs.commit }}'
+          verify/legal-mcp verify-runtime | grep -F '"onnx_runtime_ready":true'
       - name: Package and verify zip
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path package
           Copy-Item "${{ matrix.binary }}" package/legal-mcp.exe
+          Set-Content -Path package/SOURCE_COMMIT -Value '${{ needs.validate.outputs.commit }}' -Encoding ascii
           $ort = "${{ matrix.ort_version }}"
           $dll = "onnxruntime/onnxruntime-win-x64-$ort/lib/onnxruntime.dll"
           Copy-Item $dll package/
-          Copy-Item README.md, DEPLOYMENT.md, LICENSE package/
+          $ortRoot = "onnxruntime/onnxruntime-win-x64-$ort"
+          Copy-Item "$ortRoot/LICENSE" package/ONNXRUNTIME-LICENSE
+          Copy-Item "$ortRoot/ThirdPartyNotices.txt" package/ONNXRUNTIME-THIRD-PARTY-NOTICES
+          Copy-Item README.md, DEPLOYMENT.md, MICROSOFT_COPILOT.md, LICENSE package/
           $version = $env:RELEASE_TAG.Substring(1)
-          & package/legal-mcp.exe --version | Select-String $version
+          & package/legal-mcp.exe verify-runtime | Select-String '"onnx_runtime_ready":true'
           Compress-Archive -Path package/* `
             -DestinationPath "${{ steps.archive.outputs.name }}"
           Expand-Archive "${{ steps.archive.outputs.name }}" verify
-          & verify/legal-mcp.exe --version | Select-String $version
+          if ((Get-Content verify/SOURCE_COMMIT -Raw).Trim() -ne '${{ needs.validate.outputs.commit }}') {
+            throw 'release archive source revision mismatch'
+          }
+          & verify/legal-mcp.exe verify-runtime | Select-String '"onnx_runtime_ready":true'
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ${{ steps.archive.outputs.name }}
           path: ${{ steps.archive.outputs.name }}
           if-no-files-found: error
 
+  container:
+    name: publish signed OCI image
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Define immutable image identity
+        id: image
+        shell: bash
+        run: |
+          version=${RELEASE_TAG#v}
+          repository="ghcr.io/${GITHUB_REPOSITORY,,}"
+          {
+            echo "repository=$repository"
+            echo "version=$version"
+            echo "sha_tag=sha-${{ needs.validate.outputs.commit }}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Install OCI transport
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends skopeo
+          printf '%s' "$GH_TOKEN" | skopeo login --username "$GITHUB_ACTOR" \
+            --password-stdin ghcr.io
+      - name: Resolve a restartable immutable candidate
+        id: existing
+        shell: bash
+        run: |
+          set -euo pipefail
+          repository='${{ steps.image.outputs.repository }}'
+          archive="${RUNNER_TEMP}/legal-mcp.oci.tar"
+          selected_reference=''
+          selected_digest=''
+          for tag in '${{ steps.image.outputs.version }}' '${{ steps.image.outputs.sha_tag }}'; do
+            reference="$repository:$tag"
+            manifest="$(mktemp)"
+            error="$(mktemp)"
+            if skopeo inspect --raw "docker://$reference" > "$manifest" 2> "$error"; then
+              digest="sha256:$(sha256sum "$manifest" | cut -d ' ' -f 1)"
+              if [[ -n "$selected_digest" && "$digest" != "$selected_digest" ]]; then
+                echo 'immutable release tags name different image digests' >&2
+                exit 1
+              fi
+              selected_reference="$reference"
+              selected_digest="$digest"
+            elif ! grep -Eqi '(manifest unknown|name unknown|not found|status code: 404)' "$error"; then
+              cat "$error" >&2
+              exit 1
+            fi
+            rm -f "$manifest" "$error"
+          done
+          if [[ -n "$selected_reference" ]]; then
+            skopeo copy --all "docker://$selected_reference" "oci-archive:$archive"
+            echo 'reuse=true' >> "$GITHUB_OUTPUT"
+            echo "reusing=$selected_reference@$selected_digest" >> "$GITHUB_OUTPUT"
+          else
+            echo 'reuse=false' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+        if: steps.existing.outputs.reuse != 'true'
+        with:
+          driver-opts: image=moby/buildkit@sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f
+      - name: Build one immutable OCI release candidate
+        if: steps.existing.outputs.reuse != 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: Containerfile
+          platforms: linux/amd64
+          outputs: type=oci,dest=${{ runner.temp }}/legal-mcp.oci.tar
+          pull: true
+          sbom: generator=docker.io/docker/buildkit-syft-scanner@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68
+          provenance: mode=max
+          build-args: |
+            VERSION=${{ steps.image.outputs.version }}
+            VCS_REF=${{ needs.validate.outputs.commit }}
+          tags: ${{ steps.image.outputs.repository }}:${{ steps.image.outputs.version }}
+      - name: Verify and exercise the exact OCI artifact
+        id: artifact
+        shell: bash
+        run: |
+          archive="${RUNNER_TEMP}/legal-mcp.oci.tar"
+          digest="$(python3 - "$archive" <<'PY'
+          import hashlib, json, pathlib, sys, tarfile
+          archive = sys.argv[1]
+          with tarfile.open(archive) as value:
+              for member in value.getmembers():
+                  path = pathlib.PurePosixPath(member.name)
+                  if path.is_absolute() or '..' in path.parts or not (member.isdir() or member.isreg()):
+                      raise SystemExit(f'unsafe OCI archive member: {member.name!r}')
+              index = json.load(value.extractfile('index.json'))
+              if len(index.get('manifests', [])) != 1:
+                  raise SystemExit('OCI archive does not have one top-level descriptor')
+              digest = index['manifests'][0]['digest']
+              algorithm, encoded = digest.split(':', 1)
+              blob = value.extractfile(f'blobs/{algorithm}/{encoded}').read()
+              if hashlib.new(algorithm, blob).hexdigest() != encoded:
+                  raise SystemExit('OCI top-level manifest digest is invalid')
+              print(digest)
+          PY
+          )"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          mkdir "${RUNNER_TEMP}/legal-mcp-oci"
+          tar --extract --file "$archive" --directory "${RUNNER_TEMP}/legal-mcp-oci"
+          skopeo copy --override-os linux --override-arch amd64 \
+            "oci-archive:$archive" \
+            'docker-daemon:legal-mcp-release-candidate:${{ needs.validate.outputs.commit }}'
+          image='legal-mcp-release-candidate:${{ needs.validate.outputs.commit }}'
+          test "$(docker image inspect "$image" --format '{{.Config.User}}')" = 971:971
+          test "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" \
+            = '${{ steps.image.outputs.version }}'
+          test "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" \
+            = '${{ needs.validate.outputs.commit }}'
+          test "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" \
+            = 'https://github.com/gunba/australian-legal-mcp'
+          container="$(docker create "$image")"
+          cleanup_container() {
+            if [[ -n "$container" ]]; then docker rm -f "$container" >/dev/null 2>&1 || true; fi
+          }
+          trap cleanup_container EXIT
+          docker export "$container" > "${RUNNER_TEMP}/release-image-rootfs.tar"
+          docker rm "$container" >/dev/null
+          container=''
+          tar -tf "${RUNNER_TEMP}/release-image-rootfs.tar" > "${RUNNER_TEMP}/release-image-rootfs.list"
+          if grep -Eq '(^var/lib/legal-mcp/(generations|lifecycle)/.+|(^|/)(legal\.db|[^/]+\.ann|model\.onnx|tokenizer\.json)$)' \
+            "${RUNNER_TEMP}/release-image-rootfs.list"; then
+            echo 'release OCI artifact unexpectedly contains corpus/model data' >&2
+            exit 1
+          fi
+          trap - EXIT
+          docker run --rm --user 0:0 --entrypoint /usr/bin/bash \
+            --volume "$PWD/scripts/legal-mcp-publisher-command:/publisher:ro" \
+            --volume "$PWD/tests/host-publisher-fixture.sh:/fixture:ro" \
+            "$image" /fixture
+          docker run --rm --read-only --cap-drop=ALL \
+            --security-opt=no-new-privileges "$image" verify-runtime |
+            grep -F '"onnx_runtime_ready":true'
+      - name: Scan before publication
+        shell: bash
+        run: |
+          docker run --rm \
+            --volume "${RUNNER_TEMP}/legal-mcp-oci:/input:ro" \
+            aquasec/trivy@sha256:16f1ee8462d0ba07dd69239150d60ba7b591c55e02dfc33a3fc19710b861d180 \
+            image --input /input --scanners vuln --pkg-types os,library \
+            --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 \
+            --skip-version-check
+      - name: Recheck release identity
+        shell: bash
+        run: |
+          remote_commit=$(git ls-remote origin "refs/tags/$RELEASE_TAG^{}" | awk 'NR==1 {print $1}')
+          if [[ -z "$remote_commit" ]]; then
+            remote_commit=$(git ls-remote origin "refs/tags/$RELEASE_TAG" | awk 'NR==1 {print $1}')
+          fi
+          test "$remote_commit" = "${{ needs.validate.outputs.commit }}"
+      - name: Publish or reuse the scanned OCI digest
+        id: push
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/legal-mcp.oci.tar"
+          repository='${{ steps.image.outputs.repository }}'
+          expected='${{ steps.artifact.outputs.digest }}'
+          printf '%s' "$GH_TOKEN" | skopeo login --username "$GITHUB_ACTOR" \
+            --password-stdin ghcr.io
+
+          remote_digest() {
+            local reference="$1" manifest
+            manifest="$(mktemp)"
+            if ! skopeo inspect --raw "docker://$reference" > "$manifest"; then
+              rm -f "$manifest"
+              return 1
+            fi
+            sha256sum "$manifest" | awk '{print "sha256:" $1}'
+            rm -f "$manifest"
+          }
+          publish_or_reuse() {
+            local tag="$1" reference found
+            reference="$repository:$tag"
+            if found="$(remote_digest "$reference" 2>/dev/null)"; then
+              [[ "$found" = "$expected" ]] || {
+                echo "immutable tag $reference already names $found, not $expected" >&2
+                return 1
+              }
+              echo "reusing $reference@$found"
+            else
+              skopeo copy --all "oci-archive:$archive" "docker://$reference"
+            fi
+            found="$(remote_digest "$reference")"
+            [[ "$found" = "$expected" ]] || {
+              echo "published tag $reference does not preserve the scanned digest" >&2
+              return 1
+            }
+          }
+
+          publish_or_reuse '${{ steps.image.outputs.version }}'
+          publish_or_reuse '${{ steps.image.outputs.sha_tag }}'
+          echo "digest=$expected" >> "$GITHUB_OUTPUT"
+      - name: Attest the pushed image digest
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-name: ${{ steps.image.outputs.repository }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - name: Exercise the immutable registry digest
+        shell: bash
+        run: |
+          image="${{ steps.image.outputs.repository }}@${{ steps.push.outputs.digest }}"
+          docker pull "$image"
+          test "$(docker image inspect "$image" --format '{{.Config.User}}')" = 971:971
+          docker run --rm --read-only --cap-drop=ALL \
+            --security-opt=no-new-privileges "$image" verify-runtime |
+            grep -F '"onnx_runtime_ready":true'
+
   publish:
     name: upload release assets
-    needs: build
+    needs: [validate, build, container]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -186,10 +539,52 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
-          gh release view "$RELEASE_TAG" --repo "$REPO" >/dev/null 2>&1 \
-            || gh release create "$RELEASE_TAG" --repo "$REPO" \
-              --title "$RELEASE_TAG" --generate-notes
+          set -euo pipefail
+          remote_commit=$(gh api "repos/$REPO/commits/$RELEASE_TAG" --jq .sha)
+          test "$remote_commit" = "${{ needs.validate.outputs.commit }}"
           find artifacts -maxdepth 2 -type f -exec cp {} . \;
-          sha256sum legal-mcp-* > SHA256SUMS
+          LC_ALL=C sha256sum legal-mcp-* > SHA256SUMS
+          expected_assets="$(printf '%s\n' legal-mcp-* SHA256SUMS | sort)"
+
+          verify_release_assets() {
+            local compare_local="$1" directory source_commit archive
+            directory="$(mktemp -d)"
+            gh release download "$RELEASE_TAG" --repo "$REPO" --dir "$directory"
+            if [[ "$compare_local" = true ]]; then cmp SHA256SUMS "$directory/SHA256SUMS"; fi
+            (cd "$directory" && sha256sum --check SHA256SUMS)
+            for archive in "$directory"/legal-mcp-*; do
+              case "$archive" in
+                *.tar.gz) source_commit="$(tar -xOf "$archive" ./SOURCE_COMMIT)" ;;
+                *.zip) source_commit="$(unzip -p "$archive" SOURCE_COMMIT | tr -d '\r\n')" ;;
+                *) return 1 ;;
+              esac
+              test "$source_commit" = '${{ needs.validate.outputs.commit }}'
+            done
+            rm -rf "$directory"
+          }
+
+          if release_json="$(gh release view "$RELEASE_TAG" --repo "$REPO" \
+            --json assets,isDraft,targetCommitish 2>/dev/null)"; then
+            is_draft="$(jq -r .isDraft <<< "$release_json")"
+            target="$(jq -r .targetCommitish <<< "$release_json")"
+            test "$target" = "${{ needs.validate.outputs.commit }}" || test "$target" = "$RELEASE_TAG"
+            if [[ "$is_draft" = false ]]; then
+              actual_assets="$(jq -r '.assets[].name' <<< "$release_json" | sort)"
+              test "$actual_assets" = "$expected_assets"
+              verify_release_assets false
+              echo "immutable release $RELEASE_TAG already contains the expected assets"
+              exit 0
+            fi
+          else
+            gh release create "$RELEASE_TAG" --repo "$REPO" --verify-tag \
+              --target '${{ needs.validate.outputs.commit }}' --draft \
+              --title "$RELEASE_TAG" --generate-notes
+          fi
+
           gh release upload "$RELEASE_TAG" legal-mcp-* SHA256SUMS \
             --repo "$REPO" --clobber
+          actual_assets="$(gh api "repos/$REPO/releases/tags/$RELEASE_TAG" \
+            --jq '.assets[].name' | sort)"
+          test "$actual_assets" = "$expected_assets"
+          verify_release_assets true
+          gh release edit "$RELEASE_TAG" --repo "$REPO" --draft=false

@@ -110,7 +110,7 @@ PY
 }
 
 active_key() {
-  local path="$RUNTIME_DIR/active-generation"
+  local path="$RUNTIME_DIR/lifecycle/active-generation"
   [[ -f "$path" ]] || return 0
   local key; key="$(<"$path")"
   [[ "$key" =~ ^[0-9a-f]{64}$ ]] || { echo "malformed active-generation" >&2; return 2; }
@@ -222,7 +222,9 @@ fi
 
 if [[ "$PHASE" == build ]]; then
   mkdir -p "$BUILD_DIR"
-  command -v chattr >/dev/null 2>&1 && chattr +C "$BUILD_DIR" 2>/dev/null || true
+  if command -v chattr >/dev/null 2>&1; then
+    chattr +C "$BUILD_DIR" 2>/dev/null || true
+  fi
   export LEGAL_MCP_TENSORRT_CACHE_DIR="$CACHE_ROOT/tensorrt/$RUN_ID"
   mkdir -p "$LEGAL_MCP_TENSORRT_CACHE_DIR"
   BUILD_CACHE_ARGS=()

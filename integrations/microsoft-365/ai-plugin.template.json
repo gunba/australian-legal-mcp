@@ -1,0 +1,105 @@
+{
+  "schema_version": "v2.4",
+  "name_for_human": "Australian Legal",
+  "namespace": "AustralianLegal",
+  "description_for_human": "Search ten official Australian legal sources",
+  "description_for_model": "Use this plugin for source-grounded Australian legal and tax research. Every search and definition request must select exactly one registered source. Start with search, then use typed chunk and document references for follow-up retrieval. Treat results as research material, not legal advice.",
+  "functions": [
+    {
+      "name": "search",
+      "description": "Search exactly one official Australian legal source.",
+      "capabilities": {
+        "confirmation": { "type": "None", "isNonConsequential": true },
+        "security_info": { "data_handling": ["GetPublicData"] }
+      }
+    },
+    {
+      "name": "get_chunks",
+      "description": "Read typed corpus chunks and bounded neighbours.",
+      "capabilities": {
+        "confirmation": { "type": "None", "isNonConsequential": true },
+        "security_info": { "data_handling": ["GetPublicData"] }
+      }
+    },
+    {
+      "name": "get_asset",
+      "description": "Resolve a retained source-qualified image asset.",
+      "capabilities": {
+        "confirmation": { "type": "None", "isNonConsequential": true },
+        "security_info": { "data_handling": ["GetPublicData"] }
+      }
+    },
+    {
+      "name": "get_doc_anchors",
+      "description": "Read anchors, links, history and reverse citations.",
+      "capabilities": {
+        "confirmation": { "type": "None", "isNonConsequential": true },
+        "security_info": { "data_handling": ["GetPublicData"] }
+      }
+    },
+    {
+      "name": "get_definition",
+      "description": "Find definitions within one explicit legal source.",
+      "capabilities": {
+        "confirmation": { "type": "None", "isNonConsequential": true },
+        "security_info": { "data_handling": ["GetPublicData"] }
+      }
+    },
+    {
+      "name": "stats",
+      "description": "Read corpus counts, source metadata and search policy.",
+      "capabilities": {
+        "confirmation": { "type": "None", "isNonConsequential": true },
+        "security_info": { "data_handling": ["GetPublicData"] }
+      }
+    },
+    {
+      "name": "fetch",
+      "description": "Live-fetch one canonical official legal document URI.",
+      "capabilities": {
+        "confirmation": { "type": "None", "isNonConsequential": true },
+        "security_info": { "data_handling": ["GetPublicData"] }
+      }
+    }
+  ],
+  "runtimes": [
+    {
+      "type": "RemoteMCPServer",
+      "auth": {
+        "type": "OAuthPluginVault",
+        "reference_id": "__SSO_REGISTRATION_ID__"
+      },
+      "run_for_functions": [
+        "search",
+        "get_chunks",
+        "get_asset",
+        "get_doc_anchors",
+        "get_definition",
+        "stats",
+        "fetch"
+      ],
+      "spec": {
+        "url": "https://__PUBLIC_HOST__/mcp",
+        "mcp_tool_description": {
+          "tools": "__MCP_TOOLS__"
+        }
+      }
+    }
+  ],
+  "capabilities": {
+    "conversation_starters": [
+      {
+        "title": "Tax guidance",
+        "text": "Search the ATO source for current guidance on research and development tax incentive eligibility."
+      },
+      {
+        "title": "Federal legislation",
+        "text": "Search the Federal Register of Legislation for the statutory definition of taxable income."
+      },
+      {
+        "title": "Case law",
+        "text": "Search Federal Court decisions for recent authorities concerning legal professional privilege."
+      }
+    ]
+  }
+}

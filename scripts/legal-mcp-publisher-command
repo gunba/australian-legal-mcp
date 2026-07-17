@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Forced SSH command for the unprivileged corpus publisher. It can write only
+# resumable upload staging and invoke two exact root transaction operations.
+set -euo pipefail
+umask 077
+export LC_ALL=C
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+original="${SSH_ORIGINAL_COMMAND:-}"
+[[ -n "$original" && ${#original} -le 4096 && "$original" != *$'\n'* && "$original" != *$'\r'* ]] || {
+  echo 'publisher command is missing or malformed' >&2
+  exit 2
+}
+
+if [[ "$original" =~ ^(prepare|activate)\ ([0-9a-f]{64})$ ]]; then
+  action="${BASH_REMATCH[1]}"
+  generation="${BASH_REMATCH[2]}"
+  exec /usr/bin/sudo -n /usr/local/sbin/legal-mcp-host-deploy "$action" "$generation"
+fi
+
+if [[ "$original" =~ ^rsync\ --server\ .*\ \.\ ([0-9a-f]{64})/$ ]]; then
+  generation="${BASH_REMATCH[1]}"
+  [[ -x /usr/bin/rrsync ]] || {
+    echo 'rrsync is unavailable on the deployment host' >&2
+    exit 1
+  }
+  lock_file=/run/lock/legal-mcp-host-transaction.lock
+  authorization=/run/legal-mcp/authorized-upload
+  [[ -f "$lock_file" && ! -L "$lock_file" \
+    && "$(stat -c '%U:%G:%a:%h' "$lock_file")" = root:legal-mcp-publisher:640:1 ]] || {
+    echo 'publisher transaction lock is missing or unsafe' >&2
+    exit 1
+  }
+  exec 9<"$lock_file"
+  flock -x 9
+  [[ -f "$authorization" && ! -L "$authorization" \
+    && "$(stat -c '%U:%G:%a:%h:%s' "$authorization")" = root:legal-mcp-publisher:440:1:65 ]] || {
+    echo 'no safe prepared upload is authorized' >&2
+    exit 1
+  }
+  mapfile -t authorized < "$authorization"
+  [[ ${#authorized[@]} -eq 1 && "${authorized[0]}" = "$generation" ]] || {
+    echo 'rsync destination is not the prepared generation' >&2
+    exit 1
+  }
+  exec /usr/bin/rrsync -wo /srv/legal-mcp/uploads
+fi
+
+if [[ "$original" == 'rsync --server '* ]]; then
+  echo 'rsync destination must be one prepared 64-character generation directory' >&2
+  exit 2
+fi
+
+echo 'only prepare, restricted rsync upload, and activate are permitted' >&2
+exit 2

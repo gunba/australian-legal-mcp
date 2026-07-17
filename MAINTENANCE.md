@@ -7,9 +7,13 @@ GitHub Releases. GitHub tags and releases contain software binaries only.
 
 ## Software release contract
 
-Release tags are immutable `vX.Y.Z` tags. Cargo, plugin/package metadata,
-archive names, and the tag version must agree. Platform archives contain
-`legal-mcp` and the matching CPU ONNX Runtime software library. Publish and
+Release tags are immutable `vX.Y.Z` tags on `main`; repository rules must block
+tag update/deletion. Cargo, plugin/package metadata, archive names, and the tag
+version must agree. The workflow binds every job to the validated commit and
+uses Rust 1.95.0. Platform archives contain `legal-mcp`, ONNX Runtime 1.25.0,
+its licence/notices, and run `verify-runtime` after extraction before one
+non-replaceable release is created. Linux requires glibc 2.27+; Windows requires
+the Microsoft Visual C++ 2015–2022 Redistributable. Publish and independently
 verify `SHA256SUMS` for every archive.
 
 ## Canonical local data
@@ -174,14 +178,19 @@ LEGAL_MCP_DATA_DIR="$PWD/data/runtime" legal-mcp prune-generations \
   --keep-inactive 1
 ```
 
-Deploy the locally active generation directly:
+Deploy the locally active generation through the restricted CoW/delta path:
 
 ```bash
-scripts/deploy-generation.sh deploy@example-vps
+scripts/deploy-generation.sh \
+  --host legal-mcp-publisher@HOST
 ```
 
-See [DEPLOYMENT.md](DEPLOYMENT.md) for VM setup, Tailscale, service hardening,
-space requirements, exact-generation readiness checks, and rollback behavior.
+The first run uploads the complete generation. Subsequent runs CoW-seed remote
+staging from the active XFS generation and rsync only changed blocks; interrupted
+uploads resume in place. A one-shot copy of the exact OCI image strictly
+validates and activates the result. See [DEPLOYMENT.md](DEPLOYMENT.md) for
+OpenTofu, volume identity, authentication, readiness, rollback, and VPS
+replacement; see [MICROSOFT_COPILOT.md](MICROSOFT_COPILOT.md) for Entra/Copilot.
 
 ## Build semantics
 
@@ -211,12 +220,18 @@ cargo test --workspace --locked --all-features
 cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
 cargo audit
 cargo deny check advisories
-bash -n scripts/*.sh
+bash -n scripts/*.sh scripts/legal-mcp-azure-deploy \
+  scripts/legal-mcp-host-deploy scripts/legal-mcp-publisher-command \
+  infra/hosting/*.sh infra/linode/*.sh tests/*.sh
+python3 -m unittest discover -s tests -p 'test_*.py'
+# Run pinned ShellCheck and actionlint exactly as .github/workflows/ci.yml does.
+az bicep build --file infra/azure/main.bicep
 git diff --check
 LEGAL_MCP_DATA_DIR="$PWD/data/runtime" scripts/smoke.sh
 ```
 
 The production gate also exercises `activate`, failed activation, `verify`,
-`rollback`, pruning, direct SSH transfer, exact-generation `/readyz`, service
-restart persistence, and representative keyword/vector/hybrid retrieval across
+`rollback`, pruning, CoW/delta hosted deployment, hardened OCI/API-key behavior,
+exact-generation `/readyz`, service restart persistence, and representative
+keyword/vector/hybrid retrieval across
 all ten sources. Per-source ANN recall must remain at least 0.99 at 50.

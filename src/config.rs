@@ -3,11 +3,11 @@
 
 use crate::legal_source::SourceId;
 use crate::APP_NAME;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use fs2::FileExt;
 use serde_json::Value as JsonValue;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,6 +17,8 @@ static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MCP_SERVER_CONFIG_NAME: &str = "australian-legal";
 pub(crate) const LEGAL_DB_FILENAME: &str = "legal.db";
 pub(crate) const GENERATION_MANIFEST_FILENAME: &str = "generation.json";
+pub(crate) const LIFECYCLE_DIRECTORY: &str = "lifecycle";
+pub(crate) const RUNTIME_STATE_DIRECTORY: &str = "state";
 
 pub(crate) fn data_dir() -> Result<PathBuf> {
     if let Some(value) = std::env::var_os("LEGAL_MCP_DATA_DIR") {
@@ -61,6 +63,13 @@ pub(crate) fn generation_dir(key: &str) -> Result<PathBuf> {
     Ok(generations_dir()?.join(key))
 }
 
+pub(crate) fn lifecycle_dir() -> Result<PathBuf> {
+    let path = data_dir()?.join(LIFECYCLE_DIRECTORY);
+    fs::create_dir_all(&path)?;
+    require_real_directory(&path, "lifecycle directory")?;
+    Ok(path)
+}
+
 fn require_real_directory(path: &Path, description: &str) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("reading {description} {}", path.display()))?;
@@ -74,11 +83,12 @@ fn require_real_directory(path: &Path, description: &str) -> Result<()> {
 }
 
 pub(crate) fn active_generation_key() -> Result<Option<String>> {
-    let path = data_dir()?.join("active-generation");
-    if !path.exists() {
-        return Ok(None);
-    }
-    let key = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let path = lifecycle_dir()?.join("active-generation");
+    let key = match read_regular_file_no_follow(&path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
     validate_generation_key(&key)?;
     let generation = generation_dir(&key)?;
     if !generation.exists() {
@@ -88,6 +98,46 @@ pub(crate) fn active_generation_key() -> Result<Option<String>> {
     }
     require_real_directory(&generation, "active corpus generation")?;
     Ok(Some(key))
+}
+
+fn read_regular_file_no_follow(path: &Path) -> io::Result<String> {
+    let path_metadata = fs::symlink_metadata(path)?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        return Err(io::Error::other(
+            "active generation pointer is not a regular non-symlink file",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::other(
+            "active generation pointer is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(io::Error::other(
+                "active generation pointer must have exactly one link",
+            ));
+        }
+    }
+    if metadata.len() != 64 {
+        return Err(io::Error::other(
+            "active generation pointer must contain exactly 64 bytes",
+        ));
+    }
+    let mut value = String::with_capacity(64);
+    file.read_to_string(&mut value)?;
+    Ok(value)
 }
 
 pub(crate) fn activate_generation(key: &str) -> Result<()> {
@@ -100,7 +150,7 @@ pub(crate) fn activate_generation(key: &str) -> Result<()> {
         ));
     }
     require_real_directory(&generation, "corpus generation")?;
-    atomic_write(&data_dir()?.join("active-generation"), key.as_bytes())
+    atomic_write(&lifecycle_dir()?.join("active-generation"), key.as_bytes())
 }
 
 pub(crate) fn live_dir() -> Result<PathBuf> {
@@ -117,24 +167,31 @@ pub(crate) fn ann_path(source_id: &SourceId) -> Result<PathBuf> {
     Ok(live_dir()?.join(crate::ann::sidecar_relative_path(source_id)))
 }
 
+pub(crate) fn runtime_state_dir() -> Result<PathBuf> {
+    let path = data_dir()?.join(RUNTIME_STATE_DIRECTORY);
+    fs::create_dir_all(&path)?;
+    require_real_directory(&path, "runtime state directory")?;
+    Ok(path)
+}
+
 pub(crate) fn lock_path() -> Result<PathBuf> {
-    Ok(data_dir()?.join("LOCK"))
+    Ok(lifecycle_dir()?.join("LOCK"))
 }
 
 pub(crate) fn server_lock_path() -> Result<PathBuf> {
-    Ok(data_dir()?.join("SERVER_LOCK"))
+    Ok(runtime_state_dir()?.join("SERVER_LOCK"))
 }
 
 pub(crate) fn lifecycle_lock_path() -> Result<PathBuf> {
-    Ok(data_dir()?.join("LIFECYCLE_LOCK"))
+    Ok(lifecycle_dir()?.join("LIFECYCLE_LOCK"))
 }
 
 pub(crate) fn http_state_path() -> Result<PathBuf> {
-    Ok(data_dir()?.join("http.json"))
+    Ok(runtime_state_dir()?.join("http.json"))
 }
 
 pub(crate) fn server_log_path() -> Result<PathBuf> {
-    Ok(data_dir()?.join("server.log"))
+    Ok(runtime_state_dir()?.join("server.log"))
 }
 
 pub(crate) fn model_path() -> Result<PathBuf> {
@@ -147,12 +204,7 @@ pub(crate) fn tokenizer_path() -> Result<PathBuf> {
 
 pub(crate) fn lock_file() -> Result<File> {
     let path = lock_path()?;
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)?;
+    let file = open_lock_file(&path, true, true)?;
     // Single-writer guard around update/install: cross-platform
     // advisory lock via fs2::FileExt on the app LOCK file.
     file.lock_exclusive()?;
@@ -161,37 +213,57 @@ pub(crate) fn lock_file() -> Result<File> {
 
 pub(crate) fn corpus_read_lock() -> Result<File> {
     let path = lock_path()?;
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)?;
+    let file = open_lock_file(&path, false, false).with_context(|| {
+        format!(
+            "opening pre-created corpus lock {}; activate a generation before serving it",
+            path.display()
+        )
+    })?;
     fs2::FileExt::lock_shared(&file)?;
     Ok(file)
 }
 
 pub(crate) fn lifecycle_lock_file() -> Result<File> {
     let path = lifecycle_lock_path()?;
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)?;
+    let file = open_lock_file(&path, true, true)?;
     file.lock_exclusive()?;
     Ok(file)
 }
 
 pub(crate) fn server_lock_file() -> Result<File> {
     let path = server_lock_path()?;
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)?;
+    let file = open_lock_file(&path, true, true)?;
     file.lock_exclusive()?;
+    Ok(file)
+}
+
+fn open_lock_file(path: &Path, create: bool, write: bool) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(write).truncate(false);
+    if create {
+        options.create(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o660)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("opening lock file {}", path.display()))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        bail!("lock path is not a regular file: {}", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            bail!("lock file must have exactly one link: {}", path.display());
+        }
+    }
     Ok(file)
 }
 
@@ -590,9 +662,13 @@ mod tests {
         assert!(live_dir().is_err());
         assert!(!root.path().join("live").exists());
 
-        fs::write(root.path().join("active-generation"), "A".repeat(64))?;
+        fs::create_dir_all(root.path().join("lifecycle"))?;
+        fs::write(
+            root.path().join("lifecycle/active-generation"),
+            "A".repeat(64),
+        )?;
         assert!(active_generation_key().is_err());
-        fs::remove_file(root.path().join("active-generation"))?;
+        fs::remove_file(root.path().join("lifecycle/active-generation"))?;
 
         let key = "a".repeat(64);
         let generation = generation_dir(&key)?;
@@ -621,7 +697,8 @@ mod tests {
         let key = "c".repeat(64);
         fs::create_dir_all(generations_dir()?)?;
         symlink(outside.path(), generation_dir(&key)?)?;
-        fs::write(root.path().join("active-generation"), &key)?;
+        fs::create_dir_all(root.path().join("lifecycle"))?;
+        fs::write(root.path().join("lifecycle/active-generation"), &key)?;
 
         assert!(active_generation_key().is_err());
         assert!(activate_generation(&key).is_err());

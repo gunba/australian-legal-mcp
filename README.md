@@ -28,19 +28,23 @@ containing:
 - the pinned ONNX model and tokenizer;
 - `generation.json`, binding every file, source, vector set, schema, and model.
 
-A validated generation is activated atomically and transferred directly over
-SSH to a CPU-only serving VM. The serving runtime never downloads, scrapes,
-embeds, packages, or publishes corpus/model artifacts. GitHub Releases are
-binary-only.
+A validated generation is activated atomically and deployed to an external
+XFS/reflink corpus volume on an Akamai Cloud (Linode) VPS. Restricted rsync
+seeds from a CoW clone and transmits only changed blocks. The serving runtime
+never scrapes, embeds, builds, or publishes corpus/model artifacts. GitHub
+Releases remain binary-only; a separately attested GHCR image contains runtime
+software but no corpus or model artifacts.
 
 Semantic search uses mdbr-leaf-ir ANN candidates followed by exact reranking
 from authoritative normalized int8 vectors in SQLite. Bodies remain cleaned
 structural HTML; FTS and embeddings use source-derived plain text.
 
-For private production hosting, `legal-mcp.service` binds
-`127.0.0.1:51235` behind Tailscale HTTPS. Local development and compatible MCP
-hosts may instead run `legal-mcp mcp`, which starts or reuses a loopback backend.
-See [DEPLOYMENT.md](DEPLOYMENT.md).
+For hosted operation, a non-root, read-only OCI container publishes only
+`127.0.0.1:51235` behind host Caddy. Public `/mcp` requires individually
+revocable API keys, exact single-tenant Entra bearer validation, or both; hosted
+startup fails closed without authentication. The same image/volume contract can
+later move to Azure. Local development may run `legal-mcp mcp`. See
+[DEPLOYMENT.md](DEPLOYMENT.md) and [MICROSOFT_COPILOT.md](MICROSOFT_COPILOT.md).
 
 ## Exactly seven MCP tools
 
@@ -70,10 +74,16 @@ legal://ato/PAC%2F1?pit=20200101000000&view=HISTFT
 
 ## Client installation
 
-Binary releases contain only the executable, checksums, and the CPU ONNX Runtime
-software library. Verify the archive against `SHA256SUMS`, then keep
+Binary releases contain the executable, checksums, CPU ONNX Runtime library,
+licenses, and the version-matched hosting bundle. Verify the archive against
+`SHA256SUMS`, then keep
 `legal-mcp` and its ONNX Runtime library together in a stable directory on
-`PATH`.
+`PATH`. Release archives target Linux x86-64 (glibc 2.27+), macOS arm64, and
+Windows x86-64. Windows requires the current Microsoft Visual C++ 2015–2022
+Redistributable because the official ONNX Runtime DLL imports `MSVCP140` and
+`VCRUNTIME140`; this dependency is not bundled. Run `legal-mcp verify-runtime`
+from the extracted directory before installation to prove the packaged shared
+library loads on that host.
 
 For local stdio development, clone and install the package metadata:
 
@@ -102,9 +112,10 @@ The local registration is:
 }
 ```
 
-A production client should instead use the private HTTPS `/mcp` endpoint
-provisioned by the serving host. Do not publicly expose the loopback service or
-replace OAuth/device identity with a shared static token.
+An enterprise client uses the Entra-protected HTTPS `/mcp` endpoint regardless
+of whether the image currently runs on Linode or Azure. API keys are supported
+for individually identified automation clients, but not as a substitute for
+Copilot delegated user identity. Never expose container port 51235 publicly.
 
 ## Search policy
 
@@ -137,15 +148,18 @@ runtime/
 │       ├── ann/<source>.ann
 │       ├── model.onnx
 │       └── tokenizer.json
-├── active-generation
-├── LOCK
-├── LIFECYCLE_LOCK
-├── SERVER_LOCK
-└── http.json              # local stdio/backend mode only
+├── lifecycle/
+│   ├── active-generation
+│   ├── LOCK
+│   └── LIFECYCLE_LOCK
+└── state/
+    ├── SERVER_LOCK
+    ├── http.json          # local stdio/backend mode only
+    └── server.log         # local background backend only
 ```
 
 Generation directories are real, non-symlink, read-only directories.
-`active-generation` is the atomic switch. Lifecycle commands are:
+`lifecycle/active-generation` is the atomic switch. Lifecycle commands are:
 
 ```bash
 legal-mcp activate --generation-dir /same/filesystem/complete-generation
@@ -195,10 +209,11 @@ Fresh full repair:
 scripts/maintainer-sync.sh --full
 ```
 
-Direct deployment of the locally active generation:
+CoW/delta deployment of the locally active generation:
 
 ```bash
-scripts/deploy-generation.sh deploy@example-vps
+scripts/deploy-generation.sh \
+  --host legal-mcp-publisher@HOST
 ```
 
 The maintainer pipeline requires the pinned model in
@@ -215,12 +230,21 @@ cargo test --locked --workspace --all-features
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo audit
 cargo deny check advisories
+python3 -m unittest \
+  tests/test_azure_generation_transport.py \
+  tests/test_manage_api_keys.py \
+  tests/test_remote_mcp.py \
+  tests/test_render_microsoft_integrations.py
+# Validate infra/linode with the lock-pinned Linode provider.
+tofu -chdir=infra/linode init -backend=false -lockfile=readonly
+tofu -chdir=infra/linode validate
 LEGAL_MCP_DATA_DIR="$PWD/data/runtime" scripts/smoke.sh
 ```
 
 See [MAINTENANCE.md](MAINTENANCE.md) for maintainer operations,
-[CURRENT_STATE.md](CURRENT_STATE.md) for the implementation snapshot, and
-[DEPLOYMENT.md](DEPLOYMENT.md) for low-cost private hosting.
+[CURRENT_STATE.md](CURRENT_STATE.md) for the implementation snapshot,
+[DEPLOYMENT.md](DEPLOYMENT.md) for Akamai/Linode OCI hosting, and
+[MICROSOFT_COPILOT.md](MICROSOFT_COPILOT.md) for Entra/Copilot onboarding.
 
 ## License
 

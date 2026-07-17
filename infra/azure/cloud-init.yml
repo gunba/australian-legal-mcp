@@ -1,0 +1,169 @@
+#cloud-config
+package_update: true
+packages:
+  - ca-certificates
+  - curl
+  - jq
+  - python3
+  - rsync
+  - xfsprogs
+  - zstd
+
+write_files:
+  - path: /usr/local/sbin/prepare-legal-mcp-data-disk
+    owner: root:root
+    permissions: '0750'
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      admin_user="$(printf '%s' '__ADMIN_USERNAME_B64__' | base64 --decode)"
+      [[ "$admin_user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]
+      mount_point=/var/lib/australian-legal-mcp
+      service_uid=971
+      deploy_uid=972
+      publisher_uid=973
+      service_gid=971
+
+      ensure_group() {
+        if getent group legal-mcp >/dev/null; then
+          test "$(getent group legal-mcp | cut -d: -f3)" = "$service_gid"
+        else
+          if getent group "$service_gid" >/dev/null; then
+            echo "GID $service_gid is already assigned" >&2
+            exit 1
+          fi
+          groupadd --system --gid "$service_gid" legal-mcp
+        fi
+      }
+      ensure_user() {
+        local name="$1" uid="$2" group="$3" home="$4"
+        if getent passwd "$name" >/dev/null; then
+          test "$(id -u "$name")" = "$uid"
+          test "$(id -g "$name")" = "$service_gid"
+        else
+          if getent passwd "$uid" >/dev/null; then
+            echo "UID $uid is already assigned" >&2
+            exit 1
+          fi
+          useradd --system --uid "$uid" --gid "$group" \
+            --home-dir "$home" --shell /usr/sbin/nologin "$name"
+        fi
+      }
+
+      ensure_group
+      ensure_user legal-mcp "$service_uid" legal-mcp /nonexistent
+      ensure_user legal-mcp-deploy "$deploy_uid" legal-mcp "$mount_point"
+      if getent passwd legal-mcp-publisher >/dev/null; then
+        test "$(id -u legal-mcp-publisher)" = "$publisher_uid"
+        test "$(id -g legal-mcp-publisher)" = "$service_gid"
+      else
+        if getent passwd "$publisher_uid" >/dev/null; then
+          echo "UID $publisher_uid is already assigned" >&2
+          exit 1
+        fi
+        useradd --uid "$publisher_uid" --gid legal-mcp --create-home \
+          --home-dir /home/legal-mcp-publisher --shell /bin/bash legal-mcp-publisher
+      fi
+      publisher_key=/run/legal-mcp-publisher-key
+      printf '%s' '__PUBLISHER_SSH_KEY_B64__' | base64 --decode > "$publisher_key"
+      test "$(wc -l < "$publisher_key")" -le 1
+      grep -Eq '^ssh-(ed25519|rsa) [A-Za-z0-9+/=]+( .*)?$' "$publisher_key"
+      install -d -o legal-mcp-publisher -g legal-mcp -m 0700 \
+        /home/legal-mcp-publisher/.ssh
+      {
+        printf 'restrict,command="/usr/local/sbin/legal-mcp-publisher-command" '
+        cat "$publisher_key"
+        printf '\n'
+      } > /home/legal-mcp-publisher/.ssh/authorized_keys
+      chown legal-mcp-publisher:legal-mcp \
+        /home/legal-mcp-publisher/.ssh/authorized_keys
+      chmod 0600 /home/legal-mcp-publisher/.ssh/authorized_keys
+      rm -f "$publisher_key"
+      usermod --append --groups legal-mcp "$admin_user"
+
+      device=''
+      for _ in $(seq 1 120); do
+        for candidate in \
+          /dev/disk/azure/data/by-lun/0 \
+          /dev/disk/azure/scsi1/lun0; do
+          if test -b "$candidate"; then
+            device="$(readlink -f "$candidate")"
+            break 2
+          fi
+        done
+        sleep 1
+      done
+      test -n "$device" || { echo 'Azure LUN 0 data disk did not appear' >&2; exit 1; }
+
+      filesystem="$(blkid -o value -s TYPE "$device" || true)"
+      newly_formatted=false
+      if test -z "$filesystem"; then
+        test "$(lsblk -n -o NAME "$device" | wc -l)" = 1 || {
+          echo 'refusing to format a data disk that contains partitions' >&2
+          exit 1
+        }
+        test -z "$(wipefs --no-act "$device")" || {
+          echo 'refusing to format a data disk that contains signatures' >&2
+          exit 1
+        }
+        mkfs.xfs -L legal-mcp-data -m reflink=1 "$device"
+        filesystem=xfs
+        newly_formatted=true
+      fi
+      test "$filesystem" = xfs || {
+        echo "data disk must be XFS, found $filesystem" >&2
+        exit 1
+      }
+      xfs_info "$device" | grep -Eq 'reflink=1' || {
+        echo 'data disk XFS filesystem does not support reflinks' >&2
+        exit 1
+      }
+      uuid="$(blkid -o value -s UUID "$device")"
+      test -n "$uuid"
+
+      install -d -o root -g root -m 0755 "$mount_point"
+      fstab_line="UUID=$uuid $mount_point xfs defaults,x-systemd.device-timeout=2min 0 2"
+      existing_source="$(awk -v mount_point="$mount_point" '$2 == mount_point { print $1 }' /etc/fstab)"
+      if test -n "$existing_source" && test "$existing_source" != "UUID=$uuid"; then
+        echo "fstab already binds $mount_point to a different filesystem" >&2
+        exit 1
+      fi
+      if ! grep -Fq "UUID=$uuid " /etc/fstab; then
+        printf '%s\n' "$fstab_line" >> /etc/fstab
+      fi
+      mount "$mount_point" 2>/dev/null || mountpoint -q "$mount_point"
+      mountpoint -q "$mount_point"
+      test "$(findmnt -n -o UUID --target "$mount_point")" = "$uuid"
+
+      marker="$mount_point/.legal-mcp-data-volume"
+      if test -e "$marker"; then
+        test -f "$marker" && ! test -L "$marker"
+        test "$(jq -r .filesystem_uuid "$marker")" = "$uuid"
+        test "$(jq -r .format_version "$marker")" = 1
+      elif test "$newly_formatted" = true; then
+        printf '{"format_version":1,"filesystem_uuid":"%s"}\n' "$uuid" > "$marker"
+      else
+        echo 'existing XFS data disk is missing the legal-mcp volume marker' >&2
+        exit 1
+      fi
+      chown root:root "$marker"
+      chmod 0444 "$marker"
+      chown root:legal-mcp "$mount_point"
+      chmod 0750 "$mount_point"
+
+      install -d -o legal-mcp-deploy -g legal-mcp -m 0750 \
+        "$mount_point/generations" "$mount_point/incoming" "$mount_point/lifecycle"
+      install -o legal-mcp-deploy -g legal-mcp -m 0640 /dev/null \
+        "$mount_point/lifecycle/LOCK"
+      install -d -o legal-mcp -g legal-mcp -m 0700 "$mount_point/state"
+      touch "$mount_point/state/SERVER_LOCK"
+      chown legal-mcp:legal-mcp "$mount_point/state/SERVER_LOCK"
+      chmod 0600 "$mount_point/state/SERVER_LOCK"
+      install -d -o root -g legal-mcp -m 0750 /etc/australian-legal-mcp
+      sync
+
+runcmd:
+  - [bash, -lc, /usr/local/sbin/prepare-legal-mcp-data-disk]
+
+final_message: 'Australian Legal MCP Azure host base provisioning completed.'

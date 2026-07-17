@@ -1,0 +1,545 @@
+#!/usr/bin/env bash
+# Root-only transactional activation helper for the provider-neutral OCI host.
+set -euo pipefail
+umask 027
+export LC_ALL=C
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+[[ $EUID -eq 0 ]] || { echo 'legal-mcp-host-deploy must run as root' >&2; exit 2; }
+[[ $# -eq 2 ]] || { echo 'usage: legal-mcp-host-deploy prepare|activate GENERATION' >&2; exit 2; }
+ACTION="$1"
+GENERATION="$2"
+[[ "$ACTION" = prepare || "$ACTION" = activate ]] || { echo 'invalid deployment action' >&2; exit 2; }
+[[ "$GENERATION" =~ ^[0-9a-f]{64}$ ]] || { echo 'generation ID is malformed' >&2; exit 2; }
+
+DATA_ROOT=/srv/legal-mcp
+GENERATIONS="$DATA_ROOT/generations"
+LIFECYCLE="$DATA_ROOT/lifecycle"
+UPLOADS="$DATA_ROOT/uploads"
+STATE="$DATA_ROOT/state"
+JOURNAL="$LIFECYCLE/.deployment-transaction"
+IMAGE_FILE=/etc/legal-mcp/image
+SERVICE=legal-mcp.service
+LOCK_FILE=/run/lock/legal-mcp-host-transaction.lock
+RUNTIME_CONTROL=/run/legal-mcp
+UPLOAD_AUTHORIZATION="$RUNTIME_CONTROL/authorized-upload"
+PUBLISHER=legal-mcp-publisher
+SERVICE_USER=legal-mcp
+
+for command_name in blkid cp curl df findmnt flock getfacl getent podman python3 setfacl stat systemctl xfs_info; do
+  command -v "$command_name" >/dev/null || { echo "missing host dependency: $command_name" >&2; exit 1; }
+done
+
+[[ -f "$LOCK_FILE" && ! -L "$LOCK_FILE" \
+  && "$(stat -c '%U:%G:%a:%h' "$LOCK_FILE")" = root:legal-mcp-publisher:640:1 ]] || {
+  echo 'host transaction lock is missing or unsafe' >&2
+  exit 1
+}
+exec 9<>"$LOCK_FILE"
+flock -x 9
+
+require_owner_mode() {
+  local path="$1" owner="$2" group="$3" mode="$4"
+  [[ ! -L "$path" ]] || { echo "symlink rejected: $path" >&2; exit 1; }
+  [[ "$(stat -c '%U:%G:%a' "$path")" = "$owner:$group:$mode" ]] || {
+    echo "unsafe owner or mode for $path" >&2
+    exit 1
+  }
+}
+
+require_acl() {
+  local path="$1" expected="$2"
+  [[ "$(getfacl --absolute-names --numeric --omit-header "$path")" = "$expected" ]] || {
+    echo "unsafe access ACL for $path" >&2
+    exit 1
+  }
+}
+
+validate_host_state() {
+  local target source fstype options marker_uuid actual_uuid xfs_details expected_acl directory
+  local -a marker
+  read -r target source fstype options < <(findmnt --noheadings --raw --output TARGET,SOURCE,FSTYPE,OPTIONS --target "$DATA_ROOT")
+  [[ "$target" = "$DATA_ROOT" && "$fstype" = xfs \
+    && ",$options," = *,noatime,* && ",$options," = *,nodev,* \
+    && ",$options," = *,noexec,* && ",$options," = *,nosuid,* ]] || {
+    echo "$DATA_ROOT must be the exact XFS volume mount" >&2
+    exit 1
+  }
+  xfs_details="$(xfs_info "$DATA_ROOT")"
+  if ! grep -Eq 'reflink=1([[:space:]]|$)' <<< "$xfs_details" \
+    || ! grep -Eq 'ftype=1([[:space:]]|$)' <<< "$xfs_details"; then
+    echo 'the corpus XFS volume must have reflink and directory file types enabled' >&2
+    exit 1
+  fi
+  [[ -f "$DATA_ROOT/.legal-mcp-volume" && ! -L "$DATA_ROOT/.legal-mcp-volume" \
+    && "$(stat -c '%U:%G:%a:%h' "$DATA_ROOT/.legal-mcp-volume")" = root:root:444:1 ]] || {
+    echo 'corpus volume identity marker is missing' >&2
+    exit 1
+  }
+  require_acl "$DATA_ROOT/.legal-mcp-volume" $'user::r--\ngroup::r--\nother::r--'
+  mapfile -t marker < "$DATA_ROOT/.legal-mcp-volume"
+  [[ ${#marker[@]} -eq 2 && "${marker[0]}" = LEGAL_MCP_VOLUME_V1 \
+    && "${marker[1]}" =~ ^UUID=([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$ ]] || {
+    echo 'corpus volume identity marker is malformed' >&2
+    exit 1
+  }
+  marker_uuid="${BASH_REMATCH[1],,}"
+  actual_uuid="$(blkid -s UUID -o value "$source")"
+  [[ "${actual_uuid,,}" = "$marker_uuid" ]] || {
+    echo 'mounted corpus volume UUID does not match its marker' >&2
+    exit 1
+  }
+
+  require_owner_mode "$DATA_ROOT" root legal-mcp 750
+  expected_acl=$'user::rwx\nuser:973:--x\ngroup::r-x\nmask::r-x\nother::---'
+  [[ "$(getfacl --absolute-names --numeric --omit-header "$DATA_ROOT")" = "$expected_acl" ]] || {
+    echo 'corpus root traversal ACL does not match the publisher contract' >&2
+    exit 1
+  }
+  for directory in "$GENERATIONS" "$LIFECYCLE" "$STATE" "$UPLOADS"; do
+    [[ -d "$directory" && ! -L "$directory" ]] || {
+      echo "required host directory is missing or unsafe: $directory" >&2
+      exit 1
+    }
+  done
+  require_owner_mode "$GENERATIONS" root legal-mcp 750
+  require_acl "$GENERATIONS" $'user::rwx\ngroup::r-x\nother::---'
+  require_owner_mode "$LIFECYCLE" root legal-mcp 750
+  require_acl "$LIFECYCLE" $'user::rwx\ngroup::r-x\nother::---'
+  require_owner_mode "$STATE" legal-mcp legal-mcp 700
+  require_acl "$STATE" $'user::rwx\ngroup::---\nother::---'
+  require_owner_mode "$UPLOADS" legal-mcp-publisher legal-mcp-publisher 700
+  require_acl "$UPLOADS" $'user::rwx\ngroup::---\nother::---'
+  require_owner_mode "$LIFECYCLE/LOCK" root legal-mcp 640
+  require_acl "$LIFECYCLE/LOCK" $'user::rw-\ngroup::r--\nother::---'
+  [[ "$(stat -c '%h' "$LIFECYCLE/LOCK")" = 1 ]] || {
+    echo 'corpus lock must have exactly one link' >&2
+    exit 1
+  }
+}
+
+read_image() {
+  [[ -f "$IMAGE_FILE" && ! -L "$IMAGE_FILE" ]] || { echo 'pinned image file is missing' >&2; exit 1; }
+  require_owner_mode "$IMAGE_FILE" root root 600
+  IMAGE="$(<"$IMAGE_FILE")"
+  [[ "$IMAGE" =~ ^ghcr\.io/gunba/australian-legal-mcp@sha256:[0-9a-f]{64}$ ]] || {
+    echo 'image must be the canonical GHCR repository pinned by digest' >&2
+    exit 1
+  }
+  podman image exists "$IMAGE" || { echo 'pinned legal-mcp image is not present' >&2; exit 1; }
+}
+
+run_legal() {
+  podman run --rm \
+    --network=none \
+    --user=0:0 \
+    --read-only \
+    --cap-drop=all \
+    --security-opt=no-new-privileges \
+    --pids-limit=256 \
+    --memory=6g \
+    --memory-swap=6g \
+    --tmpfs=/tmp:rw,nodev,nosuid,noexec,size=64m,mode=1777 \
+    --volume="$DATA_ROOT:/var/lib/legal-mcp:rw,nodev,nosuid" \
+    "$IMAGE" "$@"
+}
+
+active_generation() {
+  local pointer="$LIFECYCLE/active-generation"
+  if [[ ! -e "$pointer" ]]; then
+    printf '%s\n' '-'
+    return
+  fi
+  [[ -f "$pointer" && ! -L "$pointer" && "$(stat -c '%h:%s' "$pointer")" = 1:64 ]] || {
+    echo 'active-generation pointer is unsafe' >&2
+    exit 1
+  }
+  local value
+  value="$(<"$pointer")"
+  [[ "$value" =~ ^[0-9a-f]{64}$ && -d "$GENERATIONS/$value" && ! -L "$GENERATIONS/$value" ]] || {
+    echo 'active-generation pointer is invalid' >&2
+    exit 1
+  }
+  printf '%s\n' "$value"
+}
+
+write_journal() {
+  local phase="$1" previous="$2" temporary
+  [[ "$phase" =~ ^(preparing|prepared|activating|activated|rolling-back|rolled-back)$ ]] || exit 1
+  [[ "$previous" = - || "$previous" =~ ^[0-9a-f]{64}$ ]] || exit 1
+  temporary="$LIFECYCLE/.deployment-transaction.$$.tmp"
+  printf '%s\n%s\n%s\n' "$GENERATION" "$previous" "$phase" > "$temporary"
+  chown root:root "$temporary"
+  chmod 600 "$temporary"
+  sync -f "$temporary"
+  mv -fT "$temporary" "$JOURNAL"
+  sync -f "$LIFECYCLE"
+}
+
+read_journal() {
+  [[ -f "$JOURNAL" && ! -L "$JOURNAL" && "$(stat -c '%U:%G:%a:%h' "$JOURNAL")" = root:root:600:1 ]] || {
+    echo 'deployment transaction journal is unsafe' >&2
+    exit 1
+  }
+  mapfile -t transaction < "$JOURNAL"
+  [[ ${#transaction[@]} -eq 3 \
+    && "${transaction[0]}" =~ ^[0-9a-f]{64}$ \
+    && ( "${transaction[1]}" = - || "${transaction[1]}" =~ ^[0-9a-f]{64}$ ) \
+    && "${transaction[2]}" =~ ^(preparing|prepared|activating|activated|rolling-back|rolled-back)$ ]] || {
+    echo 'deployment transaction journal is malformed' >&2
+    exit 1
+  }
+  TX_GENERATION="${transaction[0]}"
+  TX_PREVIOUS="${transaction[1]}"
+  TX_PHASE="${transaction[2]}"
+}
+
+normalize_upload_for_activation() {
+  local upload="$UPLOADS/$GENERATION"
+  [[ -d "$upload" && ! -L "$upload" ]] || { echo 'prepared upload is missing' >&2; exit 1; }
+  setfacl --recursive --remove-all "$upload"
+  chown -R root:legal-mcp "$upload"
+  find "$upload" -xdev -type d -exec chmod 750 {} +
+  find "$upload" -xdev -type f -exec chmod 640 {} +
+  sync -f "$upload"
+}
+
+restore_upload_to_publisher() {
+  local upload="$UPLOADS/$GENERATION"
+  [[ -d "$upload" && ! -L "$upload" ]] || return 0
+  setfacl --recursive --remove-all "$upload"
+  chown -R "$PUBLISHER:$PUBLISHER" "$upload"
+  find "$upload" -xdev -type d -exec chmod 700 {} +
+  find "$upload" -xdev -type f -exec chmod 600 {} +
+}
+
+clear_upload_authorization() {
+  [[ -d "$RUNTIME_CONTROL" && ! -L "$RUNTIME_CONTROL" \
+    && "$(stat -c '%U:%G:%a' "$RUNTIME_CONTROL")" = root:legal-mcp-publisher:710 ]] || {
+    echo 'runtime upload-control directory is unsafe' >&2
+    exit 1
+  }
+  rm -f "$UPLOAD_AUTHORIZATION"
+  sync -f "$RUNTIME_CONTROL"
+}
+
+authorize_upload() {
+  local temporary="$RUNTIME_CONTROL/.authorized-upload.$$.tmp"
+  [[ -d "$RUNTIME_CONTROL" && ! -L "$RUNTIME_CONTROL" \
+    && "$(stat -c '%U:%G:%a' "$RUNTIME_CONTROL")" = root:legal-mcp-publisher:710 ]] || {
+    echo 'runtime upload-control directory is unsafe' >&2
+    exit 1
+  }
+  printf '%s\n' "$GENERATION" > "$temporary"
+  chown root:legal-mcp-publisher "$temporary"
+  chmod 440 "$temporary"
+  sync -f "$temporary"
+  mv -fT "$temporary" "$UPLOAD_AUTHORIZATION"
+  sync -f "$RUNTIME_CONTROL"
+}
+
+probe_exact_generation() {
+  local expected="$1"
+  curl --fail --silent --max-time 5 http://127.0.0.1:51235/readyz 2>/dev/null |
+    python3 -c 'import json,sys; value=json.load(sys.stdin); expected=sys.argv[1]; raise SystemExit(0 if value == {"status":"ok","generation":expected} else 1)' "$expected" 2>/dev/null
+}
+
+wait_for_exact_generation() {
+  local expected="$1" deadline=$((SECONDS + 180))
+  while (( SECONDS < deadline )); do
+    probe_exact_generation "$expected" && return 0
+    systemctl is-active --quiet "$SERVICE" || return 1
+    sleep 1
+  done
+  return 1
+}
+
+running_image_is_pinned() {
+  local expected_image_id running_image_id
+  expected_image_id="$(podman image inspect "$IMAGE" --format '{{.Id}}')" || return 1
+  running_image_id="$(podman inspect australian-legal-mcp --format '{{.Image}}')" || return 1
+  [[ "$running_image_id" = "$expected_image_id" ]]
+}
+
+rollback_pointer() {
+  local previous="$1"
+  if [[ "$previous" = - ]]; then
+    run_legal deactivate --expected-generation "$GENERATION" >/dev/null
+  else
+    run_legal rollback --generation "$previous" >/dev/null
+  fi
+}
+
+validate_host_state
+read_image
+[[ ! -e /etc/legal-mcp/.auth-transaction && ! -e /etc/legal-mcp/.image-transaction ]] || {
+  echo 'a host auth or image transaction must be recovered before corpus deployment' >&2
+  exit 1
+}
+publisher_uid="$(id -u "$PUBLISHER")"
+publisher_gid="$(id -g "$PUBLISHER")"
+[[ "$publisher_uid" = 973 && "$publisher_gid" = 973 ]] || {
+  echo 'publisher identity does not match the fixed host contract' >&2
+  exit 1
+}
+[[ "$(id -G "$PUBLISHER")" = 973 ]] || {
+  echo 'publisher must not have supplementary host groups' >&2
+  exit 1
+}
+[[ "$(id -u "$SERVICE_USER")" = 971 && "$(id -g "$SERVICE_USER")" = 971 \
+  && "$(id -G "$SERVICE_USER")" = 971 ]] || {
+  echo 'service identity does not match the fixed host contract' >&2
+  exit 1
+}
+
+if [[ "$ACTION" = prepare ]]; then
+  clear_upload_authorization
+  previous="$(active_generation)"
+  if [[ ! -e "$JOURNAL" && "$previous" = "$GENERATION" ]]; then
+    if systemctl is-active --quiet "$SERVICE" \
+      && wait_for_exact_generation "$GENERATION" \
+      && running_image_is_pinned; then
+      echo already-active
+      exit 0
+    fi
+    echo 'generation is active but the service is not exactly ready; repair authentication or service state' >&2
+    exit 1
+  fi
+  if [[ -e "$JOURNAL" ]]; then
+    read_journal
+    [[ "$TX_GENERATION" = "$GENERATION" ]] || {
+      echo "another generation transaction is pending: $TX_GENERATION" >&2
+      exit 1
+    }
+    case "$TX_PHASE" in
+      prepared)
+        [[ -d "$UPLOADS/$GENERATION" && ! -L "$UPLOADS/$GENERATION" ]] || {
+          echo 'prepared transaction has no upload directory' >&2
+          exit 1
+        }
+        authorize_upload
+        echo prepared
+        exit 0
+        ;;
+      activated|rolling-back|rolled-back)
+        echo staged
+        exit 0
+        ;;
+      activating)
+        current="$(active_generation)"
+        if [[ "$current" = "$GENERATION" ]]; then
+          write_journal activated "$TX_PREVIOUS"
+          echo staged
+          exit 0
+        fi
+        [[ "$current" = "$TX_PREVIOUS" ]] || {
+          echo 'activating transaction has an unexpected active pointer' >&2
+          exit 1
+        }
+        if [[ -d "$UPLOADS/$GENERATION" && ! -L "$UPLOADS/$GENERATION" ]]; then
+          restore_upload_to_publisher
+          write_journal prepared "$TX_PREVIOUS"
+          authorize_upload
+          echo prepared
+          exit 0
+        fi
+        if [[ -d "$GENERATIONS/$GENERATION" && ! -L "$GENERATIONS/$GENERATION" ]]; then
+          write_journal rolled-back "$TX_PREVIOUS"
+          echo staged
+          exit 0
+        fi
+        echo 'activating transaction has neither upload nor installed generation' >&2
+        exit 1
+        ;;
+      preparing)
+        rm -rf --one-file-system "$UPLOADS/.$GENERATION.preparing"
+        ;;
+    esac
+    previous="$TX_PREVIOUS"
+  else
+    if [[ -d "$GENERATIONS/$GENERATION" && ! -L "$GENERATIONS/$GENERATION" ]]; then
+      write_journal rolled-back "$previous"
+      echo staged
+      exit 0
+    fi
+    write_journal preparing "$previous"
+  fi
+
+  upload="$UPLOADS/$GENERATION"
+  temporary="$UPLOADS/.$GENERATION.preparing"
+  if [[ ! -e "$upload" ]]; then
+    available_bytes="$(df --block-size=1 --output=avail "$DATA_ROOT" | tail -n 1 | tr -d ' ')"
+    [[ "$available_bytes" =~ ^[0-9]+$ && "$available_bytes" -ge 5368709120 ]] || {
+      echo 'corpus volume has less than the required 5-GiB free margin' >&2
+      exit 1
+    }
+    rm -rf --one-file-system "$temporary"
+    mkdir -m 700 "$temporary"
+    if [[ "$previous" != - ]]; then
+      cp --archive --one-file-system --reflink=always "$GENERATIONS/$previous/." "$temporary/"
+    fi
+    chown -R "$publisher_uid:$publisher_gid" "$temporary"
+    find "$temporary" -xdev -type d -exec chmod 700 {} +
+    find "$temporary" -xdev -type f -exec chmod 600 {} +
+    mv -T "$temporary" "$upload"
+    sync -f "$UPLOADS"
+  else
+    [[ -d "$upload" && ! -L "$upload" ]] || { echo 'upload path is unsafe' >&2; exit 1; }
+  fi
+  write_journal prepared "$previous"
+  authorize_upload
+  echo prepared
+  exit 0
+fi
+
+clear_upload_authorization
+[[ -e "$JOURNAL" ]] || { echo 'no prepared deployment transaction exists' >&2; exit 1; }
+read_journal
+[[ "$TX_GENERATION" = "$GENERATION" ]] || { echo 'generation does not match pending transaction' >&2; exit 1; }
+[[ "$TX_PHASE" != preparing ]] || {
+  echo 'deployment upload has not completed preparation' >&2
+  exit 1
+}
+
+was_active=false
+if systemctl is-active --quiet "$SERVICE"; then
+  was_active=true
+  systemctl stop "$SERVICE"
+fi
+
+case "$TX_PHASE" in
+  prepared)
+    write_journal activating "$TX_PREVIOUS"
+    normalize_upload_for_activation
+    activation_ok=false
+    if run_legal activate --generation-dir "/var/lib/legal-mcp/uploads/$GENERATION" \
+      --expected-generation "$GENERATION" >/dev/null; then
+      activation_ok=true
+    fi
+    ;;
+  activating)
+    current="$(active_generation)"
+    if [[ "$current" = "$GENERATION" ]]; then
+      activation_ok=true
+    elif [[ "$current" = "$TX_PREVIOUS" \
+      && -d "$UPLOADS/$GENERATION" && ! -L "$UPLOADS/$GENERATION" ]]; then
+      normalize_upload_for_activation
+      activation_ok=false
+      if run_legal activate --generation-dir "/var/lib/legal-mcp/uploads/$GENERATION" \
+        --expected-generation "$GENERATION" >/dev/null; then
+        activation_ok=true
+      fi
+    elif [[ "$current" = "$TX_PREVIOUS" \
+      && -d "$GENERATIONS/$GENERATION" && ! -L "$GENERATIONS/$GENERATION" ]]; then
+      activation_ok=false
+      if run_legal rollback --generation "$GENERATION" >/dev/null; then
+        activation_ok=true
+      fi
+    else
+      echo 'activating transaction cannot locate one unambiguous candidate' >&2
+      exit 1
+    fi
+    ;;
+  rolled-back)
+    [[ "$(active_generation)" = "$TX_PREVIOUS" ]] || {
+      echo 'rolled-back transaction does not match the previous pointer' >&2
+      exit 1
+    }
+    run_legal rollback --generation "$GENERATION" >/dev/null
+    write_journal activated "$TX_PREVIOUS"
+    ;;
+  rolling-back)
+    current="$(active_generation)"
+    if [[ "$current" = "$GENERATION" ]]; then
+      rollback_pointer "$TX_PREVIOUS"
+    elif [[ "$current" != "$TX_PREVIOUS" ]]; then
+      echo 'rolling-back transaction has an unexpected active pointer' >&2
+      exit 1
+    fi
+    write_journal rolled-back "$TX_PREVIOUS"
+    run_legal rollback --generation "$GENERATION" >/dev/null
+    write_journal activated "$TX_PREVIOUS"
+    ;;
+  activated)
+    [[ "$(active_generation)" = "$GENERATION" ]] || {
+      echo 'activated transaction does not match the active pointer' >&2
+      exit 1
+    }
+    ;;
+esac
+
+if [[ "$TX_PHASE" = prepared || "$TX_PHASE" = activating ]]; then
+  if [[ "$activation_ok" = true ]]; then
+    write_journal activated "$TX_PREVIOUS"
+  else
+      current="$(active_generation)"
+      if [[ "$current" = "$GENERATION" ]]; then
+        write_journal rolling-back "$TX_PREVIOUS"
+        rollback_pointer "$TX_PREVIOUS"
+        write_journal rolled-back "$TX_PREVIOUS"
+      else
+        [[ "$current" = "$TX_PREVIOUS" ]] || {
+          echo 'activation failed with an unexpected active pointer' >&2
+          exit 1
+        }
+        if [[ -d "$UPLOADS/$GENERATION" && ! -L "$UPLOADS/$GENERATION" ]]; then
+          restore_upload_to_publisher
+          write_journal prepared "$TX_PREVIOUS"
+        elif [[ -d "$GENERATIONS/$GENERATION" && ! -L "$GENERATIONS/$GENERATION" ]]; then
+          write_journal rolled-back "$TX_PREVIOUS"
+        else
+          echo 'failed activation lost both candidate locations' >&2
+          exit 1
+        fi
+      fi
+      if [[ "$was_active" = true ]]; then
+        [[ "$TX_PREVIOUS" != - ]] || { echo 'no previous service should be active' >&2; exit 1; }
+        systemctl start "$SERVICE"
+        if ! wait_for_exact_generation "$TX_PREVIOUS" || ! running_image_is_pinned; then
+          echo 'activation failed and the previous service did not recover' >&2
+          exit 1
+        fi
+      fi
+      echo 'remote generation validation or activation failed' >&2
+      exit 1
+  fi
+fi
+
+# Bootstrap activation intentionally stops before starting a public-capable
+# service. Authentication is configured and probed in a separate transaction.
+if [[ "$TX_PREVIOUS" = - && "$was_active" = false ]]; then
+  rm -f "$JOURNAL"
+  sync -f "$LIFECYCLE"
+  echo activated-pending-auth
+  exit 0
+fi
+
+if systemctl start "$SERVICE" \
+  && wait_for_exact_generation "$GENERATION" \
+  && running_image_is_pinned; then
+  run_legal verify --quiet >/dev/null
+  run_legal prune-generations --keep-inactive 1 >/dev/null
+  rm -f "$JOURNAL"
+  sync -f "$LIFECYCLE"
+  echo activated
+  exit 0
+fi
+
+systemctl stop "$SERVICE" || true
+write_journal rolling-back "$TX_PREVIOUS"
+if [[ "$TX_PREVIOUS" = - ]]; then
+  rollback_pointer "$TX_PREVIOUS"
+else
+  rollback_pointer "$TX_PREVIOUS"
+  write_journal rolled-back "$TX_PREVIOUS"
+  if [[ "$was_active" = true ]]; then
+    systemctl start "$SERVICE"
+    if ! wait_for_exact_generation "$TX_PREVIOUS" || ! running_image_is_pinned; then
+      echo 'new generation failed and the previous service did not recover' >&2
+      exit 1
+    fi
+  fi
+fi
+if [[ "$TX_PREVIOUS" = - ]]; then write_journal rolled-back "$TX_PREVIOUS"; fi
+echo 'new generation failed readiness and the previous state was restored' >&2
+exit 1

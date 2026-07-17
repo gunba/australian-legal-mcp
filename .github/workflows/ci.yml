@@ -25,10 +25,12 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.95.0
       - name: Check every target and feature
-        run: cargo check --all-targets --all-features --locked
+        run: cargo check --workspace --all-targets --all-features --locked
       - name: Test
-        run: cargo test --locked
+        run: cargo test --workspace --locked
 
   quality:
     name: lint, security, and contracts
@@ -39,11 +41,12 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
+          toolchain: 1.95.0
           components: clippy, rustfmt
       - name: Rust formatting
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Install security policy tools
         run: |
           cargo install cargo-audit --version 0.22.2 --locked
@@ -53,7 +56,104 @@ jobs:
           cargo audit
           cargo deny check advisories
       - name: Shell syntax
-        run: bash -n scripts/*.sh
+        run: |
+          bash -n scripts/*.sh scripts/legal-mcp-azure-deploy scripts/legal-mcp-host-deploy \
+            scripts/legal-mcp-publisher-command infra/hosting/*.sh infra/linode/*.sh tests/*.sh
+          paths=(scripts/*.sh scripts/legal-mcp-azure-deploy scripts/legal-mcp-host-deploy \
+            scripts/legal-mcp-publisher-command infra/hosting/*.sh infra/linode/*.sh tests/*.sh)
+          container_paths=()
+          for path in "${paths[@]}"; do container_paths+=("/repo/$path"); done
+          docker run --rm -v "$PWD:/repo:ro" \
+            koalaman/shellcheck@sha256:0fa384f2a6171aef8aab2999a531c8c8158727d54a8f20157a5c3c51a734d6b2 \
+            "${container_paths[@]}"
+          awk '
+            /content: \|/ { found=1; next }
+            found && /^      / { sub(/^      /, ""); print; next }
+            found { exit }
+          ' infra/azure/cloud-init.yml > "$RUNNER_TEMP/prepare-data-disk"
+          docker run --rm -v "$RUNNER_TEMP/prepare-data-disk:/script:ro" \
+            koalaman/shellcheck@sha256:0fa384f2a6171aef8aab2999a531c8c8158727d54a8f20157a5c3c51a734d6b2 \
+            /script
+          docker run --rm -v "$PWD:/repo:ro" -w /repo \
+            rhysd/actionlint@sha256:2ef3ed94025747bd876118bfcae405d13532a07904d5ee0d70948110ef32f71d
+      - name: Hosting, preserved Azure, and Microsoft contracts
+        run: |
+          python3 -m py_compile \
+            scripts/azure_generation_transport.py \
+            scripts/manage-api-keys.py \
+            scripts/render-microsoft-integrations.py \
+            scripts/test-remote-mcp.py
+          python3 -m unittest \
+            tests/test_azure_generation_transport.py \
+            tests/test_manage_api_keys.py \
+            tests/test_remote_mcp.py \
+            tests/test_render_microsoft_integrations.py
+          az bicep build --file infra/azure/main.bicep --stdout \
+            > "$RUNNER_TEMP/azure-main.json"
+          jq -e '.resources | length > 0' "$RUNNER_TEMP/azure-main.json" >/dev/null
+          sed 's/__PUBLIC_HOST__/legalmcptest.australiaeast.cloudapp.azure.com/' \
+            infra/hosting/Caddyfile > "$RUNNER_TEMP/Caddyfile"
+          docker run --rm \
+            -v "$RUNNER_TEMP/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy@sha256:98eb57d882ccd5213d1688764db10c1ca2c58a1ca3a6717a3411ad798f7a423a \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          cargo run --locked -- export-mcp-tools \
+            --output "$RUNNER_TEMP/mcp-tools.json"
+          python3 scripts/render-microsoft-integrations.py \
+            --tools "$RUNNER_TEMP/mcp-tools.json" \
+            --public-host legalmcptest.australiaeast.cloudapp.azure.com \
+            --tenant-id 11111111-1111-1111-1111-111111111111 \
+            --server-app-id 22222222-2222-2222-2222-222222222222 \
+            --sso-registration-id test-registration \
+            --output-dir "$RUNNER_TEMP/microsoft"
+          jq -e '
+            .schema_version == "v2.4" and
+            .runtimes[0].type == "RemoteMCPServer" and
+            (.runtimes[0].spec.mcp_tool_description.tools | length) == 7
+          ' "$RUNNER_TEMP/microsoft/microsoft-365-ai-plugin.json" >/dev/null
+          rendered_quadlet="$RUNNER_TEMP/legal-mcp.container"
+          sed 's|__IMAGE_DIGEST__|ghcr.io/gunba/australian-legal-mcp@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|' \
+            infra/hosting/legal-mcp.container.template > "$rendered_quadlet"
+          grep -Fq 'PublishPort=127.0.0.1:51235:51235' "$rendered_quadlet"
+          grep -Fq 'ReadOnly=true' "$rendered_quadlet"
+          mkdir "$RUNNER_TEMP/quadlet"
+          cp "$rendered_quadlet" "$RUNNER_TEMP/quadlet/legal-mcp.container"
+          docker run --rm --entrypoint /usr/lib/systemd/system-generators/podman-system-generator \
+            -e QUADLET_UNIT_DIRS=/quadlet -v "$RUNNER_TEMP/quadlet:/quadlet:ro" \
+            quay.io/podman/stable@sha256:cc3563b15b511b3e84d23dc04087cf06df5dee8146c3834c652bd217d4ace1cd \
+            -dryrun > "$RUNNER_TEMP/generated-quadlet"
+          grep -Fq -- '--cpus=3.5' "$RUNNER_TEMP/generated-quadlet"
+          grep -Fq 'LimitCORE=0' "$RUNNER_TEMP/generated-quadlet"
+      - name: Ubuntu 24.04 host recovery and restricted rsync contracts
+        run: |
+          docker run --rm --user 0:0 --entrypoint /bin/bash \
+            --volume "$PWD/tests/host-rrsync-options-fixture.sh:/fixture:ro" \
+            --volume "$PWD/tests/host-auth-recovery-fixture.sh:/auth-fixture:ro" \
+            --volume "$PWD/infra/hosting/configure-auth.sh:/configure-auth:ro" \
+            --volume "$PWD/infra/hosting/update-image.sh:/update-image:ro" \
+            ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \
+            -ceu 'export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null; apt-get install --yes --no-install-recommends python3 rsync >/dev/null; /fixture; /auth-fixture'
+      - name: Linode OpenTofu contract
+        run: |
+          mkdir "$RUNNER_TEMP/linode-tofu"
+          cp -a infra/linode/. "$RUNNER_TEMP/linode-tofu/"
+          tofu_image=ghcr.io/opentofu/opentofu@sha256:6b66d996afc7f043154e33a0420285d0d58c165305ac8f36d32df213a3c4bbd4
+          docker run --rm -v "$RUNNER_TEMP/linode-tofu:/workspace" -w /workspace \
+            "$tofu_image" fmt -check
+          docker run --rm -v "$RUNNER_TEMP/linode-tofu:/workspace" -w /workspace \
+            "$tofu_image" init -backend=false -lockfile=readonly
+          docker run --rm -v "$RUNNER_TEMP/linode-tofu:/workspace" -w /workspace \
+            "$tofu_image" validate
+          ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/linode-admin"
+          cat > "$RUNNER_TEMP/linode-tofu/terraform.tfvars" <<EOF
+          admin_ssh_public_key = "$(cat "$RUNNER_TEMP/linode-admin.pub")"
+          admin_source_cidr    = "203.0.113.10/32"
+          EOF
+          docker run --rm \
+            -e LINODE_TOKEN=0000000000000000000000000000000000000000000000000000000000000000 \
+            -v "$RUNNER_TEMP/linode-tofu:/workspace" -w /workspace \
+            "$tofu_image" plan -refresh=false -input=false -lock=false \
+            -out=/tmp/offline.tfplan
       - name: Metadata and npm allowlist contracts
         run: |
           npm pack --dry-run --json > "$RUNNER_TEMP/npm-pack.json"
@@ -82,6 +182,8 @@ jobs:
               marketplace["plugins"][0]["version"],
           }
           assert len(versions) == 1, f"manifest versions differ: {versions}"
+          version = versions.pop()
+          assert f"ARG VERSION={version}" in pathlib.Path("Containerfile").read_text()
           expected_skills = [
               "skills/australian-legal-mcp/SKILL.md",
               "skills/setup-australian-legal-mcp/SKILL.md",
@@ -92,7 +194,8 @@ jobs:
           names = {entry["path"] for entry in packed}
           allowed = (
               "package.json", "README.md", "LICENSE", "AGENTS.md", ".mcp.json",
-              "CURRENT_STATE.md", "DEPLOYMENT.md", "MAINTENANCE.md", "PLAN.md",
+              "CURRENT_STATE.md", "DEPLOYMENT.md", "MAINTENANCE.md",
+              "MICROSOFT_COPILOT.md", "PLAN.md",
           )
           roots = (".claude-plugin/", "skills/")
           unexpected = {
@@ -138,3 +241,104 @@ jobs:
             > "$RUNNER_TEMP/stdio.jsonl"
           jq -e '.result.serverInfo.name == "australian-legal-mcp"' \
             "$RUNNER_TEMP/stdio.jsonl"
+
+  container:
+    name: hardened OCI image
+    needs: quality
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Build and exercise the production container contract
+        shell: bash
+        run: |
+          version=$(jq -r .version package.json)
+          revision=$(git rev-parse HEAD)
+          image=legal-mcp-ci:$revision
+          docker build --file Containerfile \
+            --build-arg "VERSION=$version" --build-arg "VCS_REF=$revision" \
+            --tag "$image" .
+          test "$(docker image inspect "$image" --format '{{.Config.User}}')" = 971:971
+          docker run --rm --read-only --cap-drop=ALL \
+            --security-opt=no-new-privileges "$image" verify-runtime |
+            grep -F '"onnx_runtime_ready":true'
+          docker run --rm --user 0:0 --entrypoint /usr/bin/bash \
+            --volume "$PWD/scripts/legal-mcp-publisher-command:/publisher:ro" \
+            --volume "$PWD/tests/host-publisher-fixture.sh:/fixture:ro" \
+            "$image" /fixture
+
+          container=$(docker create "$image")
+          cleanup() {
+            if [[ -n "$container" ]]; then docker rm -f "$container" >/dev/null 2>&1 || true; fi
+            docker rm -f legal-mcp-ci-test >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker export "$container" > "$RUNNER_TEMP/image-rootfs.tar"
+          docker rm "$container" >/dev/null
+          container=''
+          tar -tf "$RUNNER_TEMP/image-rootfs.tar" > "$RUNNER_TEMP/image-rootfs.list"
+          if grep -Eq '(^var/lib/legal-mcp/(generations|lifecycle)/.+|(^|/)(legal\.db|[^/]+\.ann|model\.onnx|tokenizer\.json)$)' \
+            "$RUNNER_TEMP/image-rootfs.list"; then
+            echo 'container image unexpectedly contains corpus generation data' >&2
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/runtime"/{generations,lifecycle,state}
+          sudo chown 971:971 "$RUNNER_TEMP/runtime/state"
+          token="automation.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+          digest=$(printf '%s' "$token" | sha256sum | cut -d ' ' -f 1)
+          printf '{"keys":[{"id":"automation","sha256":"%s"}],"version":1}\n' "$digest" |
+            sudo tee "$RUNNER_TEMP/api-keys.json" >/dev/null
+          sudo chown 971:971 "$RUNNER_TEMP/api-keys.json"
+          sudo chmod 400 "$RUNNER_TEMP/api-keys.json"
+          cat > "$RUNNER_TEMP/runtime.env" <<EOF
+          LEGAL_MCP_HTTP_AUTH=api-key
+          LEGAL_MCP_API_KEYS_FILE=/run/secrets/legal-mcp-api-keys.json
+          EOF
+          docker run --detach --name legal-mcp-ci-test \
+            --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+            --pids-limit=256 --tmpfs /tmp:rw,nodev,nosuid,noexec,size=64m \
+            --publish 127.0.0.1:51235:51235 \
+            --env-file "$RUNNER_TEMP/runtime.env" \
+            --volume "$RUNNER_TEMP/runtime/generations:/var/lib/legal-mcp/generations:ro" \
+            --volume "$RUNNER_TEMP/runtime/lifecycle:/var/lib/legal-mcp/lifecycle:ro" \
+            --volume "$RUNNER_TEMP/runtime/state:/var/lib/legal-mcp/state:rw" \
+            --volume "$RUNNER_TEMP/api-keys.json:/run/secrets/legal-mcp-api-keys.json:ro" \
+            "$image" serve --port 51235 --network-scope container --require-http-auth
+          deadline=$((SECONDS + 30))
+          until docker logs legal-mcp-ci-test 2>&1 |
+            grep -q 'listening on http://127.0.0.1:51235/mcp'; do
+            test "$(docker inspect legal-mcp-ci-test --format '{{.State.Status}}')" = running
+            (( SECONDS < deadline )) || { echo 'container did not become ready' >&2; exit 1; }
+            sleep 0.1
+          done
+          test "$(docker port legal-mcp-ci-test 51235/tcp)" = '127.0.0.1:51235'
+          status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --header 'Accept: application/json, text/event-stream' \
+            --header 'Content-Type: application/json' \
+            --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+            http://127.0.0.1:51235/mcp)
+          test "$status" = 401
+          curl --fail --silent --show-error \
+            --header 'Accept: application/json, text/event-stream' \
+            --header 'Content-Type: application/json' \
+            --header "X-API-Key: $token" \
+            --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+            http://127.0.0.1:51235/mcp |
+            jq -e '.result.serverInfo.name == "australian-legal-mcp"' >/dev/null
+          test "$(docker inspect legal-mcp-ci-test --format '{{.HostConfig.ReadonlyRootfs}}')" = true
+          docker inspect legal-mcp-ci-test --format '{{json .HostConfig.CapDrop}}' |
+            grep -F 'ALL'
+          docker rm --force legal-mcp-ci-test >/dev/null
+          trap - EXIT
+      - name: Scan the production image
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/legal-mcp-ci.tar"
+          docker save --output "$archive" "legal-mcp-ci:${{ github.sha }}"
+          docker run --rm --volume "$archive:/input/image.tar:ro" \
+            aquasec/trivy@sha256:16f1ee8462d0ba07dd69239150d60ba7b591c55e02dfc33a3fc19710b861d180 \
+            image --input /input/image.tar --scanners vuln --pkg-types os,library \
+            --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 \
+            --skip-version-check

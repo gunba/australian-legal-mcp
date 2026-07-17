@@ -15,7 +15,6 @@ use ort::session::{
 };
 use ort::value::TensorRef;
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -165,7 +164,6 @@ impl SemanticEncodeStats {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn initialize_packaged_ort() -> Result<()> {
     static INITIALIZED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     match INITIALIZED.get_or_init(|| {
@@ -177,11 +175,11 @@ fn initialize_packaged_ort() -> Result<()> {
                 executable
                     .parent()
                     .ok_or_else(|| anyhow!("legal-mcp executable has no parent directory"))?
-                    .join("libonnxruntime.so")
+                    .join(packaged_ort_filename())
             };
             let metadata = std::fs::symlink_metadata(&library).with_context(|| {
                 format!(
-                    "ONNX Runtime library not found at {}; set ORT_DYLIB_PATH to a real libonnxruntime.so",
+                    "ONNX Runtime library not found at {}; set ORT_DYLIB_PATH to a real ONNX Runtime shared library",
                     library.display()
                 )
             })?;
@@ -203,9 +201,23 @@ fn initialize_packaged_ort() -> Result<()> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn initialize_packaged_ort() -> Result<()> {
-    Ok(())
+fn packaged_ort_filename() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "onnxruntime.dll"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "libonnxruntime.dylib"
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        "libonnxruntime.so"
+    }
+}
+
+pub(crate) fn verify_onnx_runtime() -> Result<()> {
+    initialize_packaged_ort()
 }
 
 pub(crate) struct SemanticRuntime {

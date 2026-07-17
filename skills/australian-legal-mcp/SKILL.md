@@ -26,13 +26,14 @@ ATO default.
 
 If the tools are missing or connection fails, tell the user that you are
 checking the Australian legal research service, then load
-`setup-australian-legal-mcp`. Diagnose the configured private HTTPS endpoint and
-serving-host readiness first. `legal-mcp mcp` is valid only for deliberately
-configured local stdio development.
+`setup-australian-legal-mcp`. Diagnose the hosted Linode OCI endpoint,
+API-key/Entra challenge, Caddy, and serving-host readiness first. `legal-mcp mcp` is
+valid only for deliberately configured local stdio development.
 
 The runtime cannot download or update a corpus. A missing active generation
 requires maintainer build/validation, immutable activation or rollback, and—on
-the hosted service—direct SSH deployment. Never recommend `legal-mcp update`.
+the hosted service—restricted CoW/rsync generation deployment. Never recommend
+`legal-mcp update`.
 
 Do not silently substitute general web search when the source-grounded service
 should be used. If recovery is impossible, state the exact failure and the

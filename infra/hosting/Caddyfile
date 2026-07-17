@@ -1,0 +1,50 @@
+# Rendered by the provider host installer. Podman publishes the Rust service
+# only on host loopback; Caddy exposes MCP and OAuth resource metadata only.
+{
+	servers {
+		timeouts {
+			read_body 30s
+			read_header 10s
+			write 5m
+			idle 5m
+		}
+	}
+}
+
+http://__PUBLIC_HOST__ {
+	respond "not found" 404
+}
+
+https://__PUBLIC_HOST__ {
+	encode zstd gzip
+
+	@mcp path /mcp /.well-known/oauth-protected-resource/mcp
+	handle @mcp {
+		request_body {
+			max_size 1MB
+		}
+		header {
+			-Server
+			Cache-Control "no-store"
+			Strict-Transport-Security "max-age=31536000"
+			X-Content-Type-Options "nosniff"
+		}
+		reverse_proxy 127.0.0.1:51235 {
+			flush_interval -1
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 310s
+				read_timeout 310s
+				write_timeout 310s
+				max_conns_per_host 8
+			}
+		}
+	}
+
+	handle {
+		respond "not found" 404
+	}
+
+	# Access logging is deliberately disabled: request URIs may contain user
+	# research terms, and authorization material must never enter proxy logs.
+}

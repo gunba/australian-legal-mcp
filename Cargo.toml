@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "australian-legal-mcp"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2021"
 license = "MIT"
 description = "Standalone MCP server for Australian legal sources"
@@ -31,6 +31,7 @@ legal-model = { version = "0.1.0", path = "crates/legal-model" }
 legal-source-sdk = { version = "0.1.0", path = "crates/legal-source-sdk" }
 libc = "0.2"
 heed = { version = "=0.22.1", default-features = false }
+jsonwebtoken = "9.3.1"
 rand = "0.8.5"
 rand_chacha = "=0.3.1"
 rayon = "1.10"
@@ -95,7 +96,11 @@ ort = { version = "2.0.0-rc.12", default-features = false, features = [
   "ndarray",
 ] }
 
-[target.'cfg(all(not(windows), not(target_os = "linux")))'.dependencies]
-ort = "2.0.0-rc.12"
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "2.0.0-rc.12", default-features = false, features = [
+  "load-dynamic",
+  "api-24",
+  "ndarray",
+] }
 
 [dev-dependencies]
