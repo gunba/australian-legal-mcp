@@ -31,11 +31,16 @@ jobs:
       - name: Match checkout, tag, and Cargo version
         id: release_commit
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           test "$(git describe --tags --exact-match)" = "$RELEASE_TAG"
-          git fetch origin main --no-tags
-          git merge-base --is-ancestor HEAD origin/main
+          commit=$(git rev-parse HEAD)
+          remote_commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)
+          test "$remote_commit" = "$commit"
+          relationship=$(gh api "repos/$GITHUB_REPOSITORY/compare/$commit...main" --jq .status)
+          [[ "$relationship" = ahead || "$relationship" = identical ]]
           version=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "australian-legal-mcp") | .version')
           test "v$version" = "$RELEASE_TAG"
@@ -43,7 +48,7 @@ jobs:
           test "$(jq -r .version .claude-plugin/plugin.json)" = "$version"
           test "$(jq -r '.plugins[0].version' .claude-plugin/marketplace.json)" = "$version"
           grep -Fxq "ARG VERSION=$version" Containerfile
-          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           toolchain: 1.95.0
@@ -457,11 +462,10 @@ jobs:
             --skip-version-check
       - name: Recheck release identity
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          remote_commit=$(git ls-remote origin "refs/tags/$RELEASE_TAG^{}" | awk 'NR==1 {print $1}')
-          if [[ -z "$remote_commit" ]]; then
-            remote_commit=$(git ls-remote origin "refs/tags/$RELEASE_TAG" | awk 'NR==1 {print $1}')
-          fi
+          remote_commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)
           test "$remote_commit" = "${{ needs.validate.outputs.commit }}"
       - name: Publish or reuse the scanned OCI digest
         id: push
