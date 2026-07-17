@@ -2,7 +2,8 @@
 
 Instructions for agents developing, installing, or operating Australian Legal
 MCP. Read [README.md](README.md), [MAINTENANCE.md](MAINTENANCE.md),
-[CURRENT_STATE.md](CURRENT_STATE.md), and [DEPLOYMENT.md](DEPLOYMENT.md).
+[CURRENT_STATE.md](CURRENT_STATE.md), [DEPLOYMENT.md](DEPLOYMENT.md), and
+[MICROSOFT_COPILOT.md](MICROSOFT_COPILOT.md).
 
 ## Canonical contract
 
@@ -22,10 +23,12 @@ MCP. Read [README.md](README.md), [MAINTENANCE.md](MAINTENANCE.md),
 | Live URI | `legal://<source>/<encoded-native-id>` |
 
 Source acquisition, OCR, embeddings, and corpus construction run on the local
-RTX maintainer host. A complete generation is validated and atomically
-activated, then transferred directly over SSH to a CPU serving host. The serving
-runtime never downloads, scrapes, embeds, packages, or publishes corpus/model
-artifacts. GitHub Releases are binary-only.
+RTX maintainer host. A complete generation is validated, atomically activated,
+and delta-copied into staging on an external XFS/reflink volume attached to the
+current Akamai/Linode VPS. A one-shot copy of the exact serving image validates
+and activates it. The serving container never scrapes, embeds, builds, or
+publishes corpus/model artifacts, and the image contains no corpus. GitHub
+Releases are binary-only; GHCR images are digest-pinned and attested.
 
 ## Design principles
 
@@ -136,16 +139,24 @@ Local maintainer lifecycle:
 cargo build --release --features cuda
 scripts/maintainer-sync.sh             # or --full
 LEGAL_MCP_DATA_DIR="$PWD/data/runtime" legal-mcp verify
-scripts/deploy-generation.sh deploy@example-vps
+scripts/deploy-generation.sh \
+  --host legal-mcp-publisher@HOST
 ```
 
 Manual recovery uses `activate`, `verify`, `rollback`, and
 `prune-generations`. There is no runtime `update`, corpus download, corpus/model
 package, publication, or offline-bundle command.
 
-The hosted service runs `legal-mcp serve` on loopback behind private Tailscale
-HTTPS. Local stdio development may use `legal-mcp mcp`. Never expose port 51235
-publicly or substitute a shared static token for proper private identity/OAuth.
+Hosted service runs in the digest-pinned OCI image as UID/GID 971 with a
+read-only root, all capabilities dropped, and separate read-only corpus/lifecycle
+plus read-write state bind mounts. Podman publishes the bridge port only at
+`127.0.0.1:51235`; native Caddy owns public TLS. Hosted startup requires
+`api-key`, `entra`, or `entra+api-key` authentication. API keys are individually
+identified 256-bit credentials stored server-side only as protected digests;
+Copilot always uses delegated Entra identity. Caddy remains disabled until auth
+and exact readiness pass. Local stdio may use `legal-mcp mcp`. Never expose
+51235, put corpus bytes in the image, or use FUSE/network storage for live
+SQLite, ANN, pointers, or locks.
 
 ## Validation
 
@@ -158,6 +169,13 @@ cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
 cargo audit
 cargo deny check advisories
 bash -n scripts/*.sh
+python3 -m unittest \
+  tests/test_azure_generation_transport.py \
+  tests/test_manage_api_keys.py \
+  tests/test_remote_mcp.py \
+  tests/test_render_microsoft_integrations.py
+tofu -chdir=infra/linode init -backend=false -lockfile=readonly
+tofu -chdir=infra/linode validate
 git diff --check
 LEGAL_MCP_DATA_DIR="$PWD/data/runtime" scripts/smoke.sh
 ```
@@ -170,8 +188,10 @@ and per-source ANN recall ≥ 0.99 at 50.
 
 - Missing active corpus: do not suggest a download. Locate/build a validated
   generation, activate it, or roll back.
-- Hosted endpoint failure: check Tailscale, `/livez`, `/readyz`,
-  `systemctl status legal-mcp.service`, and `journalctl -u legal-mcp.service`.
+- Hosted endpoint failure: check the Akamai Cloud Firewall and UFW, API-key or
+  Entra challenges, Caddy, loopback `/livez` and `/readyz`,
+  `systemctl status legal-mcp.service`, `podman inspect australian-legal-mcp`,
+  and `journalctl -u legal-mcp.service`.
 - Local stdio failure: confirm `legal-mcp mcp` and the intended
   `LEGAL_MCP_DATA_DIR`.
 - Empty search: require the explicit source, inspect `stats`, and check type/date

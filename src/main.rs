@@ -33,6 +33,7 @@ mod db;
 mod extract;
 mod frl;
 mod html;
+mod http_auth;
 mod legal_source;
 mod official_sources;
 mod pipeline;
@@ -48,6 +49,7 @@ mod uri;
 use bert_tokenizer::BertWordPieceTokenizer;
 use build::{build_corpus, BuildCorpusArgs};
 use config::live_dir;
+use http_auth::{AuthFailureKind, HttpAuth};
 use legal_model::{AssetRef, ChunkRef, DocumentId, SourceId};
 use legal_source::source_registry;
 use retrieval::{
@@ -61,9 +63,9 @@ use semantic::dot_i8_scalar_reference;
 use semantic::EMBEDDING_MODEL_FILES;
 use semantic::{SemanticEncodeStats, SemanticModelPaths, SemanticRuntime};
 use source::{
-    activate_local_generation, link_download, prune_inactive_generations, rollback_generation,
-    scrape_diff, snapshot_reduce, stats, tree_crawl, verify_active_generation, LinkDownloadArgs,
-    ModelInfo,
+    activate_local_generation, deactivate_generation, link_download, prune_inactive_generations,
+    rollback_generation, scrape_diff, snapshot_reduce, stats, tree_crawl, verify_active_generation,
+    verify_active_generation_quick, LinkDownloadArgs, ModelInfo,
 };
 use source_update::{run_source_updates, SourceUpdateMode, SourceUpdateRequest};
 
@@ -173,6 +175,21 @@ struct SourceWorkspaceArg {
     path: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum HttpNetworkScope {
+    Loopback,
+    Container,
+}
+
+impl HttpNetworkScope {
+    fn bind_address(self) -> &'static str {
+        match self {
+            Self::Loopback => "127.0.0.1",
+            Self::Container => "0.0.0.0",
+        }
+    }
+}
+
 impl std::str::FromStr for SourceWorkspaceArg {
     type Err = String;
 
@@ -215,16 +232,37 @@ enum Command {
     Serve {
         #[arg(long)]
         port: Option<u16>,
-        #[arg(long, default_value = "127.0.0.1")]
-        bind: String,
+        #[arg(long, value_enum, default_value_t = HttpNetworkScope::Loopback)]
+        network_scope: HttpNetworkScope,
         #[arg(long, hide = true)]
         ready_stdout: bool,
+        /// Refuse to start unless at least one configured HTTP authenticator is enabled.
+        #[arg(long)]
+        require_http_auth: bool,
+        /// Refuse to start unless one immutable corpus generation is ready.
+        #[arg(long)]
+        require_ready_corpus: bool,
+    },
+    /// Probe the loopback readiness endpoint for container health checks.
+    #[command(hide = true)]
+    Healthcheck {
+        #[arg(long, default_value_t = 51235)]
+        port: u16,
     },
     /// Validate and atomically activate a complete local corpus generation.
     /// The directory is moved into LEGAL_MCP_DATA_DIR and is never fetched.
     Activate {
         #[arg(long)]
         generation_dir: PathBuf,
+        /// Refuse activation unless validated content derives this exact generation ID.
+        #[arg(long)]
+        expected_generation: Option<String>,
+    },
+    /// Remove the active pointer only when it still names the expected generation.
+    #[command(hide = true)]
+    Deactivate {
+        #[arg(long)]
+        expected_generation: String,
     },
     /// Atomically reactivate an already installed immutable generation.
     Rollback {
@@ -240,7 +278,14 @@ enum Command {
     Stats {},
     /// Fail unless every source, model file, and ANN sidecar in the active
     /// generation is ready for production search.
-    Verify {},
+    Verify {
+        /// Emit only the active generation and corpus totals after full verification.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Load the packaged ONNX Runtime shared library and report success.
+    #[command(hide = true)]
+    VerifyRuntime {},
     /// Run a search from the CLI.
     Search {
         query: String,
@@ -323,6 +368,13 @@ enum Command {
     },
     /// Print the production source catalogue, one canonical source ID per line.
     SourceList,
+    /// Export the exact tools/list result used to render Microsoft integration
+    /// assets without starting a corpus server.
+    #[command(hide = true)]
+    ExportMcpTools {
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Fetch compact statutory definitions for a term.
     GetDefinition {
         term: String,
@@ -444,33 +496,67 @@ fn main() -> Result<()> {
         Command::Mcp {} => serve_stdio_mcp(),
         Command::Serve {
             port,
-            bind,
+            network_scope,
             ready_stdout,
+            require_http_auth,
+            require_ready_corpus,
         } => {
+            if network_scope == HttpNetworkScope::Container && !require_http_auth {
+                bail!("container network scope requires --require-http-auth");
+            }
             let choice = config::resolve_serve_port(port)?;
             let (cached_instructions, corpus_ready) = server_instructions();
+            if require_ready_corpus && !corpus_ready {
+                bail!("--require-ready-corpus refuses to start without a ready generation");
+            }
+            let http_auth = HttpAuth::from_env()?;
+            if require_http_auth && !http_auth.is_enabled() {
+                bail!(
+                    "--require-http-auth refuses to start without configured HTTP authentication"
+                );
+            }
+            if require_http_auth {
+                http_auth
+                    .prewarm()
+                    .context("prewarming Entra signing keys for hosted HTTP")?;
+            }
             let state = ServerState {
                 cached_instructions,
+                http_auth,
+                allow_non_loopback_peers: network_scope == HttpNetworkScope::Container,
                 ..Default::default()
             };
             let model_ready = if corpus_ready {
-                match state.encode_query_embedding("Australian legal service readiness") {
-                    Ok(_) => true,
-                    Err(error) => {
-                        eprintln!("legal-mcp semantic model readiness failed: {error:#}");
-                        false
-                    }
-                }
+                state
+                    .encode_query_embedding("Australian legal service readiness")
+                    .context("loading and executing the active semantic model before serving")?;
+                true
             } else {
                 false
             };
             state.ready.store(model_ready, Ordering::Release);
-            serve(choice, &bind, ready_stdout, Arc::new(state))
+            serve(choice, network_scope, ready_stdout, Arc::new(state))
         }
-        Command::Activate { generation_dir } => {
+        Command::Healthcheck { port } => healthcheck(port),
+        Command::Activate {
+            generation_dir,
+            expected_generation,
+        } => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&activate_local_generation(&generation_dir)?)?
+                serde_json::to_string_pretty(&activate_local_generation(
+                    &generation_dir,
+                    expected_generation.as_deref(),
+                )?)?
+            );
+            Ok(())
+        }
+        Command::Deactivate {
+            expected_generation,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&deactivate_generation(&expected_generation)?)?
             );
             Ok(())
         }
@@ -494,13 +580,34 @@ fn main() -> Result<()> {
             println!("{}", stats()?);
             Ok(())
         }
-        Command::Verify {} => {
-            let report = verify_active_generation()?;
+        Command::Verify { quiet } => {
             let state = ServerState::default();
-            state
-                .encode_query_embedding("Australian legal service readiness")
-                .context("loading and executing the active semantic model")?;
-            println!("{}", report);
+            let report = verify_active_generation(|| {
+                state
+                    .encode_query_embedding("Australian legal service readiness")
+                    .map(|_| ())
+            })?;
+            if quiet {
+                let value: JsonValue = serde_json::from_str(&report)?;
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "active_generation": value["active_generation"],
+                        "documents": value["documents"],
+                        "chunks": value["chunks"],
+                        "chunk_embeddings": value["chunk_embeddings"],
+                        "definitions": value["definitions"],
+                        "semantic_search_ready": value["semantic_search_ready"],
+                    }))?
+                );
+            } else {
+                println!("{}", report);
+            }
+            Ok(())
+        }
+        Command::VerifyRuntime {} => {
+            semantic::verify_onnx_runtime()?;
+            println!("{{\"onnx_runtime_ready\":true}}");
             Ok(())
         }
         Command::Search {
@@ -686,6 +793,18 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::ExportMcpTools { output } => {
+            let rendered = format!(
+                "{}\n",
+                serde_json::to_string_pretty(&json!({ "tools": tool_descriptors() }))?
+            );
+            if let Some(output) = output {
+                config::atomic_write(&output, rendered.as_bytes())?;
+            } else {
+                print!("{rendered}");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -709,6 +828,8 @@ struct ServerState {
     cached_instructions: String,
     ready: AtomicBool,
     request_sequence: AtomicU64,
+    http_auth: HttpAuth,
+    allow_non_loopback_peers: bool,
 }
 
 impl ServerState {
@@ -721,6 +842,8 @@ impl ServerState {
             cached_instructions: String::new(),
             ready: AtomicBool::new(false),
             request_sequence: AtomicU64::new(0),
+            http_auth: HttpAuth::default(),
+            allow_non_loopback_peers: false,
         }
     }
 
@@ -733,6 +856,8 @@ impl ServerState {
             cached_instructions: String::new(),
             ready: AtomicBool::new(false),
             request_sequence: AtomicU64::new(0),
+            http_auth: HttpAuth::default(),
+            allow_non_loopback_peers: false,
         }
     }
 
@@ -956,18 +1081,58 @@ fn configured_shutdown_grace() -> Result<Duration> {
     Ok(Duration::from_secs(seconds))
 }
 
+fn healthcheck(port: u16) -> Result<()> {
+    if port == 0 {
+        bail!("healthcheck port must be nonzero");
+    }
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("building readiness probe client")?;
+    let response = client
+        .get(format!("http://127.0.0.1:{port}/readyz"))
+        .header("accept", "application/json")
+        .send()
+        .context("requesting loopback readiness endpoint")?;
+    if response.status() != reqwest::StatusCode::OK {
+        bail!("readiness endpoint returned {}", response.status());
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > 4096)
+    {
+        bail!("readiness response exceeds size limit");
+    }
+    let bytes = response.bytes().context("reading readiness response")?;
+    if bytes.len() > 4096 {
+        bail!("readiness response exceeds size limit");
+    }
+    let body: JsonValue = serde_json::from_slice(&bytes).context("parsing readiness response")?;
+    let generation = body
+        .get("generation")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| anyhow!("readiness response has no active generation"))?;
+    if body.get("status").and_then(JsonValue::as_str) != Some("ok")
+        || generation.len() != 64
+        || !generation
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("readiness response is malformed or not ready");
+    }
+    Ok(())
+}
+
 fn serve(
     choice: config::PortChoice,
-    bind: &str,
+    network_scope: HttpNetworkScope,
     ready_stdout: bool,
     state: Arc<ServerState>,
 ) -> Result<()> {
     let shutdown_grace = configured_shutdown_grace()?;
-    if bind != "127.0.0.1" {
-        bail!(
-            "HTTP MCP transport is loopback-only; --bind must be the canonical address 127.0.0.1"
-        );
-    }
+    let bind = network_scope.bind_address();
     let requested_port = match &choice {
         config::PortChoice::Cli(p) => *p,
         config::PortChoice::PluginUnchanged(p) => *p,
@@ -1032,7 +1197,7 @@ fn serve(
                     let method = format!("{:?}", request.method());
                     let path = request.url().split('?').next().unwrap_or("/").to_string();
                     let started = Instant::now();
-                    let outcome = handle_http(request, &state);
+                    let outcome = handle_http(request, &state, request_id);
                     eprintln!(
                         "{}",
                         json!({
@@ -1211,6 +1376,7 @@ fn ensure_http_server() -> Result<String> {
 
 fn mcp_http_client(timeout: Duration) -> Result<Client> {
     Ok(Client::builder()
+        .no_proxy()
         .connect_timeout(Duration::from_secs(2))
         .timeout(timeout)
         .build()?)
@@ -1327,6 +1493,10 @@ fn json_content_type() -> tiny_http::Header {
     tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap()
 }
 
+fn no_store_header() -> tiny_http::Header {
+    tiny_http::Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..]).unwrap()
+}
+
 fn request_header<'a>(request: &'a tiny_http::Request, name: &str) -> Result<Option<&'a str>> {
     let values = request
         .headers()
@@ -1396,18 +1566,50 @@ fn accepts_streamable_http(request: &tiny_http::Request) -> Result<bool> {
     Ok(accepted.contains("application/json") && accepted.contains("text/event-stream"))
 }
 
-fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<()> {
+fn handle_http(
+    mut request: tiny_http::Request,
+    state: &ServerState,
+    request_id: u64,
+) -> Result<()> {
     use tiny_http::{Header, Method, Response};
 
-    if request
-        .remote_addr()
-        .is_some_and(|address| !address.ip().is_loopback())
+    if !state.allow_non_loopback_peers
+        && request
+            .remote_addr()
+            .is_some_and(|address| !address.ip().is_loopback())
     {
         let resp = Response::from_string("forbidden").with_status_code(403);
         return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
     }
 
-    let path = request.url().split('?').next().unwrap_or("/").to_string();
+    let request_target = request.url();
+    if request_target.contains('?') {
+        let resp = Response::from_string("not found").with_status_code(404);
+        return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
+    }
+    let path = request_target.to_string();
+    if state
+        .http_auth
+        .metadata_path()
+        .is_some_and(|metadata_path| path == metadata_path)
+    {
+        if !matches!(request.method(), Method::Get) {
+            let resp = Response::from_string("method not allowed")
+                .with_status_code(405)
+                .with_header(Header::from_bytes(&b"Allow"[..], &b"GET"[..]).unwrap())
+                .with_header(no_store_header());
+            return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
+        }
+        let metadata = state
+            .http_auth
+            .protected_resource_metadata()
+            .expect("metadata paths exist only when Entra auth is enabled");
+        let resp = Response::from_string(serde_json::to_string(&metadata)?)
+            .with_status_code(200)
+            .with_header(json_content_type())
+            .with_header(no_store_header());
+        return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
+    }
     if path == "/livez" || path == "/readyz" {
         if !matches!(request.method(), Method::Get) {
             let resp = Response::from_string("method not allowed").with_status_code(405);
@@ -1423,21 +1625,31 @@ fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<(
         });
         let resp = Response::from_string(serde_json::to_string(&body)?)
             .with_status_code(status)
-            .with_header(json_content_type());
+            .with_header(json_content_type())
+            .with_header(no_store_header());
         return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
     }
 
-    let is_mcp = path == "/mcp" || path == "/mcp/";
+    let is_mcp = path == "/mcp";
 
     if !is_mcp {
         let resp = Response::from_string("not found").with_status_code(404);
         return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
     }
-    if !matches!(request.method(), Method::Post) {
-        let resp = Response::from_string("method not allowed")
-            .with_status_code(405)
-            .with_header(Header::from_bytes(&b"Allow"[..], &b"POST"[..]).unwrap());
-        return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
+    for name in [
+        "Accept",
+        "Authorization",
+        "Content-Type",
+        "MCP-Protocol-Version",
+        "Origin",
+        "X-API-Key",
+    ] {
+        if request_header(&request, name).is_err() {
+            let resp = Response::from_string("duplicate security-sensitive header")
+                .with_status_code(400)
+                .with_header(no_store_header());
+            return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
+        }
     }
 
     if let Some(origin) = request_header(&request, "Origin")? {
@@ -1447,6 +1659,58 @@ fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<(
         }
     }
 
+    let authorization = request_header(&request, "Authorization")?;
+    let api_key = request_header(&request, "X-API-Key")?;
+    match state.http_auth.authorize(authorization, api_key) {
+        Ok(Some(principal)) => eprintln!(
+            "{}",
+            json!({
+                "event": "http-authorization",
+                "request_id": request_id,
+                "outcome": "allowed",
+                "principal": principal,
+            })
+        ),
+        Ok(None) => {}
+        Err(failure) => {
+            eprintln!(
+                "{}",
+                json!({
+                    "event": "http-authorization",
+                    "request_id": request_id,
+                    "outcome": "denied",
+                    "reason": failure.reason,
+                })
+            );
+            let status = match failure.kind {
+                AuthFailureKind::Missing | AuthFailureKind::Invalid => 401,
+                AuthFailureKind::InsufficientScope | AuthFailureKind::ForbiddenClient => 403,
+            };
+            let mut resp = Response::from_string(if status == 401 {
+                "unauthorized"
+            } else {
+                "forbidden"
+            })
+            .with_status_code(status)
+            .with_header(no_store_header());
+            if let Some(challenge) = state.http_auth.challenge(failure.kind) {
+                resp.add_header(
+                    Header::from_bytes(&b"WWW-Authenticate"[..], challenge.as_bytes())
+                        .map_err(|_| anyhow!("invalid authentication challenge"))?,
+                );
+            }
+            return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
+        }
+    }
+
+    if !matches!(request.method(), Method::Post) {
+        let resp = Response::from_string("method not allowed")
+            .with_status_code(405)
+            .with_header(Header::from_bytes(&b"Allow"[..], &b"POST"[..]).unwrap())
+            .with_header(no_store_header());
+        return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
+    }
+
     if !accepts_streamable_http(&request)? {
         let resp =
             Response::from_string("Accept must include application/json and text/event-stream")
@@ -1454,14 +1718,11 @@ fn handle_http(mut request: tiny_http::Request, state: &ServerState) -> Result<(
         return request.respond(resp).map_err(|e| anyhow!("respond: {e}"));
     }
 
-    let is_json = request.headers().iter().any(|header| {
-        header.field.equiv("Content-Type")
-            && header
-                .value
-                .as_str()
-                .split(';')
-                .next()
-                .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+    let is_json = request_header(&request, "Content-Type")?.is_some_and(|value| {
+        value
+            .split(';')
+            .next()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
     });
     if !is_json {
         let resp = Response::from_string(serde_json::to_string(&json_rpc_error(
@@ -2099,7 +2360,7 @@ const LEGAL_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first; hits carry type
 // If stats cannot be read, tell the operator to activate a locally built
 // generation; the runtime never downloads corpus artifacts.
 fn server_instructions() -> (String, bool) {
-    match verify_active_generation()
+    match verify_active_generation_quick()
         .ok()
         .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
     {
@@ -2157,10 +2418,23 @@ fn tool_descriptors() -> JsonValue {
         "required": ["source", "asset_id"],
         "additionalProperties": false
     });
+    let read_only_annotations = json!({
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+    });
+    let live_fetch_annotations = json!({
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+    });
     json!([
         {
             "name": "search",
             "description": "Search one source; returns document and chunk refs.",
+            "annotations": read_only_annotations.clone(),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2186,6 +2460,7 @@ fn tool_descriptors() -> JsonValue {
         {
             "name": "get_asset",
             "description": "Resolve a typed asset to bytes and caption.",
+            "annotations": read_only_annotations.clone(),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2198,6 +2473,7 @@ fn tool_descriptors() -> JsonValue {
         {
             "name": "get_doc_anchors",
             "description": "Return anchors, links, history, and citations.",
+            "annotations": read_only_annotations.clone(),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2210,6 +2486,7 @@ fn tool_descriptors() -> JsonValue {
         {
             "name": "get_chunks",
             "description": "Fetch typed chunks and optional neighbours; follow meta.next_call.",
+            "annotations": read_only_annotations.clone(),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2226,6 +2503,7 @@ fn tool_descriptors() -> JsonValue {
         {
             "name": "get_definition",
             "description": "Find definitions within one legal source.",
+            "annotations": read_only_annotations.clone(),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2241,6 +2519,7 @@ fn tool_descriptors() -> JsonValue {
         {
             "name": "stats",
             "description": "Return counts, index metadata, and search policy.",
+            "annotations": read_only_annotations,
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -2250,6 +2529,7 @@ fn tool_descriptors() -> JsonValue {
         {
             "name": "fetch",
             "description": "Live-fetch a canonical legal:// URI from a fetch marker.",
+            "annotations": live_fetch_annotations,
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2310,7 +2590,12 @@ mod tests {
     fn prepare_test_generation(data_dir: &Path) -> Result<PathBuf> {
         let generation = data_dir.join("generations").join(TEST_GENERATION);
         fs::create_dir_all(&generation)?;
-        fs::write(data_dir.join("active-generation"), TEST_GENERATION)?;
+        fs::create_dir_all(data_dir.join("lifecycle"))?;
+        fs::write(data_dir.join("lifecycle/LOCK"), [])?;
+        fs::write(
+            data_dir.join("lifecycle/active-generation"),
+            TEST_GENERATION,
+        )?;
         Ok(generation)
     }
 
@@ -2814,8 +3099,9 @@ mod tests {
     fn read_http_state_requires_the_exact_endpoint_contract() -> Result<()> {
         let _lock = lock_test_db();
         let dir = tempdir()?;
+        fs::create_dir(dir.path().join("state"))?;
         fs::write(
-            dir.path().join("http.json"),
+            dir.path().join("state/http.json"),
             r#"{
   "bind": "127.0.0.1",
   "port": 37409
@@ -2832,8 +3118,9 @@ mod tests {
     fn read_http_state_rejects_noncanonical_endpoint() -> Result<()> {
         let _lock = TEST_DB_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let dir = tempdir()?;
+        fs::create_dir(dir.path().join("state"))?;
         fs::write(
-            dir.path().join("http.json"),
+            dir.path().join("state/http.json"),
             r#"{"port":37409,"url":"http://example.test:37409/mcp"}"#,
         )?;
         with_data_dir(dir.path(), || -> Result<()> {

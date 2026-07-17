@@ -1,0 +1,41 @@
+swagger: '2.0'
+info:
+  title: Australian Legal MCP
+  description: >-
+    Source-grounded search and retrieval across ten official Australian legal
+    sources. Every legal query must select one explicit source.
+  version: 1.0.0
+host: __PUBLIC_HOST__
+basePath: /
+schemes:
+  - https
+consumes:
+  - application/json
+produces: []
+securityDefinitions:
+  entra_oauth:
+    type: oauth2
+    flow: accessCode
+    authorizationUrl: https://login.microsoftonline.com/__TENANT_ID__/oauth2/v2.0/authorize
+    tokenUrl: https://login.microsoftonline.com/__TENANT_ID__/oauth2/v2.0/token
+    scopes:
+      __SCOPE_URI__: Read the Australian Legal MCP corpus as the signed-in user.
+security:
+  - entra_oauth:
+      - __SCOPE_URI__
+paths:
+  /mcp:
+    post:
+      summary: Invoke Australian Legal MCP
+      description: Streamable HTTP MCP endpoint with seven read-only tools.
+      operationId: InvokeMCP
+      x-ms-agentic-protocol: mcp-streamable-1.0
+      responses:
+        '200':
+          description: JSON-RPC response
+        '202':
+          description: Accepted MCP notification
+        '401':
+          description: Missing or invalid Entra bearer token
+        '403':
+          description: Authenticated caller lacks the delegated read scope

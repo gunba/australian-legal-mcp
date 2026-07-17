@@ -1,0 +1,11 @@
+label                = "australian-legal-mcp"
+region               = "ap-southeast"
+instance_type        = "g6-standard-4"
+admin_ssh_public_key = "ssh-ed25519 REPLACE_WITH_BREAK_GLASS_ADMIN_PUBLIC_KEY"
+admin_source_cidr    = "203.0.113.10/32"
+volume_size_gib      = 128
+public_mcp_enabled   = false
+
+# Optional existing Akamai DNS Manager zone.
+# dns_domain_id   = 1234567
+# dns_record_name = "legal"

@@ -263,7 +263,7 @@ if [[ "$SKIP_NETWORK" != "1" ]]; then
 	if printf '%s' "$fetch_json" | jq -e . >/dev/null 2>&1; then
 		assert_jq_count "fetch: chunks returned" "$fetch_json" '.chunks | length' 1
 		assert_jq "fetch: canonical_url" "$fetch_json" '.canonical_url' \
-			'docid=TXR/TR20007/NAT/ATO/00001'
+			'docid=TXR%2FTR20007%2FNAT%2FATO%2F00001'
 		assert_jq "fetch: canonical URI echoed" "$fetch_json" '.uri' "$fetch_uri"
 		assert_jq "fetch: source" "$fetch_json" '.source' 'ato'
 		assert_jq "fetch: document identity" "$fetch_json" '.document.native_id' \

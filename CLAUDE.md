@@ -5,10 +5,11 @@ generations. The package is `australian-legal-mcp`, executable `legal-mcp`, MCP
 key `australian-legal`, and environment prefix `LEGAL_MCP_*`.
 
 Acquisition, OCR, embedding, ANN construction, and builds run on the local RTX
-maintainer host. Validated generations are activated locally and transferred
-directly over SSH to a CPU serving VM. The runtime never downloads, scrapes,
-embeds, packages, or publishes corpus/model artifacts. GitHub Releases contain
-software binaries only.
+maintainer host. Validated generations are activated locally, CoW-seeded, and
+rsynced by changed blocks to an external XFS/reflink volume on the current
+Akamai/Linode host. A corpus-free OCI image serves and validates them. The
+runtime never scrapes, embeds, builds, packages, or publishes corpus/model
+artifacts. GitHub Releases contain software binaries only.
 
 Persistent project data is
 `data/{sources,source-snapshots,models,builds,runtime,cache,runs,logs,validation,archive}`.
@@ -69,7 +70,8 @@ authoritative reranking.
 cargo build --release --features cuda
 scripts/maintainer-sync.sh             # or --full
 LEGAL_MCP_DATA_DIR="$PWD/data/runtime" legal-mcp verify
-scripts/deploy-generation.sh deploy@example-vps
+scripts/deploy-generation.sh \
+  --host legal-mcp-publisher@HOST
 ```
 
 The unpacked model is under `data/models/mdbr-leaf-ir-standard`. Maintainer
@@ -81,8 +83,12 @@ Lifecycle commands are `activate`, `verify`, `rollback`, and
 `prune-generations`. There is no runtime updater, remote model assumption,
 corpus package/publication, or offline bundle.
 
-Production `legal-mcp.service` binds loopback behind private Tailscale HTTPS.
-Local stdio development may use `legal-mcp mcp`. See [DEPLOYMENT.md](DEPLOYMENT.md).
+The digest-pinned non-root container publishes only host loopback behind Caddy.
+Public requests require individual digest-backed API keys, single-tenant
+delegated Entra tokens, or both; Caddy stays disabled until auth is proved. The
+live corpus stays on external XFS and never enters the image. Local stdio may
+use `legal-mcp mcp`. See
+[DEPLOYMENT.md](DEPLOYMENT.md) and [MICROSOFT_COPILOT.md](MICROSOFT_COPILOT.md).
 
 ## Documentation and proofd
 

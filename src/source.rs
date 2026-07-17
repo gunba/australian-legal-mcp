@@ -358,32 +358,68 @@ pub(crate) fn stats() -> Result<String> {
     Ok(serde_json::to_string_pretty(&payload)?)
 }
 
-pub(crate) fn verify_active_generation() -> Result<String> {
-    let active =
-        active_generation_key()?.ok_or_else(|| anyhow!("no immutable generation is active"))?;
-    ensure_generation_read_only(&generation_dir(&active)?)?;
-    let report = stats()?;
-    let value: JsonValue = serde_json::from_str(&report)?;
-    if value
-        .get("semantic_search_ready")
-        .and_then(JsonValue::as_bool)
-        != Some(true)
-    {
-        let conn = open_read()?;
-        for descriptor in source_registry().descriptors() {
-            ensure_vector_search_ready(&conn, &descriptor.id).with_context(|| {
-                format!(
-                    "active generation is not ready for semantic search in source `{}`",
-                    descriptor.id
-                )
-            })?;
+pub(crate) fn verify_active_generation(prewarm: impl FnOnce() -> Result<()>) -> Result<String> {
+    let corpus_lock = crate::config::corpus_read_lock()?;
+    let result = (|| {
+        let active =
+            active_generation_key()?.ok_or_else(|| anyhow!("no immutable generation is active"))?;
+        let target = generation_dir(&active)?;
+        let (_, validated_key) = validate_installed_generation_dir(&target)
+            .context("validating every immutable generation artifact")?;
+        if validated_key != active {
+            bail!("active generation directory name does not match its immutable content");
         }
-        bail!("active generation is not ready for semantic search across every source");
-    }
-    if value.get("active_generation").and_then(JsonValue::as_str) != Some(active.as_str()) {
-        bail!("active generation changed during strict verification");
-    }
-    Ok(report)
+        ensure_generation_read_only(&target)?;
+        let report = stats()?;
+        let value: JsonValue = serde_json::from_str(&report)?;
+        if value
+            .get("semantic_search_ready")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        {
+            let conn = open_read()?;
+            for descriptor in source_registry().descriptors() {
+                ensure_vector_search_ready(&conn, &descriptor.id).with_context(|| {
+                    format!(
+                        "active generation is not ready for semantic search in source `{}`",
+                        descriptor.id
+                    )
+                })?;
+            }
+            bail!("active generation is not ready for semantic search across every source");
+        }
+        if value.get("active_generation").and_then(JsonValue::as_str) != Some(active.as_str()) {
+            bail!("active generation changed during strict verification");
+        }
+        prewarm().context("loading and executing the verified semantic model")?;
+        Ok(report)
+    })();
+    fs2::FileExt::unlock(&corpus_lock)?;
+    result
+}
+
+pub(crate) fn verify_active_generation_quick() -> Result<String> {
+    let corpus_lock = crate::config::corpus_read_lock()?;
+    let result = (|| {
+        let active =
+            active_generation_key()?.ok_or_else(|| anyhow!("no immutable generation is active"))?;
+        ensure_generation_read_only(&generation_dir(&active)?)?;
+        let report = stats()?;
+        let value: JsonValue = serde_json::from_str(&report)?;
+        if value
+            .get("semantic_search_ready")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        {
+            bail!("active generation is not ready for semantic search across every source");
+        }
+        if value.get("active_generation").and_then(JsonValue::as_str) != Some(active.as_str()) {
+            bail!("active generation changed during startup verification");
+        }
+        Ok(report)
+    })();
+    fs2::FileExt::unlock(&corpus_lock)?;
+    result
 }
 
 fn parse_count_meta(value: Option<String>, label: &str) -> Result<Option<i64>> {
@@ -757,6 +793,11 @@ pub(crate) struct ActivationReport {
     pub(crate) previous_generation: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct DeactivationReport {
+    pub(crate) deactivated_generation: String,
+}
+
 fn set_generation_read_only(root: &Path) -> Result<()> {
     fn visit(path: &Path) -> Result<()> {
         let metadata = fs::symlink_metadata(path)?;
@@ -1120,18 +1161,31 @@ fn manifest_tokenizer_path() -> &'static str {
     EMBEDDING_MODEL_FILES[1].output_name
 }
 
-pub(crate) fn activate_local_generation(source: &Path) -> Result<ActivationReport> {
+pub(crate) fn activate_local_generation(
+    source: &Path,
+    expected_generation: Option<&str>,
+) -> Result<ActivationReport> {
     let lifecycle_lock = lifecycle_lock_file()?;
-    let result = activate_local_generation_locked(source);
+    let result = activate_local_generation_locked(source, expected_generation);
     fs2::FileExt::unlock(&lifecycle_lock)?;
     result
 }
 
-fn activate_local_generation_locked(source: &Path) -> Result<ActivationReport> {
+fn activate_local_generation_locked(
+    source: &Path,
+    expected_generation: Option<&str>,
+) -> Result<ActivationReport> {
     let source = source
         .canonicalize()
         .with_context(|| format!("canonicalizing generation {}", source.display()))?;
     let (_, key) = validate_generation_dir(&source)?;
+    if let Some(expected) = expected_generation {
+        if expected != key {
+            bail!(
+                "validated generation key {key} differs from required deployment generation {expected}"
+            );
+        }
+    }
     validate_installed_generation_dir(&source)
         .and_then(|(_, sealed_key)| {
             if sealed_key != key {
@@ -1141,6 +1195,32 @@ fn activate_local_generation_locked(source: &Path) -> Result<ActivationReport> {
         })
         .context("revalidating generation immediately before sealing")?;
     commit_validated_generation(&source, &key)
+}
+
+pub(crate) fn deactivate_generation(expected_generation: &str) -> Result<DeactivationReport> {
+    let lifecycle_lock = lifecycle_lock_file()?;
+    let corpus_lock = lock_file()?;
+    let result = (|| {
+        let active = active_generation_key()?
+            .ok_or_else(|| anyhow!("cannot deactivate: no generation is active"))?;
+        if active != expected_generation {
+            bail!("refusing to deactivate generation {active}; expected {expected_generation}");
+        }
+        let pointer = crate::config::lifecycle_dir()?.join("active-generation");
+        let metadata = fs::symlink_metadata(&pointer)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("active generation pointer must be a regular non-symlink file");
+        }
+        reject_hard_link(&metadata, &pointer)?;
+        fs::remove_file(&pointer)?;
+        sync_directory(&crate::config::lifecycle_dir()?)?;
+        Ok(DeactivationReport {
+            deactivated_generation: active,
+        })
+    })();
+    fs2::FileExt::unlock(&corpus_lock)?;
+    fs2::FileExt::unlock(&lifecycle_lock)?;
+    result
 }
 
 fn commit_validated_generation(source: &Path, key: &str) -> Result<ActivationReport> {
@@ -1188,7 +1268,7 @@ fn commit_validated_generation_locked(source: &Path, key: &str) -> Result<Activa
     })?;
     if let Err(error) = activate_generation(key) {
         if active_generation_key()?.as_deref() == Some(key) {
-            sync_directory(&data_dir()?)?;
+            sync_directory(&crate::config::lifecycle_dir()?)?;
             return Ok(ActivationReport {
                 active_generation: key.to_string(),
                 previous_generation: previous,
@@ -1236,6 +1316,13 @@ pub(crate) fn prune_inactive_generations(keep: usize) -> Result<Vec<String>> {
     let result = (|| {
         let active = active_generation_key()?
             .ok_or_else(|| anyhow!("cannot prune generations without an active generation"))?;
+        let active_path = generation_dir(&active)?;
+        let (_, validated_key) = validate_installed_generation_dir(&active_path)
+            .context("validating active generation before pruning rollback state")?;
+        if validated_key != active {
+            bail!("active generation directory name does not match its immutable content");
+        }
+        ensure_generation_read_only(&active_path)?;
         let mut inactive = Vec::new();
         for entry in fs::read_dir(generations_dir()?)? {
             let entry = entry?;
@@ -3095,7 +3182,7 @@ mod security_tests {
     }
 
     #[test]
-    fn validated_generation_commit_is_immutable_and_prune_keeps_active() -> Result<()> {
+    fn validated_generation_commit_is_immutable_and_prune_revalidates_active() -> Result<()> {
         let root = tempfile::tempdir()?;
         let _environment =
             crate::TestEnvironment::set(&[("LEGAL_MCP_DATA_DIR", root.path().as_os_str())]);
@@ -3136,13 +3223,18 @@ mod security_tests {
             "an idempotent activation must not consume its duplicate input"
         );
 
-        let removed = prune_inactive_generations(0)?;
-        assert_eq!(removed, vec![first_key]);
+        let error = prune_inactive_generations(0).expect_err("fake generation must not prune");
+        assert!(format!("{error:#}").contains("generation contents differ"));
         assert_eq!(
             active_generation_key()?.as_deref(),
             Some(second_key.as_str())
         );
+        assert!(generation_dir(&first_key)?.is_dir());
         assert!(generation_dir(&second_key)?.is_dir());
+        assert!(deactivate_generation(&first_key).is_err());
+        let deactivated = deactivate_generation(&second_key)?;
+        assert_eq!(deactivated.deactivated_generation, second_key);
+        assert_eq!(active_generation_key()?, None);
         Ok(())
     }
 }

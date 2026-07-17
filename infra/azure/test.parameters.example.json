@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "resourceGroupName": { "value": "rg-australian-legal-mcp-test" },
+    "location": { "value": "australiaeast" },
+    "namePrefix": { "value": "REPLACE_UNIQUE_LOWERCASE_PREFIX" },
+    "adminUsername": { "value": "azureadmin" },
+    "adminSshPublicKey": { "value": "REPLACE_WITH_BREAK_GLASS_SSH_PUBLIC_KEY" },
+    "publisherSshPublicKey": { "value": "REPLACE_WITH_DISTINCT_PUBLISHER_SSH_PUBLIC_KEY" },
+    "adminSourceIp": { "value": "REPLACE_WITH_PUBLIC_IPV4" },
+    "publicMcpEnabled": { "value": false },
+    "vmSize": { "value": "Standard_B2s_v2" },
+    "dataDiskSizeGiB": { "value": 128 },
+    "uploaderPrincipalId": { "value": "REPLACE_WITH_ENTRA_USER_OBJECT_ID" },
+    "autoShutdownTime": { "value": "1900" },
+    "autoShutdownTimeZone": { "value": "W. Australia Standard Time" },
+    "monthlyBudgetAmount": { "value": 25 },
+    "budgetContactEmail": { "value": "REPLACE_WITH_EMAIL" }
+  }
+}

@@ -3,70 +3,57 @@
 ## Mission
 
 Operate one source-grounded Australian Legal MCP over ten official sources with
-exactly seven tools, explicit source selection, deterministic citations and
-ranking, locally built immutable generations, and secure low-cost private
-hosting.
+exactly seven tools, explicit source selection, deterministic citations/ranking,
+locally built immutable generations, portable Akamai/Linode OCI hosting, and an
+Entra-governed path into Microsoft 365 Copilot.
 
 ## Fixed architecture
 
-- Current source truth: `data/sources/<source>`.
-- Fresh/rollback/legacy stores: `data/source-snapshots`.
-- Pinned unpacked model: `data/models/mdbr-leaf-ir-standard`.
-- Resumable builds: `data/builds`; disposable acceleration: `data/cache`.
-- Local activation: `data/runtime`; evidence: `data/runs`, `logs`, and
-  `validation`.
-- Acquisition, OCR, embedding, and ANN construction run only on the RTX PC.
-- Builds consume committed source stores and never rescrape.
-- Complete generations are validated, sealed read-only, atomically activated,
-  and directly transferred over SSH.
-- The CPU serving VM never downloads or builds corpus/model artifacts.
+- Official source truth, acquisition, OCR, embedding, ANN construction, and
+  builds remain on the local RTX PC beneath project `data/`.
+- Builds consume committed source stores and never scrape.
+- Complete generations are strictly validated, sealed read-only, and atomically
+  activated under `data/runtime`.
+- The current hosted target is a corpus-free, digest-pinned OCI image on an
+  Akamai/Linode VPS. A detachable encrypted XFS/reflink volume is the live
+  SQLite/ANN filesystem.
+- A restricted publisher CoW-seeds and rsyncs changed blocks; a one-shot copy of
+  the same image validates and activates each generation.
+- Podman publishes the application bridge only on host loopback. Native Caddy
+  exposes exact `/mcp` and OAuth resource metadata after auth checks pass.
+- Public access uses exact Entra delegated identity, individually revocable
+  digest-backed API keys, or both. Copilot always uses Entra.
 - GitHub Releases remain binary-only.
 
-Every search requires one registered source. Omission is an error. Public JSON
-uses typed source-qualified document/chunk/asset identities. `fetch` accepts only
-canonical `legal://SOURCE/PERCENT_ENCODED_NATIVE_ID`. The MCP surface remains:
-`search`, `get_chunks`, `get_asset`, `get_doc_anchors`, `get_definition`,
-`stats`, and `fetch`.
+Every search requires one registered source. Public JSON uses typed
+source-qualified identities. `fetch` accepts only canonical `legal://` URIs. The
+MCP surface remains exactly `search`, `get_chunks`, `get_asset`,
+`get_doc_anchors`, `get_definition`, `stats`, and `fetch`.
 
-## Completed
+## Completed foundation
 
-- Ten official adapters, concurrent source coordinator, adaptive ordinary HTTP,
-  bounded Federal Court Chrome CDP, transactional acquisition, and strict
-  source-quality gates.
-- Source-qualified schema 10, cleaned HTML, links/assets/definitions, FTS,
-  deterministic ranking/continuations, exact reranking, and ANN recall ≥ 0.99
-  at 50.
-- Pinned mdbr-leaf-ir FP32 ONNX graph, exact tokenizer, lossless 512-token
-  splitting, TensorRT FP16/CUDA build path, and CPU serving path.
-- V19: 409,528 documents, 6,968,250 chunks/embeddings, 20,170 definitions,
-  validated DB/FTS/model/ANN/source bindings and all-source retrieval.
-- Consolidated adjacent roots into the canonical ignored project `data/` tree
-  without deleting rollback/legacy source truth.
-- Removed remote updater/downloader/corpus publication/offline-bundle/GPU release
-  paths.
-- Added local activation, strict verification, rollback, pruning, lifecycle
-  locks, durable build state, read-only generation sealing, generation-aware
-  readiness, graceful bounded HTTP serving, and direct resumable SSH deployment.
-- Added hardened systemd and a sub-USD-100 private VPS/Tailscale design.
+- Ten official adapters, adaptive acquisition, bounded Federal Chrome CDP,
+  transactional workspaces, strict source quality, schema 10, cleaned HTML,
+  links/assets/definitions, deterministic FTS/vector ranking, and ANN recall at
+  least 0.99 at 50.
+- Pinned mdbr-leaf-ir FP32 graph, exact tokenizer, TensorRT FP16/CUDA local build,
+  and CPU serving path.
+- Validated/active v19: 409,528 documents, 6,968,250 chunks/embeddings, 20,170
+  definitions, exact DB/model/ten-ANN bindings, all-source retrieval, rollback,
+  pruning, and graceful bounded Streamable HTTP.
+- Removed runtime corpus download/publication/offline-bundle paths.
+- Added immutable activation, strict verification, lifecycle locks, durable
+  maintainer resumption, exact-generation readiness, and hardened systemd.
+- Added a hardened non-root OCI image, lock-pinned Linode OpenTofu, strict
+  XFS-volume adoption, CoW/rsync delta deployment, narrow publisher/root
+  transactions, Caddy, API-key plus Entra auth, signed image provenance/SBOM
+  policy, RFC 9728 metadata/challenges, and Copilot templates.
+- Preserved Azure Bicep, managed-disk, private Blob, and content-addressed
+  transport as a future provider adapter rather than the active deployment.
 
-## Phase 1 — prove local lifecycle
+## Phase 1 — local hosting/identity gates
 
-1. Build the final release binary and complete v19 activation from
-   `data/builds/v19-local-generation` into `data/runtime`.
-2. Verify exact generation ID, read-only permissions, hashes, SQLite/FTS,
-   ten-source ANN readiness, and all-source representative retrieval.
-3. Attempt activation of malformed/incomplete/symlink/hardlink generations and
-   prove the pointer and v19 remain unchanged.
-4. Prove rollback and pruning using storage-efficient Btrfs generation fixtures
-   while preserving one known-good copy.
-5. Prove interrupted activation/build resumption and pending source-set recovery.
-
-Exit criterion: local build → validate → seal → activate → verify → rollback →
-prune is deterministic, crash-safe, and contains no remote artifact assumption.
-
-## Phase 2 — complete repository gates
-
-Run and repair until all pass:
+The branch currently passes:
 
 ```bash
 cargo fmt --all -- --check
@@ -75,53 +62,92 @@ cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
 cargo audit
 cargo deny check advisories
 bash -n scripts/*.sh
+python3 -m unittest \
+  tests/test_azure_generation_transport.py \
+  tests/test_manage_api_keys.py \
+  tests/test_remote_mcp.py \
+  tests/test_render_microsoft_integrations.py
+tofu -chdir=infra/linode init -backend=false -lockfile=readonly
+tofu -chdir=infra/linode validate
+LINODE_TOKEN=0000000000000000000000000000000000000000000000000000000000000000 \
+  tofu -chdir=infra/linode plan -refresh=false -input=false -lock=false
 git diff --check
 LEGAL_MCP_DATA_DIR="$PWD/data/runtime" scripts/smoke.sh
 cargo package --workspace --locked --allow-dirty
 ```
 
-Also validate Linux binary packaging, CPU ONNX Runtime discovery, exactly seven
-MCP descriptors, Streamable HTTP header/status behavior, SIGTERM drain,
-backpressure, origin rejection, and exact-generation readiness.
+Local evidence includes valid/invalid signed-token and API-key tests; resource
+metadata and 401/403 challenges; exact seven descriptors; official Microsoft
+v2.4 schema validation; bridged non-root/read-only container probes; zero fixed
+HIGH/CRITICAL image findings; Caddy validation; strict disk/mount guards;
+packaged ONNX loading; and a clean offline Linode provider plan. The live
+instance/volume boundary now also proves Ubuntu 24.04, a signature-free attached
+volume, restricted SSH, and closed public 80/443/51235. Volume initialization,
+host installation, and Microsoft tenant behavior remain in the cloud phases.
 
-## Phase 3 — private low-cost deployment
+## Phase 2 — disposable Linode infrastructure
 
-1. Provision a Sydney Linux VPS with at least 4 vCPU, 8 GiB RAM, and 160 GiB
-   local SSD/NVMe; prefer 200–256 GB when budget permits.
-2. Create the non-login `legal-mcp` account and install the release binary, CPU
-   ONNX Runtime, environment file, and hardened `legal-mcp.service`.
-3. Join the private Tailscale network. Keep port 51235 loopback-only and publish
-   private HTTPS with Tailscale Serve.
-4. Run `scripts/deploy-generation.sh deploy@host` from the RTX PC.
-5. Verify direct transfer resume, disk margin, strict pre-prune checks, immutable
-   activation, exact `/readyz` generation, representative searches, restart
-   persistence, rollback, and retention.
-6. Capture monthly cost, p50/p95 latency, request queue rejections, RSS, page
-   cache, disk growth, and service logs.
+1. **Completed 2026-07-16:** applied `infra/linode` in Sydney with
+   `public_mcp_enabled=false`, distinct administrator/publisher keys, and an
+   encrypted 128-GiB volume; verified the attached device is signature-free and
+   public 80/443/51235 are closed.
+2. Run the host installer and prove signature-free initialization, exact
+   UUID/marker adoption, XFS reflink, fixed identities, UFW, Quadlet, and
+   digest-pinned runtime verification.
+3. Perform one v19 CoW/rsync upload and bootstrap activation.
+4. Configure API-key and/or Entra auth privately; only then open Cloud Firewall
+   80/443 and run the transactional Caddy cutover.
+5. Test reboot, changed/unchanged generation deltas, readiness rollback,
+   API-key rotation/revocation, image rollback, volume detach/reattach, and VPS
+   replacement without another full upload.
+6. Record compute/volume cost, p50/p95 latency, CPU, RSS, page cache, queue
+   rejection, and disk extent growth.
 
-Exit criterion: the hosted machine can be rebuilt from binary + direct local
-transfer, serves no public unauthenticated port, and recovers to the previous
-generation after a failed deployment.
+Exit criterion: the disposable VPS can be recreated from OpenTofu + an attested
+image digest + the retained volume, while 51235 never becomes public.
 
-## Phase 4 — scale only from evidence
+## Phase 3 — Copilot Studio OBO
 
-- Increase RAM/workers vertically when p95 latency or queue rejection warrants.
-- Add local-SSD read-only replicas behind an OAuth-capable gateway when one VM
-  is insufficient; never put SQLite/Arroy on a network filesystem.
-- Move to an Azure VM plus managed disk when Entra governance, procurement,
-  private networking, or Microsoft 365/Copilot integration justifies the extra
-  cost.
-- Before public/cross-tenant exposure, implement MCP-compatible OAuth protected
-  resource metadata, audience/expiry validation, authorization challenges, and
-  audited tenant policy. Never use a shared static bearer token as a substitute.
+1. Create a single-tenant resource app and delegated `legal.read` scope.
+2. Create the connector app, delegated permission/admin consent, short-lived
+   secret, `access_as_user`, and Azure API Connections preauthorization.
+3. Keep public ingress closed until app IDs exist; run
+   `legal-mcp-configure-auth --mode entra` so auth is proved before Caddy stays
+   enabled.
+4. Import the rendered Streamable MCP Swagger custom connector with OBO enabled.
+5. Test consent, valid invocation, expiry, revoked consent, disabled user,
+   Conditional Access, wrong tenant/audience/client, missing scope, DLP, and
+   publication to a controlled Microsoft 365 Copilot test audience.
+
+Exit criterion: every cloud request is a validated delegated user call, all
+seven tools remain read-only, and no bearer token/query content is leaked into
+infrastructure logs.
+
+## Phase 4 — direct Microsoft 365 declarative agent
+
+- Register Teams Developer Portal Entra SSO for the exact MCP base URL.
+- Add the generated Application ID URI and Microsoft enterprise token-store
+  client to exact server allowlists.
+- Render plugin manifest v2.4 with static seven-tool definitions.
+- Provision/sideload with Microsoft 365 Agents Toolkit, then test admin consent,
+  assignment, revocation, and tenant policy.
+
+Treat Agent 365 BYO registry and dynamic tenant tool discovery as optional
+preview paths, not production dependencies.
+
+## Phase 5 — scale only from evidence
+
+- Resize or move to dedicated CPU only for sustained CPU/latency evidence.
+- Add read-only replicas and a suitable managed edge/gateway only when one VPS
+  is insufficient; never put SQLite/Arroy on network/FUSE storage.
+- Move the same attested OCI digest and volume contract to an Azure VM only for
+  a real production decision; then re-enable the preserved managed-identity,
+  Blob, monitoring, and DR adapters.
+- Preserve application-level authentication even when a gateway is introduced.
 
 ## Cleanup gate
 
-Delete v18, manual validation runtimes, old model archives, repair workspaces,
-legacy diagnostics, and obsolete adjacent snapshots only after:
-
-- v19 local activation and rollback pass;
-- hosted v19 retrieval and restart persistence pass;
-- direct deployment rollback passes;
-- retained source snapshots are explicitly inventoried;
-- no surviving file is the sole copy of source truth or validation evidence.
+Delete historical local builds/snapshots or cloud bootstrap/rollback artifacts
+only after local and Linode activation, VPS replacement, exact readiness,
+Copilot token validation, and rollback are proven, and no surviving item is the
+sole source of source truth or validation evidence.

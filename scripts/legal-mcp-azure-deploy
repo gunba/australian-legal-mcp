@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+# Root-owned Azure generation transaction. The publisher account is restricted
+# to this helper by a forced SSH command and a single sudoers rule.
+set -euo pipefail
+
+[[ "$(id -u)" = 0 ]] || { echo "must run as root" >&2; exit 2; }
+[[ $# = 1 && "$1" =~ ^[0-9a-f]{64}$ ]] || {
+  echo "usage: legal-mcp-azure-deploy GENERATION_ID" >&2
+  exit 2
+}
+
+GENERATION="$1"
+DATA_DIR=/var/lib/australian-legal-mcp
+CONFIG=/etc/australian-legal-mcp/azure-deployment.json
+BINARY=/usr/local/bin/legal-mcp
+TRANSPORT=/usr/local/libexec/australian-legal-mcp/azure_generation_transport.py
+SERVICE=legal-mcp.service
+DEPLOY_USER=legal-mcp-deploy
+ORT_DYLIB_PATH=/usr/local/lib/australian-legal-mcp/libonnxruntime.so
+TRANSACTION="$DATA_DIR/.deployment-transaction"
+DEPLOY_LOCK=/run/lock/australian-legal-mcp-deploy.lock
+
+for command_name in curl findmnt flock jq mountpoint python3 runuser stat systemctl xfs_info zstd; do
+  command -v "$command_name" >/dev/null || { echo "missing $command_name" >&2; exit 2; }
+done
+for path in "$CONFIG" "$BINARY" "$TRANSPORT" "$ORT_DYLIB_PATH"; do
+  [[ -f "$path" && ! -L "$path" ]] || { echo "required regular file is missing: $path" >&2; exit 2; }
+  [[ "$(stat -c %h "$path")" = 1 ]] || { echo "required file is hard-linked: $path" >&2; exit 2; }
+done
+[[ "$(stat -c %U:%G "$CONFIG")" = root:legal-mcp ]] || {
+  echo "Azure deployment config ownership is unsafe" >&2
+  exit 2
+}
+config_mode="$(stat -c %a "$CONFIG")"
+[[ "$config_mode" = 640 || "$config_mode" = 440 ]] || {
+  echo "Azure deployment config permissions are unsafe" >&2
+  exit 2
+}
+
+mountpoint -q "$DATA_DIR" || { echo "$DATA_DIR is not a mount point" >&2; exit 2; }
+MARKER="$DATA_DIR/.legal-mcp-data-volume"
+[[ -f "$MARKER" && ! -L "$MARKER" && "$(stat -c %h "$MARKER")" = 1 ]] || {
+  echo "data-volume marker is missing or unsafe" >&2
+  exit 2
+}
+[[ "$(jq -er .format_version "$MARKER")" = 1 ]] || { echo "unknown data-volume format" >&2; exit 2; }
+EXPECTED_UUID="$(jq -er .filesystem_uuid "$MARKER")"
+ACTUAL_UUID="$(findmnt -n -o UUID --target "$DATA_DIR")"
+[[ -n "$EXPECTED_UUID" && "$ACTUAL_UUID" = "$EXPECTED_UUID" ]] || {
+  echo "wrong filesystem mounted at $DATA_DIR" >&2
+  exit 2
+}
+[[ "$(stat -c %U:%G:%a "$DATA_DIR")" = root:legal-mcp:750 ]] || {
+  echo "Azure data root ownership or permissions are unsafe" >&2
+  exit 2
+}
+[[ "$(findmnt -n -o FSTYPE --target "$DATA_DIR")" = xfs ]] || {
+  echo "Azure data volume must be XFS" >&2
+  exit 2
+}
+xfs_info "$DATA_DIR" | grep -Eq 'reflink=1' || {
+  echo "Azure data volume must have XFS reflink enabled" >&2
+  exit 2
+}
+
+BLOB_BASE_URL="$(jq -er .blob_base_url "$CONFIG")"
+[[ "$BLOB_BASE_URL" =~ ^https://[a-z0-9]{3,24}\.blob\.core\.windows\.net/[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$ ]] || {
+  echo "configured Blob base URL is not canonical" >&2
+  exit 2
+}
+
+for specification in \
+  "incoming:legal-mcp-deploy:legal-mcp:750" \
+  "generations:legal-mcp-deploy:legal-mcp:750" \
+  "lifecycle:legal-mcp-deploy:legal-mcp:750" \
+  "state:legal-mcp:legal-mcp:700"; do
+  IFS=: read -r name owner group mode <<<"$specification"
+  path="$DATA_DIR/$name"
+  [[ -d "$path" && ! -L "$path" ]] || { echo "unsafe data directory: $path" >&2; exit 2; }
+  [[ "$(stat -c %U:%G:%a "$path")" = "$owner:$group:$mode" ]] || {
+    echo "wrong ownership or permissions on $path" >&2
+    exit 2
+  }
+done
+CORPUS_LOCK="$DATA_DIR/lifecycle/LOCK"
+[[ -f "$CORPUS_LOCK" && ! -L "$CORPUS_LOCK" && "$(stat -c %h "$CORPUS_LOCK")" = 1 ]] || {
+  echo "corpus lock is missing or unsafe" >&2
+  exit 2
+}
+[[ "$(stat -c %U:%G:%a "$CORPUS_LOCK")" = legal-mcp-deploy:legal-mcp:640 ]] || {
+  echo "corpus lock ownership or permissions are unsafe" >&2
+  exit 2
+}
+
+exec 9>"$DEPLOY_LOCK"
+flock -n 9 || { echo "another Azure generation deployment is active" >&2; exit 73; }
+
+run_as_deploy() {
+  runuser -u "$DEPLOY_USER" -- env \
+    LEGAL_MCP_DATA_DIR="$DATA_DIR" \
+    ORT_DYLIB_PATH="$ORT_DYLIB_PATH" \
+    "$@"
+}
+active_generation() {
+  local pointer="$DATA_DIR/lifecycle/active-generation"
+  if [[ -e "$pointer" ]]; then
+    [[ -f "$pointer" && ! -L "$pointer" && "$(stat -c %h "$pointer")" = 1 ]] || {
+      echo "active generation pointer is unsafe" >&2
+      return 2
+    }
+    local value
+    value="$(<"$pointer")"
+    [[ "$value" =~ ^[0-9a-f]{64}$ ]] || { echo "active generation is malformed" >&2; return 2; }
+    printf '%s' "$value"
+  fi
+}
+wait_ready() {
+  local expected="$1" body
+  for _ in $(seq 1 300); do
+    body="$(curl --fail --silent --show-error --connect-timeout 1 --max-time 3 \
+      http://127.0.0.1:51235/readyz 2>/dev/null || true)"
+    if [[ -n "$body" ]] && jq -e --arg expected "$expected" \
+      '.status == "ok" and .generation == $expected' <<<"$body" >/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+write_transaction() {
+  local target="$1" previous="$2" phase="$3" temporary
+  temporary="$(mktemp /run/legal-mcp-deployment.XXXXXX)"
+  jq -n --arg target "$target" --arg previous "$previous" --arg phase "$phase" \
+    '{format_version:1,target:$target,previous:(if $previous == "" then null else $previous end),phase:$phase}' \
+    > "$temporary"
+  chmod 0600 "$temporary"
+  install -o root -g root -m 0600 "$temporary" "$TRANSACTION"
+  rm -f "$temporary"
+  sync -f "$DATA_DIR"
+}
+clear_transaction() {
+  rm -f "$TRANSACTION"
+  sync -f "$DATA_DIR"
+}
+recover_transaction() {
+  [[ -e "$TRANSACTION" ]] || return 0
+  [[ -f "$TRANSACTION" && ! -L "$TRANSACTION" && "$(stat -c %h "$TRANSACTION")" = 1 ]] || {
+    echo "deployment transaction journal is unsafe" >&2
+    return 1
+  }
+  [[ "$(stat -c %U:%G:%a "$TRANSACTION")" = root:root:600 ]] || {
+    echo "deployment transaction journal ownership is unsafe" >&2
+    return 1
+  }
+  local target previous phase active
+  target="$(jq -er 'select(.format_version == 1) | .target' "$TRANSACTION")"
+  previous="$(jq -er '.previous // ""' "$TRANSACTION")"
+  phase="$(jq -er '.phase' "$TRANSACTION")"
+  [[ "$target" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ -z "$previous" || "$previous" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ "$phase" = prepared || "$phase" = activated || "$phase" = ready ]] || return 1
+  active="$(active_generation)"
+  if [[ "$phase" = ready && "$active" = "$target" ]]; then
+    clear_transaction
+    return 0
+  fi
+  if [[ "$active" = "$target" ]]; then
+    if [[ -n "$previous" ]]; then
+      echo "recovering interrupted deployment by rolling back to $previous" >&2
+      run_as_deploy "$BINARY" rollback --generation "$previous" >/dev/null
+      systemctl restart "$SERVICE"
+      wait_ready "$previous"
+    else
+      echo "recovering interrupted bootstrap by removing the unready active pointer" >&2
+      run_as_deploy "$BINARY" deactivate --expected-generation "$target" >/dev/null
+      systemctl stop "$SERVICE" || true
+    fi
+  fi
+  clear_transaction
+}
+
+recover_transaction
+transaction_armed=false
+on_exit() {
+  local status="$1"
+  trap - EXIT
+  if [[ "$status" != 0 && "$transaction_armed" = true ]]; then
+    recover_transaction || echo "automatic deployment recovery failed; rerun the helper" >&2
+  fi
+  exit "$status"
+}
+trap 'on_exit $?' EXIT
+trap 'exit 130' INT TERM
+
+REMOTE_ACTIVE="$(active_generation)"
+if [[ "$REMOTE_ACTIVE" = "$GENERATION" ]]; then
+  echo "generation $GENERATION is already active; reconciling service"
+  run_as_deploy "$BINARY" verify --quiet >/dev/null
+  if systemctl is-active --quiet "$SERVICE" && wait_ready "$GENERATION"; then
+    echo "Azure deployment already converged on generation $GENERATION"
+    exit 0
+  fi
+  systemctl restart "$SERVICE"
+  wait_ready "$GENERATION"
+  echo "Azure deployment reconciled generation $GENERATION"
+  exit 0
+fi
+
+if [[ -n "$REMOTE_ACTIVE" ]]; then
+  # Prune revalidates every active-generation artifact before deleting rollback state.
+  run_as_deploy "$BINARY" prune-generations --keep-inactive 0 >/dev/null
+fi
+
+# A transaction may resume its own target, but unrelated abandoned restores are removed.
+while IFS= read -r -d '' abandoned; do
+  name="${abandoned##*/}"
+  [[ "$name" =~ ^[0-9a-f]{64}$ ]] || { echo "unexpected incoming entry: $abandoned" >&2; exit 2; }
+  [[ "$name" = "$GENERATION" ]] && continue
+  run_as_deploy rm -rf -- "$abandoned"
+done < <(find "$DATA_DIR/incoming" -mindepth 1 -maxdepth 1 -print0)
+
+INCOMING="$DATA_DIR/incoming/$GENERATION"
+RESTORE_ARGS=(
+  "$TRANSPORT" restore
+  --generation-id "$GENERATION"
+  --source "$BLOB_BASE_URL"
+  --output-dir "$INCOMING"
+  --token-mode managed-identity
+  --workers 4
+)
+if [[ -n "$REMOTE_ACTIVE" ]]; then
+  RESTORE_ARGS+=(--basis-dir "$DATA_DIR/generations/$REMOTE_ACTIVE")
+fi
+run_as_deploy python3 "${RESTORE_ARGS[@]}"
+
+write_transaction "$GENERATION" "$REMOTE_ACTIVE" prepared
+transaction_armed=true
+ACTIVATION_JSON="$(run_as_deploy "$BINARY" activate \
+  --generation-dir "$INCOMING" --expected-generation "$GENERATION")"
+printf '%s\n' "$ACTIVATION_JSON"
+ACTIVATED="$(jq -er .active_generation <<<"$ACTIVATION_JSON")"
+PREVIOUS="$(jq -er '.previous_generation // ""' <<<"$ACTIVATION_JSON")"
+[[ "$ACTIVATED" = "$GENERATION" && "$PREVIOUS" = "$REMOTE_ACTIVE" ]] || {
+  echo "activation returned an inconsistent transaction result" >&2
+  exit 1
+}
+write_transaction "$GENERATION" "$REMOTE_ACTIVE" activated
+
+systemctl restart "$SERVICE"
+wait_ready "$GENERATION"
+write_transaction "$GENERATION" "$REMOTE_ACTIVE" ready
+clear_transaction
+transaction_armed=false
+sync -f "$DATA_DIR"
+echo "Azure deployment activated and verified generation $GENERATION"
