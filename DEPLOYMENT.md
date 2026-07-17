@@ -308,7 +308,9 @@ the v0.19.0 binary cannot directly roll back to it.
 The script first performs strict local hashing and semantic-model execution. The
 remote root helper then creates a CoW clone of the active generation, and
 restricted rsync uses checksums, block deltas, and in-place writes. An unchanged
-redeploy transmits no file data; interrupted uploads resume. The publisher can
+redeploy transmits no file data; interrupted uploads resume. Zstd is negotiated
+for transport because the ANN tree and SQLite bytes compress materially on the
+maintainer uplink; the immutable files remain uncompressed on XFS. The publisher can
 write only `/srv/legal-mcp/uploads` and can invoke only `prepare`, `activate`,
 or explicit `abort`. It cannot otherwise mutate lifecycle state, installed
 generations, service configuration, or image/auth secrets.

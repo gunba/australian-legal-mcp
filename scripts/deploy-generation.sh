@@ -106,6 +106,9 @@ esac
 # The remote helper CoW-clones the active generation first. --checksum and the
 # rsync delta algorithm then transmit only changed blocks; --inplace preserves
 # unchanged reflink extents and interrupted transfers resume in the same upload.
+# Zstd substantially reduces the repetitive ANN tree and SQLite bytes on the
+# constrained maintainer uplink; both installer-supported rsync builds negotiate
+# this exact compressor.
 if [[ "$SKIP_UPLOAD" = false ]]; then
   RSYNC_RSH='ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=120'
   export RSYNC_RSH
@@ -114,6 +117,9 @@ if [[ "$SKIP_UPLOAD" = false ]]; then
     --links \
     --times \
     --checksum \
+    --compress \
+    --compress-choice=zstd \
+    --compress-level=3 \
     --inplace \
     --no-whole-file \
     --partial \

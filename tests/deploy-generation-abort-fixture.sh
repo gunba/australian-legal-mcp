@@ -97,6 +97,7 @@ if LEGAL_MCP_DATA_DIR="$runtime" LEGAL_MCP_BINARY="$fixture_root/legal-mcp" \
   exit 1
 fi
 grep -Fq "legal-mcp-publisher@fixture.example prepare $generation" "$ssh_log"
+grep -Fq -- '--compress-choice=zstd --compress-level=3' "$ssh_log"
 if grep -Fq "abort $generation" "$ssh_log"; then
   echo 'failed upload triggered an automatic abort' >&2
   exit 1

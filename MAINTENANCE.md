@@ -205,9 +205,10 @@ scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
 
-The first run uploads the complete generation. Subsequent runs CoW-seed remote
-staging from the active XFS generation and rsync only changed blocks; interrupted
-uploads resume in place. A one-shot copy of the exact OCI image strictly
+The first run uploads the complete generation with negotiated zstd transport
+compression. Subsequent runs CoW-seed remote staging from the active XFS
+generation and rsync only changed blocks; interrupted uploads resume in place.
+A one-shot copy of the exact OCI image strictly
 validates and activates the result. See [DEPLOYMENT.md](DEPLOYMENT.md) for
 OpenTofu, volume identity, authentication, readiness, rollback, and VPS
 replacement; see [MICROSOFT_COPILOT.md](MICROSOFT_COPILOT.md) for Entra/Copilot.
