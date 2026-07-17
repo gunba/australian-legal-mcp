@@ -151,8 +151,8 @@ Implemented hard cut:
   atomically persisting fstab and requires `noatime,nodev,noexec,nosuid`, exact
   ACLs, and file-type support. It creates fixed service, publisher, and
   break-glass administrator identities, disables root/password SSH, installs
-  rootful Podman/Quadlet, and leaves the application and checksum-pinned Caddy
-  disabled;
+  rootful Podman/Quadlet, and leaves the application and release-bundled,
+  checksum-pinned Caddy disabled;
 - the forced publisher can write only upload staging. Strict local verification,
   CoW seeding, checksum/block-delta rsync, one-shot image validation, atomic
   activation, explicit activation/rollback journal phases, exact readiness,
@@ -196,9 +196,9 @@ secondary future provider path in
 
 1. Push the reviewed branch and require its pinned cross-platform CI/release
    contract checks to pass before merge.
-2. Publish and verify the immutable v0.18.0 Linux bundle and GHCR digest, then
-   install the host contract, initialize the empty volume, and perform the
-   initial v19 delta deployment.
+2. Publish and verify the immutable v0.18.1 Linux bundle and GHCR digest, then
+   install the host contract against the validated external volume and perform
+   the initial v19 delta deployment.
 3. Prove reboot, rollback, volume detach/reattach, image rollback, authentication
    rotation, and disposable VPS replacement before removing retained evidence.
 4. Create the tenant resource and connector app registrations, exercise a real

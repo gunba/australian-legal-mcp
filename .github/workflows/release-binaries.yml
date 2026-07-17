@@ -233,6 +233,15 @@ jobs:
             throw "ONNX Runtime checksum mismatch: $actual"
           }
           Expand-Archive -Path onnxruntime.zip -DestinationPath onnxruntime
+      - name: Download and verify Caddy package
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          name=caddy_2.11.4_linux_amd64.deb
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 5 \
+            --output "$name" \
+            "https://github.com/caddyserver/caddy/releases/download/v2.11.4/$name"
+          sha512sum --check --strict infra/hosting/caddy-artifact.sha512
       - name: Package and verify tar
         if: matrix.archive == 'tar'
         shell: bash
@@ -254,9 +263,10 @@ jobs:
             cp Containerfile package/
             cp infra/hosting/Caddyfile infra/hosting/legal-mcp.container.template \
               infra/hosting/runtime.env.example infra/hosting/configure-auth.sh \
-              infra/hosting/update-image.sh \
+              infra/hosting/update-image.sh infra/hosting/caddy-artifact.sha512 \
               package/infra/hosting/
             cp infra/linode/install-host.sh package/infra/linode/
+            cp caddy_2.11.4_linux_amd64.deb package/
             cp scripts/deploy-generation.sh scripts/legal-mcp-host-deploy \
               scripts/legal-mcp-publisher-command scripts/manage-api-keys.py \
               package/scripts/
@@ -272,6 +282,9 @@ jobs:
           mkdir verify
           tar -C verify -xzf "${{ steps.archive.outputs.name }}"
           test "$(cat verify/SOURCE_COMMIT)" = '${{ needs.validate.outputs.commit }}'
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            (cd verify && sha512sum --check --strict infra/hosting/caddy-artifact.sha512)
+          fi
           verify/legal-mcp verify-runtime | grep -F '"onnx_runtime_ready":true'
       - name: Package and verify zip
         if: matrix.archive == 'zip'
