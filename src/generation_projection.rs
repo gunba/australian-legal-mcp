@@ -1755,7 +1755,10 @@ mod tests {
         let sibling = root.path().join("candidate");
         fs::create_dir(&source)?;
         let paths = validate_projection_paths(&source, &sibling)?;
-        assert_eq!(paths.output_root, sibling);
+        assert_eq!(
+            paths.output_root,
+            root.path().canonicalize()?.join("candidate")
+        );
 
         fs::create_dir(&sibling)?;
         assert!(validate_projection_paths(&source, &sibling).is_err());
