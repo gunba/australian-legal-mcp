@@ -333,11 +333,12 @@ jobs:
           docker rm --force legal-mcp-ci-test >/dev/null
           trap - EXIT
       - name: Scan the production image
-        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
-        with:
-          image-ref: legal-mcp-ci:${{ github.sha }}
-          format: table
-          exit-code: "1"
-          ignore-unfixed: true
-          vuln-type: os,library
-          severity: CRITICAL,HIGH
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/legal-mcp-ci.tar"
+          docker save --output "$archive" "legal-mcp-ci:${{ github.sha }}"
+          docker run --rm --volume "$archive:/input/image.tar:ro" \
+            aquasec/trivy@sha256:16f1ee8462d0ba07dd69239150d60ba7b591c55e02dfc33a3fc19710b861d180 \
+            image --input /input/image.tar --scanners vuln --pkg-types os,library \
+            --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 \
+            --skip-version-check
