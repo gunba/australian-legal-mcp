@@ -1,10 +1,14 @@
 # Future Azure deployment
 
-> Secondary portability reference. The active hosted path is the attested OCI
+> Secondary portability reference. The selected hosted path is the attested OCI
 > image on Akamai/Linode documented in [../DEPLOYMENT.md](../DEPLOYMENT.md).
 > Revalidate this adapter before any Azure return; it is preserved to retain
 > the hardened Bicep, Blob, identity, and recovery work.
 
+The current local serving generation is schema-11 v20; Azure has not received
+it and no Azure resource exists. The Linode host is also not serving: it has no
+active generation, authentication, application service, active Caddy service,
+or ingress.
 
 This preserved adapter would use Azure when the enterprise deployment decision
 requires it; Microsoft 365 Copilot itself does not require Azure hosting.
@@ -42,10 +46,11 @@ Official references:
 
 ## Why this storage design
 
-The installed generation is about 57 GiB and includes a 40-GiB SQLite database,
-ten ANN sidecars, the model, and tokenizer. SQLite/Arroy require local random
-reads, locking, and same-filesystem atomic renames. BlobFuse, Azure Files, App
-Service storage, and Container Apps network storage are not the live database.
+The active local v20 generation is approximately 37.42 GiB and includes a
+19,746,840,576-byte SQLite database, ten ANN sidecars, the model, and tokenizer.
+SQLite/Arroy require local random reads, locking, and same-filesystem atomic
+renames. BlobFuse, Azure Files, App Service storage, and Container Apps network
+storage are not the live database.
 
 Blob is a distribution and disaster-recovery store only. The transport:
 
@@ -58,9 +63,9 @@ Blob is a distribution and disaster-recovery store only. The transport:
 - re-hashes every reconstructed file before the Rust lifecycle validates it.
 
 Repeating an unchanged deployment uploads zero chunks. A slightly changed
-corpus uploads only changed chunks, not another 57-GiB tree. No automatic Blob
-GC is performed because deleting a chunk still referenced by a retained
-transport manifest would make rollback unrecoverable.
+corpus uploads only changed chunks, not another complete generation. No
+automatic Blob GC is performed because deleting a chunk still referenced by a
+retained transport manifest would make rollback unrecoverable.
 
 ## Prerequisites
 
@@ -177,7 +182,7 @@ The systemd service:
 - performs bounded installed-state checks before start, then exits unless model
   execution succeeds while the server initializes.
 
-## 3. Upload once and activate v19
+## 3. Upload once and activate v20
 
 Build the CPU release locally if necessary, ensure `ORT_DYLIB_PATH` points to a
 compatible local ONNX Runtime, then deploy:
@@ -192,8 +197,9 @@ scripts/deploy-generation-azure.sh \
   --blob-base-url 'https://<account>.blob.core.windows.net/corpus'
 ```
 
-The first invocation strictly verifies v19, compresses/uploads its unique
-chunks, restores it with the VM managed identity, validates every reconstructed
+The first invocation strictly verifies active v20 generation
+`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`,
+compresses/uploads its unique chunks, restores it with the VM managed identity, validates every reconstructed
 file, activates it atomically, starts the service, checks exact-generation
 readiness, and rolls back on failure. A root-owned durable transaction journal
 also recovers interruption, reboot, or SSH loss after pointer activation;
@@ -212,6 +218,12 @@ Azure stores no source workspaces and performs no scrape, OCR, embedding, ANN
 build, or corpus update. Blob versioning plus 30-day blob/container soft delete
 protects the upload-once cache from accidental replacement or deletion; those
 retained versions remain billable.
+
+V20 was projected locally from retained schema-10 v19. SQLite FTS tokenization
+rebuilt only the chunk index as contentless-delete; acquisition, OCR,
+rechunking, model tokenization/execution, re-embedding, and ANN reconstruction
+did not run. The v19 parent remains a local fallback and is not an Azure
+bootstrap prerequisite.
 
 ## 4. Test privately before opening HTTPS
 

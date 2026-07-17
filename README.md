@@ -37,7 +37,9 @@ software but no corpus or model artifacts.
 
 Semantic search uses mdbr-leaf-ir ANN candidates followed by exact reranking
 from authoritative normalized int8 vectors in SQLite. Bodies remain cleaned
-structural HTML; FTS and embeddings use source-derived plain text.
+structural HTML; FTS and embeddings use source-derived plain text. Schema 11
+stores chunk keyword postings in a contentless-delete FTS5 table while
+authoritative chunk text remains in `chunks`.
 
 For hosted operation, a non-root, read-only OCI container publishes only
 `127.0.0.1:51235` behind host Caddy. Public `/mcp` requires individually
@@ -171,6 +173,29 @@ legal-mcp prune-generations --keep-inactive 1
 There is no runtime `update`, corpus downloader, offline bundle, corpus package,
 or GitHub corpus-release path.
 
+Software is version 0.19.0. The active local v20 generation is
+`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`.
+It retains all 409,528 documents, 6,968,250 chunks/embeddings, and 20,170
+definitions in schema 11. Its 19,746,840,576-byte `legal.db` has SHA-256
+`26143e8908fc879a7e03af158cf014101d846c93f5d48d2b1687e48b2cc5fe90`;
+the complete generation is approximately 37.42 GiB. The v19 schema-10 parent
+remains installed with its matching v0.18.1 binary/image as a fallback; the
+schema-11 binary deliberately rejects schema 10.
+
+Maintainers may project an exact immutable schema-10 generation without a
+source or model rebuild:
+
+```bash
+target/release/legal-mcp derive-schema11-from-schema10 \
+  --source-generation-dir "$PWD/data/runtime/generations/<schema-10-generation>" \
+  --expected-source-generation <schema-10-generation> \
+  --out-dir "$PWD/data/builds/<fresh-schema-11-candidate>"
+```
+
+This command uses SQLite FTS tokenization to rebuild only chunk FTS storage. It
+does not acquire sources, run OCR, rechunk, tokenize for the model, execute the
+model, re-embed, or rebuild ANN sidecars.
+
 ## Maintainer data and builds
 
 All persistent project data is ignored by Git and consolidated beneath
@@ -215,6 +240,13 @@ CoW/delta deployment of the locally active generation:
 scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
+
+The current Linode host is fail-closed and not serving: its v19 upload was
+intentionally stopped with about 23 GiB prepared, and it has no active remote
+generation, authentication, application service, active Caddy service, or
+public ingress. The v20 cutover order is a verified version-matched v0.19.0 bundle and OCI digest, host-tool upgrade,
+explicit publisher abort, empty-host image cutover, v20 deployment, then
+authentication. See [DEPLOYMENT.md](DEPLOYMENT.md) for the exact commands.
 
 The maintainer pipeline requires the pinned model in
 `data/models/mdbr-leaf-ir-standard`, CUDA/TensorRT ONNX Runtime, Google

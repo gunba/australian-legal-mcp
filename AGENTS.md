@@ -24,11 +24,13 @@ MCP. Read [README.md](README.md), [MAINTENANCE.md](MAINTENANCE.md),
 
 Source acquisition, OCR, embeddings, and corpus construction run on the local
 RTX maintainer host. A complete generation is validated, atomically activated,
-and delta-copied into staging on an external XFS/reflink volume attached to the
-current Akamai/Linode VPS. A one-shot copy of the exact serving image validates
+and can be delta-copied into staging on an external XFS/reflink volume attached
+to the Akamai/Linode VPS. A one-shot copy of the exact serving image validates
 and activates it. The serving container never scrapes, embeds, builds, or
 publishes corpus/model artifacts, and the image contains no corpus. GitHub
-Releases are binary-only; GHCR images are digest-pinned and attested.
+Releases are binary-only; GHCR images are digest-pinned and attested. The
+current host has no active remote generation, authentication, application
+service, active Caddy service, or ingress; do not describe it as live.
 
 ## Design principles
 
@@ -125,7 +127,17 @@ and CUDA fallback, profiles `1x1` through `64x512`, and
 at 512 tokens; store normalized int8 first-256-dimension vectors.
 
 ANN proposes candidates; SQLite vectors are authoritative for exact reranking.
-Keep deterministic Arroy construction and source-qualified schema 10.
+Keep deterministic Arroy construction and source-qualified schema 11. Schema
+11 makes `chunks_fts` a contentless-delete FTS5 table while preserving the
+authoritative chunk text in `chunks` and binding FTS postings/BM25 metadata by
+digest.
+
+`derive-schema11-from-schema10` is the sole schema-10 projection path. It
+strictly validates one immutable schema-10 generation, uses SQLite FTS
+tokenization to rebuild only `chunks_fts`, removes the disposable embedding
+cache, and creates a fresh complete generation. It performs no acquisition,
+OCR, rechunking, model tokenization, model execution, re-embedding, or ANN
+rebuild; model, tokenizer, and ANN artifacts remain byte-identical.
 
 Maintainer dependencies are `unrtf`, `antiword`, `soffice`, `pdftotext`,
 `pdftoppm`, `tesseract`, and Chrome/Chromium for Federal Court. Serving is
@@ -142,6 +154,18 @@ LEGAL_MCP_DATA_DIR="$PWD/data/runtime" legal-mcp verify
 scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
+
+Software is 0.19.0. Active local v20 is
+`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`;
+retain its v19 parent with the matching v0.18.1 binary/image as the schema-10
+fallback. The schema-11 binary must not attempt to roll back to schema 10.
+
+The pending empty-host v20 cutover has one order: verify the version-matched
+v0.19.0 bundle and digest; run `infra/linode/install-host.sh` with
+`--upgrade-host-tools --version 0.19.0`; explicitly abort the prepared v19
+publisher transaction; run `infra/hosting/update-image.sh` with
+`--bootstrap-empty-host` for the v0.19.0 digest; deploy v20; then configure
+authentication. Never skip, reorder, or automatically infer the abort.
 
 Manual recovery uses `activate`, `verify`, `rollback`, and
 `prune-generations`. There is no runtime `update`, corpus download, corpus/model
