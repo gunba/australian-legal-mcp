@@ -7,13 +7,18 @@ and is never baked into an image.
 The host is currently fail-closed. Its v0.19.0 empty-host contract is installed
 and the complete v20 candidate is preserved at
 `/srv/legal-mcp/uploads/a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`
-in a publisher-owned `prepared` transaction. Activation failed before
-validation because the capability-free one-shot container could not traverse
-the UID/GID 973 mode-`0700` upload parent; recovery restored publisher ownership
-without aborting or deleting staging. There is no active remote generation,
+in a publisher-owned `prepared` transaction. Activation durably created
+`/srv/legal-mcp/lifecycle/LIFECYCLE_LOCK` before validation, then failed because
+the capability-free one-shot container could not traverse the UID/GID 973
+mode-`0700` upload parent. Recovery restored publisher ownership without
+aborting or deleting staging. The lock is a zero-byte, single-link regular file
+owned by `root:root`, mode `0640`, with owner `rw`, group `r`, and no other ACL
+access. A v0.19.1 host-tool upgrade made no mutations, but rejected this
+legitimate lifecycle entry because its prepared-bootstrap allowlist knew only
+`.deployment-transaction` and `LOCK`. There is no active remote generation,
 authentication, application service, Caddy, DNS record, or ingress. Public
-ports 80, 443, and 51235 remain closed. Software 0.19.1 is the unreleased patch
-for this host-side permission boundary.
+ports 80, 443, and 51235 remain closed. Software 0.19.2 is the unreleased patch
+that makes `LIFECYCLE_LOCK` a strict installed-host contract.
 
 The same image and mounted-generation contract can later run on an Azure VM.
 Azure-specific work is retained in [docs/AZURE_FUTURE.md](docs/AZURE_FUTURE.md),
@@ -110,15 +115,17 @@ SHA-512 manifest; the installer verifies both before package, firewall, or
 volume mutation:
 
 ```bash
-gh release download v0.19.1 --repo gunba/australian-legal-mcp \
+gh release download v0.19.2 --repo gunba/australian-legal-mcp \
   --pattern 'legal-mcp-*' --pattern SHA256SUMS
 sha256sum --check SHA256SUMS
 ```
 
-This v0.19.1 command is valid only after that immutable patch release exists.
+This v0.19.2 command is valid only after that immutable patch release exists.
 The existing host was bootstrapped from the separately verified v0.18.1 bundle
 and later cut over with v0.19.0; do not relabel either historical evidence set
-as v0.19.1.
+as v0.19.2. The rejected v0.19.1 host-tool attempt also remains distinct
+evidence: it completed preflight without changing host tools, authorization,
+the prepared journal, or staged corpus bytes.
 
 Verify the attestation before deployment:
 
@@ -214,8 +221,9 @@ sudo infra/linode/install-host.sh \
 
 An existing volume is accepted only when its XFS filesystem, reflink/file-type
 features, UUID-bound marker, exact `noatime,nodev,noexec,nosuid` mount contract,
-ownership/ACLs, and pre-created lock all match. Unknown volumes are neither
-formatted nor adopted, and an unvalidated temporary mount never writes fstab.
+ownership/ACLs, and pre-created `LOCK` plus `LIFECYCLE_LOCK` all match. Unknown
+volumes are neither formatted nor adopted, and an unvalidated temporary mount
+never writes fstab.
 
 The installer:
 
@@ -235,8 +243,9 @@ Before closing the initial root session, open a second SSH session as
 Also retain the Akamai Cloud Firewall. UFW is defence in depth, not a substitute.
 
 The current host completed its initial install with v0.18.1 and its empty-host
-software cutover with v0.19.0. Do not rerun the initial installer against it;
-use the staged-activation repair below.
+software cutover with v0.19.0. Its rejected v0.19.1 host-tool upgrade made no
+mutations. Do not rerun the initial installer against it; use the
+staged-activation repair below.
 
 ## 4. Repair the preserved v20 activation
 
@@ -255,20 +264,23 @@ The complete schema-11 generation
 is already staged. It is approximately 37.42 GiB complete, with a
 19,746,840,576-byte `legal.db`. The failed v0.19.0 activation restored the
 journal to `prepared` and recursively restored UID/GID 973 ownership with
-mode `0700` directories and `0600` files. Preserve that transaction exactly.
-Do **not** run `prepare`, rsync, or `abort`.
+mode `0700` directories and `0600` files. It also left the exact
+`LIFECYCLE_LOCK` described above. The v0.19.1 upgrade rejected that lock before
+its first mutation, so upload authorization remains absent and all prepared
+corpus state is unchanged. Preserve that transaction exactly. Do **not** run
+`prepare`, rsync, or `abort`.
 
-From the verified, unpacked v0.19.1 Linux bundle, first transactionally replace
+From the verified, unpacked v0.19.2 Linux bundle, first transactionally replace
 only the digest-pinned host publisher tools and sudo policy:
 
 ```bash
-sudo infra/linode/install-host.sh --upgrade-host-tools --version 0.19.1
+sudo infra/linode/install-host.sh --upgrade-host-tools --version 0.19.2
 ```
 
 If interrupted, recover from that same release bundle before continuing:
 
 ```bash
-sudo infra/linode/install-host.sh --recover-host-tools --version 0.19.1
+sudo infra/linode/install-host.sh --recover-host-tools --version 0.19.2
 ```
 
 The host-tool preflight accepts upload authorization only when it is safely
@@ -434,7 +446,7 @@ Linux release bundle:
 ```bash
 sudo infra/hosting/update-image.sh \
   --image ghcr.io/gunba/australian-legal-mcp@sha256:NEW_DIGEST \
-  --version 0.19.1 \
+  --version 0.19.2 \
   --template infra/hosting/legal-mcp.container.template
 ```
 

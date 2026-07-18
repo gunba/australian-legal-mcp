@@ -84,6 +84,15 @@ require_regular_file() {
   }
 }
 
+require_empty_regular_file() {
+  local path="$1" owner="$2" group="$3" mode="$4"
+  require_regular_file "$path" "$owner" "$group" "$mode" || return 1
+  [[ "$(stat -c '%s' "$path")" = 0 ]] || {
+    echo "host contract file must be empty: $path" >&2
+    return 1
+  }
+}
+
 require_exact_acl() {
   local path="$1" expected="$2"
   [[ "$(getfacl --absolute-names --numeric --omit-header "$path")" = "$expected" ]] || {
@@ -431,6 +440,8 @@ validate_installed_bootstrap_host() {
   require_exact_acl /srv/legal-mcp/uploads $'user::rwx\ngroup::---\nother::---'
   require_regular_file /srv/legal-mcp/lifecycle/LOCK root legal-mcp 640
   require_exact_acl /srv/legal-mcp/lifecycle/LOCK $'user::rw-\ngroup::r--\nother::---'
+  require_empty_regular_file /srv/legal-mcp/lifecycle/LIFECYCLE_LOCK root root 640
+  require_exact_acl /srv/legal-mcp/lifecycle/LIFECYCLE_LOCK $'user::rw-\ngroup::r--\nother::---'
 
   [[ "$(id -u legal-mcp):$(id -g legal-mcp):$(id -G legal-mcp)" = 971:971:971 \
     && "$(id -u legal-mcp-publisher):$(id -g legal-mcp-publisher):$(id -G legal-mcp-publisher)" = 973:973:973 \
@@ -555,7 +566,8 @@ PY
       return 1
     }
   fi
-  directory_contains_only /srv/legal-mcp/lifecycle .deployment-transaction LOCK || {
+  directory_contains_only /srv/legal-mcp/lifecycle \
+    .deployment-transaction LIFECYCLE_LOCK LOCK || {
     echo 'lifecycle contains unexpected bootstrap state' >&2
     return 1
   }
@@ -1303,6 +1315,7 @@ if [[ "$INITIALIZE" = true ]]; then
   install -d -o legal-mcp -g legal-mcp -m 0700 /srv/legal-mcp/state
   install -d -o legal-mcp-publisher -g legal-mcp-publisher -m 0700 /srv/legal-mcp/uploads
   install -o root -g legal-mcp -m 0640 /dev/null /srv/legal-mcp/lifecycle/LOCK
+  install -o root -g root -m 0640 /dev/null /srv/legal-mcp/lifecycle/LIFECYCLE_LOCK
 else
   [[ "$(stat -c '%U:%G:%a' /srv/legal-mcp)" = root:legal-mcp:750 \
     && "$(getfacl --absolute-names --numeric --omit-header /srv/legal-mcp)" \
@@ -1333,6 +1346,9 @@ fi
   echo 'corpus lock does not satisfy the host contract' >&2
   exit 1
 }
+require_empty_regular_file /srv/legal-mcp/lifecycle/LIFECYCLE_LOCK root root 640
+require_exact_acl /srv/legal-mcp/lifecycle/LIFECYCLE_LOCK \
+  $'user::rw-\ngroup::r--\nother::---'
 volume_validated=true
 trap - ERR HUP INT TERM EXIT
 if [[ "$fstab_needs_append" = true ]]; then

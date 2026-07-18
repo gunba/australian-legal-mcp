@@ -173,7 +173,7 @@ legal-mcp prune-generations --keep-inactive 1
 There is no runtime `update`, corpus downloader, offline bundle, corpus package,
 or GitHub corpus-release path.
 
-Software is version 0.19.1. The active local v20 generation is
+Software is version 0.19.2. The active local v20 generation is
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`.
 It retains all 409,528 documents, 6,968,250 chunks/embeddings, and 20,170
 definitions in schema 11. Its 19,746,840,576-byte `legal.db` has SHA-256
@@ -242,14 +242,17 @@ scripts/deploy-generation.sh \
 ```
 
 The current Linode host is fail-closed and not serving. The complete v20
-generation is preserved under its publisher-owned prepared upload transaction,
-but v0.19.0 activation could not traverse the mode-`0700` upload parent after
-normalizing the candidate. The failed attempt preserved the prepared journal,
-full staging, and publisher ownership; there is still no active remote
+generation is preserved under its publisher-owned prepared upload transaction.
+V0.19.0 activation created the empty root-owned `LIFECYCLE_LOCK`, then could not
+traverse the mode-`0700` upload parent during validation. The failed attempt
+preserved the prepared journal, full staging, and publisher ownership. A
+v0.19.1 host-tool upgrade made no mutations because its bootstrap lifecycle
+allowlist rejected that legitimate lock. There is still no active remote
 generation, authentication, application service, active Caddy service, or
-public ingress. The v0.19.1 repair upgrades only the digest-pinned host tools,
-then retries the exact `activate` operation without rsync or abort. See
-[DEPLOYMENT.md](DEPLOYMENT.md) for the exact recovery and security boundary.
+public ingress. The v0.19.2 repair recognizes the lock as installed-host state,
+upgrades only the digest-pinned host tools, then retries the exact `activate`
+operation without rsync or abort. See [DEPLOYMENT.md](DEPLOYMENT.md) for the
+exact recovery and security boundary.
 
 The maintainer pipeline requires the pinned model in
 `data/models/mdbr-leaf-ir-standard`, CUDA/TensorRT ONNX Runtime, Google

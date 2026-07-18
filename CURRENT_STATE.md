@@ -1,6 +1,6 @@
 # Current state
 
-Updated 2026-07-18 on branch `codex/v0191-activation-permission`.
+Updated 2026-07-18 on branch `codex/v0192-lifecycle-lock-contract`.
 
 ## Implemented product
 
@@ -118,7 +118,7 @@ strict Clippy, audit/deny, npm allowlisting, and workspace packaging pass.
 
 ## V20 corpus
 
-The software tree is 0.19.1. The active local generation is
+The software tree is 0.19.2. The active local generation is
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`:
 
 - minimum client 0.19.0, index `2026.07.14`, schema 11, and the unchanged
@@ -236,11 +236,17 @@ bootstrapped with verified v0.18.1 artifacts and subsequently cut over to the
 v0.19.0 empty-host software contract. The complete v20
 candidate is now preserved at
 `/srv/legal-mcp/uploads/a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`.
-V0.19.0 activation normalized that candidate to `root:legal-mcp` mode `0750`,
-but its capability-free one-shot container could not traverse the
-publisher-owned UID/GID 973 mode-`0700` parent. The failure restored the
-`prepared` journal phase and publisher ownership without aborting or deleting
-staging. There is no active remote generation, authentication configuration,
+V0.19.0 activation normalized the candidate to `root:legal-mcp` mode `0750`,
+then its lifecycle binary created the zero-byte, single-link
+`lifecycle/LIFECYCLE_LOCK` as `root:root` mode `0640` with exact owner `rw`,
+group `r`, and no other ACL access before validation failed. The capability-free
+one-shot container could not traverse the publisher-owned UID/GID 973
+mode-`0700` parent. The failure restored the `prepared` journal phase and
+publisher ownership without aborting or deleting staging. The v0.19.1 host-tool
+upgrade correctly made no mutations, but rejected `LIFECYCLE_LOCK` because the
+prepared-bootstrap allowlist admitted
+only `.deployment-transaction` and `LOCK`. Upload authorization remains absent.
+There is no active remote generation, authentication configuration,
 application service, Caddy service, DNS record, or public ingress; ports 80,
 443, and 51235 remain closed. No Azure resource or Entra tenant object exists.
 Azure Bicep/Blob work remains preserved as a secondary future provider path in
@@ -250,11 +256,11 @@ Azure Bicep/Blob work remains preserved as a secondary future provider path in
 
 1. Push the reviewed branch and require its pinned cross-platform CI/release
    contract checks to pass before merge.
-2. Publish and verify the immutable v0.19.1 Linux bundle and GHCR digest. From
+2. Publish and verify the immutable v0.19.2 Linux bundle and GHCR digest. From
    that exact bundle, transactionally upgrade only the host tools and retry the
    exact publisher `activate` command against the preserved v20 staging. Do not
    prepare, rsync, or abort it. Configure authentication after activation, then
-   move the running image to the attested v0.19.1 digest through the normal
+   move the running image to the attested v0.19.2 digest through the normal
    authenticated image transaction.
 3. Prove reboot, rollback, volume detach/reattach, image rollback, authentication
    rotation, and disposable VPS replacement before removing retained evidence.

@@ -20,6 +20,7 @@ GENERATIONS="$DATA_ROOT/generations"
 LIFECYCLE="$DATA_ROOT/lifecycle"
 UPLOADS="$DATA_ROOT/uploads"
 STATE="$DATA_ROOT/state"
+LIFECYCLE_LOCK="$LIFECYCLE/LIFECYCLE_LOCK"
 JOURNAL="$LIFECYCLE/.deployment-transaction"
 JOURNAL_PREPARING="$LIFECYCLE/.deployment-transaction.preparing"
 IMAGE_FILE=/etc/legal-mcp/image
@@ -160,6 +161,12 @@ validate_host_state() {
     echo 'corpus lock must have exactly one link' >&2
     exit 1
   }
+  [[ -f "$LIFECYCLE_LOCK" && ! -L "$LIFECYCLE_LOCK" \
+    && "$(stat -c '%U:%G:%a:%h:%s' "$LIFECYCLE_LOCK")" = root:root:640:1:0 ]] || {
+    echo 'lifecycle lock is missing or unsafe' >&2
+    exit 1
+  }
+  require_acl "$LIFECYCLE_LOCK" $'user::rw-\ngroup::r--\nother::---'
 }
 
 read_image() {

@@ -15,7 +15,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
   exit 2
 }
 
-version=0.19.1
+version=0.19.2
 revision=1111111111111111111111111111111111111111
 generation=1a6beead567b55babebbe253b5ae13efcd9ce2e8ab55b60c2de4106e39f180f4
 volume_uuid=11111111-2222-3333-4444-555555555555
@@ -33,6 +33,7 @@ rollback_retired=${transaction}.rollback-retired
 publisher_restore=${transaction}.publisher-restore
 publisher_restore_retired=${transaction}.publisher-restore-retired
 journal=/srv/legal-mcp/lifecycle/.deployment-transaction
+lifecycle_lock=/srv/legal-mcp/lifecycle/LIFECYCLE_LOCK
 upload=/srv/legal-mcp/uploads/$generation
 authorization=/run/legal-mcp/authorized-upload
 host_deploy=/usr/local/sbin/legal-mcp-host-deploy
@@ -62,7 +63,7 @@ if [[ "$1" = --version ]]; then
   if [[ -e /tmp/wrong-release-binary ]]; then
     printf '%s\n' 'legal-mcp 9.9.9'
   else
-    printf '%s\n' 'legal-mcp 0.19.1'
+    printf '%s\n' 'legal-mcp 0.19.2'
   fi
   exit 0
 fi
@@ -96,6 +97,7 @@ install -d -o root -g legal-mcp -m 0750 \
 install -d -o legal-mcp -g legal-mcp -m 0700 /srv/legal-mcp/state
 install -d -o legal-mcp-publisher -g legal-mcp-publisher -m 0700 /srv/legal-mcp/uploads
 install -o root -g legal-mcp -m 0640 /dev/null /srv/legal-mcp/lifecycle/LOCK
+install -o root -g root -m 0640 /dev/null "$lifecycle_lock"
 printf 'LEGAL_MCP_VOLUME_V1\nUUID=%s\n' "$volume_uuid" > /srv/legal-mcp/.legal-mcp-volume
 chown root:root /srv/legal-mcp/.legal-mcp-volume
 chmod 444 /srv/legal-mcp/.legal-mcp-volume
@@ -423,6 +425,8 @@ reset_old_state() {
     "$publisher_restore_retired" \
     /etc/legal-mcp/host-tools \
     /etc/legal-mcp/.publisher-sudoers-* /etc/legal-mcp/.host-tools-new.*
+  "$real_rm" -f -- "$lifecycle_lock" /tmp/LIFECYCLE_LOCK.hardlink
+  "$real_install" -o root -g root -m 0640 /dev/null "$lifecycle_lock"
   "$real_install" -o root -g root -m 0755 /tmp/old-host-deploy "$host_deploy"
   "$real_install" -o root -g root -m 0755 /tmp/old-publisher "$publisher"
   "$real_install" -o root -g root -m 0440 /tmp/old-sudoers "$sudoers"
@@ -476,7 +480,7 @@ expect_upgrade_failed() {
 
 reset_old_state
 expect_upgrade_failed_version=false
-if "$installer" --upgrade-host-tools --version 0.19.2 \
+if "$installer" --upgrade-host-tools --version 0.19.3 \
   >/tmp/host-tool.stdout 2>/tmp/host-tool.stderr; then
   expect_upgrade_failed_version=true
 fi
@@ -502,6 +506,46 @@ cmp --silent /tmp/old-host-deploy "$host_deploy"
 
 reset_old_state
 printf '%064d\n' 2 > "$authorization"
+expect_upgrade_failed
+assert_old_tools
+
+# LIFECYCLE_LOCK was durably created by the failed v0.19.0 activation before
+# generation validation. V0.19.2 treats that exact empty root-owned file as
+# installed state, while rejecting every unsafe identity and representation.
+reset_old_state
+"$real_rm" -f -- "$lifecycle_lock"
+expect_upgrade_failed
+assert_old_tools
+
+reset_old_state
+"$real_rm" -f -- "$lifecycle_lock"
+ln -s /dev/null "$lifecycle_lock"
+expect_upgrade_failed
+assert_old_tools
+
+reset_old_state
+ln "$lifecycle_lock" /tmp/LIFECYCLE_LOCK.hardlink
+expect_upgrade_failed
+assert_old_tools
+
+reset_old_state
+printf 'unexpected content\n' > "$lifecycle_lock"
+expect_upgrade_failed
+assert_old_tools
+
+reset_old_state
+chown root:legal-mcp "$lifecycle_lock"
+expect_upgrade_failed
+assert_old_tools
+
+reset_old_state
+chmod 600 "$lifecycle_lock"
+expect_upgrade_failed
+assert_old_tools
+
+reset_old_state
+setfacl --modify user:legal-mcp-publisher:r-- "$lifecycle_lock"
+chmod 640 "$lifecycle_lock"
 expect_upgrade_failed
 assert_old_tools
 

@@ -110,13 +110,14 @@ or ingress.
    contract, fully staged v20, and safely recovered its permission-denied
    activation to the publisher-owned `prepared` state with no active remote
    generation.
-3. Publish and verify the v0.19.1 bundle and OCI digest. From that exact bundle,
-   run `--upgrade-host-tools --version 0.19.1`, then retry only the exact
-   publisher `activate` command against preserved staging. Do not abort or
-   rerun rsync.
+3. Publish and verify the v0.19.2 bundle and OCI digest. The v0.19.1 host-tool
+   attempt made no mutations but rejected the legitimate `LIFECYCLE_LOCK`
+   created by v0.19.0. From the v0.19.2 bundle, run
+   `--upgrade-host-tools --version 0.19.2`, then retry only the exact publisher
+   `activate` command against preserved staging. Do not abort or rerun rsync.
 4. Configure API-key and/or Entra auth privately only after v20 activation;
    then open Cloud Firewall 80/443, run the transactional Caddy cutover, and
-   update the running image to the attested v0.19.1 digest.
+   update the running image to the attested v0.19.2 digest.
 5. Test reboot, changed/unchanged generation deltas, readiness rollback,
    API-key rotation/revocation, image rollback, volume detach/reattach, and VPS
    replacement without another full upload.

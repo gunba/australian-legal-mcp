@@ -16,7 +16,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
   exit 2
 }
 
-version=0.19.1
+version=0.19.2
 revision=1111111111111111111111111111111111111111
 old_revision=2222222222222222222222222222222222222222
 old_digest="ghcr.io/gunba/australian-legal-mcp@sha256:$(printf 'a%.0s' {1..64})"
@@ -62,7 +62,7 @@ case "$1" in
     if [[ -e /tmp/wrong-release-binary ]]; then
       printf '%s\n' 'legal-mcp 9.9.9'
     else
-      printf '%s\n' 'legal-mcp 0.19.1'
+      printf '%s\n' 'legal-mcp 0.19.2'
     fi
     ;;
   verify-runtime)
@@ -99,6 +99,7 @@ install -d -o root -g legal-mcp -m 0750 \
 install -d -o legal-mcp -g legal-mcp -m 0700 /srv/legal-mcp/state
 install -d -o legal-mcp-publisher -g legal-mcp-publisher -m 0700 /srv/legal-mcp/uploads
 install -o root -g legal-mcp -m 0640 /dev/null /srv/legal-mcp/lifecycle/LOCK
+install -o root -g root -m 0640 /dev/null /srv/legal-mcp/lifecycle/LIFECYCLE_LOCK
 printf 'LEGAL_MCP_VOLUME_V1\nUUID=%s\n' "$volume_uuid" > /srv/legal-mcp/.legal-mcp-volume
 chown root:root /srv/legal-mcp/.legal-mcp-volume
 chmod 444 /srv/legal-mcp/.legal-mcp-volume
@@ -297,7 +298,7 @@ case "\$1" in
         format="\${!#}"
         if [[ "\$format" == *'.version'* ]]; then
           if [[ "\$image" = "\$new_image" ]]; then
-            if [[ -e /tmp/wrong-oci-version ]]; then printf '%s\n' 9.9.9; else printf '%s\n' 0.19.1; fi
+            if [[ -e /tmp/wrong-oci-version ]]; then printf '%s\n' 9.9.9; else printf '%s\n' 0.19.2; fi
           else
             printf '%s\n' 0.18.1
           fi
@@ -334,7 +335,7 @@ case "\$1" in
     done
     case "\$command" in
       --version)
-        if [[ -e /tmp/wrong-oci-binary ]]; then printf '%s\n' 'legal-mcp 9.9.9'; else printf '%s\n' 'legal-mcp 0.19.1'; fi
+        if [[ -e /tmp/wrong-oci-binary ]]; then printf '%s\n' 'legal-mcp 9.9.9'; else printf '%s\n' 'legal-mcp 0.19.2'; fi
         ;;
       verify-runtime) printf '%s\n' '{"onnx_runtime_ready":true}' ;;
       *) exit 95 ;;
@@ -440,7 +441,9 @@ reset_baseline() {
   /usr/bin/find.fixture-real /srv/legal-mcp/state -mindepth 1 -maxdepth 1 \
     -exec /usr/bin/rm.fixture-real -rf -- {} +
   /usr/bin/find.fixture-real /srv/legal-mcp/lifecycle -mindepth 1 -maxdepth 1 \
-    ! -name LOCK -exec /usr/bin/rm.fixture-real -rf -- {} +
+    ! -name LOCK ! -name LIFECYCLE_LOCK -exec /usr/bin/rm.fixture-real -rf -- {} +
+  "$real_install" -o root -g root -m 0640 /dev/null \
+    /srv/legal-mcp/lifecycle/LIFECYCLE_LOCK
   "$real_rm" -f /run/legal-mcp/authorized-upload /tmp/*-active /tmp/*-enabled \
     /tmp/ufw-web-open /tmp/ufw-extra-open /tmp/bootstrap-listener \
     /tmp/existing-container /tmp/missing-old-image /tmp/podman-container-error \
@@ -534,7 +537,7 @@ kill_update_at() {
 
 reset_baseline
 if "$updater" --bootstrap-empty-host --image "$new_digest" \
-  --version 0.19.2 --template "$source_template" >/dev/null 2>&1; then
+  --version 0.19.3 --template "$source_template" >/dev/null 2>&1; then
   echo 'wrong requested release version was unexpectedly accepted' >&2
   exit 1
 fi
@@ -605,6 +608,11 @@ assert_old_state
 
 reset_baseline
 chmod 644 "$image_file"
+expect_update_failed
+cmp --silent /tmp/old-image "$image_file"
+
+reset_baseline
+printf 'unexpected content\n' > /srv/legal-mcp/lifecycle/LIFECYCLE_LOCK
 expect_update_failed
 cmp --silent /tmp/old-image "$image_file"
 

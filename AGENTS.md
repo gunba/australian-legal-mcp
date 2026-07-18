@@ -155,16 +155,18 @@ scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
 
-Software is 0.19.1. Active local v20 is
+Software is 0.19.2. Active local v20 is
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`;
 retain its v19 parent with the matching v0.18.1 binary/image as the schema-10
 fallback. The schema-11 binary must not attempt to roll back to schema 10.
 
 The current remote v20 transaction is fully staged but not active. V0.19.0
-activation safely failed because its capability-free one-shot container could
-not traverse the publisher-owned mode-`0700` upload parent. Preserve that
-prepared transaction. After publishing and verifying v0.19.1, upgrade only the
-host tools with `--upgrade-host-tools --version 0.19.1`, then retry the exact
+created the legitimate empty root-owned `LIFECYCLE_LOCK`, then safely failed
+because its capability-free one-shot container could not traverse the
+publisher-owned mode-`0700` upload parent. A v0.19.1 host-tool upgrade made no
+mutations but rejected that extra lifecycle entry. Preserve the prepared
+transaction. After publishing and verifying v0.19.2, upgrade only the host
+tools with `--upgrade-host-tools --version 0.19.2`, then retry the exact
 publisher `activate` command. Do not abort or rerun rsync; configure
 authentication only after activation succeeds.
 

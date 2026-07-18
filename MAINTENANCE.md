@@ -16,10 +16,10 @@ non-replaceable release is created. Linux requires glibc 2.27+; Windows requires
 the Microsoft Visual C++ 2015–2022 Redistributable. Publish and independently
 verify `SHA256SUMS` for every archive.
 
-The software tree is version 0.19.1. V0.19.1 is the patch release for the
-remote upload-parent activation permission boundary. Do not install its host
-tools or image until the immutable release bundle, checksums, source revision,
-and OCI digest have been verified.
+The software tree is version 0.19.2. V0.19.2 makes the lifecycle lock created
+by the failed v0.19.0 activation part of the strict installed-host contract.
+Do not install its host tools or image until the immutable release bundle,
+checksums, source revision, and OCI digest have been verified.
 
 ## Canonical local data
 
@@ -221,12 +221,15 @@ authentication, readiness, rollback, and VPS replacement; see
 [MICROSOFT_COPILOT.md](MICROSOFT_COPILOT.md) for Entra/Copilot.
 
 The current Linode host has the complete v20 candidate preserved in a prepared
-publisher transaction. Its v0.19.0 activation failed before validation because
-the capability-free container could not search the locked upload parent, then
-restored publisher ownership and the `prepared` phase. Follow the v0.19.1
-recovery in [DEPLOYMENT.md](DEPLOYMENT.md): transactionally upgrade only the
-host tools, then issue the exact publisher `activate` command. Do not abort,
-prepare, or rerun rsync.
+publisher transaction. Its v0.19.0 activation created the zero-byte,
+single-link `root:root` mode-`0640` `lifecycle/LIFECYCLE_LOCK` with owner `rw`,
+group `r`, and no other ACL access before validation failed at the locked
+upload parent. Recovery restored publisher ownership and the `prepared` phase.
+The v0.19.1 host-tool upgrade correctly made no mutations, but rejected that
+legitimate lifecycle entry. Follow the v0.19.2 recovery in
+[DEPLOYMENT.md](DEPLOYMENT.md): transactionally upgrade only the host tools,
+then issue the exact publisher `activate` command. Do not abort, prepare, or
+rerun rsync.
 
 ## Build semantics
 
