@@ -108,6 +108,7 @@ jobs:
           docker run --rm --user 0:0 --entrypoint /bin/bash \
             --volume "$PWD/tests/bootstrap-empty-host-image-fixture.sh:/fixture:ro" \
             --volume "$PWD/infra/hosting/update-image.sh:/fixture-input/update-image.sh:ro" \
+            --volume "$PWD/infra/hosting/configure-auth.sh:/fixture-input/configure-auth.sh:ro" \
             --volume "$PWD/infra/hosting/legal-mcp.container.template:/fixture-input/legal-mcp.container.template:ro" \
             --volume "$PWD/scripts/legal-mcp-host-deploy:/fixture-input/legal-mcp-host-deploy:ro" \
             --volume "$PWD/scripts/legal-mcp-publisher-command:/fixture-input/legal-mcp-publisher-command:ro" \
@@ -116,6 +117,7 @@ jobs:
             -ceu 'export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null; apt-get install --yes --no-install-recommends acl passwd python3 rsync sudo util-linux >/dev/null; /fixture'
           python3 -m unittest \
             tests/test_azure_generation_transport.py \
+            tests/test_configure_azure_host.py \
             tests/test_manage_api_keys.py \
             tests/test_remote_mcp.py \
             tests/test_render_microsoft_integrations.py

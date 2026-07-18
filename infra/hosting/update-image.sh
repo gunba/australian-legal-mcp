@@ -9,7 +9,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 usage() {
   cat >&2 <<'EOF'
-usage: sudo update-image.sh \
+usage: sudo /usr/local/sbin/legal-mcp-update-image \
   --image ghcr.io/gunba/australian-legal-mcp@sha256:DIGEST \
   --version X.Y.Z \
   --template PATH
@@ -23,7 +23,8 @@ To roll back an interrupted empty-host cutover, use the same release bundle:
 
 If the configured mode contains api-key, stream one valid plaintext probe key
 on standard input. To roll back an update interrupted by power loss or SIGKILL:
-  sudo update-image.sh --recover [</root/one-time-probe-key]
+  sudo /usr/local/sbin/legal-mcp-update-image --recover \
+    [</root/one-time-probe-key]
 EOF
   exit 2
 }
@@ -35,13 +36,34 @@ LOCK_FILE=/run/lock/legal-mcp-host-transaction.lock
   echo 'host transaction lock is missing or unsafe' >&2
   exit 1
 }
-exec 9<>"$LOCK_FILE"
-flock -x 9
+# The stable launcher locks the real host transaction inode before selecting
+# and mounting an immutable implementation. Reuse only that documented open
+# file description; direct release-bundle/bootstrap calls acquire the real
+# lock themselves.
+INHERITED_LOCK_FD="${LEGAL_MCP_HOST_TRANSACTION_LOCK_FD:-9}"
+if [[ "$INHERITED_LOCK_FD" =~ ^[0-9]+$ \
+  && -e "/proc/$$/fd/$INHERITED_LOCK_FD" \
+  && "$(stat -Lc '%d:%i' "/proc/$$/fd/$INHERITED_LOCK_FD" 2>/dev/null || true)" \
+    = "$(stat -Lc '%d:%i' "$LOCK_FILE")" ]]; then
+  HOST_LOCK_FD="$INHERITED_LOCK_FD"
+else
+  exec {HOST_LOCK_FD}<>"$LOCK_FILE"
+fi
+flock -x "$HOST_LOCK_FD"
 
 IMAGE_FILE=/etc/legal-mcp/image
 QUADLET=/etc/containers/systemd/legal-mcp.container
 TEMPLATE=/usr/local/libexec/legal-mcp/legal-mcp.container.template
 RUNTIME_ENV=/etc/legal-mcp/runtime.env
+API_KEYS=/etc/legal-mcp/api-keys.json
+CADDYFILE=/etc/caddy/Caddyfile
+HOST_TOOLS_MARKER=/etc/legal-mcp/host-tools
+HOST_TOOL_LAUNCHER=/usr/local/libexec/legal-mcp/host-tool-launcher
+HOST_TOOL_LAUNCHER_MARKER=/etc/legal-mcp/host-tool-launcher
+CONFIGURE_AUTH_POINTER=/etc/legal-mcp/configure-auth-implementation
+UPDATE_IMAGE_POINTER=/etc/legal-mcp/update-image-implementation
+HOST_TOOL_IMPLEMENTATION_DIR=/usr/local/libexec/legal-mcp/host-tools
+AUTH_READY=/etc/legal-mcp/auth-ready
 TRANSACTION=/etc/legal-mcp/.image-transaction
 TRANSACTION_PREPARING=${TRANSACTION}.preparing
 TRANSACTION_PREPARING_RETIRED=${TRANSACTION}.preparing-retired
@@ -545,8 +567,10 @@ bootstrap_load_bundle() {
   local template="$1" expected_version="$2" binary_version
   local -a versions revisions
   bootstrap_require_release_file "$template"
-  [[ "$(grep -o '__IMAGE_DIGEST__' "$template" | wc -l)" = 1 ]] || {
-    echo 'bootstrap Quadlet template has an invalid image placeholder' >&2
+  [[ "$(grep -o '__IMAGE_DIGEST__' "$template" | wc -l)" = 1 \
+    && "$(grep -Fxc 'ExecCondition=/usr/local/libexec/legal-mcp/host-tool-launcher --check-auth-ready' \
+      "$template")" = 1 ]] || {
+    echo 'bootstrap Quadlet template lacks its exact image or auth-ready gate' >&2
     return 1
   }
   BOOTSTRAP_SOURCE_TEMPLATE="$(readlink -f "$template")"
@@ -560,6 +584,7 @@ bootstrap_load_bundle() {
   bootstrap_require_release_directory "$BOOTSTRAP_BUNDLE_ROOT/infra/hosting"
   bootstrap_require_release_directory "$BOOTSTRAP_BUNDLE_ROOT/scripts"
   bootstrap_require_release_file "$BOOTSTRAP_BUNDLE_ROOT/infra/hosting/update-image.sh" true
+  bootstrap_require_release_file "$BOOTSTRAP_BUNDLE_ROOT/infra/hosting/configure-auth.sh" true
   [[ ! -L "${BASH_SOURCE[0]}" \
     && "$(readlink -f "${BASH_SOURCE[0]}")" = "$BOOTSTRAP_BUNDLE_ROOT/infra/hosting/update-image.sh" ]] || {
     echo 'empty-host image cutover must run directly from the version-matched release bundle' >&2
@@ -681,12 +706,13 @@ bootstrap_services_are_off() {
 }
 
 bootstrap_validate_host_tools() {
-  local deploy_sha publisher_sha sudoers_sha expected_policy
+  local deploy_sha publisher_sha configure_auth_sha update_image_sha
+  local container_template_sha sudoers_sha expected_policy
   local -a marker
   bootstrap_require_regular /etc/legal-mcp/host-tools root root 444
   bootstrap_require_acl /etc/legal-mcp/host-tools $'user::r--\ngroup::r--\nother::r--'
   mapfile -t marker < /etc/legal-mcp/host-tools
-  [[ ${#marker[@]} -eq 6 && "${marker[0]}" = LEGAL_MCP_HOST_TOOLS_V1 \
+  [[ ${#marker[@]} -eq 9 && "${marker[0]}" = LEGAL_MCP_HOST_TOOLS_V2 \
     && "${marker[1]}" = "VERSION=$BOOTSTRAP_VERSION" \
     && "${marker[2]}" = "SOURCE_COMMIT=$BOOTSTRAP_REVISION" \
     && "${marker[3]}" =~ ^HOST_DEPLOY_SHA256=([0-9a-f]{64})$ ]] || {
@@ -696,16 +722,30 @@ bootstrap_validate_host_tools() {
   deploy_sha="${BASH_REMATCH[1]}"
   [[ "${marker[4]}" =~ ^PUBLISHER_COMMAND_SHA256=([0-9a-f]{64})$ ]] || return 1
   publisher_sha="${BASH_REMATCH[1]}"
-  [[ "${marker[5]}" =~ ^SUDOERS_SHA256=([0-9a-f]{64})$ ]] || return 1
+  [[ "${marker[5]}" =~ ^CONFIGURE_AUTH_SHA256=([0-9a-f]{64})$ ]] || return 1
+  configure_auth_sha="${BASH_REMATCH[1]}"
+  [[ "${marker[6]}" =~ ^UPDATE_IMAGE_SHA256=([0-9a-f]{64})$ ]] || return 1
+  update_image_sha="${BASH_REMATCH[1]}"
+  [[ "${marker[7]}" =~ ^CONTAINER_TEMPLATE_SHA256=([0-9a-f]{64})$ ]] || return 1
+  container_template_sha="${BASH_REMATCH[1]}"
+  [[ "${marker[8]}" =~ ^SUDOERS_SHA256=([0-9a-f]{64})$ ]] || return 1
   sudoers_sha="${BASH_REMATCH[1]}"
   bootstrap_require_regular /usr/local/sbin/legal-mcp-host-deploy root root 755
   bootstrap_require_regular /usr/local/sbin/legal-mcp-publisher-command root root 755
+  bootstrap_require_regular /usr/local/sbin/legal-mcp-configure-auth root root 755
+  bootstrap_require_regular /usr/local/sbin/legal-mcp-update-image root root 755
+  bootstrap_require_regular "$TEMPLATE" root root 644
   bootstrap_require_regular /etc/sudoers.d/legal-mcp-publisher root root 440
   [[ "$(sha256sum /usr/local/sbin/legal-mcp-host-deploy | awk '{print $1}')" = "$deploy_sha" \
     && "$(sha256sum /usr/local/sbin/legal-mcp-publisher-command | awk '{print $1}')" = "$publisher_sha" \
+    && "$(sha256sum "$TEMPLATE" | awk '{print $1}')" = "$container_template_sha" \
     && "$(sha256sum /etc/sudoers.d/legal-mcp-publisher | awk '{print $1}')" = "$sudoers_sha" \
     && "$(sha256sum "$BOOTSTRAP_BUNDLE_ROOT/scripts/legal-mcp-host-deploy" | awk '{print $1}')" = "$deploy_sha" \
-    && "$(sha256sum "$BOOTSTRAP_BUNDLE_ROOT/scripts/legal-mcp-publisher-command" | awk '{print $1}')" = "$publisher_sha" ]] || {
+    && "$(sha256sum "$BOOTSTRAP_BUNDLE_ROOT/scripts/legal-mcp-publisher-command" | awk '{print $1}')" = "$publisher_sha" \
+    && "$(sha256sum "$BOOTSTRAP_BUNDLE_ROOT/infra/hosting/configure-auth.sh" | awk '{print $1}')" = "$configure_auth_sha" \
+    && "$(sha256sum "$BOOTSTRAP_BUNDLE_ROOT/infra/hosting/update-image.sh" | awk '{print $1}')" = "$update_image_sha" \
+    && "$(sha256sum "${BASH_SOURCE[0]}" | awk '{print $1}')" = "$update_image_sha" \
+    && "$(sha256sum "$BOOTSTRAP_SOURCE_TEMPLATE" | awk '{print $1}')" = "$container_template_sha" ]] || {
     echo 'installed host tools are not the exact version-matched release helpers' >&2
     return 1
   }
@@ -721,6 +761,145 @@ bootstrap_validate_host_tools() {
   fi
   rm -f "$expected_policy"
   visudo -cf /etc/sudoers.d/legal-mcp-publisher >/dev/null
+  validate_installed_host_tool_launchers \
+    "$configure_auth_sha" "$update_image_sha" outer
+}
+
+validate_installed_host_tool_launchers() {
+  local expected_configure_sha="$1" expected_update_sha="$2"
+  local expected_entrypoint_state="$3"
+  local launcher_sha configure_sha update_sha path
+  local -a marker
+  bootstrap_require_regular "$HOST_TOOL_LAUNCHER_MARKER" root root 444
+  bootstrap_require_acl "$HOST_TOOL_LAUNCHER_MARKER" $'user::r--\ngroup::r--\nother::r--'
+  mapfile -t marker < "$HOST_TOOL_LAUNCHER_MARKER"
+  [[ ${#marker[@]} -eq 2 \
+    && "${marker[0]}" = LEGAL_MCP_HOST_TOOL_LAUNCHER_V1 \
+    && "${marker[1]}" =~ ^LAUNCHER_SHA256=([0-9a-f]{64})$ ]] || {
+      echo 'installed host-tool launcher marker is malformed' >&2
+      return 1
+    }
+  launcher_sha="${BASH_REMATCH[1]}"
+  bootstrap_require_regular "$HOST_TOOL_LAUNCHER" root root 755
+  [[ "$(sha256sum "$HOST_TOOL_LAUNCHER" | awk '{print $1}')" = "$launcher_sha" ]] || {
+    echo 'installed canonical host-tool launcher changed' >&2
+    return 1
+  }
+  bootstrap_require_regular /usr/local/sbin/legal-mcp-configure-auth root root 755
+  bootstrap_require_regular /usr/local/sbin/legal-mcp-update-image root root 755
+  case "$expected_entrypoint_state" in
+    outer)
+      [[ "$(sha256sum /usr/local/sbin/legal-mcp-configure-auth | awk '{print $1}')" = "$launcher_sha" \
+        && "$(sha256sum /usr/local/sbin/legal-mcp-update-image | awk '{print $1}')" = "$launcher_sha" ]]
+      ;;
+    internal)
+      [[ "$(sha256sum /usr/local/sbin/legal-mcp-configure-auth | awk '{print $1}')" \
+          = "$expected_configure_sha" \
+        && "$(sha256sum /usr/local/sbin/legal-mcp-update-image | awk '{print $1}')" \
+          = "$expected_update_sha" ]] || {
+          echo 'host-tool implementation bind mounts are not exact' >&2
+          return 1
+        }
+      ;;
+    *) return 1 ;;
+  esac
+  for path in "$CONFIGURE_AUTH_POINTER" "$UPDATE_IMAGE_POINTER"; do
+    bootstrap_require_regular "$path" root root 644
+    bootstrap_require_acl "$path" $'user::rw-\ngroup::r--\nother::r--'
+    [[ "$(stat -c '%s' "$path")" = 64 ]] || {
+      echo "host-tool implementation pointer is not exactly 64 bytes: $path" >&2
+      return 1
+    }
+  done
+  configure_sha="$(<"$CONFIGURE_AUTH_POINTER")"
+  update_sha="$(<"$UPDATE_IMAGE_POINTER")"
+  [[ "$configure_sha" = "$expected_configure_sha" \
+    && "$update_sha" = "$expected_update_sha" ]] || {
+      echo 'installed host-tool implementation pointers do not match this release' >&2
+      return 1
+    }
+  bootstrap_require_regular \
+    "$HOST_TOOL_IMPLEMENTATION_DIR/configure-auth.$configure_sha" root root 755
+  bootstrap_require_regular \
+    "$HOST_TOOL_IMPLEMENTATION_DIR/update-image.$update_sha" root root 755
+  [[ "$(sha256sum "$HOST_TOOL_IMPLEMENTATION_DIR/configure-auth.$configure_sha" | awk '{print $1}')" \
+      = "$configure_sha" \
+    && "$(sha256sum "$HOST_TOOL_IMPLEMENTATION_DIR/update-image.$update_sha" | awk '{print $1}')" \
+      = "$update_sha" ]] || {
+      echo 'immutable host-tool implementation changed' >&2
+      return 1
+    }
+}
+
+validate_v2_host_tool_release() {
+  local bundle_root="$1" expected_version="$2" expected_revision="$3" source_template="$4"
+  local expected_entrypoint_state="$5"
+  local deploy_sha publisher_sha configure_auth_sha update_image_sha
+  local container_template_sha sudoers_sha expected_policy
+  local -a marker
+  for path in \
+    "$bundle_root/infra/hosting/configure-auth.sh" \
+    "$bundle_root/infra/hosting/update-image.sh" \
+    "$bundle_root/scripts/legal-mcp-host-deploy" \
+    "$bundle_root/scripts/legal-mcp-publisher-command"; do
+    bootstrap_require_release_file "$path" true
+  done
+  bootstrap_require_release_file "$source_template"
+  bootstrap_require_regular /etc/legal-mcp/host-tools root root 444
+  bootstrap_require_acl /etc/legal-mcp/host-tools $'user::r--\ngroup::r--\nother::r--'
+  mapfile -t marker < /etc/legal-mcp/host-tools
+  [[ ${#marker[@]} -eq 9 && "${marker[0]}" = LEGAL_MCP_HOST_TOOLS_V2 \
+    && "${marker[1]}" = "VERSION=$expected_version" \
+    && "${marker[2]}" = "SOURCE_COMMIT=$expected_revision" \
+    && "${marker[3]}" =~ ^HOST_DEPLOY_SHA256=([0-9a-f]{64})$ ]] || {
+    echo 'installed V2 host-tool identity does not match the image release' >&2
+    return 1
+  }
+  deploy_sha="${BASH_REMATCH[1]}"
+  [[ "${marker[4]}" =~ ^PUBLISHER_COMMAND_SHA256=([0-9a-f]{64})$ ]] || return 1
+  publisher_sha="${BASH_REMATCH[1]}"
+  [[ "${marker[5]}" =~ ^CONFIGURE_AUTH_SHA256=([0-9a-f]{64})$ ]] || return 1
+  configure_auth_sha="${BASH_REMATCH[1]}"
+  [[ "${marker[6]}" =~ ^UPDATE_IMAGE_SHA256=([0-9a-f]{64})$ ]] || return 1
+  update_image_sha="${BASH_REMATCH[1]}"
+  [[ "${marker[7]}" =~ ^CONTAINER_TEMPLATE_SHA256=([0-9a-f]{64})$ ]] || return 1
+  container_template_sha="${BASH_REMATCH[1]}"
+  [[ "${marker[8]}" =~ ^SUDOERS_SHA256=([0-9a-f]{64})$ ]] || return 1
+  sudoers_sha="${BASH_REMATCH[1]}"
+
+  bootstrap_require_regular /usr/local/sbin/legal-mcp-host-deploy root root 755
+  bootstrap_require_regular /usr/local/sbin/legal-mcp-publisher-command root root 755
+  bootstrap_require_regular /usr/local/sbin/legal-mcp-configure-auth root root 755
+  bootstrap_require_regular /usr/local/sbin/legal-mcp-update-image root root 755
+  bootstrap_require_regular "$TEMPLATE" root root 644
+  bootstrap_require_regular /etc/sudoers.d/legal-mcp-publisher root root 440
+  [[ "$(sha256sum /usr/local/sbin/legal-mcp-host-deploy | awk '{print $1}')" = "$deploy_sha" \
+    && "$(sha256sum /usr/local/sbin/legal-mcp-publisher-command | awk '{print $1}')" = "$publisher_sha" \
+    && "$(sha256sum "$TEMPLATE" | awk '{print $1}')" = "$container_template_sha" \
+    && "$(sha256sum /etc/sudoers.d/legal-mcp-publisher | awk '{print $1}')" = "$sudoers_sha" \
+    && "$(sha256sum "$bundle_root/scripts/legal-mcp-host-deploy" | awk '{print $1}')" = "$deploy_sha" \
+    && "$(sha256sum "$bundle_root/scripts/legal-mcp-publisher-command" | awk '{print $1}')" = "$publisher_sha" \
+    && "$(sha256sum "$bundle_root/infra/hosting/configure-auth.sh" | awk '{print $1}')" = "$configure_auth_sha" \
+    && "$(sha256sum "$bundle_root/infra/hosting/update-image.sh" | awk '{print $1}')" = "$update_image_sha" \
+    && "$(sha256sum "$source_template" | awk '{print $1}')" = "$container_template_sha" \
+    && "$(sha256sum "${BASH_SOURCE[0]}" | awk '{print $1}')" = "$update_image_sha" ]] || {
+    echo 'installed and release-bundled V2 host tools do not match exactly' >&2
+    return 1
+  }
+  expected_policy="$(mktemp /run/legal-mcp-image-sudoers.XXXXXX)"
+  printf '%s\n' \
+    'Defaults:legal-mcp-publisher !requiretty' \
+    "legal-mcp-publisher ALL=(root) NOPASSWD: sha256:$deploy_sha /usr/local/sbin/legal-mcp-host-deploy ^prepare [0-9a-f]{64}$, sha256:$deploy_sha /usr/local/sbin/legal-mcp-host-deploy ^activate [0-9a-f]{64}$, sha256:$deploy_sha /usr/local/sbin/legal-mcp-host-deploy ^abort [0-9a-f]{64}$" \
+    > "$expected_policy"
+  if ! cmp --silent "$expected_policy" /etc/sudoers.d/legal-mcp-publisher; then
+    rm -f "$expected_policy"
+    echo 'installed publisher sudo policy is not the V2 release policy' >&2
+    return 1
+  fi
+  rm -f "$expected_policy"
+  visudo -cf /etc/sudoers.d/legal-mcp-publisher >/dev/null
+  validate_installed_host_tool_launchers \
+    "$configure_auth_sha" "$update_image_sha" "$expected_entrypoint_state"
 }
 
 bootstrap_validate_static_host() {
@@ -1097,300 +1276,969 @@ run_bootstrap_empty_host_update() {
   echo "empty bootstrap host pinned to $NEW_IMAGE; service and ingress remain off"
 }
 
-restore_unit_enablement() {
-  local unit="$1" flag="$2" state
-  if [[ -e "$TRANSACTION/$flag" ]]; then
-    if [[ "$unit" = "$SERVICE" ]]; then
-      state="$(read_systemctl_enablement "$unit")" || return 1
-      [[ "$state" = generated ]] || {
-        echo 'restored Quadlet service is not generated' >&2
-        return 1
-      }
-    else
-      systemctl enable "$unit" >/dev/null
-      state="$(read_systemctl_enablement "$unit")" || return 1
-      [[ "$state" = enabled ]] || return 1
-    fi
-  else
-    systemctl disable "$unit" >/dev/null
-    state="$(read_systemctl_enablement "$unit")" || return 1
-    [[ "$state" = disabled ]] || return 1
-  fi
+ordinary_require_regular() {
+  local path="$1" owner="$2" group="$3" mode="$4"
+  [[ -f "$path" && ! -L "$path" \
+    && "$(stat -c '%U:%G:%a:%h' "$path")" = "$owner:$group:$mode:1" ]] || {
+    echo "required host file is missing or unsafe: $path" >&2
+    return 1
+  }
 }
 
-open_recorded_ingress() {
-  if [[ -e "$TRANSACTION/caddy-was-active" ]]; then
-    systemctl start caddy.service
-  else
-    systemctl stop caddy.service >/dev/null 2>&1 || true
+ordinary_render_metadata_manifest() {
+  local destination="$1"
+  cat > "$destination" <<'EOF'
+IMAGE=root:root:600:1
+QUADLET=root:root:644:1
+TEMPLATE=root:root:644:1
+RUNTIME_ENV=root:root:600:1
+API_KEYS=legal-mcp:legal-mcp:400:1
+CADDYFILE=root:caddy:640:1
+AUTH_READY=root:root:444:1:0
+ACTIVE_GENERATION=root:root:644:1:64
+EOF
+}
+
+ordinary_render_hash_manifest() {
+  local image="$1" quadlet="$2" template="$3" runtime="$4"
+  local api_keys="$5" caddyfile="$6" auth_ready="$7" generation="$8"
+  local destination="$9"
+  cat > "$destination" <<EOF
+IMAGE_SHA256=$(sha256sum "$image" | awk '{print $1}')
+QUADLET_SHA256=$(sha256sum "$quadlet" | awk '{print $1}')
+TEMPLATE_SHA256=$(sha256sum "$template" | awk '{print $1}')
+RUNTIME_ENV_SHA256=$(sha256sum "$runtime" | awk '{print $1}')
+API_KEYS_SHA256=$(sha256sum "$api_keys" | awk '{print $1}')
+CADDYFILE_SHA256=$(sha256sum "$caddyfile" | awk '{print $1}')
+AUTH_READY_SHA256=$(sha256sum "$auth_ready" | awk '{print $1}')
+ACTIVE_GENERATION_SHA256=$(sha256sum "$generation" | awk '{print $1}')
+EOF
+}
+
+ordinary_render_release_manifest() {
+  local destination="$1"
+  cat > "$destination" <<EOF
+UPDATE_IMAGE_SHA256=$(sha256sum "$ORDINARY_RELEASE_UPDATE_IMAGE" | awk '{print $1}')
+CONFIGURE_AUTH_SHA256=$(sha256sum "$ORDINARY_RELEASE_CONFIGURE_AUTH" | awk '{print $1}')
+HOST_DEPLOY_SHA256=$(sha256sum "$ORDINARY_RELEASE_HOST_DEPLOY" | awk '{print $1}')
+PUBLISHER_COMMAND_SHA256=$(sha256sum "$ORDINARY_RELEASE_PUBLISHER" | awk '{print $1}')
+CONTAINER_TEMPLATE_SHA256=$(sha256sum "$ORDINARY_SOURCE_TEMPLATE" | awk '{print $1}')
+HOST_TOOLS_MARKER_SHA256=$(sha256sum "$HOST_TOOLS_MARKER" | awk '{print $1}')
+HOST_TOOL_LAUNCHER_SHA256=$(sha256sum "$HOST_TOOL_LAUNCHER" | awk '{print $1}')
+HOST_TOOL_LAUNCHER_MARKER_SHA256=$(sha256sum "$HOST_TOOL_LAUNCHER_MARKER" | awk '{print $1}')
+CONFIGURE_AUTH_POINTER_SHA256=$(sha256sum "$CONFIGURE_AUTH_POINTER" | awk '{print $1}')
+UPDATE_IMAGE_POINTER_SHA256=$(sha256sum "$UPDATE_IMAGE_POINTER" | awk '{print $1}')
+EOF
+}
+
+ordinary_load_installed_release_identity() {
+  local script="$1" deploy_sha publisher_sha configure_sha update_sha
+  local template_sha sudoers_sha expected_policy
+  local -a marker
+  bootstrap_require_regular "$HOST_TOOLS_MARKER" root root 444
+  bootstrap_require_acl "$HOST_TOOLS_MARKER" $'user::r--\ngroup::r--\nother::r--'
+  mapfile -t marker < "$HOST_TOOLS_MARKER"
+  [[ ${#marker[@]} -eq 9 && "${marker[0]}" = LEGAL_MCP_HOST_TOOLS_V2 \
+    && "${marker[1]}" =~ ^VERSION=([0-9]+\.[0-9]+\.[0-9]+)$ ]] || {
+      echo 'installed V2 host-tool release identity is malformed' >&2
+      return 1
+    }
+  ORDINARY_VERSION="${BASH_REMATCH[1]}"
+  [[ "${marker[2]}" =~ ^SOURCE_COMMIT=([0-9a-f]{40})$ ]]
+  ORDINARY_REVISION="${BASH_REMATCH[1]}"
+  [[ "${marker[3]}" =~ ^HOST_DEPLOY_SHA256=([0-9a-f]{64})$ ]]
+  deploy_sha="${BASH_REMATCH[1]}"
+  [[ "${marker[4]}" =~ ^PUBLISHER_COMMAND_SHA256=([0-9a-f]{64})$ ]]
+  publisher_sha="${BASH_REMATCH[1]}"
+  [[ "${marker[5]}" =~ ^CONFIGURE_AUTH_SHA256=([0-9a-f]{64})$ ]]
+  configure_sha="${BASH_REMATCH[1]}"
+  [[ "${marker[6]}" =~ ^UPDATE_IMAGE_SHA256=([0-9a-f]{64})$ ]]
+  update_sha="${BASH_REMATCH[1]}"
+  [[ "${marker[7]}" =~ ^CONTAINER_TEMPLATE_SHA256=([0-9a-f]{64})$ ]]
+  template_sha="${BASH_REMATCH[1]}"
+  [[ "${marker[8]}" =~ ^SUDOERS_SHA256=([0-9a-f]{64})$ ]]
+  sudoers_sha="${BASH_REMATCH[1]}"
+  ORDINARY_SOURCE_TEMPLATE="$TEMPLATE"
+  ORDINARY_RELEASE_HOST_DEPLOY=/usr/local/sbin/legal-mcp-host-deploy
+  ORDINARY_RELEASE_PUBLISHER=/usr/local/sbin/legal-mcp-publisher-command
+  ORDINARY_RELEASE_CONFIGURE_AUTH="$HOST_TOOL_IMPLEMENTATION_DIR/configure-auth.$configure_sha"
+  ORDINARY_RELEASE_UPDATE_IMAGE="$HOST_TOOL_IMPLEMENTATION_DIR/update-image.$update_sha"
+  bootstrap_require_regular "$ORDINARY_RELEASE_HOST_DEPLOY" root root 755
+  bootstrap_require_regular "$ORDINARY_RELEASE_PUBLISHER" root root 755
+  bootstrap_require_regular "$ORDINARY_SOURCE_TEMPLATE" root root 644
+  bootstrap_require_regular /etc/sudoers.d/legal-mcp-publisher root root 440
+  [[ "$(sha256sum "$ORDINARY_RELEASE_HOST_DEPLOY" | awk '{print $1}')" = "$deploy_sha" \
+    && "$(sha256sum "$ORDINARY_RELEASE_PUBLISHER" | awk '{print $1}')" = "$publisher_sha" \
+    && "$(sha256sum "$ORDINARY_SOURCE_TEMPLATE" | awk '{print $1}')" = "$template_sha" \
+    && "$(sha256sum /etc/sudoers.d/legal-mcp-publisher | awk '{print $1}')" = "$sudoers_sha" \
+    && "$(sha256sum "$script" | awk '{print $1}')" = "$update_sha" ]] || {
+      echo 'installed V2 release bytes do not match their marker' >&2
+      return 1
+    }
+  validate_installed_host_tool_launchers "$configure_sha" "$update_sha" internal
+  expected_policy="$(mktemp /run/legal-mcp-image-installed-sudoers.XXXXXX)"
+  printf '%s\n' \
+    'Defaults:legal-mcp-publisher !requiretty' \
+    "legal-mcp-publisher ALL=(root) NOPASSWD: sha256:$deploy_sha /usr/local/sbin/legal-mcp-host-deploy ^prepare [0-9a-f]{64}$, sha256:$deploy_sha /usr/local/sbin/legal-mcp-host-deploy ^activate [0-9a-f]{64}$, sha256:$deploy_sha /usr/local/sbin/legal-mcp-host-deploy ^abort [0-9a-f]{64}$" \
+    > "$expected_policy"
+  if ! cmp --silent "$expected_policy" /etc/sudoers.d/legal-mcp-publisher; then
+    rm -f "$expected_policy"
+    echo 'installed publisher sudo policy is not exact' >&2
+    return 1
   fi
-  if [[ -e "$TRANSACTION/public-was-open" ]]; then
-    if ! ufw allow 80/tcp comment 'Caddy ACME HTTP' >/dev/null \
-      || ! ufw allow 443/tcp comment 'Australian Legal MCP HTTPS' >/dev/null \
-      || ! probe_auth_boundary "$EXTERNAL_URL" "${EXTERNAL_URL%/mcp}/.well-known/oauth-protected-resource/mcp"; then
-      close_ingress
-      echo 'public authentication boundary failed; ingress remains closed' >&2
+  rm -f "$expected_policy"
+  visudo -cf /etc/sudoers.d/legal-mcp-publisher >/dev/null
+}
+
+ordinary_load_release_bundle() {
+  local requested_template="$1" requested_version="$2" script resolved_template
+  local entrypoint_state
+  local -a versions revisions
+  [[ ! -L "${BASH_SOURCE[0]}" ]] || {
+    echo 'image update must run from a real version-matched release implementation' >&2
+    return 1
+  }
+  script="$(readlink -f "${BASH_SOURCE[0]}")"
+  bootstrap_require_release_file "$script" true
+  if [[ -n "$requested_template" ]]; then
+    bootstrap_require_release_file "$requested_template"
+    resolved_template="$(readlink -f "$requested_template")"
+    ORDINARY_BUNDLE_ROOT="$(cd "$(dirname "$resolved_template")/../.." && pwd -P)"
+    [[ "$resolved_template" = "$ORDINARY_BUNDLE_ROOT/infra/hosting/legal-mcp.container.template" ]] || {
+      echo 'Quadlet template is not in a complete Linux release bundle' >&2
+      return 1
+    }
+  else
+    ORDINARY_BUNDLE_ROOT="$(cd "$(dirname "$script")/../.." && pwd -P)"
+    if [[ "$script" != "$ORDINARY_BUNDLE_ROOT/infra/hosting/update-image.sh" ]]; then
+      ordinary_load_installed_release_identity "$script"
+      [[ "$(grep -o '__IMAGE_DIGEST__' "$ORDINARY_SOURCE_TEMPLATE" | wc -l)" = 1 \
+        && "$(grep -Fxc 'ExecCondition=/usr/local/libexec/legal-mcp/host-tool-launcher --check-auth-ready' \
+          "$ORDINARY_SOURCE_TEMPLATE")" = 1 ]] || {
+          echo 'installed release template lacks its exact image or auth-ready gate' >&2
+          return 1
+        }
+      ORDINARY_UPDATER_SHA256="$(sha256sum "$script" | awk '{print $1}')"
+      return 0
+    fi
+  fi
+  ORDINARY_SOURCE_TEMPLATE="$ORDINARY_BUNDLE_ROOT/infra/hosting/legal-mcp.container.template"
+  for path in \
+    "$ORDINARY_BUNDLE_ROOT/Containerfile" \
+    "$ORDINARY_BUNDLE_ROOT/SOURCE_COMMIT" \
+    "$ORDINARY_BUNDLE_ROOT/libonnxruntime.so" \
+    "$ORDINARY_SOURCE_TEMPLATE"; do
+    bootstrap_require_release_file "$path"
+  done
+  bootstrap_require_release_file "$ORDINARY_BUNDLE_ROOT/legal-mcp" true
+  mapfile -t versions < <(awk -F= '$1 == "ARG VERSION" {print $2}' "$ORDINARY_BUNDLE_ROOT/Containerfile")
+  mapfile -t revisions < "$ORDINARY_BUNDLE_ROOT/SOURCE_COMMIT"
+  [[ ${#versions[@]} -eq 1 && "${versions[0]}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ \
+    && ${#revisions[@]} -eq 1 && "${revisions[0]}" =~ ^[0-9a-f]{40}$ ]] || {
+    echo 'release bundle version or source revision is malformed' >&2
+    return 1
+  }
+  ORDINARY_VERSION="${versions[0]}"
+  ORDINARY_REVISION="${revisions[0]}"
+  if [[ -n "$requested_version" && "$requested_version" != "$ORDINARY_VERSION" ]]; then
+    echo 'release bundle version does not match the request' >&2
+    return 1
+  fi
+  if [[ -n "$requested_template" ]]; then
+    [[ "$resolved_template" = "$ORDINARY_SOURCE_TEMPLATE" ]] || {
+      echo 'Quadlet template is not the exact template in this release bundle' >&2
+      return 1
+    }
+  fi
+  [[ "$(grep -o '__IMAGE_DIGEST__' "$ORDINARY_SOURCE_TEMPLATE" | wc -l)" = 1 \
+    && "$(grep -Fxc 'ExecCondition=/usr/local/libexec/legal-mcp/host-tool-launcher --check-auth-ready' \
+      "$ORDINARY_SOURCE_TEMPLATE")" = 1 ]] || {
+    echo 'version-matched Quadlet template lacks its exact image or auth-ready gate' >&2
+    return 1
+  }
+  if [[ "$script" = "$ORDINARY_BUNDLE_ROOT/infra/hosting/update-image.sh" ]]; then
+    entrypoint_state=outer
+  else
+    entrypoint_state=internal
+  fi
+  validate_v2_host_tool_release \
+    "$ORDINARY_BUNDLE_ROOT" "$ORDINARY_VERSION" "$ORDINARY_REVISION" \
+    "$ORDINARY_SOURCE_TEMPLATE" "$entrypoint_state"
+  ORDINARY_RELEASE_HOST_DEPLOY="$ORDINARY_BUNDLE_ROOT/scripts/legal-mcp-host-deploy"
+  ORDINARY_RELEASE_PUBLISHER="$ORDINARY_BUNDLE_ROOT/scripts/legal-mcp-publisher-command"
+  ORDINARY_RELEASE_CONFIGURE_AUTH="$ORDINARY_BUNDLE_ROOT/infra/hosting/configure-auth.sh"
+  ORDINARY_RELEASE_UPDATE_IMAGE="$ORDINARY_BUNDLE_ROOT/infra/hosting/update-image.sh"
+  ORDINARY_UPDATER_SHA256="$(sha256sum "$script" | awk '{print $1}')"
+}
+
+ordinary_require_live_metadata() {
+  ordinary_require_regular "$IMAGE_FILE" root root 600
+  ordinary_require_regular "$QUADLET" root root 644
+  ordinary_require_regular "$TEMPLATE" root root 644
+  ordinary_require_regular "$RUNTIME_ENV" root root 600
+  ordinary_require_regular "$API_KEYS" legal-mcp legal-mcp 400
+  ordinary_require_regular "$CADDYFILE" root caddy 640
+  ordinary_require_regular "$AUTH_READY" root root 444
+  [[ "$(stat -c '%s' "$AUTH_READY")" = 0 \
+    && "$(getfacl --absolute-names --numeric --omit-header "$AUTH_READY")" \
+      = $'user::r--\ngroup::r--\nother::r--' ]] || {
+      echo 'authentication-ready marker is not exact' >&2
+      return 1
+    }
+  ordinary_require_regular /srv/legal-mcp/lifecycle/active-generation root root 644
+  [[ "$(stat -c '%s' /srv/legal-mcp/lifecycle/active-generation)" = 64 ]] || {
+    echo 'active generation pointer must contain exactly 64 bytes' >&2
+    return 1
+  }
+}
+
+ordinary_validate_caddy_contract() {
+  local host="$1" adapted
+  ordinary_require_regular "$CADDYFILE" root caddy 640 || return 1
+  adapted="$(mktemp /run/legal-mcp-image-caddy-adapted.XXXXXX)"
+  if ! caddy adapt --config "$CADDYFILE" --adapter caddyfile --validate > "$adapted"; then
+    rm -f "$adapted"
+    echo 'Caddyfile validation/adaptation failed' >&2
+    return 1
+  fi
+  if ! python3 - "$adapted" "$host" <<'PY'
+import json, sys
+path, host = sys.argv[1:]
+with open(path, encoding="utf-8") as handle:
+    actual = json.load(handle)
+timeouts = {
+    "read_timeout": 30_000_000_000,
+    "read_header_timeout": 10_000_000_000,
+    "write_timeout": 300_000_000_000,
+    "idle_timeout": 300_000_000_000,
+}
+https_routes = [
+    {"handle": [{"encodings": {"gzip": {}, "zstd": {}}, "handler": "encode", "prefer": ["zstd", "gzip"]}]},
+    {
+        "group": "group2",
+        "handle": [{"handler": "subroute", "routes": [{"handle": [
+            {"handler": "headers", "response": {"deferred": True, "delete": ["Server"], "set": {
+                "Cache-Control": ["no-store"],
+                "Strict-Transport-Security": ["max-age=31536000"],
+                "X-Content-Type-Options": ["nosniff"],
+            }}},
+            {"handler": "request_body", "max_size": 1_000_000},
+            {"flush_interval": -1, "handler": "reverse_proxy", "transport": {
+                "dial_timeout": 5_000_000_000,
+                "max_conns_per_host": 8,
+                "protocol": "http",
+                "read_timeout": 310_000_000_000,
+                "response_header_timeout": 310_000_000_000,
+                "write_timeout": 310_000_000_000,
+            }, "upstreams": [{"dial": "127.0.0.1:51235"}]},
+        ]}]}],
+        "match": [{"path": ["/mcp", "/.well-known/oauth-protected-resource/mcp"]}],
+    },
+    {"group": "group2", "handle": [{"handler": "subroute", "routes": [{"handle": [
+        {"body": "not found", "handler": "static_response", "status_code": 404}
+    ]}]}]},
+]
+expected = {"apps": {"http": {"servers": {
+    "srv0": {
+        "listen": [":443"], **timeouts,
+        "routes": [{"match": [{"host": [host]}], "handle": [{"handler": "subroute", "routes": https_routes}], "terminal": True}],
+    },
+    "srv1": {
+        "listen": [":80"], **timeouts,
+        "routes": [{"match": [{"host": [host]}], "handle": [{"handler": "subroute", "routes": [{"handle": [
+            {"body": "not found", "handler": "static_response", "status_code": 404}
+        ]}]}], "terminal": True}],
+    },
+}}}}
+if actual != expected:
+    raise SystemExit(1)
+PY
+  then
+    rm -f "$adapted"
+    echo 'adapted Caddy routes do not match the exact MCP-only contract' >&2
+    return 1
+  fi
+  rm -f "$adapted"
+}
+
+ordinary_require_listener_topology() {
+  local expected="$1" listeners
+  listeners="$(ss --listening --tcp --numeric --no-header)" || {
+    echo 'could not inspect listening TCP sockets' >&2
+    return 1
+  }
+  printf '%s\n' "$listeners" | python3 /dev/fd/3 "$expected" 3<<'PY'
+import re, sys
+expected = sys.argv[1]
+entries = []
+for line in sys.stdin.read().splitlines():
+    if not line.strip():
+        continue
+    fields = line.split()
+    if len(fields) < 4:
+        raise SystemExit(1)
+    match = re.fullmatch(r"(.+):([0-9]+)", fields[3])
+    if not match:
+        raise SystemExit(1)
+    address, port = match.group(1), int(match.group(2))
+    if address.startswith("[") and address.endswith("]"):
+        address = address[1:-1]
+    if port in (80, 443, 51235):
+        entries.append((address, port))
+if len(entries) != len(set(entries)):
+    raise SystemExit(1)
+service = [(address, port) for address, port in entries if port == 51235]
+web = [(address, port) for address, port in entries if port in (80, 443)]
+if expected == "none":
+    if entries:
+        raise SystemExit(1)
+elif expected == "private":
+    if service != [("127.0.0.1", 51235)] or web:
+        raise SystemExit(1)
+elif expected == "public":
+    if service != [("127.0.0.1", 51235)]:
+        raise SystemExit(1)
+    if {port for _, port in web} != {80, 443}:
+        raise SystemExit(1)
+    if any(address not in {"*", "0.0.0.0", "::"} for address, _ in web):
+        raise SystemExit(1)
+    if sum(port == 80 for _, port in web) not in (1, 2) or sum(port == 443 for _, port in web) not in (1, 2):
+        raise SystemExit(1)
+else:
+    raise SystemExit(1)
+PY
+}
+
+ordinary_probe_negative_caddy_routes() {
+  local origin="$1" host path method status headers
+  host="${origin#https://}"
+  for path in / /mcp/ /.well-known/oauth-protected-resource \
+    /.well-known/oauth-protected-resource/mcp/ /readyz /livez; do
+    method=GET
+    [[ "$path" = /mcp/ ]] && method=POST
+    headers="$(mktemp /run/legal-mcp-image-negative-headers.XXXXXX)"
+    status="$(curl --silent --show-error --dump-header "$headers" --output /dev/null \
+      --write-out '%{http_code}' --max-time 20 --max-redirs 0 --request "$method" \
+      --resolve "$host:443:127.0.0.1" "$origin$path" 2>/dev/null || true)"
+    if [[ "$status" != 404 ]] || grep -Eiq '^Location:' "$headers"; then
+      rm -f "$headers"
+      echo "unexpected public route or redirect: $path" >&2
       return 1
     fi
+    rm -f "$headers"
+  done
+  headers="$(mktemp /run/legal-mcp-image-negative-headers.XXXXXX)"
+  status="$(curl --silent --show-error --dump-header "$headers" --output /dev/null \
+    --write-out '%{http_code}' --max-time 20 --max-redirs 0 \
+    --resolve "$host:80:127.0.0.1" "http://$host/mcp" 2>/dev/null || true)"
+  if [[ "$status" != 404 ]] || grep -Eiq '^Location:' "$headers"; then
+    rm -f "$headers"
+    echo 'HTTP MCP path must be an exact non-redirecting 404' >&2
+    return 1
   fi
-  return 0
+  rm -f "$headers"
 }
 
-recover_transaction() {
-  local old_image_state
+ordinary_require_no_foreign_transaction() {
+  local path auth_preparation
+  for path in \
+    /srv/legal-mcp/lifecycle/.deployment-transaction \
+    /srv/legal-mcp/lifecycle/.deployment-transaction.preparing \
+    /etc/legal-mcp/.auth-transaction \
+    /etc/legal-mcp/.auth-transaction.preparing \
+    /etc/legal-mcp/.auth-transaction.preparing-retired \
+    /etc/legal-mcp/.auth-transaction.retiring \
+    /etc/legal-mcp/.auth-transaction.retired \
+    /etc/legal-mcp/.host-tools-transaction.building \
+    /etc/legal-mcp/.host-tools-transaction.building-retired \
+    /etc/legal-mcp/.host-tools-transaction.preparing \
+    /etc/legal-mcp/.host-tools-transaction.preparing-retired \
+    /etc/legal-mcp/.host-tools-transaction \
+    /etc/legal-mcp/.host-tools-transaction.retiring \
+    /etc/legal-mcp/.host-tools-transaction.retired \
+    /etc/legal-mcp/.host-tools-transaction.rollback-retiring \
+    /etc/legal-mcp/.host-tools-transaction.rollback-retired \
+    /etc/legal-mcp/.host-tools-transaction.publisher-restore \
+    /etc/legal-mcp/.host-tools-transaction.publisher-restore-retired; do
+    image_path_is_absent "$path" || {
+      echo 'a foreign host transaction must be recovered first' >&2
+      return 1
+    }
+  done
+  auth_preparation="$(find /etc/legal-mcp -mindepth 1 -maxdepth 1 \
+    -name '.auth-transaction.preparing.*' -print -quit)" || {
+      echo 'could not inspect authentication transaction preparations' >&2
+      return 1
+    }
+  [[ -z "$auth_preparation" ]] || {
+    echo 'an authentication transaction preparation must be recovered first' >&2
+    return 1
+  }
+}
+
+ordinary_validate_transaction() {
+  local directory="$1" rendered manifest metadata release_manifest name
+  local -a kind version revision updater outcome state old_image target_image generation
+  require_image_transaction_directory "$directory"
+  for name in kind target-version target-revision updater-sha256 retirement-outcome release-sha256 \
+    saved-sha256 target-sha256 saved-metadata target-metadata state \
+    saved-image saved-quadlet saved-template saved-runtime.env \
+    saved-api-keys.json saved-Caddyfile saved-auth-ready saved-active-generation \
+    target-image target-quadlet target-template; do
+    ordinary_require_regular "$directory/$name" root root 600 || return 1
+  done
+  bootstrap_directory_contains_only "$directory" \
+    kind target-version target-revision updater-sha256 retirement-outcome release-sha256 \
+    saved-sha256 target-sha256 saved-metadata target-metadata state \
+    saved-image saved-quadlet saved-template saved-runtime.env \
+    saved-api-keys.json saved-Caddyfile saved-auth-ready saved-active-generation \
+    target-image target-quadlet target-template || {
+      echo 'image transaction contains unexpected durable state' >&2
+      return 1
+    }
+  mapfile -t kind < "$directory/kind"
+  mapfile -t version < "$directory/target-version"
+  mapfile -t revision < "$directory/target-revision"
+  mapfile -t updater < "$directory/updater-sha256"
+  mapfile -t outcome < "$directory/retirement-outcome"
+  [[ ${#kind[@]} -eq 1 && "${kind[0]}" = LEGAL_MCP_IMAGE_TRANSACTION_V2 \
+    && ${#version[@]} -eq 1 && "${version[0]}" = "$ORDINARY_VERSION" \
+    && ${#revision[@]} -eq 1 && "${revision[0]}" = "$ORDINARY_REVISION" \
+    && ${#updater[@]} -eq 1 && "${updater[0]}" = "$ORDINARY_UPDATER_SHA256" \
+    && ${#outcome[@]} -eq 1 && "${outcome[0]}" =~ ^(pending|saved|target)$ ]] || {
+    echo 'image transaction does not belong to this exact release updater' >&2
+    return 1
+  }
+  TRANSACTION_RETIREMENT_OUTCOME="${outcome[0]}"
+  release_manifest="$(mktemp /run/legal-mcp-image-release.XXXXXX)"
+  ordinary_render_release_manifest "$release_manifest"
+  if ! cmp --silent "$release_manifest" "$directory/release-sha256"; then
+    rm -f "$release_manifest"
+    echo 'image transaction release bundle hash manifest does not match' >&2
+    return 1
+  fi
+  rm -f "$release_manifest"
+  metadata="$(mktemp /run/legal-mcp-image-metadata.XXXXXX)"
+  ordinary_render_metadata_manifest "$metadata"
+  if ! cmp --silent "$metadata" "$directory/saved-metadata" \
+    || ! cmp --silent "$metadata" "$directory/target-metadata"; then
+    rm -f "$metadata"
+    echo 'image transaction host metadata manifest is not exact' >&2
+    return 1
+  fi
+  rm -f "$metadata"
+  manifest="$(mktemp /run/legal-mcp-image-hashes.XXXXXX)"
+  ordinary_render_hash_manifest \
+    "$directory/saved-image" "$directory/saved-quadlet" \
+    "$directory/saved-template" "$directory/saved-runtime.env" \
+    "$directory/saved-api-keys.json" "$directory/saved-Caddyfile" \
+    "$directory/saved-auth-ready" "$directory/saved-active-generation" "$manifest"
+  if ! cmp --silent "$manifest" "$directory/saved-sha256"; then
+    rm -f "$manifest"
+    echo 'saved image transaction bytes do not match their hash manifest' >&2
+    return 1
+  fi
+  ordinary_render_hash_manifest \
+    "$directory/target-image" "$directory/target-quadlet" \
+    "$directory/target-template" "$directory/saved-runtime.env" \
+    "$directory/saved-api-keys.json" "$directory/saved-Caddyfile" \
+    "$directory/saved-auth-ready" "$directory/saved-active-generation" "$manifest"
+  if ! cmp --silent "$manifest" "$directory/target-sha256"; then
+    rm -f "$manifest"
+    echo 'target image transaction bytes do not match their hash manifest' >&2
+    return 1
+  fi
+  rm -f "$manifest"
+
+  mapfile -t state < "$directory/state"
+  [[ ${#state[@]} -eq 13 \
+    && "${state[0]}" = SERVICE_ENABLEMENT=generated \
+    && "${state[1]}" = SERVICE_ACTIVITY=active \
+    && "${state[2]}" = CADDY_ENABLEMENT=enabled \
+    && "${state[3]}" = CADDY_ACTIVITY=active \
+    && "${state[4]}" = UFW_80=present \
+    && "${state[5]}" = UFW_443=present \
+    && "${state[6]}" =~ ^AUTH_MODE=(api-key|entra|entra\+api-key)$ \
+    && "${state[7]}" =~ ^EXTERNAL_URL=https://[a-z0-9.-]+/mcp$ \
+    && "${state[8]}" =~ ^EXPECTED_GENERATION=([0-9a-f]{64})$ ]] || {
+    echo 'image transaction service/authentication state is malformed' >&2
+    return 1
+  }
+  TRANSACTION_CADDY_ENABLEMENT="${state[2]#*=}"
+  TRANSACTION_CADDY_ACTIVITY="${state[3]#*=}"
+  TRANSACTION_UFW_80="${state[4]#*=}"
+  TRANSACTION_UFW_443="${state[5]#*=}"
+  TRANSACTION_AUTH_MODE="${state[6]#*=}"
+  TRANSACTION_EXTERNAL_URL="${state[7]#*=}"
+  TRANSACTION_GENERATION="${state[8]#*=}"
+  [[ "${state[9]}" =~ ^OLD_IMAGE=(ghcr\.io/gunba/australian-legal-mcp@sha256:[0-9a-f]{64})$ ]]
+  TRANSACTION_OLD_IMAGE="${state[9]#*=}"
+  [[ "${state[10]}" =~ ^OLD_IMAGE_ID=(sha256:[0-9a-f]{64})$ ]]
+  TRANSACTION_OLD_IMAGE_ID="${state[10]#*=}"
+  [[ "${state[11]}" =~ ^TARGET_IMAGE=(ghcr\.io/gunba/australian-legal-mcp@sha256:[0-9a-f]{64})$ ]]
+  TRANSACTION_TARGET_IMAGE="${state[11]#*=}"
+  [[ "${state[12]}" =~ ^TARGET_IMAGE_ID=(sha256:[0-9a-f]{64})$ ]]
+  TRANSACTION_TARGET_IMAGE_ID="${state[12]#*=}"
+  [[ "$TRANSACTION_OLD_IMAGE" != "$TRANSACTION_TARGET_IMAGE" \
+    && "$TRANSACTION_UFW_80" = "$TRANSACTION_UFW_443" ]] || {
+    echo 'image transaction image or UFW state is inconsistent' >&2
+    return 1
+  }
+  if [[ "$TRANSACTION_UFW_80" = present ]]; then
+    [[ "$TRANSACTION_CADDY_ENABLEMENT" = enabled \
+      && "$TRANSACTION_CADDY_ACTIVITY" = active ]] || {
+        echo 'image transaction records public ingress without active enabled Caddy' >&2
+        return 1
+      }
+  fi
+  mapfile -t old_image < "$directory/saved-image"
+  mapfile -t target_image < "$directory/target-image"
+  [[ ${#old_image[@]} -eq 1 && "${old_image[0]}" = "$TRANSACTION_OLD_IMAGE" \
+    && "$(stat -c '%s' "$directory/saved-image")" \
+      = "$(( ${#TRANSACTION_OLD_IMAGE} + 1 ))" \
+    && ${#target_image[@]} -eq 1 && "${target_image[0]}" = "$TRANSACTION_TARGET_IMAGE" \
+    && "$(stat -c '%s' "$directory/target-image")" \
+      = "$(( ${#TRANSACTION_TARGET_IMAGE} + 1 ))" ]] || {
+    echo 'image transaction pins do not match their state record' >&2
+    return 1
+  }
+  [[ "$(stat -c '%s' "$directory/saved-active-generation")" = 64 ]]
+  mapfile -t generation < "$directory/saved-active-generation"
+  [[ ${#generation[@]} -eq 1 && "${generation[0]}" = "$TRANSACTION_GENERATION" ]]
+  load_runtime_contract "$directory/saved-runtime.env"
+  [[ "$AUTH_MODE" = "$TRANSACTION_AUTH_MODE" \
+    && "$EXTERNAL_URL" = "$TRANSACTION_EXTERNAL_URL" ]] || {
+      echo 'saved runtime authentication metadata does not match the transaction' >&2
+      return 1
+    }
+  [[ "$(grep -o '__IMAGE_DIGEST__' "$directory/saved-template" | wc -l)" = 1 ]]
+  rendered="$(mktemp /run/legal-mcp-image-saved-quadlet.XXXXXX)"
+  sed "s|__IMAGE_DIGEST__|$TRANSACTION_OLD_IMAGE|g" \
+    "$directory/saved-template" > "$rendered"
+  if ! cmp --silent "$rendered" "$directory/saved-quadlet"; then
+    rm -f "$rendered"
+    echo 'saved image pin, template, and rendered Quadlet are inconsistent' >&2
+    return 1
+  fi
+  sed "s|__IMAGE_DIGEST__|$TRANSACTION_TARGET_IMAGE|g" \
+    "$directory/target-template" > "$rendered"
+  if ! cmp --silent "$rendered" "$directory/target-quadlet" \
+    || ! cmp --silent "$directory/target-template" "$ORDINARY_SOURCE_TEMPLATE"; then
+    rm -f "$rendered"
+    echo 'target image pin, release template, and rendered Quadlet are inconsistent' >&2
+    return 1
+  fi
+  rm -f "$rendered"
+}
+
+ordinary_current_file_matches() {
+  local live="$1" saved="$2" target="$3"
+  cmp --silent "$live" "$saved" || cmp --silent "$live" "$target"
+}
+
+ordinary_validate_recoverable_live_state() {
+  local activity container_state running_image_id host
+  ordinary_require_live_metadata
+  host="${TRANSACTION_EXTERNAL_URL#https://}"
+  host="${host%/mcp}"
+  ordinary_validate_caddy_contract "$host"
+  ordinary_current_file_matches "$IMAGE_FILE" \
+    "$TRANSACTION/saved-image" "$TRANSACTION/target-image" || return 1
+  ordinary_current_file_matches "$QUADLET" \
+    "$TRANSACTION/saved-quadlet" "$TRANSACTION/target-quadlet" || return 1
+  ordinary_current_file_matches "$TEMPLATE" \
+    "$TRANSACTION/saved-template" "$TRANSACTION/target-template" || return 1
+  cmp --silent "$RUNTIME_ENV" "$TRANSACTION/saved-runtime.env"
+  cmp --silent "$API_KEYS" "$TRANSACTION/saved-api-keys.json"
+  cmp --silent "$CADDYFILE" "$TRANSACTION/saved-Caddyfile"
+  cmp --silent "$AUTH_READY" "$TRANSACTION/saved-auth-ready"
+  cmp --silent /srv/legal-mcp/lifecycle/active-generation \
+    "$TRANSACTION/saved-active-generation"
+  [[ "$(read_systemctl_enablement "$SERVICE")" = generated ]]
+  activity="$(read_systemctl_activity "$SERVICE")" || return 1
+  [[ "$activity" = active || "$activity" = inactive ]]
+  if [[ "$activity" = active ]]; then
+    ordinary_require_listener_topology private
+  else
+    ordinary_require_listener_topology none
+  fi
+  container_state="$(podman_container_state australian-legal-mcp)" || return 1
+  if [[ "$container_state" = present ]]; then
+    running_image_id="$(podman inspect australian-legal-mcp --format '{{.Image}}')"
+    [[ "$running_image_id" = "$TRANSACTION_OLD_IMAGE_ID" \
+      || "$running_image_id" = "$TRANSACTION_TARGET_IMAGE_ID" ]] || {
+        echo 'recovery found a running container outside the saved/target image set' >&2
+        return 1
+      }
+  fi
+  ufw_is_fail_closed || {
+    echo 'recovery requires the exact fail-closed UFW allowlist' >&2
+    return 1
+  }
+  [[ "$(ufw_rule_state 80)" = absent && "$(ufw_rule_state 443)" = absent ]]
+}
+
+ordinary_atomic_install() {
+  local source="$1" destination="$2" owner="$3" group="$4" mode="$5" temporary
+  temporary="$(mktemp "$(dirname "$destination")/.$(basename "$destination").XXXXXX")"
+  install -o "$owner" -g "$group" -m "$mode" "$source" "$temporary"
+  sync -f "$temporary"
+  mv -fT "$temporary" "$destination"
+  sync -f "$(dirname "$destination")"
+}
+
+ordinary_restore_caddy_and_ufw() {
+  local host
+  if [[ "$TRANSACTION_CADDY_ENABLEMENT" = enabled ]]; then
+    systemctl enable caddy.service >/dev/null
+  else
+    systemctl disable caddy.service >/dev/null
+  fi
+  if [[ "$TRANSACTION_CADDY_ACTIVITY" = active ]]; then
+    systemctl start caddy.service
+  else
+    systemctl stop caddy.service >/dev/null
+  fi
+  [[ "$(read_systemctl_enablement caddy.service)" = "$TRANSACTION_CADDY_ENABLEMENT" \
+    && "$(read_systemctl_activity caddy.service)" = "$TRANSACTION_CADDY_ACTIVITY" ]]
+  if [[ "$TRANSACTION_UFW_80" = present ]]; then
+    host="${TRANSACTION_EXTERNAL_URL#https://}"
+    host="${host%/mcp}"
+    ufw_is_fail_closed
+    ordinary_validate_caddy_contract "$host"
+    ordinary_require_listener_topology public
+    ordinary_probe_negative_caddy_routes "${TRANSACTION_EXTERNAL_URL%/mcp}"
+    ufw allow 80/tcp comment 'Caddy ACME HTTP' >/dev/null
+    ufw allow 443/tcp comment 'Australian Legal MCP HTTPS' >/dev/null
+  else
+    ordinary_require_listener_topology private
+  fi
+}
+
+ordinary_verify_private_runtime() {
+  local expected_image_id="$1" running_image_id host
+  [[ "$(read_systemctl_enablement "$SERVICE")" = generated \
+    && "$(read_systemctl_activity "$SERVICE")" = active \
+    && "$(ufw_rule_state 80)" = absent \
+    && "$(ufw_rule_state 443)" = absent ]]
+  wait_for_exact_generation "$TRANSACTION_GENERATION"
+  host="${TRANSACTION_EXTERNAL_URL#https://}"
+  host="${host%/mcp}"
+  ordinary_validate_caddy_contract "$host"
+  ordinary_require_listener_topology private
+  probe_auth_boundary http://127.0.0.1:51235/mcp \
+    http://127.0.0.1:51235/.well-known/oauth-protected-resource/mcp
+  running_image_id="$(podman inspect australian-legal-mcp --format '{{.Image}}')"
+  [[ "$running_image_id" = "$expected_image_id" ]] || {
+    echo 'private service does not use the transaction image ID' >&2
+    return 1
+  }
+}
+
+ordinary_verify_final_state() {
+  local expected_manifest="$1" expected_image_id="$2" manifest running_image_id host
+  ordinary_require_live_metadata
+  manifest="$(mktemp /run/legal-mcp-image-live.XXXXXX)"
+  ordinary_render_hash_manifest "$IMAGE_FILE" "$QUADLET" "$TEMPLATE" \
+    "$RUNTIME_ENV" "$API_KEYS" "$CADDYFILE" "$AUTH_READY" \
+    /srv/legal-mcp/lifecycle/active-generation "$manifest"
+  if ! cmp --silent "$manifest" "$expected_manifest"; then
+    rm -f "$manifest"
+    echo 'live host files do not match the exact image transaction manifest' >&2
+    return 1
+  fi
+  rm -f "$manifest"
+  [[ "$(read_systemctl_enablement "$SERVICE")" = generated \
+    && "$(read_systemctl_activity "$SERVICE")" = active \
+    && "$(read_systemctl_enablement caddy.service)" = "$TRANSACTION_CADDY_ENABLEMENT" \
+    && "$(read_systemctl_activity caddy.service)" = "$TRANSACTION_CADDY_ACTIVITY" \
+    && "$(ufw_rule_state 80)" = "$TRANSACTION_UFW_80" \
+    && "$(ufw_rule_state 443)" = "$TRANSACTION_UFW_443" ]]
+  ufw_is_fail_closed
+  wait_for_exact_generation "$TRANSACTION_GENERATION"
+  probe_auth_boundary http://127.0.0.1:51235/mcp \
+    http://127.0.0.1:51235/.well-known/oauth-protected-resource/mcp
+  running_image_id="$(podman inspect australian-legal-mcp --format '{{.Image}}')"
+  [[ "$running_image_id" = "$expected_image_id" ]] || {
+    echo 'running container image ID does not match the transaction' >&2
+    return 1
+  }
+  if [[ "$TRANSACTION_UFW_80" = present ]]; then
+    host="${TRANSACTION_EXTERNAL_URL#https://}"
+    host="${host%/mcp}"
+    ordinary_validate_caddy_contract "$host"
+    ordinary_require_listener_topology public
+    ordinary_probe_negative_caddy_routes "${TRANSACTION_EXTERNAL_URL%/mcp}"
+    probe_auth_boundary "$TRANSACTION_EXTERNAL_URL" \
+      "${TRANSACTION_EXTERNAL_URL%/mcp}/.well-known/oauth-protected-resource/mcp"
+  else
+    ordinary_require_listener_topology private
+  fi
+}
+
+ordinary_restore_saved_state() {
+  local old_image_state old_image_id
+  systemctl stop "$SERVICE" >/dev/null
+  ordinary_atomic_install "$TRANSACTION/saved-image" "$IMAGE_FILE" root root 600
+  ordinary_atomic_install "$TRANSACTION/saved-quadlet" "$QUADLET" root root 644
+  ordinary_atomic_install "$TRANSACTION/saved-template" "$TEMPLATE" root root 644
+  ordinary_atomic_install "$TRANSACTION/saved-runtime.env" "$RUNTIME_ENV" root root 600
+  ordinary_atomic_install "$TRANSACTION/saved-api-keys.json" "$API_KEYS" legal-mcp legal-mcp 400
+  ordinary_atomic_install "$TRANSACTION/saved-Caddyfile" "$CADDYFILE" root caddy 640
+  ordinary_atomic_install "$TRANSACTION/saved-auth-ready" "$AUTH_READY" root root 444
+  old_image_state="$(podman_image_state "$TRANSACTION_OLD_IMAGE")" || return 1
+  if [[ "$old_image_state" = absent ]]; then podman pull "$TRANSACTION_OLD_IMAGE"; fi
+  old_image_id="$(podman image inspect "$TRANSACTION_OLD_IMAGE" --format '{{.Id}}')"
+  [[ "$old_image_id" = "$TRANSACTION_OLD_IMAGE_ID" ]] || {
+    echo 'saved image pin no longer resolves to its recorded image ID' >&2
+    return 1
+  }
+  systemctl daemon-reload
+  [[ "$(read_systemctl_enablement "$SERVICE")" = generated ]]
+  systemctl restart "$SERVICE"
+  ordinary_verify_private_runtime "$TRANSACTION_OLD_IMAGE_ID"
+  ordinary_restore_caddy_and_ufw
+  ordinary_verify_final_state "$TRANSACTION/saved-sha256" "$TRANSACTION_OLD_IMAGE_ID"
+}
+
+ordinary_read_transaction_probe_key() {
+  load_runtime_contract "$TRANSACTION/saved-runtime.env"
+  [[ "$AUTH_MODE" = "$TRANSACTION_AUTH_MODE" \
+    && "$EXTERNAL_URL" = "$TRANSACTION_EXTERNAL_URL" ]]
+  if [[ "$HAS_API" = true \
+    && "${PROBE_API_KEY:-}" =~ ^[a-z0-9][a-z0-9_-]{0,63}\.[A-Za-z0-9_-]{43}$ ]]; then
+    return 0
+  fi
+  read_probe_key
+}
+
+ordinary_recover_transaction() {
+  ordinary_validate_transaction "$TRANSACTION"
+  ordinary_read_transaction_probe_key
   close_ingress || {
     echo 'image recovery could not close public ingress' >&2
     return 1
   }
-  if ! ufw_is_fail_closed; then
-    echo 'UFW is not active with default-deny incoming; image recovery refuses to start Caddy' >&2
-    return 1
-  fi
-  [[ -d "$TRANSACTION" && ! -L "$TRANSACTION" \
-    && "$(stat -c '%U:%G:%a' "$TRANSACTION")" = root:root:700 ]] || {
-    echo 'image transaction is incomplete or unsafe; leaving ingress closed' >&2
-    close_ingress
+  ordinary_validate_recoverable_live_state || {
+    echo 'live image state is outside the exact saved/target transaction states' >&2
     return 1
   }
-  for name in image legal-mcp.container legal-mcp.container.template runtime.env expected-generation; do
-    [[ -f "$TRANSACTION/$name" && ! -L "$TRANSACTION/$name" ]] || {
-      echo "image transaction is missing $name; leaving ingress closed" >&2
-      close_ingress
+  ordinary_restore_saved_state
+  ordinary_retire_transaction saved
+}
+
+ordinary_verify_retirement_outcome() {
+  local pinned_image expected_image_id expected_manifest resolved_image_id
+  case "$TRANSACTION_RETIREMENT_OUTCOME" in
+    saved)
+      pinned_image="$TRANSACTION_OLD_IMAGE"
+      expected_image_id="$TRANSACTION_OLD_IMAGE_ID"
+      expected_manifest="$TRANSACTION/saved-sha256"
+      ;;
+    target)
+      pinned_image="$TRANSACTION_TARGET_IMAGE"
+      expected_image_id="$TRANSACTION_TARGET_IMAGE_ID"
+      expected_manifest="$TRANSACTION/target-sha256"
+      ;;
+    *)
+      echo 'image transaction is not authorized for retirement' >&2
+      return 1
+      ;;
+  esac
+  resolved_image_id="$(podman image inspect "$pinned_image" --format '{{.Id}}')"
+  [[ "$resolved_image_id" = "$expected_image_id" ]] || {
+    echo 'retiring image pin no longer resolves to its recorded image ID' >&2
+    return 1
+  }
+  ordinary_verify_final_state "$expected_manifest" "$expected_image_id"
+}
+
+ordinary_complete_retiring_transaction() {
+  ordinary_validate_transaction "$TRANSACTION_RETIRING"
+  [[ "$TRANSACTION_RETIREMENT_OUTCOME" != pending ]]
+  TRANSACTION="$TRANSACTION_RETIRING"
+  ordinary_read_transaction_probe_key
+  ordinary_verify_retirement_outcome
+  mv -T "$TRANSACTION_RETIRING" "$TRANSACTION_RETIRED"
+  sync -f /etc/legal-mcp
+  TRANSACTION=/etc/legal-mcp/.image-transaction
+  ordinary_complete_retired_transaction
+}
+
+ordinary_complete_retired_transaction() {
+  ordinary_validate_transaction "$TRANSACTION_RETIRED"
+  [[ "$TRANSACTION_RETIREMENT_OUTCOME" != pending ]]
+  TRANSACTION="$TRANSACTION_RETIRED"
+  ordinary_read_transaction_probe_key
+  ordinary_verify_retirement_outcome
+  TRANSACTION=/etc/legal-mcp/.image-transaction
+  delete_retired_image_directory "$TRANSACTION_RETIRED"
+}
+
+ordinary_retire_transaction() {
+  local retirement_choice="$1" outcome_source
+  [[ "$retirement_choice" = saved || "$retirement_choice" = target ]]
+  image_path_is_absent "$TRANSACTION_RETIRING"
+  image_path_is_absent "$TRANSACTION_RETIRED"
+  ordinary_validate_transaction "$TRANSACTION"
+  [[ "$TRANSACTION_RETIREMENT_OUTCOME" = pending ]]
+  outcome_source="$(mktemp /run/legal-mcp-image-retirement-outcome.XXXXXX)"
+  printf '%s\n' "$retirement_choice" > "$outcome_source"
+  ordinary_atomic_install "$outcome_source" \
+    "$TRANSACTION/retirement-outcome" root root 600
+  rm -f "$outcome_source"
+  ordinary_validate_transaction "$TRANSACTION"
+  ordinary_verify_retirement_outcome
+  mv -T "$TRANSACTION" "$TRANSACTION_RETIRING"
+  sync -f /etc/legal-mcp
+  mv -T "$TRANSACTION_RETIRING" "$TRANSACTION_RETIRED"
+  sync -f /etc/legal-mcp
+  ordinary_complete_retired_transaction
+}
+
+ordinary_create_transaction() {
+  local directory="$TRANSACTION_PREPARING" rendered
+  image_path_is_absent "$directory" || return 1
+  install -d -o root -g root -m 0700 "$directory"
+  install -o root -g root -m 0600 "$IMAGE_FILE" "$directory/saved-image"
+  install -o root -g root -m 0600 "$QUADLET" "$directory/saved-quadlet"
+  install -o root -g root -m 0600 "$TEMPLATE" "$directory/saved-template"
+  install -o root -g root -m 0600 "$RUNTIME_ENV" "$directory/saved-runtime.env"
+  install -o root -g root -m 0600 "$API_KEYS" "$directory/saved-api-keys.json"
+  install -o root -g root -m 0600 "$CADDYFILE" "$directory/saved-Caddyfile"
+  install -o root -g root -m 0600 "$AUTH_READY" "$directory/saved-auth-ready"
+  install -o root -g root -m 0600 /srv/legal-mcp/lifecycle/active-generation \
+    "$directory/saved-active-generation"
+  printf '%s\n' "$NEW_IMAGE" > "$directory/target-image"
+  install -o root -g root -m 0600 "$ORDINARY_SOURCE_TEMPLATE" "$directory/target-template"
+  rendered="$(mktemp /run/legal-mcp-image-target-quadlet.XXXXXX)"
+  sed "s|__IMAGE_DIGEST__|$NEW_IMAGE|g" "$ORDINARY_SOURCE_TEMPLATE" > "$rendered"
+  install -o root -g root -m 0600 "$rendered" "$directory/target-quadlet"
+  rm -f "$rendered"
+  printf '%s\n' LEGAL_MCP_IMAGE_TRANSACTION_V2 > "$directory/kind"
+  printf '%s\n' "$ORDINARY_VERSION" > "$directory/target-version"
+  printf '%s\n' "$ORDINARY_REVISION" > "$directory/target-revision"
+  printf '%s\n' "$ORDINARY_UPDATER_SHA256" > "$directory/updater-sha256"
+  printf '%s\n' pending > "$directory/retirement-outcome"
+  ordinary_render_release_manifest "$directory/release-sha256"
+  ordinary_render_metadata_manifest "$directory/saved-metadata"
+  ordinary_render_metadata_manifest "$directory/target-metadata"
+  ordinary_render_hash_manifest \
+    "$directory/saved-image" "$directory/saved-quadlet" \
+    "$directory/saved-template" "$directory/saved-runtime.env" \
+    "$directory/saved-api-keys.json" "$directory/saved-Caddyfile" \
+    "$directory/saved-auth-ready" "$directory/saved-active-generation" \
+    "$directory/saved-sha256"
+  ordinary_render_hash_manifest \
+    "$directory/target-image" "$directory/target-quadlet" \
+    "$directory/target-template" "$directory/saved-runtime.env" \
+    "$directory/saved-api-keys.json" "$directory/saved-Caddyfile" \
+    "$directory/saved-auth-ready" "$directory/saved-active-generation" \
+    "$directory/target-sha256"
+  cat > "$directory/state" <<EOF
+SERVICE_ENABLEMENT=generated
+SERVICE_ACTIVITY=active
+CADDY_ENABLEMENT=$CADDY_ENABLEMENT
+CADDY_ACTIVITY=$CADDY_ACTIVITY
+UFW_80=$UFW_80
+UFW_443=$UFW_443
+AUTH_MODE=$AUTH_MODE
+EXTERNAL_URL=$EXTERNAL_URL
+EXPECTED_GENERATION=$EXPECTED_GENERATION
+OLD_IMAGE=$OLD_IMAGE
+OLD_IMAGE_ID=$OLD_IMAGE_ID
+TARGET_IMAGE=$NEW_IMAGE
+TARGET_IMAGE_ID=$TARGET_IMAGE_ID
+EOF
+  chmod 600 "$directory"/*
+  sync -f "$directory"
+  ordinary_validate_transaction "$directory"
+  mv -T "$directory" "$TRANSACTION"
+  sync -f /etc/legal-mcp
+}
+
+ordinary_capture_baseline() {
+  local rendered image_state container_state running_image_id host
+  local -a current_image
+  ordinary_require_live_metadata
+  EXPECTED_GENERATION="$(</srv/legal-mcp/lifecycle/active-generation)"
+  [[ "$EXPECTED_GENERATION" =~ ^[0-9a-f]{64}$ ]]
+  mapfile -t current_image < "$IMAGE_FILE"
+  [[ ${#current_image[@]} -eq 1 ]]
+  OLD_IMAGE="${current_image[0]}"
+  [[ "$(stat -c '%s' "$IMAGE_FILE")" = "$(( ${#OLD_IMAGE} + 1 ))" \
+    && "$OLD_IMAGE" =~ ^ghcr\.io/gunba/australian-legal-mcp@sha256:[0-9a-f]{64}$ \
+    && "$NEW_IMAGE" != "$OLD_IMAGE" ]] || {
+      echo 'current and target image pins are malformed or identical' >&2
       return 1
     }
-  done
-  install -o root -g root -m 0600 "$TRANSACTION/image" "$IMAGE_FILE"
-  install -o root -g root -m 0644 "$TRANSACTION/legal-mcp.container" "$QUADLET"
-  install -o root -g root -m 0644 "$TRANSACTION/legal-mcp.container.template" "$TEMPLATE"
-  install -o root -g root -m 0600 "$TRANSACTION/runtime.env" "$RUNTIME_ENV"
-  expected="$(<"$TRANSACTION/expected-generation")"
-  old_image="$(<"$TRANSACTION/image")"
-  [[ "$expected" =~ ^[0-9a-f]{64}$ \
-    && "$old_image" =~ ^ghcr\.io/gunba/australian-legal-mcp@sha256:[0-9a-f]{64}$ ]]
-  load_runtime_contract "$TRANSACTION/runtime.env"
-  systemctl daemon-reload
-  restore_unit_enablement "$SERVICE" service-was-enabled
-  restore_unit_enablement caddy.service caddy-was-enabled
-  if [[ -e "$TRANSACTION/service-was-active" ]]; then
-    old_image_state="$(podman_image_state "$old_image")" || return 1
-    if [[ "$old_image_state" = absent ]]; then
-      podman pull "$old_image"
-    fi
-    systemctl restart "$SERVICE"
-    wait_for_exact_generation "$expected"
-    probe_auth_boundary http://127.0.0.1:51235/mcp \
-      http://127.0.0.1:51235/.well-known/oauth-protected-resource/mcp
-    expected_image_id="$(podman image inspect "$old_image" --format '{{.Id}}')"
-    running_image_id="$(podman inspect australian-legal-mcp --format '{{.Image}}')"
-    [[ "$running_image_id" = "$expected_image_id" ]]
-  else
-    systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+  [[ "$(grep -o '__IMAGE_DIGEST__' "$TEMPLATE" | wc -l)" = 1 ]]
+  rendered="$(mktemp /run/legal-mcp-image-current-quadlet.XXXXXX)"
+  sed "s|__IMAGE_DIGEST__|$OLD_IMAGE|g" "$TEMPLATE" > "$rendered"
+  if ! cmp --silent "$rendered" "$QUADLET"; then
+    rm -f "$rendered"
+    echo 'installed Quadlet is not the installed template rendered with /etc/legal-mcp/image' >&2
+    return 1
   fi
-  open_recorded_ingress
-  retire_image_transaction
-}
-
-if [[ "$BOOTSTRAP_EMPTY_HOST" = true ]]; then
-  for command_name in awk blkid cmp find findmnt getfacl id podman python3 \
-    readlink sha256sum ss stat sync systemctl ufw visudo xfs_info; do
-    command -v "$command_name" >/dev/null || {
-      echo "missing empty-host image dependency: $command_name" >&2
-      exit 1
+  rm -f "$rendered"
+  image_state="$(podman_image_state "$OLD_IMAGE")" || return 1
+  [[ "$image_state" = present ]] || {
+    echo 'currently pinned image is not present' >&2
+    return 1
+  }
+  OLD_IMAGE_ID="$(podman image inspect "$OLD_IMAGE" --format '{{.Id}}')"
+  [[ "$OLD_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
+  container_state="$(podman_container_state australian-legal-mcp)" || return 1
+  [[ "$container_state" = present ]] || {
+    echo 'ordinary image update requires the running service container' >&2
+    return 1
+  }
+  running_image_id="$(podman inspect australian-legal-mcp --format '{{.Image}}')"
+  [[ "$running_image_id" = "$OLD_IMAGE_ID" ]] || {
+    echo 'running container does not use the image pinned by /etc/legal-mcp/image' >&2
+    return 1
+  }
+  [[ "$(read_systemctl_enablement "$SERVICE")" = generated \
+    && "$(read_systemctl_activity "$SERVICE")" = active ]] || {
+      echo 'ordinary image updates require the generated service active' >&2
+      return 1
     }
-  done
-fi
-
-finalize_image_transaction_retirement
-finalize_image_preparation_retirement
-
-if [[ "$RECOVER" = true && "$BOOTSTRAP_EMPTY_HOST" = true ]]; then
-  [[ -z "$NEW_IMAGE$EXPECTED_VERSION$SOURCE_TEMPLATE" ]] || usage
-  bootstrap_force_off
-  [[ -d "$TRANSACTION" && ! -L "$TRANSACTION" ]] || {
-    if [[ "$IMAGE_PREPARATION_WAS_PENDING" = true ]]; then
-      echo 'interrupted empty-host image preparation discarded; service and ingress remain off'
-      exit 0
-    fi
-    if [[ "$IMAGE_RETIREMENT_WAS_PENDING" = true ]]; then
-      echo 'interrupted empty-host image transaction retirement completed; service and ingress remain off'
-      exit 0
-    fi
-    echo 'no safe empty-host image transaction exists' >&2
-    exit 1
+  CADDY_ENABLEMENT="$(read_systemctl_enablement caddy.service)" || return 1
+  CADDY_ACTIVITY="$(read_systemctl_activity caddy.service)" || return 1
+  [[ "$CADDY_ENABLEMENT" = enabled && "$CADDY_ACTIVITY" = active ]] || {
+    echo 'ordinary image updates require Caddy enabled and active' >&2
+    return 1
   }
-  bootstrap_require_regular "$TRANSACTION/target-version" root root 600
-  recovery_version="$(<"$TRANSACTION/target-version")"
-  [[ "$recovery_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-    echo 'empty-host image transaction version is malformed' >&2
-    exit 1
+  UFW_80="$(ufw_rule_state 80)" || return 1
+  UFW_443="$(ufw_rule_state 443)" || return 1
+  [[ "$UFW_80" = "$UFW_443" ]] || {
+    echo 'UFW 80/443 state is inconsistent' >&2
+    return 1
   }
-  recovery_script="$(readlink -f "${BASH_SOURCE[0]}")"
-  bootstrap_require_release_file "$recovery_script" true
-  recovery_template="$(dirname "$recovery_script")/legal-mcp.container.template"
-  bootstrap_load_bundle "$recovery_template" "$recovery_version"
-  bootstrap_recover_transaction
-  echo 'interrupted empty-host image cutover rolled back; service and ingress remain off'
-  exit 0
-fi
-
-if [[ "$BOOTSTRAP_EMPTY_HOST" = true ]]; then
-  [[ "$RECOVER" = false ]] || usage
-  run_bootstrap_empty_host_update
-  exit 0
-fi
-
-if [[ "$RECOVER" = true ]]; then
-  [[ -z "$NEW_IMAGE$EXPECTED_VERSION$SOURCE_TEMPLATE" ]] || usage
-  if image_path_is_absent "$TRANSACTION"; then
-    if [[ "$IMAGE_PREPARATION_WAS_PENDING" = true ]]; then
-      echo 'interrupted image preparation discarded'
-      exit 0
-    fi
-    if [[ "$IMAGE_RETIREMENT_WAS_PENDING" = true ]]; then
-      echo 'interrupted image transaction retirement completed'
-      exit 0
-    fi
-    echo 'no image transaction exists' >&2
-    exit 1
-  fi
-  close_ingress || { echo 'could not close ingress before image recovery' >&2; exit 1; }
-  load_runtime_contract "$TRANSACTION/runtime.env"
-  read_probe_key
-  recover_transaction
-  unset PROBE_API_KEY
-  echo 'interrupted image transaction rolled back'
-  exit 0
-fi
-
-[[ "$NEW_IMAGE" =~ ^ghcr\.io/gunba/australian-legal-mcp@sha256:[0-9a-f]{64}$ \
-  && "$EXPECTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || usage
-[[ -f "$SOURCE_TEMPLATE" && ! -L "$SOURCE_TEMPLATE" ]] || {
-  echo 'version-matched Quadlet template is missing or unsafe' >&2
-  exit 2
-}
-[[ "$(grep -o '__IMAGE_DIGEST__' "$SOURCE_TEMPLATE" | wc -l)" = 1 ]] || {
-  echo 'version-matched Quadlet template has an invalid image placeholder' >&2
-  exit 2
-}
-SOURCE_TEMPLATE="$(readlink -f "$SOURCE_TEMPLATE")"
-BUNDLE_ROOT="$(cd "$(dirname "$SOURCE_TEMPLATE")/../.." && pwd -P)"
-[[ -f "$BUNDLE_ROOT/Containerfile" && ! -L "$BUNDLE_ROOT/Containerfile" \
-  && -f "$BUNDLE_ROOT/SOURCE_COMMIT" && ! -L "$BUNDLE_ROOT/SOURCE_COMMIT" ]] || {
-  echo 'image update requires the complete version-matched Linux release bundle' >&2
-  exit 2
-}
-bundle_version="$(sed -n 's/^ARG VERSION=//p' "$BUNDLE_ROOT/Containerfile")"
-EXPECTED_REVISION="$(<"$BUNDLE_ROOT/SOURCE_COMMIT")"
-[[ "$bundle_version" = "$EXPECTED_VERSION" && "$EXPECTED_REVISION" =~ ^[0-9a-f]{40}$ ]] || {
-  echo 'release bundle version or source revision does not match the request' >&2
-  exit 2
-}
-for path in "$IMAGE_FILE" "$QUADLET" "$TEMPLATE" "$RUNTIME_ENV" \
-  /srv/legal-mcp/lifecycle/active-generation; do
-  [[ -f "$path" && ! -L "$path" ]] || { echo "required host file is missing or unsafe: $path" >&2; exit 1; }
-done
-image_path_is_absent /srv/legal-mcp/lifecycle/.deployment-transaction || {
-  echo 'a corpus deployment transaction must be completed first' >&2
-  exit 1
-}
-image_path_is_absent /etc/legal-mcp/.auth-transaction || {
-  echo 'an authentication transaction must be recovered first' >&2
-  exit 1
-}
-if ! image_path_is_absent /etc/legal-mcp/.host-tools-transaction.preparing \
-  || ! image_path_is_absent /etc/legal-mcp/.host-tools-transaction \
-  || ! image_path_is_absent /etc/legal-mcp/.host-tools-transaction.retiring \
-  || ! image_path_is_absent /etc/legal-mcp/.host-tools-transaction.rollback-retiring \
-  || ! image_path_is_absent /etc/legal-mcp/.host-tools-transaction.rollback-retired \
-  || ! image_path_is_absent /etc/legal-mcp/.host-tools-transaction.publisher-restore; then
-  echo 'a host-tool transaction must be recovered first' >&2
-  exit 1
-fi
-image_path_is_absent "$TRANSACTION" || {
-  echo 'an image transaction already exists; run this command with --recover first' >&2
-  exit 1
-}
-EXPECTED_GENERATION="$(</srv/legal-mcp/lifecycle/active-generation)"
-[[ "$EXPECTED_GENERATION" =~ ^[0-9a-f]{64}$ ]] || { echo 'active generation is malformed' >&2; exit 1; }
-OLD_IMAGE="$(<"$IMAGE_FILE")"
-[[ "$OLD_IMAGE" =~ ^ghcr\.io/gunba/australian-legal-mcp@sha256:[0-9a-f]{64}$ ]] || {
-  echo 'currently pinned image is malformed' >&2
-  exit 1
-}
-load_runtime_contract "$RUNTIME_ENV"
-read_probe_key
-ufw_is_fail_closed || {
-  close_ingress || true
-  echo 'UFW must match the exact fail-closed allowlist; image update was refused' >&2
-  exit 1
-}
-service_enablement="$(read_systemctl_enablement "$SERVICE")" || exit 1
-service_activity="$(read_systemctl_activity "$SERVICE")" || exit 1
-[[ "$service_enablement" = generated && "$service_activity" = active ]] || {
-  echo 'image updates require the generated legal-mcp service to be active' >&2
-  exit 1
-}
-caddy_enablement="$(read_systemctl_enablement caddy.service)" || exit 1
-caddy_activity="$(read_systemctl_activity caddy.service)" || exit 1
-[[ "$caddy_enablement" = enabled || "$caddy_enablement" = disabled ]] || {
-  echo 'Caddy enablement is outside the supported host contract' >&2
-  exit 1
-}
-wait_for_exact_generation "$EXPECTED_GENERATION"
-probe_auth_boundary http://127.0.0.1:51235/mcp \
-  http://127.0.0.1:51235/.well-known/oauth-protected-resource/mcp
-
-podman pull "$NEW_IMAGE"
-verify_image_runtime "$NEW_IMAGE" "$EXPECTED_VERSION" "$EXPECTED_REVISION"
-podman run --rm --network=none --user=0:0 --read-only --cap-drop=all \
-  --security-opt=no-new-privileges --pids-limit=256 --memory=6g --memory-swap=6g \
-  --tmpfs=/tmp:rw,nodev,nosuid,noexec,size=64m,mode=1777 \
-  --volume=/srv/legal-mcp:/var/lib/legal-mcp:ro,nodev,nosuid \
-  "$NEW_IMAGE" verify --quiet >/dev/null
-
-transaction_tmp="$TRANSACTION_PREPARING"
-install -d -o root -g root -m 0700 "$transaction_tmp"
-cp --preserve=mode,ownership,timestamps "$IMAGE_FILE" "$transaction_tmp/image"
-cp --preserve=mode,ownership,timestamps "$QUADLET" "$transaction_tmp/legal-mcp.container"
-cp --preserve=mode,ownership,timestamps "$TEMPLATE" "$transaction_tmp/legal-mcp.container.template"
-cp --preserve=mode,ownership,timestamps "$RUNTIME_ENV" "$transaction_tmp/runtime.env"
-printf '%s\n' "$EXPECTED_GENERATION" > "$transaction_tmp/expected-generation"
-touch "$transaction_tmp/service-was-enabled" "$transaction_tmp/service-was-active"
-if [[ "$caddy_enablement" = enabled ]]; then touch "$transaction_tmp/caddy-was-enabled"; fi
-if [[ "$caddy_activity" = active ]]; then touch "$transaction_tmp/caddy-was-active"; fi
-port_80_open="$(ufw_rule_state 80)" || {
-  retire_image_directory_for_deletion "$transaction_tmp" "$TRANSACTION_PREPARING_RETIRED"
-  exit 1
-}
-port_443_open="$(ufw_rule_state 443)" || {
-  retire_image_directory_for_deletion "$transaction_tmp" "$TRANSACTION_PREPARING_RETIRED"
-  exit 1
-}
-[[ "$port_80_open" = "$port_443_open" ]] || {
-  echo 'UFW 80/443 state is inconsistent; refusing image update' >&2
-  retire_image_directory_for_deletion "$transaction_tmp" "$TRANSACTION_PREPARING_RETIRED"
-  exit 1
-}
-if [[ "$port_80_open" = present ]]; then
-  [[ -e "$transaction_tmp/caddy-was-active" \
-    && -e "$transaction_tmp/service-was-active" ]] || {
-    echo 'public UFW ingress is open while Caddy or legal-mcp is inactive' >&2
-    retire_image_directory_for_deletion "$transaction_tmp" "$TRANSACTION_PREPARING_RETIRED"
-    exit 1
+  [[ "$UFW_80" = present ]] || {
+    echo 'ordinary image updates require exact public UFW ingress' >&2
+    return 1
   }
-  touch "$transaction_tmp/public-was-open"
-fi
-sync -f "$transaction_tmp"
-mv -T "$transaction_tmp" "$TRANSACTION"
-sync -f /etc/legal-mcp
+  ufw_is_fail_closed
+  wait_for_exact_generation "$EXPECTED_GENERATION"
+  host="${EXTERNAL_URL#https://}"
+  host="${host%/mcp}"
+  ordinary_validate_caddy_contract "$host"
+  ordinary_require_listener_topology public
+  probe_auth_boundary http://127.0.0.1:51235/mcp \
+    http://127.0.0.1:51235/.well-known/oauth-protected-resource/mcp
+  probe_auth_boundary "$EXTERNAL_URL" \
+    "${EXTERNAL_URL%/mcp}/.well-known/oauth-protected-resource/mcp"
+  ordinary_probe_negative_caddy_routes "${EXTERNAL_URL%/mcp}"
+}
 
-rollback() {
+ordinary_rollback() {
   local status=$? recovery_status
   trap - ERR HUP INT TERM EXIT
   set +e
   (
     set -e
-    recover_transaction
+    ordinary_recover_transaction
   )
   recovery_status=$?
   set -e
@@ -1401,34 +2249,163 @@ rollback() {
   echo 'container image update rolled back' >&2
   exit "$status"
 }
-trap rollback ERR HUP INT TERM EXIT
 
-close_ingress
-printf '%s\n' "$NEW_IMAGE" > "$IMAGE_FILE"
-chown root:root "$IMAGE_FILE"
-chmod 600 "$IMAGE_FILE"
-rendered="$(mktemp /etc/containers/systemd/.legal-mcp.container.XXXXXX)"
-sed "s|__IMAGE_DIGEST__|$NEW_IMAGE|g" "$SOURCE_TEMPLATE" > "$rendered"
-chown root:root "$rendered"
-chmod 644 "$rendered"
-mv -fT "$rendered" "$QUADLET"
-install -o root -g root -m 0644 "$SOURCE_TEMPLATE" "$TEMPLATE"
-systemctl daemon-reload
-systemctl restart "$SERVICE"
-wait_for_exact_generation "$EXPECTED_GENERATION"
-probe_auth_boundary http://127.0.0.1:51235/mcp \
-  http://127.0.0.1:51235/.well-known/oauth-protected-resource/mcp
-expected_image_id="$(podman image inspect "$NEW_IMAGE" --format '{{.Id}}')"
-running_image_id="$(podman inspect australian-legal-mcp --format '{{.Image}}')"
-[[ "$running_image_id" = "$expected_image_id" ]] || {
-  echo 'running container does not use the requested image digest' >&2
-  exit 1
+ordinary_recover_pending_state() {
+  local path
+  if ! image_path_is_absent "$TRANSACTION_PREPARING" \
+    && ! image_path_is_absent "$TRANSACTION_PREPARING_RETIRED"; then
+    echo 'image preparation has conflicting recovery states' >&2
+    return 1
+  fi
+  if ! image_path_is_absent "$TRANSACTION_RETIRING" \
+    && ! image_path_is_absent "$TRANSACTION_RETIRED"; then
+    echo 'image retirement has conflicting recovery states' >&2
+    return 1
+  fi
+  if ! image_path_is_absent "$TRANSACTION_PREPARING"; then
+    ordinary_validate_transaction "$TRANSACTION_PREPARING"
+    retire_image_directory_for_deletion \
+      "$TRANSACTION_PREPARING" "$TRANSACTION_PREPARING_RETIRED"
+    echo 'interrupted image preparation discarded'
+    return 0
+  fi
+  if ! image_path_is_absent "$TRANSACTION_PREPARING_RETIRED"; then
+    ordinary_validate_transaction "$TRANSACTION_PREPARING_RETIRED"
+    delete_retired_image_directory "$TRANSACTION_PREPARING_RETIRED"
+    echo 'interrupted image preparation discarded'
+    return 0
+  fi
+  if ! image_path_is_absent "$TRANSACTION_RETIRING"; then
+    ordinary_complete_retiring_transaction
+    echo 'interrupted image transaction retirement completed'
+    return 0
+  fi
+  if ! image_path_is_absent "$TRANSACTION_RETIRED"; then
+    ordinary_complete_retired_transaction
+    echo 'interrupted image transaction retirement completed'
+    return 0
+  fi
+  path="$TRANSACTION"
+  image_path_is_absent "$path" && {
+    echo 'no image transaction exists' >&2
+    return 1
+  }
+  ordinary_validate_transaction "$path"
+  if [[ "$TRANSACTION_RETIREMENT_OUTCOME" = pending ]]; then
+    ordinary_recover_transaction
+    unset PROBE_API_KEY
+    echo 'interrupted image transaction rolled back'
+    return 0
+  fi
+  ordinary_read_transaction_probe_key
+  ordinary_verify_retirement_outcome
+  mv -T "$TRANSACTION" "$TRANSACTION_RETIRING"
+  sync -f /etc/legal-mcp
+  ordinary_complete_retiring_transaction
+  unset PROBE_API_KEY
+  echo 'interrupted image transaction retirement completed'
 }
-restore_unit_enablement "$SERVICE" service-was-enabled
-restore_unit_enablement caddy.service caddy-was-enabled
-open_recorded_ingress
+
+if [[ "$BOOTSTRAP_EMPTY_HOST" = true ]]; then
+  for command_name in awk blkid cmp find findmnt getfacl id podman python3 \
+    readlink sha256sum ss stat sync systemctl ufw visudo xfs_info; do
+    command -v "$command_name" >/dev/null || {
+      echo "missing empty-host image dependency: $command_name" >&2
+      exit 1
+    }
+  done
+  finalize_image_transaction_retirement
+  finalize_image_preparation_retirement
+  if [[ "$RECOVER" = true ]]; then
+    [[ -z "$NEW_IMAGE$EXPECTED_VERSION$SOURCE_TEMPLATE" ]] || usage
+    bootstrap_force_off
+    [[ -d "$TRANSACTION" && ! -L "$TRANSACTION" ]] || {
+      if [[ "$IMAGE_PREPARATION_WAS_PENDING" = true ]]; then
+        echo 'interrupted empty-host image preparation discarded; service and ingress remain off'
+        exit 0
+      fi
+      if [[ "$IMAGE_RETIREMENT_WAS_PENDING" = true ]]; then
+        echo 'interrupted empty-host image transaction retirement completed; service and ingress remain off'
+        exit 0
+      fi
+      echo 'no safe empty-host image transaction exists' >&2
+      exit 1
+    }
+    bootstrap_require_regular "$TRANSACTION/target-version" root root 600
+    recovery_version="$(<"$TRANSACTION/target-version")"
+    [[ "$recovery_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+      echo 'empty-host image transaction version is malformed' >&2
+      exit 1
+    }
+    recovery_script="$(readlink -f "${BASH_SOURCE[0]}")"
+    bootstrap_require_release_file "$recovery_script" true
+    recovery_template="$(dirname "$recovery_script")/legal-mcp.container.template"
+    bootstrap_load_bundle "$recovery_template" "$recovery_version"
+    bootstrap_recover_transaction
+    echo 'interrupted empty-host image cutover rolled back; service and ingress remain off'
+    exit 0
+  fi
+  run_bootstrap_empty_host_update
+  exit 0
+fi
+
+for command_name in awk caddy cmp curl find flock getfacl grep install mktemp mv \
+  podman python3 readlink sha256sum ss stat sync systemctl ufw visudo; do
+  command -v "$command_name" >/dev/null || {
+    echo "missing image update dependency: $command_name" >&2
+    exit 1
+  }
+done
+
+if [[ "$RECOVER" = true ]]; then
+  [[ -z "$NEW_IMAGE$EXPECTED_VERSION$SOURCE_TEMPLATE" ]] || usage
+  ordinary_load_release_bundle '' ''
+  ordinary_require_no_foreign_transaction
+  ordinary_recover_pending_state
+  exit 0
+fi
+
+[[ "$NEW_IMAGE" =~ ^ghcr\.io/gunba/australian-legal-mcp@sha256:[0-9a-f]{64}$ \
+  && "$EXPECTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ \
+  && -n "$SOURCE_TEMPLATE" ]] || usage
+ordinary_load_release_bundle "$SOURCE_TEMPLATE" "$EXPECTED_VERSION"
+ordinary_require_no_foreign_transaction
+for path in "$TRANSACTION_PREPARING" "$TRANSACTION_PREPARING_RETIRED" \
+  "$TRANSACTION" "$TRANSACTION_RETIRING" "$TRANSACTION_RETIRED"; do
+  image_path_is_absent "$path" || {
+    echo 'an image transaction already exists; recover it with this exact release bundle first' >&2
+    exit 1
+  }
+done
+ordinary_require_live_metadata
+load_runtime_contract "$RUNTIME_ENV"
+read_probe_key
+ordinary_capture_baseline
+
+podman pull "$NEW_IMAGE"
+verify_image_runtime "$NEW_IMAGE" "$ORDINARY_VERSION" "$ORDINARY_REVISION"
+TARGET_IMAGE_ID="$(podman image inspect "$NEW_IMAGE" --format '{{.Id}}')"
+[[ "$TARGET_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
+podman run --rm --network=none --user=0:0 --read-only --cap-drop=all \
+  --security-opt=no-new-privileges --pids-limit=256 --memory=6g --memory-swap=6g \
+  --tmpfs=/tmp:rw,nodev,nosuid,noexec,size=64m,mode=1777 \
+  --volume=/srv/legal-mcp:/var/lib/legal-mcp:ro,nodev,nosuid \
+  "$NEW_IMAGE" verify --quiet >/dev/null
+
+ordinary_create_transaction
+trap ordinary_rollback ERR HUP INT TERM EXIT
+close_ingress
+ordinary_atomic_install "$TRANSACTION/target-image" "$IMAGE_FILE" root root 600
+ordinary_atomic_install "$TRANSACTION/target-quadlet" "$QUADLET" root root 644
+ordinary_atomic_install "$TRANSACTION/target-template" "$TEMPLATE" root root 644
+systemctl daemon-reload
+[[ "$(read_systemctl_enablement "$SERVICE")" = generated ]]
+systemctl restart "$SERVICE"
+ordinary_verify_private_runtime "$TRANSACTION_TARGET_IMAGE_ID"
+ordinary_restore_caddy_and_ufw
+ordinary_verify_final_state "$TRANSACTION/target-sha256" "$TRANSACTION_TARGET_IMAGE_ID"
 
 trap - ERR HUP INT TERM EXIT
-retire_image_transaction
+ordinary_retire_transaction target
 unset PROBE_API_KEY
 echo "container image updated to $NEW_IMAGE"

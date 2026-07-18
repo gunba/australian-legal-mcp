@@ -29,6 +29,7 @@ HealthOnFailure=kill
 PodmanArgs=--cpus=3.5 --pids-limit=256 --memory=6g --memory-swap=6g --ulimit=nofile=65536:65536
 
 [Service]
+ExecCondition=/usr/local/libexec/legal-mcp/host-tool-launcher --check-auth-ready
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=180s

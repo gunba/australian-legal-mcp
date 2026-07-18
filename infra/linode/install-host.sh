@@ -18,8 +18,8 @@ usage: sudo infra/linode/install-host.sh \
 The initialize flag formats only a signature-free, unpartitioned block device.
 An existing volume is accepted only with its exact UUID and marker.
 
-On an already installed bootstrap host, upgrade or recover only the restricted
-publisher tools from an exact version-matched Linux release bundle:
+On an installed prepared-bootstrap or activated-dark host, upgrade or recover
+the complete hosted tool set from an exact version-matched Linux release bundle:
   sudo infra/linode/install-host.sh --upgrade-host-tools --version X.Y.Z
   sudo infra/linode/install-host.sh --recover-host-tools --version X.Y.Z
 EOF
@@ -42,6 +42,18 @@ HOST_TOOLS_PUBLISHER_RESTORE_RETIRED=${HOST_TOOLS_TRANSACTION}.publisher-restore
 HOST_TOOLS_MARKER=/etc/legal-mcp/host-tools
 HOST_DEPLOY=/usr/local/sbin/legal-mcp-host-deploy
 PUBLISHER_COMMAND=/usr/local/sbin/legal-mcp-publisher-command
+CONFIGURE_AUTH=/usr/local/sbin/legal-mcp-configure-auth
+UPDATE_IMAGE=/usr/local/sbin/legal-mcp-update-image
+CONTAINER_TEMPLATE=/usr/local/libexec/legal-mcp/legal-mcp.container.template
+RENDERED_QUADLET=/etc/containers/systemd/legal-mcp.container
+HOST_TOOL_LAUNCHER=/usr/local/libexec/legal-mcp/host-tool-launcher
+HOST_TOOL_LAUNCHER_MARKER=/etc/legal-mcp/host-tool-launcher
+CONFIGURE_AUTH_POINTER=/etc/legal-mcp/configure-auth-implementation
+UPDATE_IMAGE_POINTER=/etc/legal-mcp/update-image-implementation
+HOST_TOOL_IMPLEMENTATION_DIR=/usr/local/libexec/legal-mcp/host-tools
+AUTH_READY_MARKER=/etc/legal-mcp/auth-ready
+HOST_TOOL_DISPATCH=/run/legal-mcp/host-tool-launcher-dispatch
+AUTH_CONFIGURING_PERMIT=/run/legal-mcp/auth-configuring
 PUBLISHER_SUDOERS=/etc/sudoers.d/legal-mcp-publisher
 HOST_TRANSACTION_LOCK=/run/lock/legal-mcp-host-transaction.lock
 HOST_TOOLS_RETIREMENT_WAS_PENDING=false
@@ -171,15 +183,650 @@ render_publisher_sudoers() {
   visudo -cf "$destination" >/dev/null
 }
 
+render_host_tool_launcher() {
+  cat <<'LAUNCHER'
+#!/usr/bin/env bash
+# Stable lock-first dispatcher for immutable authentication and image helpers.
+set -euo pipefail
+umask 077
+ulimit -c 0
+export LC_ALL=C
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+LOCK_FILE=/run/lock/legal-mcp-host-transaction.lock
+CANONICAL=/usr/local/libexec/legal-mcp/host-tool-launcher
+CONFIGURE=/usr/local/sbin/legal-mcp-configure-auth
+UPDATE=/usr/local/sbin/legal-mcp-update-image
+MARKER=/etc/legal-mcp/host-tool-launcher
+CONFIGURE_POINTER=/etc/legal-mcp/configure-auth-implementation
+UPDATE_POINTER=/etc/legal-mcp/update-image-implementation
+IMPLEMENTATION_DIR=/usr/local/libexec/legal-mcp/host-tools
+HOST_TOOLS_MARKER=/etc/legal-mcp/host-tools
+HOST_DEPLOY=/usr/local/sbin/legal-mcp-host-deploy
+PUBLISHER=/usr/local/sbin/legal-mcp-publisher-command
+SUDOERS=/etc/sudoers.d/legal-mcp-publisher
+TEMPLATE=/usr/local/libexec/legal-mcp/legal-mcp.container.template
+QUADLET=/etc/containers/systemd/legal-mcp.container
+IMAGE=/etc/legal-mcp/image
+AUTH_READY=/etc/legal-mcp/auth-ready
+AUTH_PERMIT=/run/legal-mcp/auth-configuring
+DISPATCH=/run/legal-mcp/host-tool-launcher-dispatch
+DISPATCH_RETIRING=${DISPATCH}.retiring
+DISPATCH_RETIRED=${DISPATCH}.retired
+
+absent() { [[ ! -e "$1" && ! -L "$1" ]]; }
+
+require_file() {
+  local path="$1" owner="$2" group="$3" mode="$4" size="${5:--}"
+  [[ -f "$path" && ! -L "$path" \
+    && "$(stat -c '%U:%G:%a:%h' "$path")" = "$owner:$group:$mode:1" ]] || return 1
+  [[ "$size" = - || "$(stat -c '%s' "$path")" = "$size" ]] || return 1
+}
+
+start_time() {
+  python3 - "$1" <<'PY'
+import pathlib, sys
+value = pathlib.Path(f"/proc/{sys.argv[1]}/stat").read_text()
+fields = value.rpartition(") ")[2].split()
+if len(fields) < 20 or not fields[19].isdigit():
+    raise SystemExit(1)
+print(fields[19])
+PY
+}
+
+strict_auth_ready() {
+  if require_file "$AUTH_READY" root root 444 0 \
+    && [[ "$(getfacl --absolute-names --numeric --omit-header "$AUTH_READY")" \
+      = $'user::r--\ngroup::r--\nother::r--' ]]; then return 0; fi
+  require_file "$AUTH_PERMIT" root root 400 || return 1
+  [[ "$(getfacl --absolute-names --numeric --omit-header "$AUTH_PERMIT")" \
+    = $'user::r--\ngroup::---\nother::---' ]] || return 1
+  local permit_pid permit_start actual_start uid_line cmdline
+  read -r permit_pid permit_start < "$AUTH_PERMIT" || return 1
+  [[ "$permit_pid" =~ ^[1-9][0-9]*$ && "$permit_start" =~ ^[1-9][0-9]*$ \
+    && "$(wc -w < "$AUTH_PERMIT")" = 2 ]] || return 1
+  actual_start="$(start_time "$permit_pid" 2>/dev/null)" || return 1
+  [[ "$actual_start" = "$permit_start" ]] || return 1
+  uid_line="$(awk '$1 == "Uid:" {print $2 ":" $3 ":" $4 ":" $5}' "/proc/$permit_pid/status")" || return 1
+  [[ "$uid_line" = 0:0:0:0 ]] || return 1
+  cmdline="$(tr '\0' '\n' < "/proc/$permit_pid/cmdline")" || return 1
+  grep -Fxq -- '--legal-mcp-launcher-internal' <<< "$cmdline" \
+    && grep -Fxq configure-auth <<< "$cmdline"
+}
+
+if [[ "${1:-}" = --check-auth-ready ]]; then
+  [[ $# -eq 1 && $EUID -eq 0 ]] || exit 1
+  strict_auth_ready
+  exit
+fi
+
+require_launcher_set() {
+  local -a values
+  require_file "$MARKER" root root 444 || return 1
+  mapfile -t values < "$MARKER"
+  [[ ${#values[@]} -eq 2 \
+    && "${values[0]}" = LEGAL_MCP_HOST_TOOL_LAUNCHER_V1 \
+    && "${values[1]}" =~ ^LAUNCHER_SHA256=([0-9a-f]{64})$ ]] || return 1
+  LAUNCHER_SHA256="${BASH_REMATCH[1]}"
+  local path
+  for path in "$CANONICAL" "$CONFIGURE" "$UPDATE"; do
+    require_file "$path" root root 755 || return 1
+    [[ "$(sha256sum "$path" | awk '{print $1}')" = "$LAUNCHER_SHA256" ]] || return 1
+  done
+}
+
+read_implementation() {
+  local pointer="$1" name="$2" value path
+  require_file "$pointer" root root 644 64 || return 1
+  [[ "$(getfacl --absolute-names --numeric --omit-header "$pointer")" \
+    = $'user::rw-\ngroup::r--\nother::r--' ]] || return 1
+  value="$(<"$pointer")"
+  [[ "$value" =~ ^[0-9a-f]{64}$ ]] || return 1
+  path="$IMPLEMENTATION_DIR/$name.$value"
+  require_file "$path" root root 755 || return 1
+  [[ "$(sha256sum "$path" | awk '{print $1}')" = "$value" ]] || return 1
+  printf '%s\n' "$value"
+}
+
+require_v2_release_binding() {
+  local configure_digest="$1" update_digest="$2" rendered
+  local deploy_sha publisher_sha template_sha sudoers_sha image
+  local -a values image_values
+  require_file "$HOST_TOOLS_MARKER" root root 444 || return 1
+  mapfile -t values < "$HOST_TOOLS_MARKER"
+  [[ ${#values[@]} -eq 9 \
+    && "${values[0]}" = LEGAL_MCP_HOST_TOOLS_V2 \
+    && "${values[1]}" =~ ^VERSION=[0-9]+\.[0-9]+\.[0-9]+$ \
+    && "${values[2]}" =~ ^SOURCE_COMMIT=[0-9a-f]{40}$ \
+    && "${values[3]}" =~ ^HOST_DEPLOY_SHA256=([0-9a-f]{64})$ ]] || return 1
+  deploy_sha="${BASH_REMATCH[1]}"
+  [[ "${values[4]}" =~ ^PUBLISHER_COMMAND_SHA256=([0-9a-f]{64})$ ]] || return 1
+  publisher_sha="${BASH_REMATCH[1]}"
+  [[ "${values[5]}" = "CONFIGURE_AUTH_SHA256=$configure_digest" \
+    && "${values[6]}" = "UPDATE_IMAGE_SHA256=$update_digest" \
+    && "${values[7]}" =~ ^CONTAINER_TEMPLATE_SHA256=([0-9a-f]{64})$ ]] || return 1
+  template_sha="${BASH_REMATCH[1]}"
+  [[ "${values[8]}" =~ ^SUDOERS_SHA256=([0-9a-f]{64})$ ]] || return 1
+  sudoers_sha="${BASH_REMATCH[1]}"
+  require_file "$HOST_DEPLOY" root root 755 || return 1
+  require_file "$PUBLISHER" root root 755 || return 1
+  require_file "$SUDOERS" root root 440 || return 1
+  require_file "$TEMPLATE" root root 644 || return 1
+  require_file "$QUADLET" root root 644 || return 1
+  require_file "$IMAGE" root root 600 || return 1
+  [[ "$(sha256sum "$HOST_DEPLOY" | awk '{print $1}')" = "$deploy_sha" \
+    && "$(sha256sum "$PUBLISHER" | awk '{print $1}')" = "$publisher_sha" \
+    && "$(sha256sum "$SUDOERS" | awk '{print $1}')" = "$sudoers_sha" \
+    && "$(sha256sum "$TEMPLATE" | awk '{print $1}')" = "$template_sha" ]] || return 1
+  mapfile -t image_values < "$IMAGE"
+  [[ ${#image_values[@]} -eq 1 \
+    && "${image_values[0]}" =~ ^ghcr\.io/gunba/australian-legal-mcp@sha256:[0-9a-f]{64}$ ]] || return 1
+  image="${image_values[0]}"
+  [[ "$(grep -o '__IMAGE_DIGEST__' "$TEMPLATE" | wc -l)" = 1 \
+    && "$(grep -Fxc 'ExecCondition=/usr/local/libexec/legal-mcp/host-tool-launcher --check-auth-ready' \
+      "$TEMPLATE")" = 1 ]] || return 1
+  rendered="$(mktemp /run/legal-mcp-launcher-quadlet.XXXXXX)"
+  sed "s|__IMAGE_DIGEST__|$image|g" "$TEMPLATE" > "$rendered"
+  if ! cmp --silent "$rendered" "$QUADLET"; then
+    rm -f "$rendered"
+    return 1
+  fi
+  rm -f "$rendered"
+}
+
+require_dispatch() {
+  local expected_pid="$1" expected_start="$2" expected_role="$3"
+  [[ -d "$DISPATCH" && ! -L "$DISPATCH" \
+    && "$(stat -c '%U:%G:%a' "$DISPATCH")" = root:root:700 ]] || return 1
+  local name
+  for name in pid start-time role configure-auth update-image; do
+    require_file "$DISPATCH/$name" root root 600 || return 1
+  done
+  [[ "$(<"$DISPATCH/pid")" = "$expected_pid" \
+    && "$(<"$DISPATCH/start-time")" = "$expected_start" \
+    && "$(<"$DISPATCH/role")" = "$expected_role" ]] || return 1
+  [[ -z "$(find "$DISPATCH" -mindepth 1 -maxdepth 1 \
+    ! -name pid ! -name start-time ! -name role ! -name configure-auth \
+    ! -name update-image -print -quit)" ]] || return 1
+}
+
+delete_dispatch_retirement() {
+  local path="$1"
+  absent "$path" && return 0
+  [[ -d "$path" && ! -L "$path" \
+    && "$(stat -c '%U:%G:%a' "$path")" = root:root:700 ]] || return 1
+  rm -rf --one-file-system -- "$path"
+  absent "$path"
+  sync -f /run/legal-mcp
+}
+
+reconcile_dispatch() {
+  if ! absent "$DISPATCH_RETIRING"; then
+    absent "$DISPATCH_RETIRED" || return 1
+    mv -T "$DISPATCH_RETIRING" "$DISPATCH_RETIRED"
+    sync -f /run/legal-mcp
+  fi
+  delete_dispatch_retirement "$DISPATCH_RETIRED"
+  if absent "$DISPATCH"; then
+    rm -f -- "$AUTH_PERMIT"
+    sync -f /run/legal-mcp
+    return 0
+  fi
+  [[ -d "$DISPATCH" && ! -L "$DISPATCH" \
+    && "$(stat -c '%U:%G:%a' "$DISPATCH")" = root:root:700 ]] || return 1
+  require_file "$DISPATCH/pid" root root 600 || return 1
+  require_file "$DISPATCH/start-time" root root 600 || return 1
+  local pid saved_start live_start
+  pid="$(<"$DISPATCH/pid")"
+  saved_start="$(<"$DISPATCH/start-time")"
+  [[ "$pid" =~ ^[1-9][0-9]*$ && "$saved_start" =~ ^[1-9][0-9]*$ ]] || return 1
+  live_start="$(start_time "$pid" 2>/dev/null || true)"
+  [[ -z "$live_start" || "$live_start" != "$saved_start" ]] || {
+    echo 'another immutable host-tool dispatch is active' >&2
+    return 1
+  }
+  rm -f -- "$AUTH_PERMIT"
+  sync -f /run/legal-mcp
+  absent "$DISPATCH_RETIRING" && absent "$DISPATCH_RETIRED" || return 1
+  mv -T "$DISPATCH" "$DISPATCH_RETIRING"
+  sync -f /run/legal-mcp
+  mv -T "$DISPATCH_RETIRING" "$DISPATCH_RETIRED"
+  sync -f /run/legal-mcp
+  delete_dispatch_retirement "$DISPATCH_RETIRED"
+}
+
+retire_dispatch() {
+  absent "$DISPATCH_RETIRING" && absent "$DISPATCH_RETIRED" || return 1
+  mv -T "$DISPATCH" "$DISPATCH_RETIRING"
+  sync -f /run/legal-mcp
+  mv -T "$DISPATCH_RETIRING" "$DISPATCH_RETIRED"
+  sync -f /run/legal-mcp
+  delete_dispatch_retirement "$DISPATCH_RETIRED"
+}
+
+auth_contract_ready() {
+  local runtime=/etc/legal-mcp/runtime.env verifier=/etc/legal-mcp/api-keys.json
+  local -a auth_values
+  require_file "$runtime" root root 600 || return 1
+  mapfile -t auth_values < <(awk -F= '$1 == "LEGAL_MCP_HTTP_AUTH" {print $2}' "$runtime")
+  [[ ${#auth_values[@]} -eq 1 \
+    && ( "${auth_values[0]}" = api-key || "${auth_values[0]}" = entra \
+      || "${auth_values[0]}" = entra+api-key ) ]] || return 1
+  require_file "$verifier" legal-mcp legal-mcp 400 || return 1
+  python3 - "$verifier" "${auth_values[0]}" <<'PY'
+import json, pathlib, sys
+value = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+if not isinstance(value, dict) or set(value) != {"keys", "version"} or value["version"] != 1:
+    raise SystemExit(1)
+keys = value["keys"]
+if not isinstance(keys, list) or len(keys) > 32:
+    raise SystemExit(1)
+if "api-key" in sys.argv[2] and not keys:
+    raise SystemExit(1)
+PY
+}
+
+strict_ready_marker() {
+  require_file "$AUTH_READY" root root 444 0 \
+    && [[ "$(getfacl --absolute-names --numeric --omit-header "$AUTH_READY")" \
+      = $'user::r--\ngroup::r--\nother::r--' ]]
+}
+
+auth_journal_states_absent() {
+  local found
+  found="$(find /etc/legal-mcp -mindepth 1 -maxdepth 1 \
+    -name '.auth-transaction*' -print -quit)" || return 1
+  [[ -z "$found" ]]
+}
+
+auth_journal_state_present() {
+  local found
+  found="$(find /etc/legal-mcp -mindepth 1 -maxdepth 1 \
+    -name '.auth-transaction*' -print -quit)" || return 1
+  [[ -n "$found" ]]
+}
+
+read_enablement() {
+  local unit="$1" output status
+  if output="$(systemctl is-enabled "$unit" 2>/dev/null)"; then status=0; else status=$?; fi
+  case "$status:$output" in
+    0:generated|0:enabled|1:disabled) printf '%s\n' "$output" ;;
+    *) return 1 ;;
+  esac
+}
+
+read_activity() {
+  local unit="$1" output status
+  if output="$(systemctl is-active "$unit" 2>/dev/null)"; then status=0; else status=$?; fi
+  case "$status:$output" in
+    0:active|3:inactive) printf '%s\n' "$output" ;;
+    *) return 1 ;;
+  esac
+}
+
+require_ufw_state() {
+  local expected="$1" admin report
+  require_file /etc/legal-mcp/admin-source-ip root root 600 || return 1
+  admin="$(</etc/legal-mcp/admin-source-ip)"
+  [[ "$admin" =~ ^[0-9A-Fa-f:.]{2,45}$ ]] || return 1
+  report="$(ufw status verbose)" || return 1
+  printf '%s\n' "$report" | python3 /dev/fd/3 "$admin" "$expected" 3<<'PY'
+import re, sys
+admin, expected = sys.argv[1:]
+report = sys.stdin.read().splitlines()
+if "Status: active" not in report:
+    raise SystemExit(1)
+if not any(re.fullmatch(r"Default: deny \(incoming\), allow \(outgoing\), (?:disabled|deny) \(routed\)", line) for line in report):
+    raise SystemExit(1)
+rules = []
+for line in report:
+    for action in ("ALLOW IN", "DENY IN", "REJECT IN", "LIMIT IN"):
+        if action in line:
+            left, right = line.split(action, 1)
+            rules.append((left.strip(), action, right.split("#", 1)[0].strip()))
+            break
+if any(action != "ALLOW IN" for _, action, _ in rules):
+    raise SystemExit(1)
+ssh = [(target, source) for target, _, source in rules if target == "22/tcp"]
+if ssh != [("22/tcp", admin)]:
+    raise SystemExit(1)
+web = [(target, source) for target, _, source in rules if target != "22/tcp"]
+allowed = {"80/tcp", "80/tcp (v6)", "443/tcp", "443/tcp (v6)"}
+if any(target not in allowed or not source.startswith("Anywhere") for target, source in web):
+    raise SystemExit(1)
+if len({target for target, _ in web}) != len(web):
+    raise SystemExit(1)
+ports = {target.split("/", 1)[0] for target, _ in web}
+if (expected == "closed" and web) or (expected == "open" and ports != {"80", "443"}):
+    raise SystemExit(1)
+if expected not in {"closed", "open"}:
+    raise SystemExit(1)
+PY
+}
+
+require_listener_state() {
+  local expected="$1" listeners
+  listeners="$(ss --listening --tcp --numeric --no-header)" || return 1
+  printf '%s\n' "$listeners" | python3 /dev/fd/3 "$expected" 3<<'PY'
+import re, sys
+expected = sys.argv[1]
+entries = []
+for line in sys.stdin.read().splitlines():
+    if not line.strip():
+        continue
+    fields = line.split()
+    if len(fields) < 4:
+        raise SystemExit(1)
+    match = re.fullmatch(r"(.+):([0-9]+)", fields[3])
+    if not match:
+        raise SystemExit(1)
+    address, port = match.group(1), int(match.group(2))
+    if address.startswith("[") and address.endswith("]"):
+        address = address[1:-1]
+    if port in (80, 443, 51235):
+        entries.append((address, port))
+if len(entries) != len(set(entries)):
+    raise SystemExit(1)
+service = [(address, port) for address, port in entries if port == 51235]
+web = [(address, port) for address, port in entries if port in (80, 443)]
+if expected == "none":
+    if entries:
+        raise SystemExit(1)
+elif expected == "public":
+    if service != [("127.0.0.1", 51235)] or {port for _, port in web} != {80, 443}:
+        raise SystemExit(1)
+    if any(address not in {"*", "0.0.0.0", "::"} for address, _ in web):
+        raise SystemExit(1)
+    if sum(port == 80 for _, port in web) not in (1, 2) or sum(port == 443 for _, port in web) not in (1, 2):
+        raise SystemExit(1)
+else:
+    raise SystemExit(1)
+PY
+}
+
+closed_surface_ready() {
+  absent "$AUTH_READY" \
+    && [[ "$(read_enablement legal-mcp.service)" = generated \
+      && "$(read_activity legal-mcp.service)" = inactive \
+      && "$(read_enablement caddy.service)" = disabled \
+      && "$(read_activity caddy.service)" = inactive ]] \
+    && require_ufw_state closed \
+    && require_listener_state none
+}
+
+public_auth_ready() {
+  local marker_state="$1"
+  auth_contract_ready || return 1
+  case "$marker_state" in
+    present) strict_ready_marker || return 1 ;;
+    absent) absent "$AUTH_READY" || return 1 ;;
+    *) return 1 ;;
+  esac
+  [[ "$(read_enablement legal-mcp.service)" = generated \
+    && "$(read_activity legal-mcp.service)" = active \
+    && "$(read_enablement caddy.service)" = enabled \
+    && "$(read_activity caddy.service)" = active ]] \
+    && require_ufw_state open \
+    && require_listener_state public
+}
+
+disabled_dark_recovery_ready() {
+  local runtime=/etc/legal-mcp/runtime.env verifier=/etc/legal-mcp/api-keys.json
+  local -a auth_values
+  require_file "$runtime" root root 600 || return 1
+  require_file "$verifier" legal-mcp legal-mcp 400 || return 1
+  mapfile -t auth_values < <(awk -F= '$1 == "LEGAL_MCP_HTTP_AUTH" {print $2}' "$runtime")
+  [[ ${#auth_values[@]} -eq 1 && "${auth_values[0]}" = disabled ]] || return 1
+  python3 - "$verifier" <<'PY'
+import json, pathlib, sys
+if json.loads(pathlib.Path(sys.argv[1]).read_bytes()) != {"keys": [], "version": 1}:
+    raise SystemExit(1)
+PY
+  auth_journal_states_absent && closed_surface_ready
+}
+
+auth_state_snapshot() {
+  local state runtime_sha verifier_sha caddy_sha
+  if disabled_dark_recovery_ready; then
+    state=dark
+  elif auth_journal_states_absent && public_auth_ready present; then
+    state=public
+  else
+    return 1
+  fi
+  require_file /etc/caddy/Caddyfile root caddy 640 || return 1
+  runtime_sha="$(sha256sum /etc/legal-mcp/runtime.env | awk '{print $1}')"
+  verifier_sha="$(sha256sum /etc/legal-mcp/api-keys.json | awk '{print $1}')"
+  caddy_sha="$(sha256sum /etc/caddy/Caddyfile | awk '{print $1}')"
+  [[ "$runtime_sha$verifier_sha$caddy_sha" =~ ^[0-9a-f]{192}$ ]] || return 1
+  printf '%s:%s:%s:%s\n' "$state" "$runtime_sha" "$verifier_sha" "$caddy_sha"
+}
+
+remove_auth_ready() {
+  absent "$AUTH_READY" && return 0
+  strict_ready_marker || return 1
+  rm -f -- "$AUTH_READY"
+  sync -f /etc/legal-mcp
+  absent "$AUTH_READY"
+}
+
+remove_auth_permit() {
+  rm -f -- "$AUTH_PERMIT"
+  sync -f /run/legal-mcp
+  absent "$AUTH_PERMIT"
+}
+
+force_auth_closed() {
+  local failed=false
+  remove_auth_ready || failed=true
+  systemctl disable --now caddy.service >/dev/null 2>&1 || failed=true
+  ufw --force delete allow 80/tcp >/dev/null 2>&1 || true
+  ufw --force delete allow 443/tcp >/dev/null 2>&1 || true
+  systemctl stop legal-mcp.service >/dev/null 2>&1 || failed=true
+  closed_surface_ready || failed=true
+  [[ "$failed" = false ]]
+}
+
+publish_auth_ready() {
+  local temporary
+  absent "$AUTH_READY" || return 1
+  temporary="$(mktemp /etc/legal-mcp/.auth-ready.XXXXXX)"
+  : > "$temporary"
+  chown root:root "$temporary"
+  chmod 444 "$temporary"
+  sync -f "$temporary"
+  mv -fT "$temporary" "$AUTH_READY"
+  sync -f /etc/legal-mcp
+  strict_ready_marker
+}
+
+write_auth_permit() {
+  local pid="$1" process_start="$2" temporary
+  temporary="$(mktemp /run/legal-mcp/.auth-configuring.XXXXXX)"
+  printf '%s %s\n' "$pid" "$process_start" > "$temporary"
+  chown root:root "$temporary"
+  chmod 400 "$temporary"
+  sync -f "$temporary"
+  mv -fT "$temporary" "$AUTH_PERMIT"
+  sync -f /run/legal-mcp
+}
+
+if [[ "${1:-}" = --legal-mcp-launcher-internal ]]; then
+  [[ $EUID -eq 0 && $# -ge 4 && "$(readlink -f "$0")" = "$CANONICAL" ]] || exit 1
+  role="$2"
+  configure_digest="$3"
+  update_digest="$4"
+  shift 4
+  [[ ( "$role" = configure-auth || "$role" = update-image ) \
+    && "$configure_digest" =~ ^[0-9a-f]{64}$ \
+    && "$update_digest" =~ ^[0-9a-f]{64}$ ]] || exit 1
+  current_start="$(start_time "$$")"
+  configure_recover_only=false
+  if [[ "$role" = configure-auth && $# -eq 1 && "$1" = --recover ]]; then
+    configure_recover_only=true
+  fi
+  require_dispatch "$$" "$current_start" "$role"
+  [[ "$(<"$DISPATCH/configure-auth")" = "$configure_digest" \
+    && "$(<"$DISPATCH/update-image")" = "$update_digest" \
+    && "$(read_implementation "$CONFIGURE_POINTER" configure-auth)" = "$configure_digest" \
+    && "$(read_implementation "$UPDATE_POINTER" update-image)" = "$update_digest" ]] || exit 1
+  mount --bind "$IMPLEMENTATION_DIR/configure-auth.$configure_digest" "$CONFIGURE"
+  mount -o remount,bind,ro,nodev,nosuid "$CONFIGURE"
+  mount --bind "$IMPLEMENTATION_DIR/update-image.$update_digest" "$UPDATE"
+  mount -o remount,bind,ro,nodev,nosuid "$UPDATE"
+  status=0
+  if [[ "$role" = configure-auth ]]; then
+    preserve_prior_state=false
+    if [[ "$configure_recover_only" = true ]]; then
+      "$CONFIGURE" --recover || status=$?
+      if [[ $status -eq 0 ]]; then
+        if disabled_dark_recovery_ready; then
+          : # Exact disabled recovery is successful but deliberately not auth-ready.
+        elif public_auth_ready present || public_auth_ready absent; then
+          if absent "$AUTH_READY"; then
+            publish_auth_ready || status=1
+          fi
+          if [[ $status -eq 0 ]] && auth_journal_state_present; then
+            "$CONFIGURE" --finalize-auth-ready || status=$?
+          fi
+          if [[ $status -eq 0 ]] \
+            && { ! public_auth_ready present || ! auth_journal_states_absent; }; then
+            status=1
+          fi
+        else
+          status=1
+        fi
+      fi
+    else
+      prior_snapshot="$(auth_state_snapshot)" || status=1
+      if [[ $status -eq 0 ]]; then
+        prepare_status=0
+        "$CONFIGURE" --prepare-auth-dispatch || prepare_status=$?
+        if [[ $prepare_status -ne 0 ]]; then
+          status=$prepare_status
+          if auth_journal_states_absent \
+            && [[ "$(auth_state_snapshot 2>/dev/null || true)" = "$prior_snapshot" ]]; then
+            preserve_prior_state=true
+          fi
+        elif ! auth_journal_state_present; then
+          status=1
+        elif ! remove_auth_ready; then
+          status=1
+        else
+          "$CONFIGURE" "$@" || status=$?
+          if [[ $status -eq 0 ]]; then
+            if public_auth_ready absent && auth_journal_state_present; then
+              publish_auth_ready || status=1
+            else
+              status=1
+            fi
+          fi
+          if [[ $status -eq 0 ]]; then
+            "$CONFIGURE" --finalize-auth-ready || status=$?
+          fi
+          if [[ $status -eq 0 ]] \
+            && { ! public_auth_ready present || ! auth_journal_states_absent; }; then
+            status=1
+          fi
+        fi
+      fi
+    fi
+    remove_auth_permit || status=1
+    if [[ $status -ne 0 && "$preserve_prior_state" = false ]]; then
+      force_auth_closed || status=1
+    fi
+  else
+    "$UPDATE" "$@" || status=$?
+  fi
+  retire_dispatch || status=1
+  exit "$status"
+fi
+
+[[ $EUID -eq 0 ]] || { echo 'host-tool launcher must run as root' >&2; exit 2; }
+case "$(basename "$0")" in
+  legal-mcp-configure-auth) role=configure-auth ;;
+  legal-mcp-update-image) role=update-image ;;
+  *) echo 'invoke the installed authentication or image launcher' >&2; exit 2 ;;
+esac
+if [[ "$role" = configure-auth ]]; then
+  for argument in "$@"; do
+    case "$argument" in
+      --prepare-auth-dispatch|--finalize-auth-ready|--legal-mcp-launcher-internal)
+        echo 'internal authentication handoff command is not a public launcher argument' >&2
+        exit 2
+        ;;
+    esac
+  done
+fi
+require_file "$LOCK_FILE" root legal-mcp-publisher 640 || {
+  echo 'host transaction lock is missing or unsafe' >&2
+  exit 1
+}
+exec 9<>"$LOCK_FILE"
+flock -x 9
+require_launcher_set || { echo 'stable host-tool launcher set is invalid' >&2; exit 1; }
+reconcile_dispatch || exit 1
+for transaction in \
+  /etc/legal-mcp/.host-tools-transaction.building \
+  /etc/legal-mcp/.host-tools-transaction.building-retired \
+  /etc/legal-mcp/.host-tools-transaction.preparing \
+  /etc/legal-mcp/.host-tools-transaction.preparing-retired \
+  /etc/legal-mcp/.host-tools-transaction \
+  /etc/legal-mcp/.host-tools-transaction.retiring \
+  /etc/legal-mcp/.host-tools-transaction.retired \
+  /etc/legal-mcp/.host-tools-transaction.rollback-retiring \
+  /etc/legal-mcp/.host-tools-transaction.rollback-retired \
+  /etc/legal-mcp/.host-tools-transaction.publisher-restore \
+  /etc/legal-mcp/.host-tools-transaction.publisher-restore-retired; do
+  absent "$transaction" || { echo 'host-tool transaction recovery is required' >&2; exit 1; }
+done
+configure_digest="$(read_implementation "$CONFIGURE_POINTER" configure-auth)" || {
+  echo 'configure-auth implementation pointer is invalid' >&2; exit 1;
+}
+update_digest="$(read_implementation "$UPDATE_POINTER" update-image)" || {
+  echo 'update-image implementation pointer is invalid' >&2; exit 1;
+}
+require_v2_release_binding "$configure_digest" "$update_digest" || {
+  echo 'V2 host-tool marker, launchers, template, and rendered Quadlet are not exact' >&2
+  exit 1
+}
+process_start="$(start_time "$$")"
+preparing="${DISPATCH}.preparing.$$"
+absent "$preparing" && absent "$DISPATCH" || exit 1
+install -d -o root -g root -m 0700 "$preparing"
+printf '%s\n' "$$" > "$preparing/pid"
+printf '%s\n' "$process_start" > "$preparing/start-time"
+printf '%s\n' "$role" > "$preparing/role"
+printf '%s\n' "$configure_digest" > "$preparing/configure-auth"
+printf '%s\n' "$update_digest" > "$preparing/update-image"
+chown root:root "$preparing"/*
+chmod 600 "$preparing"/*
+sync -f "$preparing"
+mv -T "$preparing" "$DISPATCH"
+sync -f /run/legal-mcp
+if [[ "$role" = configure-auth ]]; then
+  write_auth_permit "$$" "$process_start"
+fi
+export LEGAL_MCP_HOST_TRANSACTION_LOCK_FD=9
+exec /usr/bin/unshare --mount --propagation private -- \
+  "$CANONICAL" --legal-mcp-launcher-internal "$role" \
+  "$configure_digest" "$update_digest" "$@"
+LAUNCHER
+}
+
 load_host_tool_bundle() {
   local expected_version="$1" binary_version
   local -a versions revisions
   HOST_TOOL_REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
   HOST_TOOL_SOURCE_DEPLOY="$HOST_TOOL_REPO_DIR/scripts/legal-mcp-host-deploy"
   HOST_TOOL_SOURCE_PUBLISHER="$HOST_TOOL_REPO_DIR/scripts/legal-mcp-publisher-command"
+  HOST_TOOL_SOURCE_CONFIGURE_AUTH="$HOST_TOOL_REPO_DIR/infra/hosting/configure-auth.sh"
+  HOST_TOOL_SOURCE_UPDATE_IMAGE="$HOST_TOOL_REPO_DIR/infra/hosting/update-image.sh"
+  HOST_TOOL_SOURCE_CONTAINER_TEMPLATE="$HOST_TOOL_REPO_DIR/infra/hosting/legal-mcp.container.template"
   HOST_TOOL_SOURCE_BINARY="$HOST_TOOL_REPO_DIR/legal-mcp"
   require_release_directory "$HOST_TOOL_REPO_DIR"
   require_release_directory "$HOST_TOOL_REPO_DIR/infra"
+  require_release_directory "$HOST_TOOL_REPO_DIR/infra/hosting"
   require_release_directory "$HOST_TOOL_REPO_DIR/infra/linode"
   require_release_directory "$HOST_TOOL_REPO_DIR/scripts"
   require_release_file "$HOST_TOOL_REPO_DIR/infra/linode/install-host.sh" true
@@ -192,6 +839,15 @@ load_host_tool_bundle() {
   require_release_file "$HOST_TOOL_REPO_DIR/SOURCE_COMMIT"
   require_release_file "$HOST_TOOL_SOURCE_DEPLOY" true
   require_release_file "$HOST_TOOL_SOURCE_PUBLISHER" true
+  require_release_file "$HOST_TOOL_SOURCE_CONFIGURE_AUTH" true
+  require_release_file "$HOST_TOOL_SOURCE_UPDATE_IMAGE" true
+  require_release_file "$HOST_TOOL_SOURCE_CONTAINER_TEMPLATE"
+  [[ "$(grep -o '__IMAGE_DIGEST__' "$HOST_TOOL_SOURCE_CONTAINER_TEMPLATE" | wc -l)" = 1 \
+    && "$(grep -Fxc 'ExecCondition=/usr/local/libexec/legal-mcp/host-tool-launcher --check-auth-ready' \
+      "$HOST_TOOL_SOURCE_CONTAINER_TEMPLATE")" = 1 ]] || {
+    echo 'version-matched Quadlet template lacks its exact image or auth-ready gate' >&2
+    return 1
+  }
   require_release_file "$HOST_TOOL_SOURCE_BINARY" true
   mapfile -t versions < <(awk -F= '$1 == "ARG VERSION" {print $2}' "$HOST_TOOL_REPO_DIR/Containerfile")
   mapfile -t revisions < "$HOST_TOOL_REPO_DIR/SOURCE_COMMIT"
@@ -210,7 +866,293 @@ load_host_tool_bundle() {
   }
   HOST_DEPLOY_SHA256="$(sha256sum "$HOST_TOOL_SOURCE_DEPLOY" | awk '{print $1}')"
   PUBLISHER_COMMAND_SHA256="$(sha256sum "$HOST_TOOL_SOURCE_PUBLISHER" | awk '{print $1}')"
-  [[ "$HOST_DEPLOY_SHA256$PUBLISHER_COMMAND_SHA256" =~ ^[0-9a-f]{128}$ ]] || return 1
+  CONFIGURE_AUTH_SHA256="$(sha256sum "$HOST_TOOL_SOURCE_CONFIGURE_AUTH" | awk '{print $1}')"
+  UPDATE_IMAGE_SHA256="$(sha256sum "$HOST_TOOL_SOURCE_UPDATE_IMAGE" | awk '{print $1}')"
+  CONTAINER_TEMPLATE_SHA256="$(sha256sum "$HOST_TOOL_SOURCE_CONTAINER_TEMPLATE" | awk '{print $1}')"
+  [[ "$HOST_DEPLOY_SHA256$PUBLISHER_COMMAND_SHA256$CONFIGURE_AUTH_SHA256$UPDATE_IMAGE_SHA256$CONTAINER_TEMPLATE_SHA256" \
+    =~ ^[0-9a-f]{320}$ ]] || return 1
+}
+
+render_host_tool_launcher_marker() {
+  local launcher_sha256="$1" destination="$2"
+  cat > "$destination" <<EOF
+LEGAL_MCP_HOST_TOOL_LAUNCHER_V1
+LAUNCHER_SHA256=$launcher_sha256
+EOF
+  chmod 444 "$destination"
+}
+
+install_immutable_host_tool_implementation() {
+  local source="$1" destination="$2" expected_sha256="$3" temporary
+  require_safe_directory "$HOST_TOOL_IMPLEMENTATION_DIR" root root || return 1
+  if ! path_is_absent "$destination"; then
+    require_regular_file "$destination" root root 755 || return 1
+    [[ "$(sha256sum "$destination" | awk '{print $1}')" = "$expected_sha256" ]] || {
+      echo "immutable host-tool implementation has changed: $destination" >&2
+      return 1
+    }
+    return 0
+  fi
+  temporary="$(mktemp "$HOST_TOOL_IMPLEMENTATION_DIR/.implementation.XXXXXX")"
+  install -o root -g root -m 0755 "$source" "$temporary"
+  [[ "$(sha256sum "$temporary" | awk '{print $1}')" = "$expected_sha256" ]] || {
+    rm -f "$temporary"
+    return 1
+  }
+  sync -f "$temporary"
+  mv -T "$temporary" "$destination"
+  sync -f "$HOST_TOOL_IMPLEMENTATION_DIR"
+  require_regular_file "$destination" root root 755
+}
+
+write_pointer_source() {
+  local value="$1" destination="$2"
+  [[ "$value" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s' "$value" > "$destination"
+  chmod 644 "$destination"
+  [[ "$(stat -c '%s' "$destination")" = 64 ]]
+}
+
+prepare_host_tool_runtime_sources() {
+  HOST_TOOL_LAUNCHER_SOURCE="$(mktemp /run/legal-mcp-host-tool-launcher.XXXXXX)"
+  render_host_tool_launcher > "$HOST_TOOL_LAUNCHER_SOURCE"
+  chmod 755 "$HOST_TOOL_LAUNCHER_SOURCE"
+  HOST_TOOL_LAUNCHER_SHA256="$(sha256sum "$HOST_TOOL_LAUNCHER_SOURCE" | awk '{print $1}')"
+  [[ "$HOST_TOOL_LAUNCHER_SHA256" =~ ^[0-9a-f]{64}$ ]] || return 1
+  HOST_TOOL_LAUNCHER_MARKER_SOURCE="$(mktemp /etc/legal-mcp/.host-tool-launcher.XXXXXX)"
+  render_host_tool_launcher_marker \
+    "$HOST_TOOL_LAUNCHER_SHA256" "$HOST_TOOL_LAUNCHER_MARKER_SOURCE"
+  HOST_TOOL_CONFIGURE_POINTER_SOURCE="$(mktemp /etc/legal-mcp/.configure-auth-pointer.XXXXXX)"
+  HOST_TOOL_UPDATE_POINTER_SOURCE="$(mktemp /etc/legal-mcp/.update-image-pointer.XXXXXX)"
+  write_pointer_source "$CONFIGURE_AUTH_SHA256" "$HOST_TOOL_CONFIGURE_POINTER_SOURCE"
+  write_pointer_source "$UPDATE_IMAGE_SHA256" "$HOST_TOOL_UPDATE_POINTER_SOURCE"
+  HOST_TOOL_CONFIGURE_IMPLEMENTATION="$HOST_TOOL_IMPLEMENTATION_DIR/configure-auth.$CONFIGURE_AUTH_SHA256"
+  HOST_TOOL_UPDATE_IMPLEMENTATION="$HOST_TOOL_IMPLEMENTATION_DIR/update-image.$UPDATE_IMAGE_SHA256"
+  install -d -o root -g root -m 0755 "$HOST_TOOL_IMPLEMENTATION_DIR"
+  install_immutable_host_tool_implementation \
+    "$HOST_TOOL_SOURCE_CONFIGURE_AUTH" "$HOST_TOOL_CONFIGURE_IMPLEMENTATION" \
+    "$CONFIGURE_AUTH_SHA256"
+  install_immutable_host_tool_implementation \
+    "$HOST_TOOL_SOURCE_UPDATE_IMAGE" "$HOST_TOOL_UPDATE_IMPLEMENTATION" \
+    "$UPDATE_IMAGE_SHA256"
+  HOST_TOOL_RENDERED_QUADLET_SOURCE="$(mktemp /run/legal-mcp-host-tools-rendered.XXXXXX)"
+  sed "s|__IMAGE_DIGEST__|$(</etc/legal-mcp/image)|g" \
+    "$HOST_TOOL_SOURCE_CONTAINER_TEMPLATE" > "$HOST_TOOL_RENDERED_QUADLET_SOURCE"
+  chmod 644 "$HOST_TOOL_RENDERED_QUADLET_SOURCE"
+}
+
+validate_installed_launcher_state() {
+  local launcher_sha configure_sha update_sha path
+  local -a marker
+  require_regular_file "$HOST_TOOL_LAUNCHER_MARKER" root root 444 || return 1
+  require_exact_acl "$HOST_TOOL_LAUNCHER_MARKER" $'user::r--\ngroup::r--\nother::r--' || return 1
+  mapfile -t marker < "$HOST_TOOL_LAUNCHER_MARKER"
+  [[ ${#marker[@]} -eq 2 \
+    && "${marker[0]}" = LEGAL_MCP_HOST_TOOL_LAUNCHER_V1 \
+    && "${marker[1]}" =~ ^LAUNCHER_SHA256=([0-9a-f]{64})$ ]] || {
+    echo 'installed host-tool launcher marker is malformed' >&2
+    return 1
+  }
+  launcher_sha="${BASH_REMATCH[1]}"
+  for path in "$HOST_TOOL_LAUNCHER" "$CONFIGURE_AUTH" "$UPDATE_IMAGE"; do
+    require_regular_file "$path" root root 755 || return 1
+    require_exact_acl "$path" $'user::rwx\ngroup::r-x\nother::r-x' || return 1
+    [[ "$(sha256sum "$path" | awk '{print $1}')" = "$launcher_sha" ]] || {
+      echo "installed stable launcher bytes changed: $path" >&2
+      return 1
+    }
+  done
+  require_regular_file "$CONFIGURE_AUTH_POINTER" root root 644 || return 1
+  require_regular_file "$UPDATE_IMAGE_POINTER" root root 644 || return 1
+  require_exact_acl "$CONFIGURE_AUTH_POINTER" $'user::rw-\ngroup::r--\nother::r--' || return 1
+  require_exact_acl "$UPDATE_IMAGE_POINTER" $'user::rw-\ngroup::r--\nother::r--' || return 1
+  [[ "$(stat -c '%s' "$CONFIGURE_AUTH_POINTER")" = 64 \
+    && "$(stat -c '%s' "$UPDATE_IMAGE_POINTER")" = 64 ]] || {
+    echo 'host-tool implementation pointers must contain exactly 64 bytes' >&2
+    return 1
+  }
+  configure_sha="$(<"$CONFIGURE_AUTH_POINTER")"
+  update_sha="$(<"$UPDATE_IMAGE_POINTER")"
+  [[ "$configure_sha" =~ ^[0-9a-f]{64}$ && "$update_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  require_regular_file "$HOST_TOOL_IMPLEMENTATION_DIR/configure-auth.$configure_sha" root root 755
+  require_regular_file "$HOST_TOOL_IMPLEMENTATION_DIR/update-image.$update_sha" root root 755
+  require_exact_acl "$HOST_TOOL_IMPLEMENTATION_DIR/configure-auth.$configure_sha" \
+    $'user::rwx\ngroup::r-x\nother::r-x' || return 1
+  require_exact_acl "$HOST_TOOL_IMPLEMENTATION_DIR/update-image.$update_sha" \
+    $'user::rwx\ngroup::r-x\nother::r-x' || return 1
+  [[ "$(sha256sum "$HOST_TOOL_IMPLEMENTATION_DIR/configure-auth.$configure_sha" | awk '{print $1}')" = "$configure_sha" \
+    && "$(sha256sum "$HOST_TOOL_IMPLEMENTATION_DIR/update-image.$update_sha" | awk '{print $1}')" = "$update_sha" ]] || {
+    echo 'immutable host-tool implementation does not match its pointer' >&2
+    return 1
+  }
+}
+
+classify_installed_auth_image_entrypoints() {
+  local launcher_paths=0 path
+  for path in "$HOST_TOOL_LAUNCHER" "$HOST_TOOL_LAUNCHER_MARKER" \
+    "$CONFIGURE_AUTH_POINTER" "$UPDATE_IMAGE_POINTER"; do
+    if ! path_is_absent "$path"; then ((launcher_paths += 1)); fi
+  done
+  if [[ $launcher_paths -eq 0 ]]; then
+    require_regular_file "$CONFIGURE_AUTH" root root 755 || return 1
+    require_regular_file "$UPDATE_IMAGE" root root 755 || return 1
+    HOST_TOOL_ENTRYPOINT_STATE=legacy
+    return 0
+  fi
+  [[ $launcher_paths -eq 4 ]] || {
+    echo 'installed host-tool launcher migration state is incomplete' >&2
+    return 1
+  }
+  validate_installed_launcher_state || return 1
+  HOST_TOOL_ENTRYPOINT_STATE=stable
+}
+
+validate_legacy_v0192_host_tool_identity() {
+  local deploy_sha publisher_sha sudoers_sha
+  local -a marker_values
+  if path_is_absent "$HOST_TOOLS_MARKER"; then
+    [[ "$HOST_TOOL_HOST_STATE" = prepared ]] || {
+      echo 'activated legacy host lacks its v0.19.2 host-tool marker' >&2
+      return 1
+    }
+    return 0
+  fi
+  require_regular_file "$HOST_TOOLS_MARKER" root root 444 || return 1
+  require_exact_acl "$HOST_TOOLS_MARKER" $'user::r--\ngroup::r--\nother::r--' || return 1
+  mapfile -t marker_values < "$HOST_TOOLS_MARKER"
+  [[ ${#marker_values[@]} -eq 6 \
+    && "${marker_values[0]}" = LEGAL_MCP_HOST_TOOLS_V1 \
+    && "${marker_values[1]}" = VERSION=0.19.2 \
+    && "${marker_values[2]}" =~ ^SOURCE_COMMIT=[0-9a-f]{40}$ \
+    && "${marker_values[3]}" =~ ^HOST_DEPLOY_SHA256=([0-9a-f]{64})$ ]] || {
+    echo 'legacy host-tool marker is not the exact v0.19.2 schema' >&2
+    return 1
+  }
+  deploy_sha="${BASH_REMATCH[1]}"
+  [[ "${marker_values[4]}" =~ ^PUBLISHER_COMMAND_SHA256=([0-9a-f]{64})$ ]] || return 1
+  publisher_sha="${BASH_REMATCH[1]}"
+  [[ "${marker_values[5]}" =~ ^SUDOERS_SHA256=([0-9a-f]{64})$ ]] || return 1
+  sudoers_sha="${BASH_REMATCH[1]}"
+  [[ "$(sha256sum "$HOST_DEPLOY" | awk '{print $1}')" = "$deploy_sha" \
+    && "$(sha256sum "$PUBLISHER_COMMAND" | awk '{print $1}')" = "$publisher_sha" \
+    && "$(sha256sum "$PUBLISHER_SUDOERS" | awk '{print $1}')" = "$sudoers_sha" ]] || {
+    echo 'legacy v0.19.2 marker does not bind the installed publisher bytes' >&2
+    return 1
+  }
+}
+
+validate_target_launcher_state() {
+  validate_installed_launcher_state || return 1
+  cmp --silent "$HOST_TOOL_LAUNCHER_SOURCE" "$HOST_TOOL_LAUNCHER"
+  cmp --silent "$HOST_TOOL_LAUNCHER_SOURCE" "$CONFIGURE_AUTH"
+  cmp --silent "$HOST_TOOL_LAUNCHER_SOURCE" "$UPDATE_IMAGE"
+  cmp --silent "$HOST_TOOL_LAUNCHER_MARKER_SOURCE" "$HOST_TOOL_LAUNCHER_MARKER"
+  cmp --silent "$HOST_TOOL_CONFIGURE_POINTER_SOURCE" "$CONFIGURE_AUTH_POINTER"
+  cmp --silent "$HOST_TOOL_UPDATE_POINTER_SOURCE" "$UPDATE_IMAGE_POINTER"
+  cmp --silent "$HOST_TOOL_SOURCE_CONFIGURE_AUTH" "$HOST_TOOL_CONFIGURE_IMPLEMENTATION"
+  cmp --silent "$HOST_TOOL_SOURCE_UPDATE_IMAGE" "$HOST_TOOL_UPDATE_IMPLEMENTATION"
+}
+
+validate_live_target_host_tools() {
+  require_regular_file "$HOST_DEPLOY" root root 755 || return 1
+  require_regular_file "$PUBLISHER_COMMAND" root root 755 || return 1
+  require_regular_file "$PUBLISHER_SUDOERS" root root 440 || return 1
+  require_regular_file "$CONTAINER_TEMPLATE" root root 644 || return 1
+  require_regular_file "$RENDERED_QUADLET" root root 644 || return 1
+  require_regular_file "$HOST_TOOLS_MARKER" root root 444 || return 1
+  require_exact_acl "$HOST_DEPLOY" $'user::rwx\ngroup::r-x\nother::r-x' || return 1
+  require_exact_acl "$PUBLISHER_COMMAND" $'user::rwx\ngroup::r-x\nother::r-x' || return 1
+  require_exact_acl "$PUBLISHER_SUDOERS" $'user::r--\ngroup::r--\nother::---' || return 1
+  require_exact_acl "$CONTAINER_TEMPLATE" $'user::rw-\ngroup::r--\nother::r--' || return 1
+  require_exact_acl "$RENDERED_QUADLET" $'user::rw-\ngroup::r--\nother::r--' || return 1
+  require_exact_acl "$HOST_TOOLS_MARKER" $'user::r--\ngroup::r--\nother::r--' || return 1
+  cmp --silent "$HOST_TOOL_SOURCE_DEPLOY" "$HOST_DEPLOY" || return 1
+  cmp --silent "$HOST_TOOL_SOURCE_PUBLISHER" "$PUBLISHER_COMMAND" || return 1
+  cmp --silent "$HOST_TOOL_POLICY_SOURCE" "$PUBLISHER_SUDOERS" || return 1
+  cmp --silent "$HOST_TOOL_SOURCE_CONTAINER_TEMPLATE" "$CONTAINER_TEMPLATE" || return 1
+  cmp --silent "$HOST_TOOL_RENDERED_QUADLET_SOURCE" "$RENDERED_QUADLET" || return 1
+  cmp --silent "$HOST_TOOL_MARKER_SOURCE" "$HOST_TOOLS_MARKER" || return 1
+  validate_target_launcher_state || return 1
+  visudo -cf "$PUBLISHER_SUDOERS" >/dev/null || return 1
+  validate_installed_host
+}
+
+drain_legacy_host_tool_processes() {
+  local transaction_path="$1" configure_identity update_identity
+  configure_identity="$(<"$transaction_path/configure-auth-device-inode")"
+  update_identity="$(<"$transaction_path/update-image-device-inode")"
+  [[ "$configure_identity" = - && "$update_identity" = - ]] && return 0
+  [[ "$configure_identity" =~ ^[0-9]+:[0-9]+$ \
+    && "$update_identity" =~ ^[0-9]+:[0-9]+$ ]] || {
+    echo 'legacy host-tool migration identities are malformed' >&2
+    return 1
+  }
+  python3 - "$configure_identity" "$CONFIGURE_AUTH" \
+    "$update_identity" "$UPDATE_IMAGE" <<'PY'
+import os, pathlib, select, signal, sys
+
+targets = {}
+for encoded, path in ((sys.argv[1], sys.argv[2]), (sys.argv[3], sys.argv[4])):
+    device, inode = map(int, encoded.split(":"))
+    targets[(device, inode)] = path
+
+self_pid = os.getpid()
+candidates = []
+for proc in pathlib.Path("/proc").iterdir():
+    if not proc.name.isdigit() or int(proc.name) == self_pid:
+        continue
+    pid = int(proc.name)
+    matched = set()
+    try:
+        for fd in (proc / "fd").iterdir():
+            try:
+                meta = fd.stat()
+            except (FileNotFoundError, PermissionError):
+                continue
+            path = targets.get((meta.st_dev, meta.st_ino))
+            if path:
+                matched.add(path)
+        if not matched:
+            continue
+        status = (proc / "status").read_text().splitlines()
+        uid = next(line for line in status if line.startswith("Uid:")).split()[1:]
+        argv = (proc / "cmdline").read_bytes().split(b"\0")
+        if uid != ["0", "0", "0", "0"] or len(argv) < 2:
+            raise RuntimeError(f"unsafe process holds retired host-tool inode: {pid}")
+        executable = pathlib.PurePosixPath(os.fsdecode(argv[0])).name
+        script = os.fsdecode(argv[1])
+        if executable not in {"bash", "bash.static"} or script not in matched:
+            raise RuntimeError(f"unrecognized process holds retired host-tool inode: {pid}")
+        pidfd = os.pidfd_open(pid)
+        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+        candidates.append((pidfd, pid))
+    except FileNotFoundError:
+        continue
+
+poller = select.poll()
+for pidfd, _ in candidates:
+    poller.register(pidfd, select.POLLIN)
+remaining = {pidfd for pidfd, _ in candidates}
+while remaining:
+    for pidfd, _ in poller.poll():
+        remaining.discard(pidfd)
+for pidfd, _ in candidates:
+    os.close(pidfd)
+
+for proc in pathlib.Path("/proc").iterdir():
+    if not proc.name.isdigit():
+        continue
+    try:
+        for fd in (proc / "fd").iterdir():
+            try:
+                meta = fd.stat()
+            except (FileNotFoundError, PermissionError):
+                continue
+            if (meta.st_dev, meta.st_ino) in targets:
+                raise RuntimeError("retired host-tool implementation remains open")
+    except FileNotFoundError:
+        continue
+PY
 }
 
 read_systemctl_enablement() {
@@ -333,19 +1275,19 @@ services_and_ingress_are_off() {
   caddy_enabled="$(read_systemctl_enablement caddy.service)" || return 1
   caddy_activity="$(read_systemctl_activity caddy.service)" || return 1
   if [[ "$service_enabled" != generated ]]; then
-    echo 'legal-mcp.service must be generated for the bootstrap host-tool upgrade' >&2
+    echo 'legal-mcp.service must be generated for the host-tool upgrade' >&2
     invalid=true
   fi
   if [[ "$service_activity" != inactive ]]; then
-    echo 'legal-mcp.service must be inactive for the bootstrap host-tool upgrade' >&2
+    echo 'legal-mcp.service must be inactive for the host-tool upgrade' >&2
     invalid=true
   fi
   if [[ "$caddy_enabled" != disabled ]]; then
-    echo 'caddy.service must be disabled for the bootstrap host-tool upgrade' >&2
+    echo 'caddy.service must be disabled for the host-tool upgrade' >&2
     invalid=true
   fi
   if [[ "$caddy_activity" != inactive ]]; then
-    echo 'caddy.service must be inactive for the bootstrap host-tool upgrade' >&2
+    echo 'caddy.service must be inactive for the host-tool upgrade' >&2
     invalid=true
   fi
   if [[ "$invalid" = true ]]; then
@@ -359,26 +1301,27 @@ services_and_ingress_are_off() {
   fi
   ufw_is_ssh_only || {
     close_public_ingress || return 1
-    echo 'host ingress must be the exact SSH-only UFW allowlist' >&2
+    echo 'host-tool upgrade requires the exact SSH-only UFW allowlist' >&2
     return 1
   }
   listeners="$(ss --listening --tcp --numeric --no-header)" || {
-    echo 'could not inspect bootstrap listening sockets' >&2
+    echo 'could not inspect host listening sockets' >&2
     return 1
   }
   web_listener="$(awk '$4 ~ /:(80|443|51235)$/ { print "present"; exit }' \
     <<< "$listeners")" || {
-    echo 'could not evaluate bootstrap listening sockets' >&2
+    echo 'could not evaluate host listening sockets' >&2
     return 1
   }
   if [[ -n "$web_listener" ]]; then
-    echo 'bootstrap web or service ports must not be listening' >&2
+    echo 'host-tool upgrade requires ports 80, 443, and 51235 not to be listening' >&2
     return 1
   fi
 }
 
-validate_installed_bootstrap_host() {
-  local source fstype options xfs_details actual_uuid host_uuid volume_uuid directory image rendered
+validate_installed_host() {
+  local source fstype options xfs_details actual_uuid host_uuid volume_uuid directory image rendered path
+  local auth_preparation
   local publisher_key_re
   local -a host_marker volume_marker journal authorization entries
   require_regular_file /etc/legal-mcp/host-installed root root 444
@@ -451,12 +1394,15 @@ validate_installed_bootstrap_host() {
   }
   require_regular_file "$HOST_DEPLOY" root root 755
   require_regular_file "$PUBLISHER_COMMAND" root root 755
+  require_regular_file "$CONFIGURE_AUTH" root root 755
+  require_regular_file "$UPDATE_IMAGE" root root 755
+  classify_installed_auth_image_entrypoints || return 1
   require_regular_file "$PUBLISHER_SUDOERS" root root 440
   visudo -cf "$PUBLISHER_SUDOERS" >/dev/null
   require_regular_file /etc/legal-mcp/image root root 600
   require_regular_file /etc/legal-mcp/api-keys.json legal-mcp legal-mcp 400
   require_regular_file /etc/containers/systemd/legal-mcp.container root root 644
-  require_regular_file /usr/local/libexec/legal-mcp/legal-mcp.container.template root root 644
+  require_regular_file "$CONTAINER_TEMPLATE" root root 644
   require_regular_file /etc/caddy/Caddyfile root caddy 640
   require_exact_directory /etc/legal-mcp root root 755
   require_exact_acl /etc/legal-mcp $'user::rwx\ngroup::r-x\nother::r-x'
@@ -477,29 +1423,9 @@ validate_installed_bootstrap_host() {
   require_regular_file /etc/legal-mcp/runtime.env root root 600
   mapfile -t entries < <(awk -F= '$1 == "LEGAL_MCP_HTTP_AUTH" {print $2}' /etc/legal-mcp/runtime.env)
   [[ ${#entries[@]} -eq 1 && "${entries[0]}" = disabled ]] || {
-    echo 'bootstrap host authentication must remain disabled' >&2
+    echo 'host-tool upgrade requires disabled authentication' >&2
     return 1
   }
-  mapfile -t entries < /etc/legal-mcp/image
-  [[ ${#entries[@]} -eq 1 \
-    && "${entries[0]}" =~ ^ghcr\.io/gunba/australian-legal-mcp@sha256:[0-9a-f]{64}$ ]] || {
-    echo 'installed bootstrap image pin is malformed' >&2
-    return 1
-  }
-  image="${entries[0]}"
-  [[ "$(grep -o '__IMAGE_DIGEST__' /usr/local/libexec/legal-mcp/legal-mcp.container.template | wc -l)" = 1 ]] || {
-    echo 'installed bootstrap Quadlet template is malformed' >&2
-    return 1
-  }
-  rendered="$(mktemp /run/legal-mcp-host-tools-quadlet.XXXXXX)"
-  sed "s|__IMAGE_DIGEST__|$image|g" \
-    /usr/local/libexec/legal-mcp/legal-mcp.container.template > "$rendered"
-  if ! cmp --silent "$rendered" /etc/containers/systemd/legal-mcp.container; then
-    rm -f "$rendered"
-    echo 'installed bootstrap image, Quadlet, and template do not agree' >&2
-    return 1
-  fi
-  rm -f "$rendered"
   python3 - /etc/legal-mcp/api-keys.json <<'PY'
 import json, pathlib, stat, sys
 path = pathlib.Path(sys.argv[1])
@@ -509,68 +1435,147 @@ if path.is_symlink() or not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1:
 if json.loads(path.read_bytes()) != {"keys": [], "version": 1}:
     raise SystemExit(1)
 PY
-  path_is_absent /srv/legal-mcp/lifecycle/active-generation || {
-    echo 'host-tool upgrade requires no active generation' >&2
+  for path in "$AUTH_READY_MARKER" "$HOST_TOOL_DISPATCH" \
+    "${HOST_TOOL_DISPATCH}.retiring" "${HOST_TOOL_DISPATCH}.retired" \
+    "$AUTH_CONFIGURING_PERMIT"; do
+    path_is_absent "$path" || {
+      echo 'host-tool upgrade requires no authentication-ready or launcher-dispatch state' >&2
+      return 1
+    }
+  done
+  mapfile -t entries < /etc/legal-mcp/image
+  [[ ${#entries[@]} -eq 1 \
+    && "${entries[0]}" =~ ^ghcr\.io/gunba/australian-legal-mcp@sha256:[0-9a-f]{64}$ ]] || {
+    echo 'installed bootstrap image pin is malformed' >&2
     return 1
   }
-  if ! directory_is_empty /srv/legal-mcp/generations \
-    || ! directory_is_empty /srv/legal-mcp/state; then
-    echo 'bootstrap generations and state directories must be empty' >&2
+  image="${entries[0]}"
+  [[ "$(grep -o '__IMAGE_DIGEST__' "$CONTAINER_TEMPLATE" | wc -l)" = 1 ]] || {
+    echo 'installed bootstrap Quadlet template is malformed' >&2
+    return 1
+  }
+  rendered="$(mktemp /run/legal-mcp-host-tools-quadlet.XXXXXX)"
+  sed "s|__IMAGE_DIGEST__|$image|g" \
+    "$CONTAINER_TEMPLATE" > "$rendered"
+  if ! cmp --silent "$rendered" /etc/containers/systemd/legal-mcp.container; then
+    rm -f "$rendered"
+    echo 'installed bootstrap image, Quadlet, and template do not agree' >&2
     return 1
   fi
-  if ! path_is_absent /etc/legal-mcp/.auth-transaction \
+  rm -f "$rendered"
+  auth_preparation="$(find /etc/legal-mcp -mindepth 1 -maxdepth 1 \
+    -name '.auth-transaction.preparing.*' -print -quit)" || {
+    echo 'could not inspect authentication transaction preparations' >&2
+    return 1
+  }
+  if [[ -n "$auth_preparation" ]] \
+    || ! path_is_absent /etc/legal-mcp/.auth-transaction.preparing \
+    || ! path_is_absent /etc/legal-mcp/.auth-transaction.preparing-retired \
+    || ! path_is_absent /etc/legal-mcp/.auth-transaction \
+    || ! path_is_absent /etc/legal-mcp/.image-transaction.preparing \
+    || ! path_is_absent /etc/legal-mcp/.image-transaction.preparing-retired \
     || ! path_is_absent /etc/legal-mcp/.image-transaction \
-    || ! path_is_absent /etc/legal-mcp/.image-transaction.retiring; then
+    || ! path_is_absent /etc/legal-mcp/.image-transaction.retiring \
+    || ! path_is_absent /etc/legal-mcp/.image-transaction.retired; then
     echo 'auth or image transaction must be recovered before host-tool upgrade' >&2
     return 1
   fi
 
-  require_regular_file /srv/legal-mcp/lifecycle/.deployment-transaction root root 600
-  mapfile -t journal < /srv/legal-mcp/lifecycle/.deployment-transaction
-  [[ ${#journal[@]} -eq 3 && "${journal[0]}" =~ ^[0-9a-f]{64}$ \
-    && "${journal[1]}" = - && "${journal[2]}" = prepared ]] || {
-    echo 'host-tool upgrade requires the pending bootstrap corpus transaction at prepared phase' >&2
-    return 1
-  }
-  HOST_TOOL_PENDING_GENERATION="${journal[0]}"
-  [[ -d "/srv/legal-mcp/uploads/$HOST_TOOL_PENDING_GENERATION" \
-    && ! -L "/srv/legal-mcp/uploads/$HOST_TOOL_PENDING_GENERATION" \
-    && "$(stat -c '%U:%G:%a' "/srv/legal-mcp/uploads/$HOST_TOOL_PENDING_GENERATION")" \
-      = legal-mcp-publisher:legal-mcp-publisher:700 ]] || {
-    echo 'prepared bootstrap upload is missing or unsafe' >&2
-    return 1
-  }
-  require_exact_acl "/srv/legal-mcp/uploads/$HOST_TOOL_PENDING_GENERATION" \
-    $'user::rwx\ngroup::---\nother::---'
-  mapfile -t entries < <(
-    findmnt --submounts --noheadings --raw --output TARGET \
-      --target "/srv/legal-mcp/uploads/$HOST_TOOL_PENDING_GENERATION"
-  )
-  [[ ${#entries[@]} -eq 1 && "${entries[0]}" = /srv/legal-mcp ]] || {
-    echo 'prepared bootstrap upload contains an unexpected mount' >&2
-    return 1
-  }
-  directory_contains_only /srv/legal-mcp/uploads "$HOST_TOOL_PENDING_GENERATION" || {
-    echo 'uploads contain state outside the one prepared bootstrap generation' >&2
-    return 1
-  }
-  # Activation durably revokes rsync before validation. A recovered prepared
-  # transaction may therefore have no authorization; absence is the closed
-  # state and the upgrade must preserve it.
-  if ! path_is_absent /run/legal-mcp/authorized-upload; then
-    require_regular_file /run/legal-mcp/authorized-upload root legal-mcp-publisher 440
-    mapfile -t authorization < /run/legal-mcp/authorized-upload
-    [[ ${#authorization[@]} -eq 1 \
-      && "${authorization[0]}" = "$HOST_TOOL_PENDING_GENERATION" ]] || {
-      echo 'prepared upload authorization does not match its transaction' >&2
+  if path_is_absent /srv/legal-mcp/lifecycle/active-generation; then
+    HOST_TOOL_HOST_STATE=prepared
+    if ! directory_is_empty /srv/legal-mcp/generations \
+      || ! directory_is_empty /srv/legal-mcp/state; then
+      echo 'bootstrap generations and state directories must be empty' >&2
+      return 1
+    fi
+    require_regular_file /srv/legal-mcp/lifecycle/.deployment-transaction root root 600
+    mapfile -t journal < /srv/legal-mcp/lifecycle/.deployment-transaction
+    [[ ${#journal[@]} -eq 3 && "${journal[0]}" =~ ^[0-9a-f]{64}$ \
+      && "${journal[1]}" = - && "${journal[2]}" = prepared ]] || {
+      echo 'host-tool upgrade requires the pending bootstrap corpus transaction at prepared phase' >&2
+      return 1
+    }
+    HOST_TOOL_PENDING_GENERATION="${journal[0]}"
+    [[ -d "/srv/legal-mcp/uploads/$HOST_TOOL_PENDING_GENERATION" \
+      && ! -L "/srv/legal-mcp/uploads/$HOST_TOOL_PENDING_GENERATION" \
+      && "$(stat -c '%U:%G:%a' "/srv/legal-mcp/uploads/$HOST_TOOL_PENDING_GENERATION")" \
+        = legal-mcp-publisher:legal-mcp-publisher:700 ]] || {
+      echo 'prepared bootstrap upload is missing or unsafe' >&2
+      return 1
+    }
+    require_exact_acl "/srv/legal-mcp/uploads/$HOST_TOOL_PENDING_GENERATION" \
+      $'user::rwx\ngroup::---\nother::---'
+    mapfile -t entries < <(
+      findmnt --submounts --noheadings --raw --output TARGET \
+        --target "/srv/legal-mcp/uploads/$HOST_TOOL_PENDING_GENERATION"
+    )
+    [[ ${#entries[@]} -eq 1 && "${entries[0]}" = /srv/legal-mcp ]] || {
+      echo 'prepared bootstrap upload contains an unexpected mount' >&2
+      return 1
+    }
+    directory_contains_only /srv/legal-mcp/uploads "$HOST_TOOL_PENDING_GENERATION" || {
+      echo 'uploads contain state outside the one prepared bootstrap generation' >&2
+      return 1
+    }
+    # Activation durably revokes rsync before validation. A recovered prepared
+    # transaction may therefore have no authorization; absence is the closed
+    # state and the upgrade must preserve it.
+    if ! path_is_absent /run/legal-mcp/authorized-upload; then
+      require_regular_file /run/legal-mcp/authorized-upload root legal-mcp-publisher 440
+      mapfile -t authorization < /run/legal-mcp/authorized-upload
+      [[ ${#authorization[@]} -eq 1 \
+        && "${authorization[0]}" = "$HOST_TOOL_PENDING_GENERATION" ]] || {
+        echo 'prepared upload authorization does not match its transaction' >&2
+        return 1
+      }
+    fi
+    directory_contains_only /srv/legal-mcp/lifecycle \
+      .deployment-transaction LIFECYCLE_LOCK LOCK || {
+      echo 'lifecycle contains unexpected bootstrap state' >&2
+      return 1
+    }
+  else
+    HOST_TOOL_HOST_STATE=activated
+    local active_generation
+    require_regular_file /srv/legal-mcp/lifecycle/active-generation root root 644 || return 1
+    require_exact_acl /srv/legal-mcp/lifecycle/active-generation \
+      $'user::rw-\ngroup::r--\nother::r--' || return 1
+    [[ "$(stat -c '%s' /srv/legal-mcp/lifecycle/active-generation)" = 64 ]] || {
+      echo 'active generation pointer must contain exactly 64 bytes' >&2
+      return 1
+    }
+    active_generation="$(</srv/legal-mcp/lifecycle/active-generation)"
+    [[ "$active_generation" =~ ^[0-9a-f]{64}$ \
+      && -d "/srv/legal-mcp/generations/$active_generation" \
+      && ! -L "/srv/legal-mcp/generations/$active_generation" ]] || {
+      echo 'active generation pointer is invalid' >&2
+      return 1
+    }
+    path_is_absent /srv/legal-mcp/lifecycle/.deployment-transaction || {
+      echo 'corpus transaction must be completed before host-tool upgrade' >&2
+      return 1
+    }
+    path_is_absent /srv/legal-mcp/lifecycle/.deployment-transaction.preparing || {
+      echo 'corpus transaction preparation must be recovered before host-tool upgrade' >&2
+      return 1
+    }
+    path_is_absent /run/legal-mcp/authorized-upload || {
+      echo 'activated host must not retain upload authorization' >&2
+      return 1
+    }
+    directory_is_empty /srv/legal-mcp/uploads || {
+      echo 'activated host uploads must be empty before host-tool upgrade' >&2
+      return 1
+    }
+    directory_contains_only /srv/legal-mcp/lifecycle \
+      active-generation LIFECYCLE_LOCK LOCK || {
+      echo 'activated lifecycle contains unexpected state' >&2
       return 1
     }
   fi
-  directory_contains_only /srv/legal-mcp/lifecycle \
-    .deployment-transaction LIFECYCLE_LOCK LOCK || {
-    echo 'lifecycle contains unexpected bootstrap state' >&2
-    return 1
-  }
+  if [[ "$HOST_TOOL_ENTRYPOINT_STATE" = legacy ]]; then
+    validate_legacy_v0192_host_tool_identity || return 1
+  fi
   services_and_ingress_are_off
 }
 
@@ -655,6 +1660,8 @@ finalize_host_tools_transaction_retirement() {
   if ! path_is_absent "$HOST_TOOLS_RETIRING"; then
     HOST_TOOLS_RETIREMENT_WAS_PENDING=true
     require_exact_directory "$HOST_TOOLS_RETIRING" root root 700
+    validate_host_tools_transaction "$HOST_TOOLS_RETIRING"
+    validate_live_target_host_tools
     # The first parent sync makes removal of the canonical transaction name
     # durable. Only then is the directory moved to a deletion-only name.
     sync -f /etc/legal-mcp
@@ -663,6 +1670,7 @@ finalize_host_tools_transaction_retirement() {
   fi
   if ! path_is_absent "$HOST_TOOLS_RETIRED"; then
     HOST_TOOLS_RETIREMENT_WAS_PENDING=true
+    validate_live_target_host_tools
     delete_retired_host_tools_directory "$HOST_TOOLS_RETIRED"
   fi
   if ! path_is_absent "$HOST_TOOLS_ROLLBACK_RETIRING"; then
@@ -690,6 +1698,8 @@ retire_host_tools_transaction() {
     echo 'host-tool transaction retirement state is not clean' >&2
     return 1
   fi
+  validate_host_tools_transaction
+  validate_live_target_host_tools
   mv -T "$HOST_TOOLS_TRANSACTION" "$HOST_TOOLS_RETIRING"
   sync -f /etc/legal-mcp
   mv -T "$HOST_TOOLS_RETIRING" "$HOST_TOOLS_RETIRED"
@@ -716,14 +1726,74 @@ retire_host_tools_rollback_transaction() {
 render_host_tools_marker() {
   local sudoers_sha256="$1" destination="$2"
   cat > "$destination" <<EOF
-LEGAL_MCP_HOST_TOOLS_V1
+LEGAL_MCP_HOST_TOOLS_V2
 VERSION=$HOST_TOOL_VERSION
 SOURCE_COMMIT=$HOST_TOOL_REVISION
 HOST_DEPLOY_SHA256=$HOST_DEPLOY_SHA256
 PUBLISHER_COMMAND_SHA256=$PUBLISHER_COMMAND_SHA256
+CONFIGURE_AUTH_SHA256=$CONFIGURE_AUTH_SHA256
+UPDATE_IMAGE_SHA256=$UPDATE_IMAGE_SHA256
+CONTAINER_TEMPLATE_SHA256=$CONTAINER_TEMPLATE_SHA256
 SUDOERS_SHA256=$sudoers_sha256
 EOF
   chmod 444 "$destination"
+}
+
+host_tool_file_sha256() {
+  if [[ "$1" = - ]]; then
+    printf '%s\n' -
+  else
+    sha256sum "$1" | awk '{print $1}'
+  fi
+}
+
+render_host_tools_hash_manifest() {
+  local host_deploy="$1" publisher="$2" configure_auth="$3" update_image="$4"
+  local container_template="$5" rendered_quadlet="$6" sudoers="$7" host_marker_file="$8"
+  local launcher="$9" launcher_marker="${10}" configure_pointer="${11}"
+  local update_pointer="${12}" destination="${13}"
+  cat > "$destination" <<EOF
+HOST_DEPLOY_SHA256=$(host_tool_file_sha256 "$host_deploy")
+PUBLISHER_COMMAND_SHA256=$(host_tool_file_sha256 "$publisher")
+CONFIGURE_AUTH_ENTRYPOINT_SHA256=$(host_tool_file_sha256 "$configure_auth")
+UPDATE_IMAGE_ENTRYPOINT_SHA256=$(host_tool_file_sha256 "$update_image")
+CONTAINER_TEMPLATE_SHA256=$(host_tool_file_sha256 "$container_template")
+RENDERED_QUADLET_SHA256=$(host_tool_file_sha256 "$rendered_quadlet")
+SUDOERS_SHA256=$(host_tool_file_sha256 "$sudoers")
+HOST_TOOLS_MARKER_SHA256=$(host_tool_file_sha256 "$host_marker_file")
+LAUNCHER_SHA256=$(host_tool_file_sha256 "$launcher")
+LAUNCHER_MARKER_SHA256=$(host_tool_file_sha256 "$launcher_marker")
+CONFIGURE_AUTH_POINTER_SHA256=$(host_tool_file_sha256 "$configure_pointer")
+UPDATE_IMAGE_POINTER_SHA256=$(host_tool_file_sha256 "$update_pointer")
+EOF
+  chmod 600 "$destination"
+}
+
+validate_saved_host_tools_hashes() {
+  local transaction_path="$1" saved_marker=- launcher=- launcher_marker=-
+  local configure_pointer=- update_pointer=- manifest
+  if [[ -e "$transaction_path/marker-was-present" ]]; then
+    saved_marker="$transaction_path/host-tools-marker"
+  fi
+  if [[ -e "$transaction_path/launcher-was-present" ]]; then
+    launcher="$transaction_path/host-tool-launcher"
+    launcher_marker="$transaction_path/launcher-marker"
+    configure_pointer="$transaction_path/configure-auth-pointer"
+    update_pointer="$transaction_path/update-image-pointer"
+  fi
+  manifest="$(mktemp /run/legal-mcp-host-tools-previous.XXXXXX)"
+  render_host_tools_hash_manifest \
+    "$transaction_path/host-deploy" "$transaction_path/publisher-command" \
+    "$transaction_path/configure-auth" "$transaction_path/update-image" \
+    "$transaction_path/container-template" "$transaction_path/rendered-quadlet" \
+    "$transaction_path/publisher-sudoers" "$saved_marker" "$launcher" \
+    "$launcher_marker" "$configure_pointer" "$update_pointer" "$manifest"
+  if ! cmp --silent "$manifest" "$transaction_path/previous-sha256"; then
+    rm -f "$manifest"
+    echo 'saved host-tool hashes do not match the rollback files' >&2
+    return 1
+  fi
+  rm -f "$manifest"
 }
 
 validate_host_tools_transaction() {
@@ -734,36 +1804,64 @@ validate_host_tools_transaction() {
     echo 'host-tool transaction is missing or unsafe' >&2
     return 1
   }
-  for name in kind target-version target-revision host-deploy publisher-command publisher-sudoers; do
+  for name in kind target-version target-revision target-sha256 previous-sha256 \
+    host-deploy publisher-command configure-auth update-image container-template \
+    rendered-quadlet publisher-sudoers configure-auth-device-inode \
+    update-image-device-inode; do
     require_regular_file "$transaction_path/$name" root root 600 || return 1
   done
   mapfile -t kind < "$transaction_path/kind"
   mapfile -t version < "$transaction_path/target-version"
   mapfile -t revision < "$transaction_path/target-revision"
-  [[ ${#kind[@]} -eq 1 && "${kind[0]}" = LEGAL_MCP_HOST_TOOLS_TRANSACTION_V1 \
+  [[ ${#kind[@]} -eq 1 && "${kind[0]}" = LEGAL_MCP_HOST_TOOLS_TRANSACTION_V2 \
     && ${#version[@]} -eq 1 && "${version[0]}" = "$HOST_TOOL_VERSION" \
     && ${#revision[@]} -eq 1 && "${revision[0]}" = "$HOST_TOOL_REVISION" ]] || {
     echo 'host-tool transaction identity is invalid for this release' >&2
     return 1
   }
+  local -a expected_entries=(
+    configure-auth configure-auth-device-inode container-template host-deploy kind
+    previous-sha256 publisher-command publisher-sudoers rendered-quadlet
+    target-revision target-sha256 target-version update-image update-image-device-inode
+  )
   if [[ -e "$transaction_path/marker-was-present" ]]; then
     require_regular_file "$transaction_path/marker-was-present" root root 600
     require_regular_file "$transaction_path/host-tools-marker" root root 444
-    directory_contains_only "$transaction_path" \
-      host-deploy host-tools-marker kind marker-was-present publisher-command \
-      publisher-sudoers target-revision target-version || {
-      echo 'host-tool transaction contains unexpected state' >&2
-      return 1
-    }
+    expected_entries+=(host-tools-marker marker-was-present)
   else
     require_regular_file "$transaction_path/marker-was-absent" root root 600
-    directory_contains_only "$transaction_path" \
-      host-deploy kind marker-was-absent publisher-command publisher-sudoers \
-      target-revision target-version || {
-      echo 'host-tool transaction contains unexpected state' >&2
-      return 1
-    }
+    expected_entries+=(marker-was-absent)
   fi
+  if [[ -e "$transaction_path/launcher-was-present" ]]; then
+    require_regular_file "$transaction_path/launcher-was-present" root root 600
+    require_regular_file "$transaction_path/host-tool-launcher" root root 600
+    require_regular_file "$transaction_path/launcher-marker" root root 600
+    require_regular_file "$transaction_path/configure-auth-pointer" root root 600
+    require_regular_file "$transaction_path/update-image-pointer" root root 600
+    expected_entries+=(launcher-was-present host-tool-launcher launcher-marker
+      configure-auth-pointer update-image-pointer)
+  else
+    require_regular_file "$transaction_path/launcher-was-absent" root root 600
+    expected_entries+=(launcher-was-absent)
+  fi
+  directory_contains_only "$transaction_path" "${expected_entries[@]}" || {
+    echo 'host-tool transaction contains unexpected state' >&2
+    return 1
+  }
+  local configure_identity update_identity
+  configure_identity="$(<"$transaction_path/configure-auth-device-inode")"
+  update_identity="$(<"$transaction_path/update-image-device-inode")"
+  if [[ -e "$transaction_path/launcher-was-present" ]]; then
+    [[ "$configure_identity" = - && "$update_identity" = - ]] || return 1
+  else
+    [[ "$configure_identity" =~ ^[0-9]+:[0-9]+$ \
+      && "$update_identity" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+  fi
+  cmp --silent "$HOST_TOOL_TARGET_MANIFEST" "$transaction_path/target-sha256" || {
+    echo 'host-tool transaction target hashes do not match this release' >&2
+    return 1
+  }
+  validate_saved_host_tools_hashes "$transaction_path" || return 1
   visudo -cf "$transaction_path/publisher-sudoers" >/dev/null
 }
 
@@ -789,12 +1887,80 @@ saved_host_tools_marker_is_restored() {
   fi
 }
 
+restore_saved_quadlet_state() {
+  local transaction_path="$1"
+  atomic_install_file "$transaction_path/container-template" \
+    "$CONTAINER_TEMPLATE" root root 644
+  atomic_install_file "$transaction_path/rendered-quadlet" \
+    "$RENDERED_QUADLET" root root 644
+  systemctl daemon-reload
+  cmp --silent "$transaction_path/container-template" "$CONTAINER_TEMPLATE"
+  cmp --silent "$transaction_path/rendered-quadlet" "$RENDERED_QUADLET"
+}
+
+restore_saved_auth_image_entrypoints() {
+  local transaction_path="$1"
+  if [[ -e "$transaction_path/launcher-was-present" ]]; then
+    require_regular_file "$HOST_TOOL_LAUNCHER" root root 755
+    require_regular_file "$CONFIGURE_AUTH" root root 755
+    require_regular_file "$UPDATE_IMAGE" root root 755
+    cmp --silent "$transaction_path/host-tool-launcher" "$HOST_TOOL_LAUNCHER"
+    cmp --silent "$transaction_path/configure-auth" "$CONFIGURE_AUTH"
+    cmp --silent "$transaction_path/update-image" "$UPDATE_IMAGE"
+    atomic_install_file "$transaction_path/launcher-marker" \
+      "$HOST_TOOL_LAUNCHER_MARKER" root root 444
+    atomic_install_file "$transaction_path/configure-auth-pointer" \
+      "$CONFIGURE_AUTH_POINTER" root root 644
+    atomic_install_file "$transaction_path/update-image-pointer" \
+      "$UPDATE_IMAGE_POINTER" root root 644
+    validate_installed_launcher_state
+  else
+    drain_legacy_host_tool_processes "$transaction_path"
+    rm -f -- "$HOST_TOOL_LAUNCHER_MARKER" "$CONFIGURE_AUTH_POINTER" \
+      "$UPDATE_IMAGE_POINTER" "$HOST_TOOL_LAUNCHER"
+    sync -f /etc/legal-mcp
+    sync -f /usr/local/libexec/legal-mcp
+    atomic_install_file "$transaction_path/configure-auth" \
+      "$CONFIGURE_AUTH" root root 755
+    atomic_install_file "$transaction_path/update-image" \
+      "$UPDATE_IMAGE" root root 755
+  fi
+}
+
+saved_auth_image_state_is_restored() {
+  local transaction_path="$1"
+  cmp --silent "$transaction_path/configure-auth" "$CONFIGURE_AUTH"
+  cmp --silent "$transaction_path/update-image" "$UPDATE_IMAGE"
+  cmp --silent "$transaction_path/container-template" "$CONTAINER_TEMPLATE"
+  cmp --silent "$transaction_path/rendered-quadlet" "$RENDERED_QUADLET"
+  if [[ -e "$transaction_path/launcher-was-present" ]]; then
+    cmp --silent "$transaction_path/host-tool-launcher" "$HOST_TOOL_LAUNCHER"
+    cmp --silent "$transaction_path/launcher-marker" "$HOST_TOOL_LAUNCHER_MARKER"
+    cmp --silent "$transaction_path/configure-auth-pointer" "$CONFIGURE_AUTH_POINTER"
+    cmp --silent "$transaction_path/update-image-pointer" "$UPDATE_IMAGE_POINTER"
+  else
+    path_is_absent "$HOST_TOOL_LAUNCHER"
+    path_is_absent "$HOST_TOOL_LAUNCHER_MARKER"
+    path_is_absent "$CONFIGURE_AUTH_POINTER"
+    path_is_absent "$UPDATE_IMAGE_POINTER"
+  fi
+}
+
 complete_host_tools_publisher_restore() {
   validate_host_tools_transaction "$HOST_TOOLS_PUBLISHER_RESTORE"
   require_regular_file "$HOST_DEPLOY" root root 755
   require_regular_file "$PUBLISHER_COMMAND" root root 755
+  require_regular_file "$CONFIGURE_AUTH" root root 755
+  require_regular_file "$UPDATE_IMAGE" root root 755
+  require_regular_file "$CONTAINER_TEMPLATE" root root 644
+  require_regular_file "$RENDERED_QUADLET" root root 644
+  require_regular_file "$RENDERED_QUADLET" root root 644
   require_regular_file "$PUBLISHER_SUDOERS" root root 440
   cmp --silent "$HOST_TOOLS_PUBLISHER_RESTORE/host-deploy" "$HOST_DEPLOY"
+  cmp --silent "$HOST_TOOLS_PUBLISHER_RESTORE/configure-auth" "$CONFIGURE_AUTH"
+  cmp --silent "$HOST_TOOLS_PUBLISHER_RESTORE/update-image" "$UPDATE_IMAGE"
+  cmp --silent "$HOST_TOOLS_PUBLISHER_RESTORE/container-template" "$CONTAINER_TEMPLATE"
+  cmp --silent "$HOST_TOOLS_PUBLISHER_RESTORE/rendered-quadlet" "$RENDERED_QUADLET"
   cmp --silent "$HOST_TOOLS_PUBLISHER_RESTORE/publisher-sudoers" "$PUBLISHER_SUDOERS"
   saved_host_tools_marker_is_restored "$HOST_TOOLS_PUBLISHER_RESTORE"
   visudo -cf "$PUBLISHER_SUDOERS" >/dev/null
@@ -805,6 +1971,7 @@ complete_host_tools_publisher_restore() {
   atomic_install_file "$HOST_TOOLS_PUBLISHER_RESTORE/publisher-command" \
     "$PUBLISHER_COMMAND" root root 755
   cmp --silent "$HOST_TOOLS_PUBLISHER_RESTORE/publisher-command" "$PUBLISHER_COMMAND"
+  validate_installed_host
   retire_host_tools_directory_for_deletion \
     "$HOST_TOOLS_PUBLISHER_RESTORE" "$HOST_TOOLS_PUBLISHER_RESTORE_RETIRED"
 }
@@ -816,10 +1983,13 @@ complete_host_tools_rollback_retirement() {
 
   atomic_install_file "$HOST_TOOLS_ROLLBACK_RETIRED/host-deploy" \
     "$HOST_DEPLOY" root root 755
+  restore_saved_auth_image_entrypoints "$HOST_TOOLS_ROLLBACK_RETIRED"
+  restore_saved_quadlet_state "$HOST_TOOLS_ROLLBACK_RETIRED"
   atomic_install_file "$HOST_TOOLS_ROLLBACK_RETIRED/publisher-sudoers" \
     "$PUBLISHER_SUDOERS" root root 440
   restore_saved_host_tools_marker "$HOST_TOOLS_ROLLBACK_RETIRED"
   cmp --silent "$HOST_TOOLS_ROLLBACK_RETIRED/host-deploy" "$HOST_DEPLOY"
+  saved_auth_image_state_is_restored "$HOST_TOOLS_ROLLBACK_RETIRED"
   cmp --silent "$HOST_TOOLS_ROLLBACK_RETIRED/publisher-sudoers" "$PUBLISHER_SUDOERS"
   saved_host_tools_marker_is_restored "$HOST_TOOLS_ROLLBACK_RETIRED"
   visudo -cf "$PUBLISHER_SUDOERS" >/dev/null
@@ -838,9 +2008,31 @@ reconcile_host_tools_preparation() {
   validate_host_tools_transaction "$HOST_TOOLS_PREPARING"
   require_regular_file "$HOST_DEPLOY" root root 755
   require_regular_file "$PUBLISHER_COMMAND" root root 755
+  require_regular_file "$CONFIGURE_AUTH" root root 755
+  require_regular_file "$UPDATE_IMAGE" root root 755
+  require_regular_file "$CONTAINER_TEMPLATE" root root 644
   require_regular_file "$PUBLISHER_SUDOERS" root root 440
   cmp --silent "$HOST_TOOLS_PREPARING/host-deploy" "$HOST_DEPLOY"
+  cmp --silent "$HOST_TOOLS_PREPARING/configure-auth" "$CONFIGURE_AUTH"
+  cmp --silent "$HOST_TOOLS_PREPARING/update-image" "$UPDATE_IMAGE"
+  cmp --silent "$HOST_TOOLS_PREPARING/container-template" "$CONTAINER_TEMPLATE"
+  cmp --silent "$HOST_TOOLS_PREPARING/rendered-quadlet" "$RENDERED_QUADLET"
   cmp --silent "$HOST_TOOLS_PREPARING/publisher-sudoers" "$PUBLISHER_SUDOERS"
+  if [[ -e "$HOST_TOOLS_PREPARING/launcher-was-present" ]]; then
+    require_regular_file "$HOST_TOOL_LAUNCHER" root root 755
+    require_regular_file "$HOST_TOOL_LAUNCHER_MARKER" root root 444
+    require_regular_file "$CONFIGURE_AUTH_POINTER" root root 644
+    require_regular_file "$UPDATE_IMAGE_POINTER" root root 644
+    cmp --silent "$HOST_TOOLS_PREPARING/host-tool-launcher" "$HOST_TOOL_LAUNCHER"
+    cmp --silent "$HOST_TOOLS_PREPARING/launcher-marker" "$HOST_TOOL_LAUNCHER_MARKER"
+    cmp --silent "$HOST_TOOLS_PREPARING/configure-auth-pointer" "$CONFIGURE_AUTH_POINTER"
+    cmp --silent "$HOST_TOOLS_PREPARING/update-image-pointer" "$UPDATE_IMAGE_POINTER"
+  else
+    path_is_absent "$HOST_TOOL_LAUNCHER"
+    path_is_absent "$HOST_TOOL_LAUNCHER_MARKER"
+    path_is_absent "$CONFIGURE_AUTH_POINTER"
+    path_is_absent "$UPDATE_IMAGE_POINTER"
+  fi
   if [[ -e "$HOST_TOOLS_PREPARING/marker-was-present" ]]; then
     require_regular_file "$HOST_TOOLS_MARKER" root root 444
     cmp --silent "$HOST_TOOLS_PREPARING/host-tools-marker" "$HOST_TOOLS_MARKER"
@@ -871,7 +2063,7 @@ reconcile_host_tools_preparation() {
 recover_host_tools_transaction() {
   local deny_policy
   validate_host_tools_transaction
-  validate_installed_bootstrap_host
+  services_and_ingress_are_off
   deny_policy="$(mktemp /etc/legal-mcp/.publisher-sudoers-deny.XXXXXX)"
   printf '%s\n' 'Defaults:legal-mcp-publisher !requiretty' > "$deny_policy"
   chmod 440 "$deny_policy"
@@ -884,7 +2076,6 @@ recover_host_tools_transaction() {
 rollback_host_tools_upgrade() {
   local status=$? recovery_status
   trap - ERR HUP INT TERM EXIT
-  rm -f "$HOST_TOOL_POLICY_SOURCE" "$HOST_TOOL_MARKER_SOURCE" || true
   set +e
   (
     set -e
@@ -892,6 +2083,7 @@ rollback_host_tools_upgrade() {
   )
   recovery_status=$?
   set -e
+  cleanup_host_tool_sources
   if [[ $recovery_status -ne 0 ]]; then
     echo 'host-tool upgrade failed and automatic rollback did not complete' >&2
     exit 1
@@ -900,9 +2092,20 @@ rollback_host_tools_upgrade() {
   exit "$status"
 }
 
+cleanup_host_tool_sources() {
+  rm -f "${HOST_TOOL_POLICY_SOURCE:-}" "${HOST_TOOL_MARKER_SOURCE:-}" \
+    "${HOST_TOOL_TARGET_MANIFEST:-}" "${HOST_TOOL_LAUNCHER_SOURCE:-}" \
+    "${HOST_TOOL_LAUNCHER_MARKER_SOURCE:-}" \
+    "${HOST_TOOL_CONFIGURE_POINTER_SOURCE:-}" \
+    "${HOST_TOOL_UPDATE_POINTER_SOURCE:-}" \
+    "${HOST_TOOL_RENDERED_QUADLET_SOURCE:-}" || true
+}
+
 run_host_tools_operation() {
   local operation="$1" expected_version="$2" transaction_tmp
-  local policy_sha256 current_marker_ok=false
+  local policy_sha256 current_marker_ok=false previous_manifest previous_marker
+  local previous_launcher previous_launcher_marker previous_configure_pointer
+  local previous_update_pointer
   [[ "$expected_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || usage
   for command_name in awk blkid cmp find findmnt flock getfacl id python3 readlink sha256sum \
     sort ss stat sync systemctl ufw visudo xfs_info; do
@@ -915,6 +2118,22 @@ run_host_tools_operation() {
   exec 8<>"$HOST_TRANSACTION_LOCK"
   flock -x 8
   load_host_tool_bundle "$expected_version"
+  prepare_host_tool_runtime_sources
+  HOST_TOOL_POLICY_SOURCE="$(mktemp /etc/legal-mcp/.publisher-sudoers-new.XXXXXX)"
+  render_publisher_sudoers "$HOST_DEPLOY_SHA256" "$HOST_TOOL_POLICY_SOURCE"
+  policy_sha256="$(sha256sum "$HOST_TOOL_POLICY_SOURCE" | awk '{print $1}')"
+  HOST_TOOL_MARKER_SOURCE="$(mktemp /etc/legal-mcp/.host-tools-new.XXXXXX)"
+  render_host_tools_marker "$policy_sha256" "$HOST_TOOL_MARKER_SOURCE"
+  HOST_TOOL_TARGET_MANIFEST="$(mktemp /etc/legal-mcp/.host-tools-target.XXXXXX)"
+  render_host_tools_hash_manifest \
+    "$HOST_TOOL_SOURCE_DEPLOY" "$HOST_TOOL_SOURCE_PUBLISHER" \
+    "$HOST_TOOL_LAUNCHER_SOURCE" "$HOST_TOOL_LAUNCHER_SOURCE" \
+    "$HOST_TOOL_SOURCE_CONTAINER_TEMPLATE" "$HOST_TOOL_RENDERED_QUADLET_SOURCE" \
+    "$HOST_TOOL_POLICY_SOURCE" "$HOST_TOOL_MARKER_SOURCE" \
+    "$HOST_TOOL_LAUNCHER_SOURCE" "$HOST_TOOL_LAUNCHER_MARKER_SOURCE" \
+    "$HOST_TOOL_CONFIGURE_POINTER_SOURCE" "$HOST_TOOL_UPDATE_POINTER_SOURCE" \
+    "$HOST_TOOL_TARGET_MANIFEST"
+  trap cleanup_host_tool_sources EXIT
   reconcile_host_tools_building
   services_and_ingress_are_off
   finalize_host_tools_transaction_retirement
@@ -923,10 +2142,14 @@ run_host_tools_operation() {
   if [[ "$operation" = recover ]]; then
     if path_is_absent "$HOST_TOOLS_TRANSACTION"; then
       if [[ "$HOST_TOOLS_PREPARATION_WAS_RECOVERED" = true ]]; then
+        rm -f "$HOST_TOOL_POLICY_SOURCE" "$HOST_TOOL_MARKER_SOURCE" \
+          "$HOST_TOOL_TARGET_MANIFEST"
         echo 'interrupted host-tool preparation rolled back'
         exit 0
       fi
       if [[ "$HOST_TOOLS_RETIREMENT_WAS_PENDING" = true ]]; then
+        rm -f "$HOST_TOOL_POLICY_SOURCE" "$HOST_TOOL_MARKER_SOURCE" \
+          "$HOST_TOOL_TARGET_MANIFEST"
         echo 'interrupted host-tool transaction retirement completed'
         exit 0
       fi
@@ -934,6 +2157,8 @@ run_host_tools_operation() {
       exit 1
     fi
     recover_host_tools_transaction
+    rm -f "$HOST_TOOL_POLICY_SOURCE" "$HOST_TOOL_MARKER_SOURCE" \
+      "$HOST_TOOL_TARGET_MANIFEST"
     echo 'interrupted host-tool upgrade rolled back'
     exit 0
   fi
@@ -942,27 +2167,24 @@ run_host_tools_operation() {
     echo 'a host-tool transaction already exists; recover it first' >&2
     exit 1
   }
-  validate_installed_bootstrap_host
-  HOST_TOOL_POLICY_SOURCE="$(mktemp /etc/legal-mcp/.publisher-sudoers-new.XXXXXX)"
-  render_publisher_sudoers "$HOST_DEPLOY_SHA256" "$HOST_TOOL_POLICY_SOURCE"
-  policy_sha256="$(sha256sum "$HOST_TOOL_POLICY_SOURCE" | awk '{print $1}')"
-  HOST_TOOL_MARKER_SOURCE="$(mktemp /etc/legal-mcp/.host-tools-new.XXXXXX)"
-  render_host_tools_marker "$policy_sha256" "$HOST_TOOL_MARKER_SOURCE"
+  validate_installed_host
 
   if ! path_is_absent "$HOST_TOOLS_MARKER"; then
     require_regular_file "$HOST_TOOLS_MARKER" root root 444
     require_exact_acl "$HOST_TOOLS_MARKER" $'user::r--\ngroup::r--\nother::r--'
   fi
-  if [[ -f "$HOST_TOOLS_MARKER" && ! -L "$HOST_TOOLS_MARKER" \
-    && "$(sha256sum "$HOST_DEPLOY" | awk '{print $1}')" = "$HOST_DEPLOY_SHA256" \
-    && "$(sha256sum "$PUBLISHER_COMMAND" | awk '{print $1}')" = "$PUBLISHER_COMMAND_SHA256" \
-    && "$(sha256sum "$PUBLISHER_SUDOERS" | awk '{print $1}')" = "$policy_sha256" \
-    && "$(<"$HOST_TOOLS_MARKER")" = "$(<"$HOST_TOOL_MARKER_SOURCE")" ]]; then
+  if [[ -f "$HOST_TOOLS_MARKER" && ! -L "$HOST_TOOLS_MARKER" ]] \
+    && cmp --silent "$HOST_TOOL_MARKER_SOURCE" "$HOST_TOOLS_MARKER"; then
+    validate_live_target_host_tools || {
+      echo 'V2 host-tool marker exists but the installed target bytes are invalid' >&2
+      exit 1
+    }
     current_marker_ok=true
   fi
   if [[ "$current_marker_ok" = true ]]; then
-    rm -f "$HOST_TOOL_POLICY_SOURCE" "$HOST_TOOL_MARKER_SOURCE"
-    echo "host publisher tools already match $expected_version ($HOST_TOOL_REVISION)"
+    rm -f "$HOST_TOOL_POLICY_SOURCE" "$HOST_TOOL_MARKER_SOURCE" \
+      "$HOST_TOOL_TARGET_MANIFEST"
+    echo "host tools already match $expected_version ($HOST_TOOL_REVISION)"
     exit 0
   fi
 
@@ -972,8 +2194,12 @@ run_host_tools_operation() {
   chmod 700 "$transaction_tmp"
   install -o root -g root -m 0600 "$HOST_DEPLOY" "$transaction_tmp/host-deploy"
   install -o root -g root -m 0600 "$PUBLISHER_COMMAND" "$transaction_tmp/publisher-command"
+  install -o root -g root -m 0600 "$CONFIGURE_AUTH" "$transaction_tmp/configure-auth"
+  install -o root -g root -m 0600 "$UPDATE_IMAGE" "$transaction_tmp/update-image"
+  install -o root -g root -m 0600 "$CONTAINER_TEMPLATE" "$transaction_tmp/container-template"
+  install -o root -g root -m 0600 "$RENDERED_QUADLET" "$transaction_tmp/rendered-quadlet"
   install -o root -g root -m 0600 "$PUBLISHER_SUDOERS" "$transaction_tmp/publisher-sudoers"
-  printf '%s\n' LEGAL_MCP_HOST_TOOLS_TRANSACTION_V1 > "$transaction_tmp/kind"
+  printf '%s\n' LEGAL_MCP_HOST_TOOLS_TRANSACTION_V2 > "$transaction_tmp/kind"
   printf '%s\n' "$HOST_TOOL_VERSION" > "$transaction_tmp/target-version"
   printf '%s\n' "$HOST_TOOL_REVISION" > "$transaction_tmp/target-revision"
   chmod 600 "$transaction_tmp/kind" \
@@ -985,6 +2211,50 @@ run_host_tools_operation() {
     install -o root -g root -m 0444 "$HOST_TOOLS_MARKER" "$transaction_tmp/host-tools-marker"
     install -o root -g root -m 0600 /dev/null "$transaction_tmp/marker-was-present"
   fi
+  if [[ "$HOST_TOOL_ENTRYPOINT_STATE" = stable ]]; then
+    install -o root -g root -m 0600 /dev/null "$transaction_tmp/launcher-was-present"
+    install -o root -g root -m 0600 "$HOST_TOOL_LAUNCHER" \
+      "$transaction_tmp/host-tool-launcher"
+    install -o root -g root -m 0600 "$HOST_TOOL_LAUNCHER_MARKER" \
+      "$transaction_tmp/launcher-marker"
+    install -o root -g root -m 0600 "$CONFIGURE_AUTH_POINTER" \
+      "$transaction_tmp/configure-auth-pointer"
+    install -o root -g root -m 0600 "$UPDATE_IMAGE_POINTER" \
+      "$transaction_tmp/update-image-pointer"
+    printf '%s\n' - > "$transaction_tmp/configure-auth-device-inode"
+    printf '%s\n' - > "$transaction_tmp/update-image-device-inode"
+  else
+    install -o root -g root -m 0600 /dev/null "$transaction_tmp/launcher-was-absent"
+    stat -c '%d:%i' "$CONFIGURE_AUTH" > "$transaction_tmp/configure-auth-device-inode"
+    stat -c '%d:%i' "$UPDATE_IMAGE" > "$transaction_tmp/update-image-device-inode"
+  fi
+  chmod 600 "$transaction_tmp/configure-auth-device-inode" \
+    "$transaction_tmp/update-image-device-inode"
+  previous_manifest="$(mktemp /run/legal-mcp-host-tools-previous.XXXXXX)"
+  previous_marker=-
+  previous_launcher=-
+  previous_launcher_marker=-
+  previous_configure_pointer=-
+  previous_update_pointer=-
+  if [[ -e "$transaction_tmp/marker-was-present" ]]; then
+    previous_marker="$transaction_tmp/host-tools-marker"
+  fi
+  if [[ -e "$transaction_tmp/launcher-was-present" ]]; then
+    previous_launcher="$transaction_tmp/host-tool-launcher"
+    previous_launcher_marker="$transaction_tmp/launcher-marker"
+    previous_configure_pointer="$transaction_tmp/configure-auth-pointer"
+    previous_update_pointer="$transaction_tmp/update-image-pointer"
+  fi
+  render_host_tools_hash_manifest \
+    "$transaction_tmp/host-deploy" "$transaction_tmp/publisher-command" \
+    "$transaction_tmp/configure-auth" "$transaction_tmp/update-image" \
+    "$transaction_tmp/container-template" "$transaction_tmp/rendered-quadlet" \
+    "$transaction_tmp/publisher-sudoers" "$previous_marker" \
+    "$previous_launcher" "$previous_launcher_marker" \
+    "$previous_configure_pointer" "$previous_update_pointer" "$previous_manifest"
+  install -o root -g root -m 0600 "$previous_manifest" "$transaction_tmp/previous-sha256"
+  install -o root -g root -m 0600 "$HOST_TOOL_TARGET_MANIFEST" "$transaction_tmp/target-sha256"
+  rm -f "$previous_manifest"
   sync -f "$transaction_tmp"
   validate_host_tools_transaction "$transaction_tmp"
   mv -T "$transaction_tmp" "$HOST_TOOLS_PREPARING"
@@ -1004,19 +2274,33 @@ run_host_tools_operation() {
   atomic_install_file "$deny_policy" "$PUBLISHER_SUDOERS" root root 440
   rm -f "$deny_policy"
   atomic_install_file "$HOST_TOOL_SOURCE_DEPLOY" "$HOST_DEPLOY" root root 755
+  atomic_install_file "$HOST_TOOL_SOURCE_CONTAINER_TEMPLATE" "$CONTAINER_TEMPLATE" root root 644
+  atomic_install_file "$HOST_TOOL_RENDERED_QUADLET_SOURCE" "$RENDERED_QUADLET" root root 644
+  if [[ "$HOST_TOOL_ENTRYPOINT_STATE" = legacy ]]; then
+    atomic_install_file "$HOST_TOOL_LAUNCHER_SOURCE" "$HOST_TOOL_LAUNCHER" root root 755
+    atomic_install_file "$HOST_TOOL_LAUNCHER_SOURCE" "$CONFIGURE_AUTH" root root 755
+    atomic_install_file "$HOST_TOOL_LAUNCHER_SOURCE" "$UPDATE_IMAGE" root root 755
+    drain_legacy_host_tool_processes "$HOST_TOOLS_TRANSACTION"
+  else
+    cmp --silent "$HOST_TOOL_LAUNCHER_SOURCE" "$HOST_TOOL_LAUNCHER"
+    cmp --silent "$HOST_TOOL_LAUNCHER_SOURCE" "$CONFIGURE_AUTH"
+    cmp --silent "$HOST_TOOL_LAUNCHER_SOURCE" "$UPDATE_IMAGE"
+  fi
+  atomic_install_file "$HOST_TOOL_CONFIGURE_POINTER_SOURCE" \
+    "$CONFIGURE_AUTH_POINTER" root root 644
+  atomic_install_file "$HOST_TOOL_UPDATE_POINTER_SOURCE" \
+    "$UPDATE_IMAGE_POINTER" root root 644
+  atomic_install_file "$HOST_TOOL_LAUNCHER_MARKER_SOURCE" \
+    "$HOST_TOOL_LAUNCHER_MARKER" root root 444
   atomic_install_file "$HOST_TOOL_POLICY_SOURCE" "$PUBLISHER_SUDOERS" root root 440
   atomic_install_file "$HOST_TOOL_MARKER_SOURCE" "$HOST_TOOLS_MARKER" root root 444
+  systemctl daemon-reload
 
-  [[ "$(sha256sum "$HOST_DEPLOY" | awk '{print $1}')" = "$HOST_DEPLOY_SHA256" \
-    && "$(sha256sum "$PUBLISHER_COMMAND" | awk '{print $1}')" = "$PUBLISHER_COMMAND_SHA256" \
-    && "$(sha256sum "$PUBLISHER_SUDOERS" | awk '{print $1}')" = "$policy_sha256" ]]
-  cmp --silent "$HOST_TOOL_MARKER_SOURCE" "$HOST_TOOLS_MARKER"
-  visudo -cf "$PUBLISHER_SUDOERS" >/dev/null
-  validate_installed_bootstrap_host
+  validate_live_target_host_tools
   trap - ERR HUP INT TERM EXIT
-  rm -f "$HOST_TOOL_POLICY_SOURCE" "$HOST_TOOL_MARKER_SOURCE"
   retire_host_tools_transaction
-  echo "host publisher tools upgraded to $expected_version ($HOST_TOOL_REVISION)"
+  cleanup_host_tool_sources
+  echo "host tools upgraded to $expected_version ($HOST_TOOL_REVISION); service and ingress remain off"
   exit 0
 }
 
@@ -1101,6 +2385,12 @@ for path in \
   "$REPO_DIR/scripts/legal-mcp-publisher-command"; do
   [[ -f "$path" && ! -L "$path" ]] || { echo "required install asset missing: $path" >&2; exit 1; }
 done
+[[ "$(grep -o '__IMAGE_DIGEST__' "$REPO_DIR/infra/hosting/legal-mcp.container.template" | wc -l)" = 1 \
+  && "$(grep -Fxc 'ExecCondition=/usr/local/libexec/legal-mcp/host-tool-launcher --check-auth-ready' \
+    "$REPO_DIR/infra/hosting/legal-mcp.container.template")" = 1 ]] || {
+  echo 'release Quadlet template lacks its exact image or auth-ready gate' >&2
+  exit 1
+}
 (
   cd "$REPO_DIR"
   sha512sum --check --strict infra/hosting/caddy-artifact.sha512
@@ -1116,7 +2406,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get upgrade --yes
 apt-get install --yes --no-install-recommends \
-  acl ca-certificates curl podman python3 rsync sudo ufw unattended-upgrades xfsprogs
+  acl ca-certificates curl podman python3 rsync sudo ufw unattended-upgrades util-linux xfsprogs
 [[ -x /usr/bin/rrsync ]] || { echo 'the installed rsync package did not provide /usr/bin/rrsync' >&2; exit 1; }
 systemctl enable --now unattended-upgrades.service
 
@@ -1370,13 +2660,26 @@ chown root:root /etc/legal-mcp
 chmod 755 /etc/legal-mcp
 install -o root -g root -m 0755 "$REPO_DIR/scripts/legal-mcp-host-deploy" /usr/local/sbin/legal-mcp-host-deploy
 install -o root -g root -m 0755 "$REPO_DIR/scripts/legal-mcp-publisher-command" /usr/local/sbin/legal-mcp-publisher-command
-install -o root -g root -m 0755 "$REPO_DIR/infra/hosting/configure-auth.sh" /usr/local/sbin/legal-mcp-configure-auth
-install -o root -g root -m 0755 "$REPO_DIR/infra/hosting/update-image.sh" /usr/local/sbin/legal-mcp-update-image
 install -o root -g root -m 0644 "$REPO_DIR/infra/hosting/legal-mcp.container.template" \
   /usr/local/libexec/legal-mcp/legal-mcp.container.template
 printf '%s\n' "$IMAGE" > /etc/legal-mcp/image
 chown root:root /etc/legal-mcp/image
 chmod 600 /etc/legal-mcp/image
+HOST_TOOL_SOURCE_CONFIGURE_AUTH="$REPO_DIR/infra/hosting/configure-auth.sh"
+HOST_TOOL_SOURCE_UPDATE_IMAGE="$REPO_DIR/infra/hosting/update-image.sh"
+HOST_TOOL_SOURCE_CONTAINER_TEMPLATE="$REPO_DIR/infra/hosting/legal-mcp.container.template"
+CONFIGURE_AUTH_SHA256="$(sha256sum "$HOST_TOOL_SOURCE_CONFIGURE_AUTH" | awk '{print $1}')"
+UPDATE_IMAGE_SHA256="$(sha256sum "$HOST_TOOL_SOURCE_UPDATE_IMAGE" | awk '{print $1}')"
+CONTAINER_TEMPLATE_SHA256="$(sha256sum "$HOST_TOOL_SOURCE_CONTAINER_TEMPLATE" | awk '{print $1}')"
+prepare_host_tool_runtime_sources
+install -o root -g root -m 0755 "$HOST_TOOL_LAUNCHER_SOURCE" "$HOST_TOOL_LAUNCHER"
+install -o root -g root -m 0755 "$HOST_TOOL_LAUNCHER_SOURCE" "$CONFIGURE_AUTH"
+install -o root -g root -m 0755 "$HOST_TOOL_LAUNCHER_SOURCE" "$UPDATE_IMAGE"
+atomic_install_file "$HOST_TOOL_CONFIGURE_POINTER_SOURCE" "$CONFIGURE_AUTH_POINTER" root root 644
+atomic_install_file "$HOST_TOOL_UPDATE_POINTER_SOURCE" "$UPDATE_IMAGE_POINTER" root root 644
+atomic_install_file "$HOST_TOOL_LAUNCHER_MARKER_SOURCE" "$HOST_TOOL_LAUNCHER_MARKER" root root 444
+rm -f -- "$AUTH_READY_MARKER" "$AUTH_CONFIGURING_PERMIT"
+cleanup_host_tool_sources
 printf '%s\n' "$ADMIN_SOURCE_IP" > /etc/legal-mcp/admin-source-ip
 chown root:root /etc/legal-mcp/admin-source-ip
 chmod 600 /etc/legal-mcp/admin-source-ip
@@ -1514,6 +2817,9 @@ HOST_TOOL_VERSION="$bundle_version"
 HOST_TOOL_REVISION="$bundle_revision"
 HOST_DEPLOY_SHA256="$installed_host_deploy_sha256"
 PUBLISHER_COMMAND_SHA256="$(sha256sum /usr/local/sbin/legal-mcp-publisher-command | awk '{print $1}')"
+CONFIGURE_AUTH_SHA256="$(sha256sum "$REPO_DIR/infra/hosting/configure-auth.sh" | awk '{print $1}')"
+UPDATE_IMAGE_SHA256="$(sha256sum "$REPO_DIR/infra/hosting/update-image.sh" | awk '{print $1}')"
+CONTAINER_TEMPLATE_SHA256="$(sha256sum /usr/local/libexec/legal-mcp/legal-mcp.container.template | awk '{print $1}')"
 installed_sudoers_sha256="$(sha256sum /etc/sudoers.d/legal-mcp-publisher | awk '{print $1}')"
 host_tools_marker_tmp="$(mktemp /etc/legal-mcp/.host-tools.XXXXXX)"
 render_host_tools_marker "$installed_sudoers_sha256" "$host_tools_marker_tmp"

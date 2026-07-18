@@ -73,7 +73,7 @@ python3 - "$REPO_DIR/infra/hosting/Caddyfile" "$LOCAL_STAGE/Caddyfile" "$PUBLIC_
 import pathlib, sys
 source = pathlib.Path(sys.argv[1]).read_text()
 host = sys.argv[3]
-if source.count("__PUBLIC_HOST__") != 1:
+if source.count("__PUBLIC_HOST__") != 2:
     raise SystemExit("Caddy template placeholder contract changed")
 pathlib.Path(sys.argv[2]).write_text(source.replace("__PUBLIC_HOST__", host))
 PY
@@ -106,6 +106,48 @@ sudo mountpoint -q /var/lib/australian-legal-mcp
 sudo test -f /var/lib/australian-legal-mcp/.legal-mcp-data-volume
 sudo test "$(sudo findmnt -n -o FSTYPE --target /var/lib/australian-legal-mcp)" = xfs
 sudo xfs_info /var/lib/australian-legal-mcp | grep -Eq 'reflink=1'
+
+# Quadlet accepts symlinks and searches all three rootful source directories.
+# Reject every filesystem object at the target name, including dangling links,
+# before changing persistent host state.
+readonly -a system_quadlet_directories=(
+  /run/containers/systemd
+  /etc/containers/systemd
+  /usr/share/containers/systemd
+)
+for quadlet_directory in "${system_quadlet_directories[@]}"; do
+  quadlet_path="$quadlet_directory/legal-mcp.container"
+  if sudo test -e "$quadlet_path" || sudo test -L "$quadlet_path"; then
+    echo "refusing native Azure installation over a legal-mcp Quadlet: $quadlet_path" >&2
+    exit 1
+  fi
+done
+
+native_unit=/etc/systemd/system/legal-mcp.service
+if sudo test -e "$native_unit" || sudo test -L "$native_unit"; then
+  echo "refusing to replace existing native unit: $native_unit" >&2
+  exit 1
+fi
+if unit_file_state="$(sudo systemctl is-enabled legal-mcp.service 2>/dev/null)"; then
+  unit_file_status=0
+else
+  unit_file_status=$?
+fi
+load_state="$(sudo systemctl show --property=LoadState --value legal-mcp.service 2>/dev/null)" || {
+  echo 'could not establish the existing legal-mcp.service load state' >&2
+  exit 1
+}
+existing_fragment="$(sudo systemctl show --property=FragmentPath --value legal-mcp.service 2>/dev/null)" || {
+  echo 'could not establish the existing legal-mcp.service fragment' >&2
+  exit 1
+}
+[[ "$unit_file_status:$unit_file_state" = 4:not-found \
+  && "$load_state" = not-found \
+  && -z "$existing_fragment" ]] || {
+  echo "refusing existing or transitional legal-mcp.service state: unit-file $unit_file_status:${unit_file_state:-<empty>} load ${load_state:-<empty>} fragment ${existing_fragment:-<empty>}" >&2
+  exit 1
+}
+
 sudo systemctl disable --now caddy.service || true
 sudo systemctl mask caddy.service
 
@@ -147,8 +189,46 @@ caddy version | grep -F 'v2.11.4'
 sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 sudo rm -f /etc/systemd/system/legal-mcp.service.d/10-require-http-auth.conf
 sudo systemctl daemon-reload
+fragment_path="$(sudo systemctl show --property FragmentPath --value legal-mcp.service)"
+[[ "$fragment_path" = /etc/systemd/system/legal-mcp.service ]] || {
+  echo "legal-mcp.service is not the installed native unit: ${fragment_path:-<empty>}" >&2
+  exit 1
+}
+sudo systemctl stop legal-mcp.service
 sudo systemctl enable legal-mcp.service
-sudo systemctl is-enabled legal-mcp.service
+if enablement="$(sudo systemctl is-enabled legal-mcp.service 2>/dev/null)"; then
+  enablement_status=0
+else
+  enablement_status=$?
+fi
+[[ "$enablement_status:$enablement" = 0:enabled ]] || {
+  echo "native legal-mcp.service must be enabled, found status $enablement_status state ${enablement:-<empty>}" >&2
+  exit 1
+}
+if activity="$(sudo systemctl is-active legal-mcp.service 2>/dev/null)"; then
+  activity_status=0
+else
+  activity_status=$?
+fi
+[[ "$activity_status:$activity" = 3:inactive ]] || {
+  echo "native legal-mcp.service must remain inactive, found status $activity_status state ${activity:-<empty>}" >&2
+  exit 1
+}
+if caddy_enablement="$(sudo systemctl is-enabled caddy.service 2>/dev/null)"; then
+  caddy_enablement_status=0
+else
+  caddy_enablement_status=$?
+fi
+if caddy_activity="$(sudo systemctl is-active caddy.service 2>/dev/null)"; then
+  caddy_activity_status=0
+else
+  caddy_activity_status=$?
+fi
+[[ "$caddy_enablement_status:$caddy_enablement" = 1:disabled \
+  && "$caddy_activity_status:$caddy_activity" = 3:inactive ]] || {
+  echo "Caddy must remain disabled/inactive, found enablement $caddy_enablement_status:${caddy_enablement:-<empty>} activity $caddy_activity_status:${caddy_activity:-<empty>}" >&2
+  exit 1
+}
 REMOTE
 
 echo "configured Azure host $HOST; public Caddy ingress remains disabled until Entra auth is configured"

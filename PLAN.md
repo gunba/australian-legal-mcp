@@ -55,8 +55,11 @@ MCP surface remains exactly `search`, `get_chunks`, `get_asset`,
   XFS-volume adoption, CoW/rsync delta deployment, narrow publisher/root
   transactions, Caddy, API-key plus Entra auth, signed image provenance/SBOM
   policy, RFC 9728 metadata/challenges, and Copilot templates.
-- Added version-matched bootstrap-host tool upgrade, explicit publisher abort,
-  and fail-closed empty-host image cutover operations for the v20 transition.
+- Added version-matched host-tool upgrade, explicit publisher abort, and
+  fail-closed empty-host image cutover operations for the v20 transition.
+  V0.19.3 hard-cuts the upgrade to one exact, recoverable V2 transaction for
+  prepared-bootstrap or activated-dark state, including auth/image helpers and
+  the installed Quadlet template.
 - Restricted the locked-parent activation exception to one exact networkless
   `activate` invocation with `CAP_DAC_OVERRIDE`; the hosted service and every
   other lifecycle command remain capability-free. Disposable fixtures prove
@@ -77,6 +80,7 @@ cargo deny check advisories
 bash -n scripts/*.sh
 python3 -m unittest \
   tests/test_azure_generation_transport.py \
+  tests/test_configure_azure_host.py \
   tests/test_manage_api_keys.py \
   tests/test_remote_mcp.py \
   tests/test_render_microsoft_integrations.py
@@ -96,9 +100,12 @@ Microsoft v2.4 schema validation; bridged non-root/read-only container probes; z
 HIGH/CRITICAL image findings; Caddy validation; strict disk/mount guards;
 packaged ONNX loading; and a clean offline Linode provider plan. The live
 instance/volume boundary now also proves Ubuntu 24.04, XFS/reflink volume
-adoption, restricted SSH, and closed public 80/443/51235. The host is installed
-but has no active generation, auth, application service, active Caddy service,
-or ingress.
+adoption and restricted SSH. V20 is active on the host after the v0.19.2
+publisher-tool repair and activation, but authentication is disabled,
+`legal-mcp.service` is inactive, Caddy is disabled/inactive, and UFW 80/443 are
+closed. One known v0.19.2 authentication transaction remains for explicit
+one-shot recovery; no deployment or image transaction or upload authorization
+exists.
 
 ## Phase 2 — disposable Linode infrastructure
 
@@ -107,21 +114,21 @@ or ingress.
    encrypted 128-GiB volume; verified the attached device is signature-free and
    public 80/443/51235 are closed.
 2. **Completed:** bootstrapped the host, cut it over to the v0.19.0 empty-host
-   contract, fully staged v20, and safely recovered its permission-denied
-   activation to the publisher-owned `prepared` state with no active remote
-   generation.
-3. Publish and verify the v0.19.2 bundle and OCI digest. The v0.19.1 host-tool
-   attempt made no mutations but rejected the legitimate `LIFECYCLE_LOCK`
-   created by v0.19.0. From the v0.19.2 bundle, run
-   `--upgrade-host-tools --version 0.19.2`, then retry only the exact publisher
-   `activate` command against preserved staging. Do not abort or rerun rsync.
-4. Configure API-key and/or Entra auth privately only after v20 activation;
-   then open Cloud Firewall 80/443, run the transactional Caddy cutover, and
-   update the running image to the attested v0.19.2 digest.
-5. Test reboot, changed/unchanged generation deltas, readiness rollback,
+   contract, and fully staged v20.
+3. **Completed:** the v0.19.2 publisher-tool repair and activation succeeded;
+   v20 is active with authentication, application service, Caddy, and UFW web
+   ingress still off and no transaction or upload authorization remaining.
+4. Once v0.19.3 artifacts exist, independently verify the release bundle,
+   checksums, `SOURCE_COMMIT`, and OCI digest. Run
+   `--upgrade-host-tools --version 0.19.3` from those exact bytes; the V2
+   transaction must leave the activated host dark.
+5. Configure API-key and/or Entra auth, then move the running image to the
+   verified v0.19.3 digest through the normal authenticated image transaction.
+   Do not claim release or publication before the immutable artifacts exist.
+6. Test reboot, changed/unchanged generation deltas, readiness rollback,
    API-key rotation/revocation, image rollback, volume detach/reattach, and VPS
    replacement without another full upload.
-6. Record compute/volume cost, p50/p95 latency, CPU, RSS, page cache, queue
+7. Record compute/volume cost, p50/p95 latency, CPU, RSS, page cache, queue
    rejection, and disk extent growth.
 
 Exit criterion: the disposable VPS can be recreated from OpenTofu + an attested
@@ -170,6 +177,6 @@ preview paths, not production dependencies.
 
 Superseded local build/cache cleanup reduced project usage from 298 GiB to 197
 GiB and increased free disk from 76 GiB to 153 GiB. Retain v19 until Linode
-activation, VPS replacement, exact readiness, Copilot token validation, and
-rollback are proven. Delete no cloud bootstrap/rollback artifact or sole source
+VPS replacement, exact readiness, Copilot token validation, and rollback are
+proven. Delete no cloud bootstrap/rollback artifact or sole source
 of source truth or validation evidence before those gates pass.

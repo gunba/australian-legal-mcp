@@ -9,9 +9,11 @@ maintainer host. Validated generations are activated locally and can be
 CoW-seeded and rsynced by changed blocks to an external XFS/reflink volume on
 the Akamai/Linode host. A corpus-free OCI image serves and validates them. The
 runtime never scrapes, embeds, builds, packages, or publishes corpus/model
-artifacts. GitHub Releases contain software binaries only. The current remote
-host is not serving and has no active generation, auth, application service,
-active Caddy service, or ingress.
+artifacts. GitHub Releases contain software binaries only. V20 is active on the
+current Linode, but authentication is disabled, `legal-mcp.service` is
+inactive, Caddy is disabled/inactive, UFW 80/443 are closed, and there is no
+deployment, auth, or image transaction or upload authorization. The host is not
+serving.
 
 Persistent project data is
 `data/{sources,source-snapshots,models,builds,runtime,cache,runs,logs,validation,archive}`.
@@ -83,19 +85,21 @@ scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
 
-Software is 0.19.2. Active local v20 is
-`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`;
-retain v19 with the matching v0.18.1 binary/image as its schema-10 fallback.
-The schema-11 binary cannot roll back to schema 10.
+Software is 0.19.3. V20
+`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` is active
+locally and on the Linode after the v0.19.2 publisher-tool repair and
+activation succeeded. Retain local v19 with the matching v0.18.1 binary/image
+as its schema-10 fallback; the schema-11 binary cannot roll back to schema 10.
 
-The current remote v20 transaction is fully staged but not active. V0.19.0
-created the legitimate empty root-owned `LIFECYCLE_LOCK`, then safely restored
-the prepared state after the capability-free one-shot container could not
-traverse the publisher-owned mode-`0700` upload parent. A v0.19.1 host-tool
-upgrade made no mutations but rejected that extra lifecycle entry. After
-publishing and verifying v0.19.2, upgrade only the host tools, then retry the
-exact publisher `activate` command without abort or rsync. Configure auth only
-after activation succeeds.
+V0.19.3 implements one hard-cut V2 host-tools transaction for either a
+prepared-bootstrap or activated-dark host. It atomically covers the publisher
+helper/wrapper/sudoers, `configure-auth`, `update-image`, installed Quadlet
+template, and V2 marker/hashes; exact version, `SOURCE_COMMIT`, release bytes,
+and the shared host lock are mandatory, and recovery uses the same bundle.
+Generated-Quadlet auth state is handled without enabling or disabling the unit.
+The operation leaves service and ingress off. Once the v0.19.3 release bundle
+exists, verify it, upgrade with `--upgrade-host-tools --version 0.19.3`,
+configure auth, then move the image by verified digest.
 
 The unpacked model is under `data/models/mdbr-leaf-ir-standard`. Maintainer
 builds use deterministic FP32 ONNX, TensorRT FP16, CUDA fallback, lossless

@@ -172,6 +172,10 @@ transport, systemd unit, and checksum-pinned Caddy 2.11.4 package/configuration.
 `legal-mcp.service` for reboot persistence
 but does not start it without a generation. Caddy is explicitly disabled, so an
 accidentally open NSG does not expose an unauthenticated MCP endpoint.
+This Azure adapter installs a native unit at
+`/etc/systemd/system/legal-mcp.service`; it rejects a Linode Quadlet instead of
+treating systemd's `generated` state as native enablement, and proves the final
+unit state is exactly `enabled/inactive`.
 
 The systemd service:
 
@@ -241,9 +245,22 @@ managed disk without any public application surface.
 ## 5. Add Entra and Copilot
 
 Do not open TCP 443 until the resource app, connector app, delegated scope, and
-caller allowlist exist. Follow [MICROSOFT_COPILOT.md](../MICROSOFT_COPILOT.md).
-That guide first enables Entra validation locally, then starts Caddy and proves
-public OAuth metadata/TLS. The VM never stores the connector client secret.
+caller allowlist exist. Create those tenant objects as described in
+[MICROSOFT_COPILOT.md](../MICROSOFT_COPILOT.md), but use the native Azure
+transaction rather than the Linode Quadlet command:
+
+```bash
+scripts/configure-azure-entra.sh \
+  --host azureadmin@'<public-ip-or-fqdn>' \
+  --public-host '<name>.australiaeast.cloudapp.azure.com' \
+  --tenant-id '<tenant-id>' \
+  --server-app-id '<server-app-id>' \
+  --allowed-client-id '<connector-app-id>'
+```
+
+That transaction first enables Entra validation locally, then starts Caddy and
+proves public OAuth metadata/TLS. The VM never stores the connector client
+secret.
 
 ## Routine operation and cost control
 
