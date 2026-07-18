@@ -79,7 +79,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-EXPECTED_HOST_TOOL_VERSION=0.19.5
+EXPECTED_HOST_TOOL_VERSION=0.19.6
 HOST_TOOLS_MARKER=/etc/legal-mcp/host-tools
 IMAGE_FILE=/etc/legal-mcp/image
 RUNTIME_ENV=/etc/legal-mcp/runtime.env
@@ -461,7 +461,7 @@ validate_host_tools_v2() {
     && "${marker[1]}" = "VERSION=$EXPECTED_HOST_TOOL_VERSION" \
     && "${marker[2]}" =~ ^SOURCE_COMMIT=[0-9a-f]{40}$ \
     && "${marker[3]}" =~ ^HOST_DEPLOY_SHA256=([0-9a-f]{64})$ ]] || {
-    echo 'installed V2 host-tool marker is not the exact v0.19.5 contract' >&2
+    echo 'installed V2 host-tool marker is not the exact v0.19.6 contract' >&2
     return 1
   }
   deploy_sha="${BASH_REMATCH[1]}"

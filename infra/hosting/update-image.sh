@@ -88,6 +88,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+canonical_image_id() {
+  local value="$1"
+  [[ "$value" =~ ^(sha256:)?([0-9a-f]{64})$ ]] || {
+    echo 'Podman returned a malformed image ID' >&2
+    return 1
+  }
+  printf 'sha256:%s\n' "${BASH_REMATCH[2]}"
+}
+
 read_systemctl_enablement() {
   local unit="$1" output status
   if output="$(systemctl is-enabled "$unit" 2>/dev/null)"; then
@@ -1864,7 +1873,8 @@ ordinary_validate_recoverable_live_state() {
   fi
   container_state="$(podman_container_state australian-legal-mcp)" || return 1
   if [[ "$container_state" = present ]]; then
-    running_image_id="$(podman inspect australian-legal-mcp --format '{{.Image}}')"
+    running_image_id="$(canonical_image_id \
+      "$(podman inspect australian-legal-mcp --format '{{.Image}}')")" || return 1
     [[ "$running_image_id" = "$TRANSACTION_OLD_IMAGE_ID" \
       || "$running_image_id" = "$TRANSACTION_TARGET_IMAGE_ID" ]] || {
         echo 'recovery found a running container outside the saved/target image set' >&2
@@ -1928,7 +1938,8 @@ ordinary_verify_private_runtime() {
   ordinary_require_listener_topology private
   probe_auth_boundary http://127.0.0.1:51235/mcp \
     http://127.0.0.1:51235/.well-known/oauth-protected-resource/mcp
-  running_image_id="$(podman inspect australian-legal-mcp --format '{{.Image}}')"
+  running_image_id="$(canonical_image_id \
+    "$(podman inspect australian-legal-mcp --format '{{.Image}}')")" || return 1
   [[ "$running_image_id" = "$expected_image_id" ]] || {
     echo 'private service does not use the transaction image ID' >&2
     return 1
@@ -1958,7 +1969,8 @@ ordinary_verify_final_state() {
   wait_for_exact_generation "$TRANSACTION_GENERATION"
   probe_auth_boundary http://127.0.0.1:51235/mcp \
     http://127.0.0.1:51235/.well-known/oauth-protected-resource/mcp
-  running_image_id="$(podman inspect australian-legal-mcp --format '{{.Image}}')"
+  running_image_id="$(canonical_image_id \
+    "$(podman inspect australian-legal-mcp --format '{{.Image}}')")" || return 1
   [[ "$running_image_id" = "$expected_image_id" ]] || {
     echo 'running container image ID does not match the transaction' >&2
     return 1
@@ -1988,7 +2000,8 @@ ordinary_restore_saved_state() {
   ordinary_atomic_install "$TRANSACTION/saved-auth-ready" "$AUTH_READY" root root 444
   old_image_state="$(podman_image_state "$TRANSACTION_OLD_IMAGE")" || return 1
   if [[ "$old_image_state" = absent ]]; then podman pull "$TRANSACTION_OLD_IMAGE"; fi
-  old_image_id="$(podman image inspect "$TRANSACTION_OLD_IMAGE" --format '{{.Id}}')"
+  old_image_id="$(canonical_image_id \
+    "$(podman image inspect "$TRANSACTION_OLD_IMAGE" --format '{{.Id}}')")" || return 1
   [[ "$old_image_id" = "$TRANSACTION_OLD_IMAGE_ID" ]] || {
     echo 'saved image pin no longer resolves to its recorded image ID' >&2
     return 1
@@ -2045,7 +2058,8 @@ ordinary_verify_retirement_outcome() {
       return 1
       ;;
   esac
-  resolved_image_id="$(podman image inspect "$pinned_image" --format '{{.Id}}')"
+  resolved_image_id="$(canonical_image_id \
+    "$(podman image inspect "$pinned_image" --format '{{.Id}}')")" || return 1
   [[ "$resolved_image_id" = "$expected_image_id" ]] || {
     echo 'retiring image pin no longer resolves to its recorded image ID' >&2
     return 1
@@ -2186,14 +2200,15 @@ ordinary_capture_baseline() {
     echo 'currently pinned image is not present' >&2
     return 1
   }
-  OLD_IMAGE_ID="$(podman image inspect "$OLD_IMAGE" --format '{{.Id}}')"
-  [[ "$OLD_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
+  OLD_IMAGE_ID="$(canonical_image_id \
+    "$(podman image inspect "$OLD_IMAGE" --format '{{.Id}}')")" || return 1
   container_state="$(podman_container_state australian-legal-mcp)" || return 1
   [[ "$container_state" = present ]] || {
     echo 'ordinary image update requires the running service container' >&2
     return 1
   }
-  running_image_id="$(podman inspect australian-legal-mcp --format '{{.Image}}')"
+  running_image_id="$(canonical_image_id \
+    "$(podman inspect australian-legal-mcp --format '{{.Image}}')")" || return 1
   [[ "$running_image_id" = "$OLD_IMAGE_ID" ]] || {
     echo 'running container does not use the image pinned by /etc/legal-mcp/image' >&2
     return 1
@@ -2384,8 +2399,8 @@ ordinary_capture_baseline
 
 podman pull "$NEW_IMAGE"
 verify_image_runtime "$NEW_IMAGE" "$ORDINARY_VERSION" "$ORDINARY_REVISION"
-TARGET_IMAGE_ID="$(podman image inspect "$NEW_IMAGE" --format '{{.Id}}')"
-[[ "$TARGET_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
+TARGET_IMAGE_ID="$(canonical_image_id \
+  "$(podman image inspect "$NEW_IMAGE" --format '{{.Id}}')")"
 podman run --rm --network=none --user=0:0 --read-only --cap-drop=all \
   --security-opt=no-new-privileges --pids-limit=256 --memory=6g --memory-swap=6g \
   --tmpfs=/tmp:rw,nodev,nosuid,noexec,size=64m,mode=1777 \

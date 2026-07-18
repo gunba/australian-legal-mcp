@@ -16,7 +16,7 @@ non-replaceable release is created. Linux requires glibc 2.27+; Windows requires
 the Microsoft Visual C++ 2015–2022 Redistributable. Publish and independently
 verify `SHA256SUMS` for every archive.
 
-The software tree is version 0.19.5. V0.19.5 hard-cuts host tools to one V2
+The software tree is version 0.19.6. V0.19.6 hard-cuts host tools to one V2
 transaction and fixes authentication handling for the generated Quadlet.
 Do not install its host tools or image until the immutable release bundle,
 checksums, `SOURCE_COMMIT`, release bytes, and OCI digest have been verified;
@@ -226,13 +226,13 @@ activation succeeded. Authentication remains disabled, `legal-mcp.service` is
 inactive, Caddy is disabled/inactive, UFW 80/443 are closed, and there is no
 deployment, auth, or image transaction or upload authorization.
 
-The v0.19.5 V2 upgrade accepts either prepared-bootstrap or activated-dark
+The v0.19.6 V2 upgrade accepts either prepared-bootstrap or activated-dark
 state. Under the shared host transaction lock it atomically replaces and
 hash-binds the publisher helper/wrapper/sudoers, installed `configure-auth` and
 `update-image`, installed Quadlet template, and V2 marker. Exact version,
 `SOURCE_COMMIT`, and release bytes are required. Recover only with the same
 bundle; both success and recovery leave service and ingress off. Follow
-[DEPLOYMENT.md](DEPLOYMENT.md): verify the v0.19.5 bundle, upgrade host tools,
+[DEPLOYMENT.md](DEPLOYMENT.md): verify the v0.19.6 bundle, upgrade host tools,
 configure authentication, then move the image by verified digest.
 
 ## Build semantics
