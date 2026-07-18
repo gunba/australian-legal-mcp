@@ -57,7 +57,7 @@ MCP surface remains exactly `search`, `get_chunks`, `get_asset`,
   policy, RFC 9728 metadata/challenges, and Copilot templates.
 - Added version-matched host-tool upgrade, explicit publisher abort, and
   fail-closed empty-host image cutover operations for the v20 transition.
-  V0.19.4 hard-cuts the upgrade to one exact, recoverable V2 transaction for
+  V0.19.5 hard-cuts the upgrade to one exact, recoverable V2 transaction for
   prepared-bootstrap or activated-dark state, including auth/image helpers and
   the installed Quadlet template.
 - Restricted the locked-parent activation exception to one exact networkless
@@ -118,12 +118,12 @@ exists.
 3. **Completed:** the v0.19.2 publisher-tool repair and activation succeeded;
    v20 is active with authentication, application service, Caddy, and UFW web
    ingress still off and no transaction or upload authorization remaining.
-4. Once v0.19.4 artifacts exist, independently verify the release bundle,
+4. Once v0.19.5 artifacts exist, independently verify the release bundle,
    checksums, `SOURCE_COMMIT`, and OCI digest. Run
-   `--upgrade-host-tools --version 0.19.4` from those exact bytes; the V2
+   `--upgrade-host-tools --version 0.19.5` from those exact bytes; the V2
    transaction must leave the activated host dark.
 5. Configure API-key and/or Entra auth, then move the running image to the
-   verified v0.19.4 digest through the normal authenticated image transaction.
+   verified v0.19.5 digest through the normal authenticated image transaction.
    Do not claim release or publication before the immutable artifacts exist.
 6. Test reboot, changed/unchanged generation deltas, readiness rollback,
    API-key rotation/revocation, image rollback, volume detach/reattach, and VPS
