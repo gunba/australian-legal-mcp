@@ -3,6 +3,10 @@
 This unit is retained for local/native binary installs and the future Azure VM
 adapter. The active Akamai/Linode deployment uses the root-managed Podman
 Quadlet in `infra/hosting/legal-mcp.container.template`, not this unit.
+The Azure installer requires this unit's fragment path, exact
+`enabled/inactive` state, and absence of the Quadlet. The Linode host requires
+the generated Quadlet unit and never runs `systemctl enable` or `disable` for
+`legal-mcp.service`.
 
 The native service:
 

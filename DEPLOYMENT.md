@@ -4,21 +4,19 @@ The hosted target is one Akamai Cloud (Linode) VPS in Sydney. The host is
 disposable; the corpus lives on a detachable, encrypted Block Storage volume
 and is never baked into an image.
 
-The host is currently fail-closed. Its v0.19.0 empty-host contract is installed
-and the complete v20 candidate is preserved at
-`/srv/legal-mcp/uploads/a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`
-in a publisher-owned `prepared` transaction. Activation durably created
-`/srv/legal-mcp/lifecycle/LIFECYCLE_LOCK` before validation, then failed because
-the capability-free one-shot container could not traverse the UID/GID 973
-mode-`0700` upload parent. Recovery restored publisher ownership without
-aborting or deleting staging. The lock is a zero-byte, single-link regular file
-owned by `root:root`, mode `0640`, with owner `rw`, group `r`, and no other ACL
-access. A v0.19.1 host-tool upgrade made no mutations, but rejected this
-legitimate lifecycle entry because its prepared-bootstrap allowlist knew only
-`.deployment-transaction` and `LOCK`. There is no active remote generation,
-authentication, application service, Caddy, DNS record, or ingress. Public
-ports 80, 443, and 51235 remain closed. Software 0.19.2 is the unreleased patch
-that makes `LIFECYCLE_LOCK` a strict installed-host contract.
+The host is currently fail-closed and not serving. The v0.19.2 publisher-tool
+repair and activation succeeded, so v20
+`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` is active
+on the Linode. Authentication remains disabled, the generated
+`legal-mcp.service` is inactive, Caddy is disabled/inactive, and UFW 80/443 are
+closed. One known v0.19.2 authentication transaction remains for the explicit
+one-shot recovery below; there is no deployment or image transaction or upload
+authorization.
+
+Software 0.19.3 implements the next hard-cut host-tools transaction, but this
+document does not claim its release or publication has occurred. V2 accepts
+either prepared-bootstrap or activated-dark state and leaves service and
+ingress off.
 
 The same image and mounted-generation contract can later run on an Azure VM.
 Azure-specific work is retained in [docs/AZURE_FUTURE.md](docs/AZURE_FUTURE.md),
@@ -115,17 +113,15 @@ SHA-512 manifest; the installer verifies both before package, firewall, or
 volume mutation:
 
 ```bash
-gh release download v0.19.2 --repo gunba/australian-legal-mcp \
+gh release download v0.19.3 --repo gunba/australian-legal-mcp \
   --pattern 'legal-mcp-*' --pattern SHA256SUMS
 sha256sum --check SHA256SUMS
 ```
 
-This v0.19.2 command is valid only after that immutable patch release exists.
-The existing host was bootstrapped from the separately verified v0.18.1 bundle
-and later cut over with v0.19.0; do not relabel either historical evidence set
-as v0.19.2. The rejected v0.19.1 host-tool attempt also remains distinct
-evidence: it completed preflight without changing host tools, authorization,
-the prepared journal, or staged corpus bytes.
+This v0.19.3 command is valid only after that immutable patch release exists.
+The existing host was bootstrapped from the separately verified v0.18.1 bundle,
+cut over with v0.19.0, and repaired/activated with v0.19.2 publisher tools; do
+not relabel those historical evidence sets as v0.19.3.
 
 Verify the attestation before deployment:
 
@@ -236,18 +232,20 @@ The installer:
 - pulls and tests the exact image digest;
 - installs the forced publisher command and narrow sudo policy;
 - copies the provisioned administrator key to `legal-mcp-admin`, disables root
-  and password SSH, and leaves both `legal-mcp.service` and Caddy disabled.
+  and password SSH, and leaves the generated Quadlet `legal-mcp.service`
+  inactive and native Caddy disabled/inactive. A generated unit is not an
+  enableable or disableable native unit.
 
 Before closing the initial root session, open a second SSH session as
 `legal-mcp-admin` and confirm `sudo -n true`. Thereafter root SSH is disabled.
 Also retain the Akamai Cloud Firewall. UFW is defence in depth, not a substitute.
 
-The current host completed its initial install with v0.18.1 and its empty-host
-software cutover with v0.19.0. Its rejected v0.19.1 host-tool upgrade made no
-mutations. Do not rerun the initial installer against it; use the
-staged-activation repair below.
+The current host completed its initial install with v0.18.1, its empty-host
+software cutover with v0.19.0, and its publisher-tool repair plus v20 activation
+with v0.19.2. Do not rerun the initial installer against it; use the
+activated-dark host-tools upgrade below.
 
-## 4. Repair the preserved v20 activation
+## 4. Upgrade host tools on active-dark v20
 
 Configure SSH identities locally so only the publisher key is offered:
 
@@ -260,43 +258,48 @@ Host legal-mcp-publisher
 ```
 
 The complete schema-11 generation
-`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`
-is already staged. It is approximately 37.42 GiB complete, with a
-19,746,840,576-byte `legal.db`. The failed v0.19.0 activation restored the
-journal to `prepared` and recursively restored UID/GID 973 ownership with
-mode `0700` directories and `0600` files. It also left the exact
-`LIFECYCLE_LOCK` described above. The v0.19.1 upgrade rejected that lock before
-its first mutation, so upload authorization remains absent and all prepared
-corpus state is unchanged. Preserve that transaction exactly. Do **not** run
-`prepare`, rsync, or `abort`.
+`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` is active.
+The host must remain activated-dark for this operation: authentication disabled,
+`legal-mcp.service` generated/inactive, Caddy disabled/inactive, exact SSH-only
+UFW with 80/443 closed, no listener on 80/443/51235, empty uploads, and no upload
+authorization or corpus/image transaction.
 
-From the verified, unpacked v0.19.2 Linux bundle, first transactionally replace
-only the digest-pinned host publisher tools and sudo policy:
+The current host has one known unversioned v0.19.2 authentication journal. After
+the immutable v0.19.3 release exists, independently verify its checksums,
+`SOURCE_COMMIT`, release bytes, binary version, and OCI digest. From that exact
+unpacked Linux bundle, run this one-shot recovery **before** the V2 upgrade:
 
 ```bash
-sudo infra/linode/install-host.sh --upgrade-host-tools --version 0.19.2
+sudo infra/hosting/configure-auth.sh --recover
 ```
 
-If interrupted, recover from that same release bundle before continuing:
+This exceptional path accepts only the exact V1 v0.19.2 marker and helper bytes,
+the disabled/empty-verifier dark state, the exact active v20 pointer, strict
+Caddy/Quadlet/listener topology, and either the known unversioned journal schema
+or one dead-PID v0.19.2 preparation. It leaves service and ingress off and does
+not make legacy journals part of normal V2 recovery. Remove this documented
+exception after the host migration evidence is retained.
+
+Confirm that no auth transaction remains, then use the same verified bundle:
 
 ```bash
-sudo infra/linode/install-host.sh --recover-host-tools --version 0.19.2
+sudo infra/linode/install-host.sh --upgrade-host-tools --version 0.19.3
 ```
 
-The host-tool preflight accepts upload authorization only when it is safely
-absent (the closed post-activation state) or is the exact matching protected
-file, and preserves that state with the prepared corpus transaction. After the
-upgrade succeeds, retry only its exact forced activation command:
+If interrupted, recover from the same exact bundle before continuing:
 
 ```bash
-ssh -T legal-mcp-publisher \
-  'activate a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3'
+sudo infra/linode/install-host.sh --recover-host-tools --version 0.19.3
 ```
 
-A successful empty-host retry prints `activated-pending-auth`. If the SSH
-response is lost, issue the same exact command again; do not infer an abort or
-restart the upload. The durable journal and active pointer make the retry
-idempotently reconcile whichever of these states completed.
+The hard-cut V2 transaction holds the shared host lock and atomically replaces
+the publisher deploy helper, forced wrapper, sudoers policy,
+`legal-mcp-configure-auth`, `legal-mcp-update-image`, and installed Quadlet
+template, then writes the version/`SOURCE_COMMIT` V2 marker with exact hashes.
+Its journal binds both old and target bytes; recovery rejects a different
+version, revision, bundle, marker schema, or changed saved byte. Both success
+and recovery leave the service and ingress off. Only after this succeeds,
+configure authentication and then move the image by verified digest.
 
 The local v19 parent remains available only with its paired v0.18.1 schema-10
 binary/image fallback. The schema-11 binary cannot directly roll back to it.
@@ -384,7 +387,8 @@ The transaction restarts the private container, proves readiness, 401
 challenges, and a valid API-key call, opens host ports 80/443, enables Caddy,
 then repeats the checks through public TLS without following redirects. Any
 failure disables public Caddy, closes UFW 80/443, restores auth files, and
-restarts the prior service configuration. If the newly supplied key cannot
+restores the prior exact active/inactive application state without attempting
+to enable or disable the generated Quadlet. If the newly supplied key cannot
 also prove a prior API-key configuration during rollback, ingress stays closed
 and the explicit recovery command below must receive a valid prior key.
 
@@ -400,6 +404,8 @@ If the saved prior mode contains API-key authentication, redirect a still-valid
 prior key to the recovery command on standard input. Recovery keeps Caddy and
 UFW ingress closed unless exact readiness, expected challenges/metadata, and
 positive API-key authentication all pass for the restored configuration.
+Recovery never treats a successful `is-enabled` observation of a generated
+Quadlet as permission to enable or disable it.
 
 Delete the temporary plaintext key file after it is secured by the intended
 client. Keep the verifier file; it is not plaintext but remains protected.
@@ -446,7 +452,7 @@ Linux release bundle:
 ```bash
 sudo infra/hosting/update-image.sh \
   --image ghcr.io/gunba/australian-legal-mcp@sha256:NEW_DIGEST \
-  --version 0.19.2 \
+  --version 0.19.3 \
   --template infra/hosting/legal-mcp.container.template
 ```
 

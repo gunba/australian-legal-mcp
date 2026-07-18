@@ -118,7 +118,7 @@ strict Clippy, audit/deny, npm allowlisting, and workspace packaging pass.
 
 ## V20 corpus
 
-The software tree is 0.19.2. The active local generation is
+The software tree is 0.19.3. The active local generation is
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`:
 
 - minimum client 0.19.0, index `2026.07.14`, schema 11, and the unchanged
@@ -181,8 +181,8 @@ Implemented hard cut:
   atomically persisting fstab and requires `noatime,nodev,noexec,nosuid`, exact
   ACLs, and file-type support. It creates fixed service, publisher, and
   break-glass administrator identities, disables root/password SSH, installs
-  rootful Podman/Quadlet, and leaves the application and release-bundled,
-  checksum-pinned Caddy disabled;
+  rootful Podman/Quadlet, and leaves the generated application unit inactive
+  and release-bundled, checksum-pinned Caddy disabled/inactive;
 - the forced publisher can write only upload staging. Strict local verification,
   CoW seeding, checksum/block-delta rsync, one-shot image validation, atomic
   activation, explicit activation/rollback journal phases, exact readiness,
@@ -215,7 +215,14 @@ The host deployment contract now also provides a transactional,
 version-matched `--upgrade-host-tools` operation, a publisher-accessible
 explicit and idempotent `abort`, and a fail-closed
 `update-image.sh --bootstrap-empty-host` image cutover. Upload or activation
-failure never triggers abort automatically.
+failure never triggers abort automatically. V0.19.3 hard-cuts the upgrade to a
+V2 transaction that accepts either prepared-bootstrap or activated-dark state.
+Under the shared host lock it atomically covers the publisher helper, wrapper,
+sudoers, `configure-auth`, `update-image`, installed Quadlet template, and V2
+marker/hashes; exact version, `SOURCE_COMMIT`, and release bytes are mandatory,
+and recovery uses the same bundle. Auth cutover now treats
+`legal-mcp.service` as generated and preserves exact activity without attempting
+to enable or disable it.
 
 The historical v0.18.1 image and its SBOM/provenance-bearing OCI archive were
 built locally, loaded ONNX Runtime, ran as `971:971` with a read-only root and no
@@ -227,28 +234,22 @@ actionlint, ShellCheck, Caddy 2.11.4, and the Linode OpenTofu 4.1.0 provider
 contract validate cleanly. Disposable Ubuntu fixtures exercise the forced
 publisher/lock, packaged `rrsync -wo`, locked-parent activation with the exact
 capability bit, capability-free verify/prune, SIGKILL reconciliation,
+generated/inactive pending-auth recovery, exact active/inactive auth rollback,
 disabled/API-key/Entra auth recovery, incomplete-transaction ingress closure,
-and API-key image-recovery parsing.
+and API-key image-recovery parsing. The auth fixture rejects application
+enable/disable operations because the Quadlet service is generated.
 Provider-neutral Microsoft assets render for custom DNS. On 2026-07-16 the
 reviewed OpenTofu plan created one Sydney `g6-standard-4` instance, one encrypted
 128-GiB Block Storage volume, and one creation-time Cloud Firewall. The host was
 bootstrapped with verified v0.18.1 artifacts and subsequently cut over to the
-v0.19.0 empty-host software contract. The complete v20
-candidate is now preserved at
-`/srv/legal-mcp/uploads/a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`.
-V0.19.0 activation normalized the candidate to `root:legal-mcp` mode `0750`,
-then its lifecycle binary created the zero-byte, single-link
-`lifecycle/LIFECYCLE_LOCK` as `root:root` mode `0640` with exact owner `rw`,
-group `r`, and no other ACL access before validation failed. The capability-free
-one-shot container could not traverse the publisher-owned UID/GID 973
-mode-`0700` parent. The failure restored the `prepared` journal phase and
-publisher ownership without aborting or deleting staging. The v0.19.1 host-tool
-upgrade correctly made no mutations, but rejected `LIFECYCLE_LOCK` because the
-prepared-bootstrap allowlist admitted
-only `.deployment-transaction` and `LOCK`. Upload authorization remains absent.
-There is no active remote generation, authentication configuration,
-application service, Caddy service, DNS record, or public ingress; ports 80,
-443, and 51235 remain closed. No Azure resource or Entra tenant object exists.
+v0.19.0 empty-host software contract. The v0.19.2 publisher-tool repair and
+activation then succeeded, and v20
+`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` is active
+on the Linode. Authentication remains disabled, the generated
+`legal-mcp.service` is inactive, Caddy is disabled/inactive, and UFW 80/443 are
+closed. One known v0.19.2 authentication transaction remains for explicit
+one-shot recovery; there is no deployment or image transaction or upload
+authorization. No Azure resource or Entra tenant object exists.
 Azure Bicep/Blob work remains preserved as a secondary future provider path in
 [docs/AZURE_FUTURE.md](docs/AZURE_FUTURE.md).
 
@@ -256,12 +257,12 @@ Azure Bicep/Blob work remains preserved as a secondary future provider path in
 
 1. Push the reviewed branch and require its pinned cross-platform CI/release
    contract checks to pass before merge.
-2. Publish and verify the immutable v0.19.2 Linux bundle and GHCR digest. From
-   that exact bundle, transactionally upgrade only the host tools and retry the
-   exact publisher `activate` command against the preserved v20 staging. Do not
-   prepare, rsync, or abort it. Configure authentication after activation, then
-   move the running image to the attested v0.19.2 digest through the normal
-   authenticated image transaction.
+2. Once the immutable v0.19.3 artifacts exist, independently verify the Linux
+   release bundle, checksums, `SOURCE_COMMIT`, and GHCR digest. From those exact
+   bytes, run the V2 host-tools upgrade against the activated-dark host,
+   configure authentication, then move the running image to the verified digest
+   through the normal authenticated image transaction. Do not represent the
+   release or publication as complete before that evidence exists.
 3. Prove reboot, rollback, volume detach/reattach, image rollback, authentication
    rotation, and disposable VPS replacement before removing retained evidence.
 4. Create the tenant resource and connector app registrations, exercise a real

@@ -173,7 +173,7 @@ legal-mcp prune-generations --keep-inactive 1
 There is no runtime `update`, corpus downloader, offline bundle, corpus package,
 or GitHub corpus-release path.
 
-Software is version 0.19.2. The active local v20 generation is
+Software is version 0.19.3. The active local v20 generation is
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`.
 It retains all 409,528 documents, 6,968,250 chunks/embeddings, and 20,170
 definitions in schema 11. Its 19,746,840,576-byte `legal.db` has SHA-256
@@ -241,18 +241,21 @@ scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
 
-The current Linode host is fail-closed and not serving. The complete v20
-generation is preserved under its publisher-owned prepared upload transaction.
-V0.19.0 activation created the empty root-owned `LIFECYCLE_LOCK`, then could not
-traverse the mode-`0700` upload parent during validation. The failed attempt
-preserved the prepared journal, full staging, and publisher ownership. A
-v0.19.1 host-tool upgrade made no mutations because its bootstrap lifecycle
-allowlist rejected that legitimate lock. There is still no active remote
-generation, authentication, application service, active Caddy service, or
-public ingress. The v0.19.2 repair recognizes the lock as installed-host state,
-upgrades only the digest-pinned host tools, then retries the exact `activate`
-operation without rsync or abort. See [DEPLOYMENT.md](DEPLOYMENT.md) for the
-exact recovery and security boundary.
+V20 is now active on the Linode after the v0.19.2 publisher-tool repair and
+activation succeeded, but the host remains fail-closed and is not serving.
+Authentication is disabled, `legal-mcp.service` is inactive, Caddy is
+disabled/inactive, and UFW 80/443 are closed. One known v0.19.2 authentication
+transaction remains for explicit one-shot recovery; no deployment or image
+transaction or upload authorization exists.
+
+V0.19.3 implements a hard-cut V2 host-tools transaction for either a prepared
+bootstrap or this activated-dark state. It atomically binds the publisher
+helper/wrapper/sudoers, auth and image helpers, installed Quadlet template, and
+V2 marker/hashes to the exact release identity and shared host lock; recovery
+uses the same bundle and leaves service/ingress off. Once the v0.19.3 release
+exists, verify its bundle, run `--upgrade-host-tools --version 0.19.3`, configure
+authentication, then move the image by verified digest. See
+[DEPLOYMENT.md](DEPLOYMENT.md) for the operational sequence.
 
 The maintainer pipeline requires the pinned model in
 `data/models/mdbr-leaf-ir-standard`, CUDA/TensorRT ONNX Runtime, Google
@@ -270,6 +273,7 @@ cargo audit
 cargo deny check advisories
 python3 -m unittest \
   tests/test_azure_generation_transport.py \
+  tests/test_configure_azure_host.py \
   tests/test_manage_api_keys.py \
   tests/test_remote_mcp.py \
   tests/test_render_microsoft_integrations.py

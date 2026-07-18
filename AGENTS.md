@@ -28,9 +28,12 @@ and can be delta-copied into staging on an external XFS/reflink volume attached
 to the Akamai/Linode VPS. A one-shot copy of the exact serving image validates
 and activates it. The serving container never scrapes, embeds, builds, or
 publishes corpus/model artifacts, and the image contains no corpus. GitHub
-Releases are binary-only; GHCR images are digest-pinned and attested. The
-current host has no active remote generation, authentication, application
-service, active Caddy service, or ingress; do not describe it as live.
+Releases are binary-only; GHCR images are digest-pinned and attested. V20 is
+active on the current Linode, but authentication is disabled,
+`legal-mcp.service` is inactive, Caddy is disabled/inactive, and UFW 80/443 are
+closed. One known v0.19.2 authentication transaction remains for explicit
+one-shot recovery; there is no deployment or image transaction or upload
+authorization. Do not describe it as live.
 
 ## Design principles
 
@@ -155,20 +158,22 @@ scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
 
-Software is 0.19.2. Active local v20 is
-`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`;
-retain its v19 parent with the matching v0.18.1 binary/image as the schema-10
-fallback. The schema-11 binary must not attempt to roll back to schema 10.
+Software is 0.19.3. V20
+`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` is active
+locally and on the Linode after the v0.19.2 publisher-tool repair and
+activation succeeded. Retain its local v19 parent with the matching v0.18.1
+binary/image as the schema-10 fallback; the schema-11 binary must not attempt
+to roll back to schema 10.
 
-The current remote v20 transaction is fully staged but not active. V0.19.0
-created the legitimate empty root-owned `LIFECYCLE_LOCK`, then safely failed
-because its capability-free one-shot container could not traverse the
-publisher-owned mode-`0700` upload parent. A v0.19.1 host-tool upgrade made no
-mutations but rejected that extra lifecycle entry. Preserve the prepared
-transaction. After publishing and verifying v0.19.2, upgrade only the host
-tools with `--upgrade-host-tools --version 0.19.2`, then retry the exact
-publisher `activate` command. Do not abort or rerun rsync; configure
-authentication only after activation succeeds.
+V0.19.3 hard-cuts host tools to one V2 transaction. It accepts either the
+prepared-bootstrap or activated-dark state and atomically binds the publisher
+helper, wrapper, sudoers, auth/image helpers, installed Quadlet template, and
+V2 marker/hashes to the exact version, `SOURCE_COMMIT`, release bytes, and
+shared host lock. Recovery must use the same bundle. It fixes generated-Quadlet
+auth state handling and leaves the application and ingress off. Do not claim a
+v0.19.3 release exists: once its immutable bundle is available, verify it,
+upgrade with `--upgrade-host-tools --version 0.19.3`, configure authentication,
+then move the image by verified digest.
 
 Manual recovery uses `activate`, `verify`, `rollback`, and
 `prune-generations`. There is no runtime `update`, corpus download, corpus/model
@@ -198,6 +203,7 @@ cargo deny check advisories
 bash -n scripts/*.sh
 python3 -m unittest \
   tests/test_azure_generation_transport.py \
+  tests/test_configure_azure_host.py \
   tests/test_manage_api_keys.py \
   tests/test_remote_mcp.py \
   tests/test_render_microsoft_integrations.py

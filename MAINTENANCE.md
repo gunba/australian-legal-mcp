@@ -16,10 +16,11 @@ non-replaceable release is created. Linux requires glibc 2.27+; Windows requires
 the Microsoft Visual C++ 2015–2022 Redistributable. Publish and independently
 verify `SHA256SUMS` for every archive.
 
-The software tree is version 0.19.2. V0.19.2 makes the lifecycle lock created
-by the failed v0.19.0 activation part of the strict installed-host contract.
+The software tree is version 0.19.3. V0.19.3 hard-cuts host tools to one V2
+transaction and fixes authentication handling for the generated Quadlet.
 Do not install its host tools or image until the immutable release bundle,
-checksums, source revision, and OCI digest have been verified.
+checksums, `SOURCE_COMMIT`, release bytes, and OCI digest have been verified;
+this documentation does not assert that release or publication has occurred.
 
 ## Canonical local data
 
@@ -220,16 +221,19 @@ other command. See [DEPLOYMENT.md](DEPLOYMENT.md) for OpenTofu, volume identity,
 authentication, readiness, rollback, and VPS replacement; see
 [MICROSOFT_COPILOT.md](MICROSOFT_COPILOT.md) for Entra/Copilot.
 
-The current Linode host has the complete v20 candidate preserved in a prepared
-publisher transaction. Its v0.19.0 activation created the zero-byte,
-single-link `root:root` mode-`0640` `lifecycle/LIFECYCLE_LOCK` with owner `rw`,
-group `r`, and no other ACL access before validation failed at the locked
-upload parent. Recovery restored publisher ownership and the `prepared` phase.
-The v0.19.1 host-tool upgrade correctly made no mutations, but rejected that
-legitimate lifecycle entry. Follow the v0.19.2 recovery in
-[DEPLOYMENT.md](DEPLOYMENT.md): transactionally upgrade only the host tools,
-then issue the exact publisher `activate` command. Do not abort, prepare, or
-rerun rsync.
+V20 is active on the current Linode after the v0.19.2 publisher-tool repair and
+activation succeeded. Authentication remains disabled, `legal-mcp.service` is
+inactive, Caddy is disabled/inactive, UFW 80/443 are closed, and there is no
+deployment, auth, or image transaction or upload authorization.
+
+The v0.19.3 V2 upgrade accepts either prepared-bootstrap or activated-dark
+state. Under the shared host transaction lock it atomically replaces and
+hash-binds the publisher helper/wrapper/sudoers, installed `configure-auth` and
+`update-image`, installed Quadlet template, and V2 marker. Exact version,
+`SOURCE_COMMIT`, and release bytes are required. Recover only with the same
+bundle; both success and recovery leave service and ingress off. Follow
+[DEPLOYMENT.md](DEPLOYMENT.md): verify the v0.19.3 bundle, upgrade host tools,
+configure authentication, then move the image by verified digest.
 
 ## Build semantics
 
