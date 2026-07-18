@@ -158,21 +158,21 @@ scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
 
-Software is 0.19.3. V20
+Software is 0.19.4. V20
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` is active
 locally and on the Linode after the v0.19.2 publisher-tool repair and
 activation succeeded. Retain its local v19 parent with the matching v0.18.1
 binary/image as the schema-10 fallback; the schema-11 binary must not attempt
 to roll back to schema 10.
 
-V0.19.3 hard-cuts host tools to one V2 transaction. It accepts either the
+V0.19.4 hard-cuts host tools to one V2 transaction. It accepts either the
 prepared-bootstrap or activated-dark state and atomically binds the publisher
 helper, wrapper, sudoers, auth/image helpers, installed Quadlet template, and
 V2 marker/hashes to the exact version, `SOURCE_COMMIT`, release bytes, and
 shared host lock. Recovery must use the same bundle. It fixes generated-Quadlet
 auth state handling and leaves the application and ingress off. Do not claim a
-v0.19.3 release exists: once its immutable bundle is available, verify it,
-upgrade with `--upgrade-host-tools --version 0.19.3`, configure authentication,
+v0.19.4 release exists: once its immutable bundle is available, verify it,
+upgrade with `--upgrade-host-tools --version 0.19.4`, configure authentication,
 then move the image by verified digest.
 
 Manual recovery uses `activate`, `verify`, `rollback`, and

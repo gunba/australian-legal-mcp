@@ -13,7 +13,7 @@ closed. One known v0.19.2 authentication transaction remains for the explicit
 one-shot recovery below; there is no deployment or image transaction or upload
 authorization.
 
-Software 0.19.3 implements the next hard-cut host-tools transaction, but this
+Software 0.19.4 implements the next hard-cut host-tools transaction, but this
 document does not claim its release or publication has occurred. V2 accepts
 either prepared-bootstrap or activated-dark state and leaves service and
 ingress off.
@@ -113,15 +113,15 @@ SHA-512 manifest; the installer verifies both before package, firewall, or
 volume mutation:
 
 ```bash
-gh release download v0.19.3 --repo gunba/australian-legal-mcp \
+gh release download v0.19.4 --repo gunba/australian-legal-mcp \
   --pattern 'legal-mcp-*' --pattern SHA256SUMS
 sha256sum --check SHA256SUMS
 ```
 
-This v0.19.3 command is valid only after that immutable patch release exists.
+This v0.19.4 command is valid only after that immutable patch release exists.
 The existing host was bootstrapped from the separately verified v0.18.1 bundle,
 cut over with v0.19.0, and repaired/activated with v0.19.2 publisher tools; do
-not relabel those historical evidence sets as v0.19.3.
+not relabel those historical evidence sets as v0.19.4.
 
 Verify the attestation before deployment:
 
@@ -265,7 +265,7 @@ UFW with 80/443 closed, no listener on 80/443/51235, empty uploads, and no uploa
 authorization or corpus/image transaction.
 
 The current host has one known unversioned v0.19.2 authentication journal. After
-the immutable v0.19.3 release exists, independently verify its checksums,
+the immutable v0.19.4 release exists, independently verify its checksums,
 `SOURCE_COMMIT`, release bytes, binary version, and OCI digest. From that exact
 unpacked Linux bundle, run this one-shot recovery **before** the V2 upgrade:
 
@@ -283,13 +283,13 @@ exception after the host migration evidence is retained.
 Confirm that no auth transaction remains, then use the same verified bundle:
 
 ```bash
-sudo infra/linode/install-host.sh --upgrade-host-tools --version 0.19.3
+sudo infra/linode/install-host.sh --upgrade-host-tools --version 0.19.4
 ```
 
 If interrupted, recover from the same exact bundle before continuing:
 
 ```bash
-sudo infra/linode/install-host.sh --recover-host-tools --version 0.19.3
+sudo infra/linode/install-host.sh --recover-host-tools --version 0.19.4
 ```
 
 The hard-cut V2 transaction holds the shared host lock and atomically replaces
@@ -452,7 +452,7 @@ Linux release bundle:
 ```bash
 sudo infra/hosting/update-image.sh \
   --image ghcr.io/gunba/australian-legal-mcp@sha256:NEW_DIGEST \
-  --version 0.19.3 \
+  --version 0.19.4 \
   --template infra/hosting/legal-mcp.container.template
 ```
 
