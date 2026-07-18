@@ -15,7 +15,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
   exit 2
 }
 
-version=0.19.0
+version=0.19.1
 revision=1111111111111111111111111111111111111111
 generation=1a6beead567b55babebbe253b5ae13efcd9ce2e8ab55b60c2de4106e39f180f4
 volume_uuid=11111111-2222-3333-4444-555555555555
@@ -62,7 +62,7 @@ if [[ "$1" = --version ]]; then
   if [[ -e /tmp/wrong-release-binary ]]; then
     printf '%s\n' 'legal-mcp 9.9.9'
   else
-    printf '%s\n' 'legal-mcp 0.19.0'
+    printf '%s\n' 'legal-mcp 0.19.1'
   fi
   exit 0
 fi
@@ -476,7 +476,7 @@ expect_upgrade_failed() {
 
 reset_old_state
 expect_upgrade_failed_version=false
-if "$installer" --upgrade-host-tools --version 0.19.1 \
+if "$installer" --upgrade-host-tools --version 0.19.2 \
   >/tmp/host-tool.stdout 2>/tmp/host-tool.stderr; then
   expect_upgrade_failed_version=true
 fi
@@ -499,6 +499,11 @@ chmod 600 "$journal"
 expect_upgrade_failed
 cmp --silent /tmp/old-host-deploy "$host_deploy"
 [[ -d "$upload" && -f "$journal" ]]
+
+reset_old_state
+printf '%064d\n' 2 > "$authorization"
+expect_upgrade_failed
+assert_old_tools
 
 reset_old_state
 chmod 777 "$bundle/scripts/legal-mcp-publisher-command"
@@ -736,9 +741,21 @@ for point in transaction-retiring transaction-retired transaction-delete; do
   assert_new_tools
 done
 
-# The successful upgrade is exact, leaves the partial upload untouched, and
-# enables a separately invoked forced-command abort under the digest/regex
-# sudo policy.
+# A failed activation has already revoked rsync authorization. Host-tool repair
+# accepts that closed state, preserves it, and leaves the prepared candidate and
+# journal untouched.
+reset_old_state
+"$real_rm" -f -- "$authorization"
+output="$("$installer" --upgrade-host-tools --version "$version")"
+[[ "$output" = "host publisher tools upgraded to $version ($revision)" ]]
+cmp --silent "$bundle/scripts/legal-mcp-host-deploy" "$host_deploy"
+cmp --silent "$bundle/scripts/legal-mcp-publisher-command" "$publisher"
+[[ -d "$upload" && -f "$journal" && ! -e "$authorization" \
+  && ! -e "$transaction" ]]
+visudo -cf "$sudoers" >/dev/null
+
+# The successful authorized-state upgrade is also exact and enables a
+# separately invoked forced-command abort under the digest/regex sudo policy.
 reset_old_state
 output="$("$installer" --upgrade-host-tools --version "$version")"
 [[ "$output" = "host publisher tools upgraded to $version ($revision)" ]]

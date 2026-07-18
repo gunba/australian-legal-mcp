@@ -543,13 +543,18 @@ PY
     echo 'uploads contain state outside the one prepared bootstrap generation' >&2
     return 1
   }
-  require_regular_file /run/legal-mcp/authorized-upload root legal-mcp-publisher 440
-  mapfile -t authorization < /run/legal-mcp/authorized-upload
-  [[ ${#authorization[@]} -eq 1 \
-    && "${authorization[0]}" = "$HOST_TOOL_PENDING_GENERATION" ]] || {
-    echo 'prepared upload authorization does not match its transaction' >&2
-    return 1
-  }
+  # Activation durably revokes rsync before validation. A recovered prepared
+  # transaction may therefore have no authorization; absence is the closed
+  # state and the upgrade must preserve it.
+  if ! path_is_absent /run/legal-mcp/authorized-upload; then
+    require_regular_file /run/legal-mcp/authorized-upload root legal-mcp-publisher 440
+    mapfile -t authorization < /run/legal-mcp/authorized-upload
+    [[ ${#authorization[@]} -eq 1 \
+      && "${authorization[0]}" = "$HOST_TOOL_PENDING_GENERATION" ]] || {
+      echo 'prepared upload authorization does not match its transaction' >&2
+      return 1
+    }
+  fi
   directory_contains_only /srv/legal-mcp/lifecycle .deployment-transaction LOCK || {
     echo 'lifecycle contains unexpected bootstrap state' >&2
     return 1

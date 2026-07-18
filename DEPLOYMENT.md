@@ -4,12 +4,16 @@ The hosted target is one Akamai Cloud (Linode) VPS in Sydney. The host is
 disposable; the corpus lives on a detachable, encrypted Block Storage volume
 and is never baked into an image.
 
-The host is currently fail-closed. Its verified v0.18.1 bootstrap contract is
-installed and a v19 upload was intentionally stopped with approximately 23 GiB
-prepared, but there is no active remote generation, authentication, application
-service, Caddy, DNS record, or ingress. Public ports 80, 443, and 51235 remain
-closed. Software 0.19.0, its release bundle, and its OCI digest have not yet
-been published or applied to the host.
+The host is currently fail-closed. Its v0.19.0 empty-host contract is installed
+and the complete v20 candidate is preserved at
+`/srv/legal-mcp/uploads/a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`
+in a publisher-owned `prepared` transaction. Activation failed before
+validation because the capability-free one-shot container could not traverse
+the UID/GID 973 mode-`0700` upload parent; recovery restored publisher ownership
+without aborting or deleting staging. There is no active remote generation,
+authentication, application service, Caddy, DNS record, or ingress. Public
+ports 80, 443, and 51235 remain closed. Software 0.19.1 is the unreleased patch
+for this host-side permission boundary.
 
 The same image and mounted-generation contract can later run on an Azure VM.
 Azure-specific work is retained in [docs/AZURE_FUTURE.md](docs/AZURE_FUTURE.md),
@@ -46,10 +50,13 @@ of each complete immutable generation on the corpus volume. They are data/model
 artifacts, not image dependencies. `data/`, `release/`, `target/`, and `Temp/`
 are excluded from both Docker and OCI build contexts.
 
-The container uses a read-only root filesystem, drops every capability, sets
-`no-new-privileges`, bounds memory/PIDs/files, has no engine socket, and publishes
-its bridge port only on host loopback. Container network scope cannot start
-without `--require-http-auth`.
+The long-running service container uses a read-only root filesystem, drops
+every capability, sets `no-new-privileges`, bounds memory/PIDs/files, has no
+engine socket, and publishes its bridge port only on host loopback. Container
+network scope cannot start without `--require-http-auth`. One separate,
+networkless activation container receives only `CAP_DAC_OVERRIDE` for the exact
+prepared-upload `activate` invocation; all other one-shot lifecycle commands
+also drop every capability.
 
 ## Authentication
 
@@ -103,14 +110,15 @@ SHA-512 manifest; the installer verifies both before package, firewall, or
 volume mutation:
 
 ```bash
-gh release download v0.19.0 --repo gunba/australian-legal-mcp \
+gh release download v0.19.1 --repo gunba/australian-legal-mcp \
   --pattern 'legal-mcp-*' --pattern SHA256SUMS
 sha256sum --check SHA256SUMS
 ```
 
-This v0.19.0 command is the next-cutover example and is valid only after that
-immutable release exists. The existing host was bootstrapped from the separately
-verified historical v0.18.1 bundle; do not relabel that evidence as v0.19.0.
+This v0.19.1 command is valid only after that immutable patch release exists.
+The existing host was bootstrapped from the separately verified v0.18.1 bundle
+and later cut over with v0.19.0; do not relabel either historical evidence set
+as v0.19.1.
 
 Verify the attestation before deployment:
 
@@ -226,10 +234,11 @@ Before closing the initial root session, open a second SSH session as
 `legal-mcp-admin` and confirm `sudo -n true`. Thereafter root SSH is disabled.
 Also retain the Akamai Cloud Firewall. UFW is defence in depth, not a substitute.
 
-The current host has already completed this initial install with v0.18.1. Do
-not rerun the initial installer against it; use the cutover below.
+The current host completed its initial install with v0.18.1 and its empty-host
+software cutover with v0.19.0. Do not rerun the initial installer against it;
+use the staged-activation repair below.
 
-## 4. Cut over the empty host and activate v20
+## 4. Repair the preserved v20 activation
 
 Configure SSH identities locally so only the publisher key is offered:
 
@@ -241,79 +250,55 @@ Host legal-mcp-publisher
   IdentitiesOnly yes
 ```
 
-The existing prepared v19 transaction predates the v0.19.0 publisher abort and
-schema-11 runtime. Preserve the following order. Host-tool and image commands
-must run directly from the same verified, unpacked v0.19.0 Linux bundle whose
-`SOURCE_COMMIT` matches the attested OCI revision; the local publisher command
-must use the matching v0.19.0 script.
+The complete schema-11 generation
+`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`
+is already staged. It is approximately 37.42 GiB complete, with a
+19,746,840,576-byte `legal.db`. The failed v0.19.0 activation restored the
+journal to `prepared` and recursively restored UID/GID 973 ownership with
+mode `0700` directories and `0600` files. Preserve that transaction exactly.
+Do **not** run `prepare`, rsync, or `abort`.
 
-First upgrade only the restricted host publisher tools while the prepared v19
-transaction and empty-host invariants still exist:
+From the verified, unpacked v0.19.1 Linux bundle, first transactionally replace
+only the digest-pinned host publisher tools and sudo policy:
 
 ```bash
-sudo infra/linode/install-host.sh --upgrade-host-tools --version 0.19.0
+sudo infra/linode/install-host.sh --upgrade-host-tools --version 0.19.1
 ```
 
 If interrupted, recover from that same release bundle before continuing:
 
 ```bash
-sudo infra/linode/install-host.sh --recover-host-tools --version 0.19.0
+sudo infra/linode/install-host.sh --recover-host-tools --version 0.19.1
 ```
 
-Next explicitly abort the prepared v19 generation from the publisher path:
+The host-tool preflight accepts upload authorization only when it is safely
+absent (the closed post-activation state) or is the exact matching protected
+file, and preserves that state with the prepared corpus transaction. After the
+upgrade succeeds, retry only its exact forced activation command:
 
 ```bash
-scripts/deploy-generation.sh \
-  --host legal-mcp-publisher@legal-mcp-publisher \
-  --abort 1a6beead567b55babebbe253b5ae13efcd9ce2e8ab55b60c2de4106e39f180f4
+ssh -T legal-mcp-publisher \
+  'activate a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3'
 ```
 
-Abort is deliberate, generation-bound, and idempotent. Upload or activation
-failure never invokes it automatically. After abort leaves generations,
-uploads, runtime state, and the active pointer empty, cut over the image:
+A successful empty-host retry prints `activated-pending-auth`. If the SSH
+response is lost, issue the same exact command again; do not infer an abort or
+restart the upload. The durable journal and active pointer make the retry
+idempotently reconcile whichever of these states completed.
 
-```bash
-sudo infra/hosting/update-image.sh --bootstrap-empty-host \
-  --image ghcr.io/gunba/australian-legal-mcp@sha256:DIGEST \
-  --version 0.19.0 \
-  --template infra/hosting/legal-mcp.container.template
-```
+The local v19 parent remains available only with its paired v0.18.1 schema-10
+binary/image fallback. The schema-11 binary cannot directly roll back to it.
 
-Recover an interrupted empty-host image transaction only from the same bundle:
-
-```bash
-sudo infra/hosting/update-image.sh --recover --bootstrap-empty-host
-```
-
-The cutover validates the empty corpus/lifecycle/state boundary, disabled auth,
-stopped service/Caddy, SSH-only UFW, exact upgraded host tools, release binary,
-OCI version/revision/runtime, and digest-pinned Quadlet. It leaves service and
-ingress off.
-
-Finally deploy the active local v20 generation:
-
-```bash
-LEGAL_MCP_DATA_DIR="$PWD/data/runtime" \
-  scripts/deploy-generation.sh \
-  --host legal-mcp-publisher@legal-mcp-publisher
-```
-
-The expected local generation is
-`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`.
-It is schema 11, approximately 37.42 GiB complete, with a
-19,746,840,576-byte `legal.db`. The local v19 parent remains available for
-a paired v0.18.1 schema-10 fallback and is not uploaded during this bootstrap;
-the v0.19.0 binary cannot directly roll back to it.
-
-The script first performs strict local hashing and semantic-model execution. The
-remote root helper then creates a CoW clone of the active generation, and
-restricted rsync uses checksums, block deltas, and in-place writes. An unchanged
-redeploy transmits no file data; interrupted uploads resume. Zstd is negotiated
-for transport because the ANN tree and SQLite bytes compress materially on the
-maintainer uplink; the immutable files remain uncompressed on XFS. The publisher can
-write only `/srv/legal-mcp/uploads` and can invoke only `prepare`, `activate`,
-or explicit `abort`. It cannot otherwise mutate lifecycle state, installed
-generations, service configuration, or image/auth secrets.
+For future generation deployments, `scripts/deploy-generation.sh` first
+performs strict local hashing and semantic-model execution. The remote root
+helper then creates a CoW clone of the active generation, and restricted rsync
+uses checksums, block deltas, and in-place writes. An unchanged redeploy
+transmits no file data; interrupted uploads resume. Zstd is negotiated for
+transport because the ANN tree and SQLite bytes compress materially on the
+maintainer uplink; the immutable files remain uncompressed on XFS. The
+publisher can write only `/srv/legal-mcp/uploads` and can invoke only `prepare`,
+`activate`, or explicit `abort`. It cannot otherwise mutate lifecycle state,
+installed generations, service configuration, or image/auth secrets.
 
 `prepare` creates one root-owned, generation-specific upload authorization under
 `/run`. The forced rsync command accepts only that 64-character destination and
@@ -321,12 +306,39 @@ holds the same host transaction lock used by activation, auth, and image
 changes. Activation revokes the authorization before normalizing or validating
 staging, so rsync can never race the immutable cutover.
 
-Remote activation normalizes ownership, strictly revalidates every generation
-artifact inside a one-shot copy of the same image, atomically switches the
-pointer, starts the service, checks the exact generation, and rolls back on
-readiness failure. Initial activation intentionally reports
-`activated-pending-auth` and does not start a network listener. Configure
-authentication only after this succeeds.
+Remote activation normalizes only the candidate tree to `root:legal-mcp`,
+strictly revalidates every generation artifact inside a one-shot copy of the
+same image, atomically switches the pointer, starts the service, checks the
+exact generation, and rolls back on readiness failure. The upload parent
+intentionally remains UID/GID 973 mode `0700`; changing it would widen publisher
+visibility and could leave that wider access behind after SIGKILL.
+
+Container UID 0 with all capabilities dropped cannot search that parent or
+rename its child. `CAP_DAC_READ_SEARCH` is also insufficient because the atomic
+rename needs write/search permission on the source parent. The host helper
+therefore has two closed capability profiles:
+
+- `capability-free` for verify, rollback, deactivate, prune, and every other
+  lifecycle operation;
+- `prepared-upload-activation` for exactly
+  `activate --generation-dir /var/lib/legal-mcp/uploads/<generation>
+  --expected-generation <generation>`, with only `CAP_DAC_OVERRIDE` added.
+
+The activation container remains networkless, read-only-root,
+`no-new-privileges`, resource-bounded, and digest-pinned. The capability is not
+path-scoped, so exact arguments, the immutable image, the host transaction
+lock, and the one-command profile are material controls. It is never added to
+the Quadlet or long-running service.
+
+The `activating` journal is durable before normalization or container launch.
+If validation fails before rename, the candidate is restored to publisher
+ownership and `prepared`. If SIGKILL leaves the candidate in uploads, retry
+normalizes and reuses it; if rename completed, retry reconciles the installed
+directory and pointer. The activation child inherits the locked transaction
+file descriptor, so a surviving child prevents a concurrent retry until it
+exits. The exact `activate` retry neither reauthorizes rsync nor aborts staging.
+Initial activation intentionally reports `activated-pending-auth` and does not
+start a network listener. Configure authentication only after this succeeds.
 
 ## 5. Configure an API key and open ingress
 
@@ -422,7 +434,7 @@ Linux release bundle:
 ```bash
 sudo infra/hosting/update-image.sh \
   --image ghcr.io/gunba/australian-legal-mcp@sha256:NEW_DIGEST \
-  --version 0.19.0 \
+  --version 0.19.1 \
   --template infra/hosting/legal-mcp.container.template
 ```
 

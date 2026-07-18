@@ -175,12 +175,36 @@ read_image() {
   [[ "$image_state" = present ]] || { echo 'pinned legal-mcp image is not present' >&2; exit 1; }
 }
 
-run_legal() {
+run_legal_container() {
+  local profile="$1"
+  shift
+  local -a capability_args=()
+  case "$profile" in
+    capability-free) ;;
+    prepared-upload-activation)
+      [[ $# -eq 5 \
+        && "$1" = activate \
+        && "$2" = --generation-dir \
+        && "$3" = "/var/lib/legal-mcp/uploads/$GENERATION" \
+        && "$4" = --expected-generation \
+        && "$5" = "$GENERATION" ]] || {
+        echo 'upload activation capability requested for an unexpected command' >&2
+        return 1
+      }
+      capability_args=(--cap-add=dac_override)
+      ;;
+    *)
+      echo 'unknown one-shot container capability profile' >&2
+      return 1
+      ;;
+  esac
+
   podman run --rm \
     --network=none \
     --user=0:0 \
     --read-only \
     --cap-drop=all \
+    "${capability_args[@]}" \
     --security-opt=no-new-privileges \
     --pids-limit=256 \
     --memory=6g \
@@ -188,6 +212,17 @@ run_legal() {
     --tmpfs=/tmp:rw,nodev,nosuid,noexec,size=64m,mode=1777 \
     --volume="$DATA_ROOT:/var/lib/legal-mcp:rw,nodev,nosuid" \
     "$IMAGE" "$@"
+}
+
+run_legal() {
+  run_legal_container capability-free "$@"
+}
+
+activate_prepared_upload() {
+  run_legal_container prepared-upload-activation \
+    activate \
+    --generation-dir "/var/lib/legal-mcp/uploads/$GENERATION" \
+    --expected-generation "$GENERATION"
 }
 
 active_generation() {
@@ -650,8 +685,7 @@ case "$TX_PHASE" in
     write_journal activating "$TX_PREVIOUS"
     normalize_upload_for_activation
     activation_ok=false
-    if run_legal activate --generation-dir "/var/lib/legal-mcp/uploads/$GENERATION" \
-      --expected-generation "$GENERATION" >/dev/null; then
+    if activate_prepared_upload >/dev/null; then
       activation_ok=true
     fi
     ;;
@@ -663,8 +697,7 @@ case "$TX_PHASE" in
       && -d "$UPLOADS/$GENERATION" && ! -L "$UPLOADS/$GENERATION" ]]; then
       normalize_upload_for_activation
       activation_ok=false
-      if run_legal activate --generation-dir "/var/lib/legal-mcp/uploads/$GENERATION" \
-        --expected-generation "$GENERATION" >/dev/null; then
+      if activate_prepared_upload >/dev/null; then
         activation_ok=true
       fi
     elif [[ "$current" = "$TX_PREVIOUS" \

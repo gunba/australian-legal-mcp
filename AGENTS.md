@@ -155,17 +155,18 @@ scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
 
-Software is 0.19.0. Active local v20 is
+Software is 0.19.1. Active local v20 is
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`;
 retain its v19 parent with the matching v0.18.1 binary/image as the schema-10
 fallback. The schema-11 binary must not attempt to roll back to schema 10.
 
-The pending empty-host v20 cutover has one order: verify the version-matched
-v0.19.0 bundle and digest; run `infra/linode/install-host.sh` with
-`--upgrade-host-tools --version 0.19.0`; explicitly abort the prepared v19
-publisher transaction; run `infra/hosting/update-image.sh` with
-`--bootstrap-empty-host` for the v0.19.0 digest; deploy v20; then configure
-authentication. Never skip, reorder, or automatically infer the abort.
+The current remote v20 transaction is fully staged but not active. V0.19.0
+activation safely failed because its capability-free one-shot container could
+not traverse the publisher-owned mode-`0700` upload parent. Preserve that
+prepared transaction. After publishing and verifying v0.19.1, upgrade only the
+host tools with `--upgrade-host-tools --version 0.19.1`, then retry the exact
+publisher `activate` command. Do not abort or rerun rsync; configure
+authentication only after activation succeeds.
 
 Manual recovery uses `activate`, `verify`, `rollback`, and
 `prune-generations`. There is no runtime `update`, corpus download, corpus/model
