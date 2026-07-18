@@ -17,7 +17,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
   exit 2
 }
 
-version=0.19.5
+version=0.19.6
 revision=1111111111111111111111111111111111111111
 old_revision=2222222222222222222222222222222222222222
 old_digest="ghcr.io/gunba/australian-legal-mcp@sha256:$(printf 'a%.0s' {1..64})"
@@ -75,7 +75,7 @@ case "$1" in
     if [[ -e /tmp/wrong-release-binary ]]; then
       printf '%s\n' 'legal-mcp 9.9.9'
     else
-      printf '%s\n' 'legal-mcp 0.19.5'
+      printf '%s\n' 'legal-mcp 0.19.6'
     fi
     ;;
   verify-runtime)
@@ -483,6 +483,13 @@ cat > /usr/bin/podman <<EOF
 printf 'podman:%s\n' "\$*" >> /tmp/bootstrap-host-actions.log
 old_image='$old_digest'
 new_image='$new_digest'
+emit_image_id() {
+  if [[ -e /tmp/podman-bare-image-ids ]]; then
+    sed 's/^sha256://' "\$1"
+  else
+    cat "\$1"
+  fi
+}
 case "\$1" in
   container)
     [[ "\$2" = exists ]]
@@ -502,13 +509,13 @@ case "\$1" in
         format="\${!#}"
         if [[ "\$format" = '{{.Id}}' ]]; then
           if [[ "\$image" = "\$new_image" ]]; then
-            cat /tmp/target-image-id
+            emit_image_id /tmp/target-image-id
           else
-            cat /tmp/old-image-id
+            emit_image_id /tmp/old-image-id
           fi
         elif [[ "\$format" == *'.version'* ]]; then
           if [[ "\$image" = "\$new_image" ]]; then
-            if [[ -e /tmp/wrong-oci-version ]]; then printf '%s\n' 9.9.9; else printf '%s\n' 0.19.5; fi
+            if [[ -e /tmp/wrong-oci-version ]]; then printf '%s\n' 9.9.9; else printf '%s\n' 0.19.6; fi
           else
             printf '%s\n' 0.18.1
           fi
@@ -545,7 +552,7 @@ case "\$1" in
     done
     case "\$command" in
       --version)
-        if [[ -e /tmp/wrong-oci-binary ]]; then printf '%s\n' 'legal-mcp 9.9.9'; else printf '%s\n' 'legal-mcp 0.19.5'; fi
+        if [[ -e /tmp/wrong-oci-binary ]]; then printf '%s\n' 'legal-mcp 9.9.9'; else printf '%s\n' 'legal-mcp 0.19.6'; fi
         ;;
       verify-runtime) printf '%s\n' '{"onnx_runtime_ready":true}' ;;
       '')
@@ -556,7 +563,7 @@ case "\$1" in
     ;;
   inspect)
     [[ "\$2" = australian-legal-mcp && "\${!#}" = '{{.Image}}' ]]
-    cat /tmp/running-image-id
+    emit_image_id /tmp/running-image-id
     ;;
   *) exit 96 ;;
 esac
@@ -1252,7 +1259,7 @@ reset_ordinary_baseline() {
   "$real_install" -o root -g root -m 0755 /fixture-input/update-image.sh \
     /usr/local/sbin/legal-mcp-update-image
   touch /tmp/ordinary-mode /tmp/service-active /tmp/caddy-enabled \
-    /tmp/caddy-active /tmp/ufw-web-open
+    /tmp/caddy-active /tmp/ufw-web-open /tmp/podman-bare-image-ids
   printf '%s\n' "$old_image_id" > /tmp/old-image-id
   printf '%s\n' "$target_image_id" > /tmp/target-image-id
   printf '%s\n' "$old_image_id" > /tmp/running-image-id

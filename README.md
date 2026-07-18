@@ -173,7 +173,7 @@ legal-mcp prune-generations --keep-inactive 1
 There is no runtime `update`, corpus downloader, offline bundle, corpus package,
 or GitHub corpus-release path.
 
-Software is version 0.19.5. The active local v20 generation is
+Software is version 0.19.6. The active local v20 generation is
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`.
 It retains all 409,528 documents, 6,968,250 chunks/embeddings, and 20,170
 definitions in schema 11. Its 19,746,840,576-byte `legal.db` has SHA-256
@@ -248,12 +248,12 @@ disabled/inactive, and UFW 80/443 are closed. One known v0.19.2 authentication
 transaction remains for explicit one-shot recovery; no deployment or image
 transaction or upload authorization exists.
 
-V0.19.5 implements a hard-cut V2 host-tools transaction for either a prepared
+V0.19.6 implements a hard-cut V2 host-tools transaction for either a prepared
 bootstrap or this activated-dark state. It atomically binds the publisher
 helper/wrapper/sudoers, auth and image helpers, installed Quadlet template, and
 V2 marker/hashes to the exact release identity and shared host lock; recovery
-uses the same bundle and leaves service/ingress off. Once the v0.19.5 release
-exists, verify its bundle, run `--upgrade-host-tools --version 0.19.5`, configure
+uses the same bundle and leaves service/ingress off. Once the v0.19.6 release
+exists, verify its bundle, run `--upgrade-host-tools --version 0.19.6`, configure
 authentication, then move the image by verified digest. See
 [DEPLOYMENT.md](DEPLOYMENT.md) for the operational sequence.
 
