@@ -118,7 +118,7 @@ strict Clippy, audit/deny, npm allowlisting, and workspace packaging pass.
 
 ## V20 corpus
 
-The software tree is 0.19.3. The active local generation is
+The software tree is 0.19.4. The active local generation is
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`:
 
 - minimum client 0.19.0, index `2026.07.14`, schema 11, and the unchanged
@@ -215,7 +215,7 @@ The host deployment contract now also provides a transactional,
 version-matched `--upgrade-host-tools` operation, a publisher-accessible
 explicit and idempotent `abort`, and a fail-closed
 `update-image.sh --bootstrap-empty-host` image cutover. Upload or activation
-failure never triggers abort automatically. V0.19.3 hard-cuts the upgrade to a
+failure never triggers abort automatically. V0.19.4 hard-cuts the upgrade to a
 V2 transaction that accepts either prepared-bootstrap or activated-dark state.
 Under the shared host lock it atomically covers the publisher helper, wrapper,
 sudoers, `configure-auth`, `update-image`, installed Quadlet template, and V2
@@ -257,7 +257,7 @@ Azure Bicep/Blob work remains preserved as a secondary future provider path in
 
 1. Push the reviewed branch and require its pinned cross-platform CI/release
    contract checks to pass before merge.
-2. Once the immutable v0.19.3 artifacts exist, independently verify the Linux
+2. Once the immutable v0.19.4 artifacts exist, independently verify the Linux
    release bundle, checksums, `SOURCE_COMMIT`, and GHCR digest. From those exact
    bytes, run the V2 host-tools upgrade against the activated-dark host,
    configure authentication, then move the running image to the verified digest

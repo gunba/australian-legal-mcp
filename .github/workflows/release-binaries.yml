@@ -83,9 +83,10 @@ jobs:
             --volume "$PWD/tests/host-rrsync-options-fixture.sh:/fixture:ro" \
             --volume "$PWD/tests/host-auth-recovery-fixture.sh:/auth-fixture:ro" \
             --volume "$PWD/infra/hosting/configure-auth.sh:/configure-auth:ro" \
+            --volume "$PWD/infra/linode/install-host.sh:/install-host:ro" \
             --volume "$PWD/infra/hosting/update-image.sh:/update-image:ro" \
             ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \
-            -ceu 'export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null; apt-get install --yes --no-install-recommends python3 rsync >/dev/null; /fixture; /auth-fixture'
+            -ceu 'export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null; apt-get install --yes --no-install-recommends acl python3 rsync util-linux >/dev/null; /fixture; /auth-fixture'
           docker run --rm --user 0:0 --entrypoint /bin/bash \
             --volume "$PWD/scripts/legal-mcp-host-deploy:/host-deploy:ro" \
             --volume "$PWD/tests/host-deploy-abort-fixture.sh:/abort-fixture:ro" \

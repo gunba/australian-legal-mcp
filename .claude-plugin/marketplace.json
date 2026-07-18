@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "australian-legal-mcp",
-      "version": "0.19.3",
+      "version": "0.19.4",
       "description": "Source-grounded search and retrieval across Australian legal sources.",
       "source": "./",
       "category": "research",
