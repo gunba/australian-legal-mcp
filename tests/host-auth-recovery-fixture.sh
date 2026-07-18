@@ -8,7 +8,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 [[ $EUID -eq 0 && -x /configure-auth && -x /install-host ]] || exit 2
 
-version=0.19.4
+version=0.19.5
 revision=1111111111111111111111111111111111111111
 generation=a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3
 old_image="ghcr.io/gunba/australian-legal-mcp@sha256:$(printf 'a%.0s' {1..64})"
@@ -347,7 +347,17 @@ case "$url" in
     body='{"resource":"https://legal.example.com/mcp"}'
     ;;
   http://127.0.0.1:51235/mcp|https://legal.example.com/mcp)
-    if [[ -n "$api_key" ]]; then
+    if [[ "$url" = https://legal.example.com/mcp && -f /tmp/public-auth-delay ]]; then
+      remaining="$(</tmp/public-auth-delay)"
+      [[ "$remaining" =~ ^[1-9][0-9]*$ ]] || exit 92
+      remaining=$((remaining - 1))
+      if [[ $remaining -eq 0 ]]; then
+        rm -f /tmp/public-auth-delay
+      else
+        printf '%s' "$remaining" > /tmp/public-auth-delay
+      fi
+      status=000
+    elif [[ -n "$api_key" ]]; then
       expected="$(</tmp/expected-api-key)"
       if [[ "$api_key" = "$expected" ]]; then
         status=200
@@ -626,8 +636,11 @@ chown root:caddy /etc/caddy/Caddyfile
 chmod 640 /etc/caddy/Caddyfile
 
 # First dark-to-public Entra cutover validates private/listener/Caddy state,
-# starts Caddy while UFW is closed, and opens UFW only afterward.
+# starts Caddy while UFW is closed, and opens UFW only afterward. The public
+# boundary deliberately becomes available only after two failed attempts so
+# the ACME/TLS readiness retry is part of the executable contract.
 : > "$log"
+printf '%s' 2 > /tmp/public-auth-delay
 output="$(run_entra_cutover)"
 [[ "$output" = 'authentication configured; exact private/public auth and route probes passed' ]]
 [[ "$(stat -c '%U:%G:%a:%h:%s' "$auth_ready")" = root:root:444:1:0 \
@@ -642,6 +655,7 @@ private_line="$(grep -nF 'curl:POST:http://127.0.0.1:51235/mcp' "$log" | head -n
 caddy_line="$(grep -nF 'systemctl:enable --now caddy.service' "$log" | tail -n1 | cut -d: -f1)"
 ufw_line="$(grep -nF 'ufw:allow 80/tcp comment Caddy ACME HTTP' "$log" | tail -n1 | cut -d: -f1)"
 public_line="$(grep -nF 'curl:POST:https://legal.example.com/mcp' "$log" | tail -n1 | cut -d: -f1)"
+[[ "$(grep -Fc 'curl:POST:https://legal.example.com/mcp' "$log")" -ge 4 ]]
 [[ "$private_line" -lt "$caddy_line" && "$caddy_line" -lt "$ufw_line" && "$ufw_line" -lt "$public_line" ]]
 for route in /mcp/ /.well-known/oauth-protected-resource /readyz /livez; do
   grep -Fq "https://legal.example.com$route" "$log"

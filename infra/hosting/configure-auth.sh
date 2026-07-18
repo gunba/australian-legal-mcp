@@ -79,7 +79,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-EXPECTED_HOST_TOOL_VERSION=0.19.4
+EXPECTED_HOST_TOOL_VERSION=0.19.5
 HOST_TOOLS_MARKER=/etc/legal-mcp/host-tools
 IMAGE_FILE=/etc/legal-mcp/image
 RUNTIME_ENV=/etc/legal-mcp/runtime.env
@@ -461,7 +461,7 @@ validate_host_tools_v2() {
     && "${marker[1]}" = "VERSION=$EXPECTED_HOST_TOOL_VERSION" \
     && "${marker[2]}" =~ ^SOURCE_COMMIT=[0-9a-f]{40}$ \
     && "${marker[3]}" =~ ^HOST_DEPLOY_SHA256=([0-9a-f]{64})$ ]] || {
-    echo 'installed V2 host-tool marker is not the exact v0.19.4 contract' >&2
+    echo 'installed V2 host-tool marker is not the exact v0.19.5 contract' >&2
     return 1
   }
   deploy_sha="${BASH_REMATCH[1]}"
@@ -846,6 +846,23 @@ probe_auth_boundary() {
   fi
 }
 
+wait_for_public_auth_boundary() {
+  local mcp_url="$1" metadata_url="$2" mode="$3" external_url="$4"
+  local require_positive_api="${5:-true}" deadline=$((SECONDS + 180))
+  while (( SECONDS < deadline )); do
+    if probe_auth_boundary "$mcp_url" "$metadata_url" "$mode" "$external_url" \
+      "$require_positive_api" 2>/dev/null; then
+      return 0
+    fi
+    require_caddy_state enabled active || return 1
+    require_listener_topology public || return 1
+    require_ufw_state open || return 1
+    sleep 2
+  done
+  echo "public authentication boundary did not become ready: $mcp_url" >&2
+  return 1
+}
+
 probe_negative_public_routes() {
   local origin="$1" path method status headers
   for path in / /mcp/ /.well-known/oauth-protected-resource \
@@ -948,7 +965,7 @@ restore_current_configured_public() {
   ufw allow 443/tcp comment 'Australian Legal MCP HTTPS' >/dev/null
   require_ufw_state open
   require_listener_topology public
-  probe_auth_boundary "$CLOSED_EXTERNAL_URL" \
+  wait_for_public_auth_boundary "$CLOSED_EXTERNAL_URL" \
     "${CLOSED_EXTERNAL_URL%/mcp}/.well-known/oauth-protected-resource/mcp" \
     "$CLOSED_AUTH_MODE" "$CLOSED_EXTERNAL_URL"
   probe_negative_public_routes "${CLOSED_EXTERNAL_URL%/mcp}"
@@ -1340,7 +1357,7 @@ restore_v2_journal() {
     ufw allow 443/tcp comment 'Australian Legal MCP HTTPS' >/dev/null
     require_ufw_state open
     require_listener_topology public
-    probe_auth_boundary "$JOURNAL_EXTERNAL_URL" \
+    wait_for_public_auth_boundary "$JOURNAL_EXTERNAL_URL" \
       "${JOURNAL_EXTERNAL_URL%/mcp}/.well-known/oauth-protected-resource/mcp" \
       "$JOURNAL_AUTH_MODE" "$JOURNAL_EXTERNAL_URL"
     probe_negative_public_routes "${JOURNAL_EXTERNAL_URL%/mcp}"
@@ -2010,7 +2027,7 @@ require_ufw_state open
 require_listener_topology public
 
 external_url="https://$PUBLIC_HOST/mcp"
-probe_auth_boundary "$external_url" \
+wait_for_public_auth_boundary "$external_url" \
   "https://$PUBLIC_HOST/.well-known/oauth-protected-resource/mcp" \
   "$MODE" "$external_url"
 probe_negative_public_routes "https://$PUBLIC_HOST"
