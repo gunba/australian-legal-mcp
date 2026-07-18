@@ -1,6 +1,6 @@
 # Current state
 
-Updated 2026-07-18 on branch `codex/v20-runtime-projection`.
+Updated 2026-07-18 on branch `codex/v0191-activation-permission`.
 
 ## Implemented product
 
@@ -118,10 +118,10 @@ strict Clippy, audit/deny, npm allowlisting, and workspace packaging pass.
 
 ## V20 corpus
 
-The active local generation is
+The software tree is 0.19.1. The active local generation is
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`:
 
-- software 0.19.0, index `2026.07.14`, schema 11, and the unchanged
+- minimum client 0.19.0, index `2026.07.14`, schema 11, and the unchanged
   `mdbr-leaf-ir-tensorrt-fp16-256d` model binding;
 - 409,528 documents, 6,968,250 chunks/embeddings, and 20,170 definitions;
 - 19,746,840,576-byte `legal.db`, SHA-256
@@ -161,7 +161,7 @@ Implemented hard cut:
   Rust/Debian bases with bundled SQLite, Arroy/heed search, tokenizer/reranking
   code, ONNX Runtime 1.25.0, native runtimes, CA certificates, and fixed
   unprivileged UID/GID 971;
-- the OCI contract uses a read-only root, zero capabilities,
+- the long-running OCI service uses a read-only root, zero capabilities,
   `no-new-privileges`, bounded resources, separate read-only
   generations/lifecycle and read-write state mounts, and bridge publication only
   at host `127.0.0.1:51235`;
@@ -188,7 +188,10 @@ Implemented hard cut:
   activation, explicit activation/rollback journal phases, exact readiness,
   durable recovery, and rollback remain separate privileged operations. An
   execute-only ACL lets the publisher reach staging without exposing generation
-  or lifecycle directories;
+  or lifecycle directories. The exact networkless prepared-upload `activate`
+  invocation alone receives `CAP_DAC_OVERRIDE` so it can traverse and rename
+  from the publisher-owned mode-`0700` parent; the service and all other
+  lifecycle invocations remain capability-free;
 - corpus, auth/ingress, and image-digest changes share one host transaction lock.
   Auth and image changes close UFW/Caddy during mutation, persist recoverable
   prior state, enforce the exact administrator/public UFW allowlist, and
@@ -222,29 +225,37 @@ scanned top-level digest, and Trivy 0.65.0 reported zero fixed HIGH/CRITICAL
 findings across 92 Debian packages. Podman 4.9.3 generated the final Quadlet;
 actionlint, ShellCheck, Caddy 2.11.4, and the Linode OpenTofu 4.1.0 provider
 contract validate cleanly. Disposable Ubuntu fixtures exercise the forced
-publisher/lock, packaged `rrsync -wo`, disabled/API-key/Entra auth recovery,
-incomplete-transaction ingress closure, and API-key image-recovery parsing.
+publisher/lock, packaged `rrsync -wo`, locked-parent activation with the exact
+capability bit, capability-free verify/prune, SIGKILL reconciliation,
+disabled/API-key/Entra auth recovery, incomplete-transaction ingress closure,
+and API-key image-recovery parsing.
 Provider-neutral Microsoft assets render for custom DNS. On 2026-07-16 the
 reviewed OpenTofu plan created one Sydney `g6-standard-4` instance, one encrypted
-128-GiB Block Storage volume, and one creation-time Cloud Firewall. The host
-contract was installed with verified v0.18.1 artifacts. A v19 upload was
-intentionally stopped with approximately 23 GiB in its prepared publisher
-transaction. There is no active remote generation, authentication
-configuration, application service, Caddy service, DNS record, or public
-ingress; ports 80, 443, and 51235 remain closed. The v0.19.0 host tools and
-image have not mutated the host because no v0.19.0 release or verified OCI
-digest exists yet. No Azure resource or Entra tenant object exists. Azure
-Bicep/Blob work remains preserved as a secondary future provider path in
+128-GiB Block Storage volume, and one creation-time Cloud Firewall. The host was
+bootstrapped with verified v0.18.1 artifacts and subsequently cut over to the
+v0.19.0 empty-host software contract. The complete v20
+candidate is now preserved at
+`/srv/legal-mcp/uploads/a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`.
+V0.19.0 activation normalized that candidate to `root:legal-mcp` mode `0750`,
+but its capability-free one-shot container could not traverse the
+publisher-owned UID/GID 973 mode-`0700` parent. The failure restored the
+`prepared` journal phase and publisher ownership without aborting or deleting
+staging. There is no active remote generation, authentication configuration,
+application service, Caddy service, DNS record, or public ingress; ports 80,
+443, and 51235 remain closed. No Azure resource or Entra tenant object exists.
+Azure Bicep/Blob work remains preserved as a secondary future provider path in
 [docs/AZURE_FUTURE.md](docs/AZURE_FUTURE.md).
 
 ## Remaining proof before completion
 
 1. Push the reviewed branch and require its pinned cross-platform CI/release
    contract checks to pass before merge.
-2. Publish and verify the immutable v0.19.0 Linux bundle and GHCR digest. From
-   that exact bundle, upgrade the host tools, explicitly abort the prepared v19
-   transaction, perform the empty-host image cutover, deploy v20, and only then
-   configure authentication.
+2. Publish and verify the immutable v0.19.1 Linux bundle and GHCR digest. From
+   that exact bundle, transactionally upgrade only the host tools and retry the
+   exact publisher `activate` command against the preserved v20 staging. Do not
+   prepare, rsync, or abort it. Configure authentication after activation, then
+   move the running image to the attested v0.19.1 digest through the normal
+   authenticated image transaction.
 3. Prove reboot, rollback, volume detach/reattach, image rollback, authentication
    rotation, and disposable VPS replacement before removing retained evidence.
 4. Create the tenant resource and connector app registrations, exercise a real

@@ -57,6 +57,10 @@ MCP surface remains exactly `search`, `get_chunks`, `get_asset`,
   policy, RFC 9728 metadata/challenges, and Copilot templates.
 - Added version-matched bootstrap-host tool upgrade, explicit publisher abort,
   and fail-closed empty-host image cutover operations for the v20 transition.
+- Restricted the locked-parent activation exception to one exact networkless
+  `activate` invocation with `CAP_DAC_OVERRIDE`; the hosted service and every
+  other lifecycle command remain capability-free. Disposable fixtures prove
+  the real DAC boundary and SIGKILL/retry reconciliation.
 - Preserved Azure Bicep, managed-disk, private Blob, and content-addressed
   transport as a future provider adapter rather than the active deployment.
 
@@ -102,14 +106,17 @@ or ingress.
    `public_mcp_enabled=false`, distinct administrator/publisher keys, and an
    encrypted 128-GiB volume; verified the attached device is signature-free and
    public 80/443/51235 are closed.
-2. **Completed:** installed the v0.18.1 host contract and started the first v19
-   upload; it was intentionally stopped with approximately 23 GiB prepared and
-   no active remote generation.
-3. Publish and verify the v0.19.0 bundle and OCI digest. From that exact bundle,
-   run `--upgrade-host-tools`, explicitly abort the prepared v19 transaction,
-   run `update-image.sh --bootstrap-empty-host`, and deploy v20.
+2. **Completed:** bootstrapped the host, cut it over to the v0.19.0 empty-host
+   contract, fully staged v20, and safely recovered its permission-denied
+   activation to the publisher-owned `prepared` state with no active remote
+   generation.
+3. Publish and verify the v0.19.1 bundle and OCI digest. From that exact bundle,
+   run `--upgrade-host-tools --version 0.19.1`, then retry only the exact
+   publisher `activate` command against preserved staging. Do not abort or
+   rerun rsync.
 4. Configure API-key and/or Entra auth privately only after v20 activation;
-   then open Cloud Firewall 80/443 and run the transactional Caddy cutover.
+   then open Cloud Firewall 80/443, run the transactional Caddy cutover, and
+   update the running image to the attested v0.19.1 digest.
 5. Test reboot, changed/unchanged generation deltas, readiness rollback,
    API-key rotation/revocation, image rollback, volume detach/reattach, and VPS
    replacement without another full upload.

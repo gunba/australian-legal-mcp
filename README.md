@@ -173,7 +173,7 @@ legal-mcp prune-generations --keep-inactive 1
 There is no runtime `update`, corpus downloader, offline bundle, corpus package,
 or GitHub corpus-release path.
 
-Software is version 0.19.0. The active local v20 generation is
+Software is version 0.19.1. The active local v20 generation is
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`.
 It retains all 409,528 documents, 6,968,250 chunks/embeddings, and 20,170
 definitions in schema 11. Its 19,746,840,576-byte `legal.db` has SHA-256
@@ -241,12 +241,15 @@ scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
 
-The current Linode host is fail-closed and not serving: its v19 upload was
-intentionally stopped with about 23 GiB prepared, and it has no active remote
+The current Linode host is fail-closed and not serving. The complete v20
+generation is preserved under its publisher-owned prepared upload transaction,
+but v0.19.0 activation could not traverse the mode-`0700` upload parent after
+normalizing the candidate. The failed attempt preserved the prepared journal,
+full staging, and publisher ownership; there is still no active remote
 generation, authentication, application service, active Caddy service, or
-public ingress. The v20 cutover order is a verified version-matched v0.19.0 bundle and OCI digest, host-tool upgrade,
-explicit publisher abort, empty-host image cutover, v20 deployment, then
-authentication. See [DEPLOYMENT.md](DEPLOYMENT.md) for the exact commands.
+public ingress. The v0.19.1 repair upgrades only the digest-pinned host tools,
+then retries the exact `activate` operation without rsync or abort. See
+[DEPLOYMENT.md](DEPLOYMENT.md) for the exact recovery and security boundary.
 
 The maintainer pipeline requires the pinned model in
 `data/models/mdbr-leaf-ir-standard`, CUDA/TensorRT ONNX Runtime, Google

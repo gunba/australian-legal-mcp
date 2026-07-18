@@ -92,6 +92,12 @@ jobs:
             ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \
             -ceu 'export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null; apt-get install --yes --no-install-recommends acl passwd util-linux >/dev/null; /abort-fixture'
           docker run --rm --user 0:0 --entrypoint /bin/bash \
+            --volume "$PWD/scripts/legal-mcp-host-deploy:/host-deploy:ro" \
+            --volume "$PWD/tests/host-deploy-activation-fixture.sh:/activation-fixture:ro" \
+            --volume "$PWD/infra/hosting/legal-mcp.container.template:/legal-mcp.container.template:ro" \
+            ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \
+            -ceu 'export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null; apt-get install --yes --no-install-recommends acl libcap2-bin passwd python3 util-linux >/dev/null; /activation-fixture'
+          docker run --rm --user 0:0 --entrypoint /bin/bash \
             --volume "$PWD/tests/host-tool-upgrade-fixture.sh:/fixture:ro" \
             --volume "$PWD/infra/linode/install-host.sh:/fixture-input/install-host.sh:ro" \
             --volume "$PWD/scripts/legal-mcp-host-deploy:/fixture-input/legal-mcp-host-deploy:ro" \

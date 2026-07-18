@@ -16,8 +16,10 @@ non-replaceable release is created. Linux requires glibc 2.27+; Windows requires
 the Microsoft Visual C++ 2015–2022 Redistributable. Publish and independently
 verify `SHA256SUMS` for every archive.
 
-The software tree is version 0.19.0. No v0.19.0 release or GHCR digest has been
-published yet, so no host mutation may use an unverified substitute.
+The software tree is version 0.19.1. V0.19.1 is the patch release for the
+remote upload-parent activation permission boundary. Do not install its host
+tools or image until the immutable release bundle, checksums, source revision,
+and OCI digest have been verified.
 
 ## Canonical local data
 
@@ -208,15 +210,23 @@ scripts/deploy-generation.sh \
 The first run uploads the complete generation with negotiated zstd transport
 compression. Subsequent runs CoW-seed remote staging from the active XFS
 generation and rsync only changed blocks; interrupted uploads resume in place.
-A one-shot copy of the exact OCI image strictly
-validates and activates the result. See [DEPLOYMENT.md](DEPLOYMENT.md) for
-OpenTofu, volume identity, authentication, readiness, rollback, and VPS
-replacement; see [MICROSOFT_COPILOT.md](MICROSOFT_COPILOT.md) for Entra/Copilot.
+A one-shot copy of the exact OCI image strictly validates and activates the
+result. The long-running service and every ordinary lifecycle invocation drop
+all capabilities. Only the exact prepared-upload `activate` invocation adds
+`CAP_DAC_OVERRIDE`, while remaining networkless, read-only-root, and
+`no-new-privileges`; this is required to traverse and rename from the
+publisher-owned mode-`0700` upload parent. The capability profile rejects every
+other command. See [DEPLOYMENT.md](DEPLOYMENT.md) for OpenTofu, volume identity,
+authentication, readiness, rollback, and VPS replacement; see
+[MICROSOFT_COPILOT.md](MICROSOFT_COPILOT.md) for Entra/Copilot.
 
-On the current empty Linode host, use only the ordered v20 cutover in
-[DEPLOYMENT.md](DEPLOYMENT.md): verified v0.19.0 bundle, transactional
-`--upgrade-host-tools`, explicit publisher abort of the prepared v19 upload,
-`update-image.sh --bootstrap-empty-host`, v20 deployment, then authentication.
+The current Linode host has the complete v20 candidate preserved in a prepared
+publisher transaction. Its v0.19.0 activation failed before validation because
+the capability-free container could not search the locked upload parent, then
+restored publisher ownership and the `prepared` phase. Follow the v0.19.1
+recovery in [DEPLOYMENT.md](DEPLOYMENT.md): transactionally upgrade only the
+host tools, then issue the exact publisher `activate` command. Do not abort,
+prepare, or rerun rsync.
 
 ## Build semantics
 
@@ -250,7 +260,8 @@ bash -n scripts/*.sh scripts/legal-mcp-azure-deploy \
   scripts/legal-mcp-host-deploy scripts/legal-mcp-publisher-command \
   infra/hosting/*.sh infra/linode/*.sh tests/*.sh
 python3 -m unittest discover -s tests -p 'test_*.py'
-# Run pinned ShellCheck and actionlint exactly as .github/workflows/ci.yml does.
+# Run the host deployment fixtures, pinned ShellCheck, and actionlint exactly as
+# .github/workflows/ci.yml does.
 az bicep build --file infra/azure/main.bicep
 git diff --check
 LEGAL_MCP_DATA_DIR="$PWD/data/runtime" scripts/smoke.sh

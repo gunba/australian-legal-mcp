@@ -16,7 +16,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
   exit 2
 }
 
-version=0.19.0
+version=0.19.1
 revision=1111111111111111111111111111111111111111
 old_revision=2222222222222222222222222222222222222222
 old_digest="ghcr.io/gunba/australian-legal-mcp@sha256:$(printf 'a%.0s' {1..64})"
@@ -62,7 +62,7 @@ case "$1" in
     if [[ -e /tmp/wrong-release-binary ]]; then
       printf '%s\n' 'legal-mcp 9.9.9'
     else
-      printf '%s\n' 'legal-mcp 0.19.0'
+      printf '%s\n' 'legal-mcp 0.19.1'
     fi
     ;;
   verify-runtime)
@@ -297,7 +297,7 @@ case "\$1" in
         format="\${!#}"
         if [[ "\$format" == *'.version'* ]]; then
           if [[ "\$image" = "\$new_image" ]]; then
-            if [[ -e /tmp/wrong-oci-version ]]; then printf '%s\n' 9.9.9; else printf '%s\n' 0.19.0; fi
+            if [[ -e /tmp/wrong-oci-version ]]; then printf '%s\n' 9.9.9; else printf '%s\n' 0.19.1; fi
           else
             printf '%s\n' 0.18.1
           fi
@@ -334,7 +334,7 @@ case "\$1" in
     done
     case "\$command" in
       --version)
-        if [[ -e /tmp/wrong-oci-binary ]]; then printf '%s\n' 'legal-mcp 9.9.9'; else printf '%s\n' 'legal-mcp 0.19.0'; fi
+        if [[ -e /tmp/wrong-oci-binary ]]; then printf '%s\n' 'legal-mcp 9.9.9'; else printf '%s\n' 'legal-mcp 0.19.1'; fi
         ;;
       verify-runtime) printf '%s\n' '{"onnx_runtime_ready":true}' ;;
       *) exit 95 ;;
@@ -534,7 +534,7 @@ kill_update_at() {
 
 reset_baseline
 if "$updater" --bootstrap-empty-host --image "$new_digest" \
-  --version 0.19.1 --template "$source_template" >/dev/null 2>&1; then
+  --version 0.19.2 --template "$source_template" >/dev/null 2>&1; then
   echo 'wrong requested release version was unexpectedly accepted' >&2
   exit 1
 fi
