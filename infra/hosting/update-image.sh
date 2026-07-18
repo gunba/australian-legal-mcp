@@ -464,6 +464,15 @@ bootstrap_require_regular() {
   }
 }
 
+bootstrap_require_empty_regular() {
+  local path="$1" owner="$2" group="$3" mode="$4"
+  bootstrap_require_regular "$path" "$owner" "$group" "$mode" || return 1
+  [[ "$(stat -c '%s' "$path")" = 0 ]] || {
+    echo "bootstrap host contract file must be empty: $path" >&2
+    return 1
+  }
+}
+
 bootstrap_require_acl() {
   local path="$1" expected="$2"
   [[ "$(getfacl --absolute-names --numeric --omit-header "$path")" = "$expected" ]] || {
@@ -777,6 +786,8 @@ bootstrap_validate_static_host() {
   bootstrap_require_acl /srv/legal-mcp/uploads $'user::rwx\ngroup::---\nother::---'
   bootstrap_require_regular /srv/legal-mcp/lifecycle/LOCK root legal-mcp 640
   bootstrap_require_acl /srv/legal-mcp/lifecycle/LOCK $'user::rw-\ngroup::r--\nother::---'
+  bootstrap_require_empty_regular /srv/legal-mcp/lifecycle/LIFECYCLE_LOCK root root 640
+  bootstrap_require_acl /srv/legal-mcp/lifecycle/LIFECYCLE_LOCK $'user::rw-\ngroup::r--\nother::---'
 
   [[ "$(id -u legal-mcp):$(id -g legal-mcp):$(id -G legal-mcp)" = 971:971:971 \
     && "$(id -u legal-mcp-publisher):$(id -g legal-mcp-publisher):$(id -G legal-mcp-publisher)" = 973:973:973 \
@@ -849,7 +860,7 @@ PY
     echo 'empty-host image cutover refuses corpus, upload, or runtime state' >&2
     return 1
   fi
-  bootstrap_directory_contains_only /srv/legal-mcp/lifecycle LOCK || {
+  bootstrap_directory_contains_only /srv/legal-mcp/lifecycle LIFECYCLE_LOCK LOCK || {
     echo 'empty-host lifecycle contains unexpected state' >&2
     return 1
   }

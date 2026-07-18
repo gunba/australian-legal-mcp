@@ -44,6 +44,7 @@ install -d -o root -g legal-mcp -m 0750 \
 install -d -o legal-mcp -g legal-mcp -m 0700 /srv/legal-mcp/state
 install -d -o legal-mcp-publisher -g legal-mcp-publisher -m 0700 /srv/legal-mcp/uploads
 install -o root -g legal-mcp -m 0640 /dev/null /srv/legal-mcp/lifecycle/LOCK
+install -o root -g root -m 0640 /dev/null /srv/legal-mcp/lifecycle/LIFECYCLE_LOCK
 printf 'LEGAL_MCP_VOLUME_V1\nUUID=%s\n' "$volume_uuid" > /srv/legal-mcp/.legal-mcp-volume
 chown root:root /srv/legal-mcp/.legal-mcp-volume
 chmod 444 /srv/legal-mcp/.legal-mcp-volume

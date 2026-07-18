@@ -9,6 +9,9 @@ installer="$repo_dir/infra/linode/install-host.sh"
 [[ -f "$installer" && ! -L "$installer" ]] || exit 2
 
 grep -Fq "render_publisher_sudoers \"\$installed_host_deploy_sha256\"" "$installer"
+grep -Fq 'install -o root -g root -m 0640 /dev/null /srv/legal-mcp/lifecycle/LIFECYCLE_LOCK' "$installer"
+grep -Fq 'require_empty_regular_file /srv/legal-mcp/lifecycle/LIFECYCLE_LOCK root root 640' "$installer"
+grep -Fq 'require_exact_acl /srv/legal-mcp/lifecycle/LIFECYCLE_LOCK' "$installer"
 grep -Fq "sha256:\$deploy_sha256 \$HOST_DEPLOY ^prepare [0-9a-f]{64}\$" "$installer"
 grep -Fq "sha256:\$deploy_sha256 \$HOST_DEPLOY ^activate [0-9a-f]{64}\$" "$installer"
 grep -Fq "sha256:\$deploy_sha256 \$HOST_DEPLOY ^abort [0-9a-f]{64}\$" "$installer"

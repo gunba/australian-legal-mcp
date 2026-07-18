@@ -83,17 +83,19 @@ scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
 
-Software is 0.19.1. Active local v20 is
+Software is 0.19.2. Active local v20 is
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`;
 retain v19 with the matching v0.18.1 binary/image as its schema-10 fallback.
 The schema-11 binary cannot roll back to schema 10.
 
 The current remote v20 transaction is fully staged but not active. V0.19.0
-activation safely restored its prepared state after the capability-free
-one-shot container could not traverse the publisher-owned mode-`0700` upload
-parent. After publishing and verifying v0.19.1, upgrade only the host tools,
-then retry the exact publisher `activate` command without abort or rsync.
-Configure auth only after activation succeeds.
+created the legitimate empty root-owned `LIFECYCLE_LOCK`, then safely restored
+the prepared state after the capability-free one-shot container could not
+traverse the publisher-owned mode-`0700` upload parent. A v0.19.1 host-tool
+upgrade made no mutations but rejected that extra lifecycle entry. After
+publishing and verifying v0.19.2, upgrade only the host tools, then retry the
+exact publisher `activate` command without abort or rsync. Configure auth only
+after activation succeeds.
 
 The unpacked model is under `data/models/mdbr-leaf-ir-standard`. Maintainer
 builds use deterministic FP32 ONNX, TensorRT FP16, CUDA fallback, lossless
