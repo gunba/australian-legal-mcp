@@ -8,6 +8,7 @@
 //! contentless keyword index.
 
 use crate::config::{GENERATION_MANIFEST_FILENAME, LEGAL_DB_FILENAME};
+use crate::legacy_arroy::LegacyArroyManifest;
 use crate::source::{GenerationId, Manifest, ManifestDb};
 use crate::SUPPORTED_SCHEMA_VERSION;
 use anyhow::{anyhow, bail, Context, Result};
@@ -36,6 +37,12 @@ pub(crate) struct DeriveSchema11Args<'a> {
     pub(crate) out_dir: &'a Path,
 }
 
+pub(crate) struct DeriveFlatInt8Args<'a> {
+    pub(crate) source_generation_dir: &'a Path,
+    pub(crate) expected_source_generation: &'a GenerationId,
+    pub(crate) out_dir: &'a Path,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct ProjectionReport {
     source_generation: GenerationId,
@@ -48,6 +55,24 @@ pub(crate) struct ProjectionReport {
     embedding_cache_rows_removed: u64,
     reflinked_files: usize,
     copied_files: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct FlatInt8DerivationReport {
+    source_generation: GenerationId,
+    generation: GenerationId,
+    schema_version: u32,
+    output_dir: String,
+    database_size: u64,
+    database_sha256: String,
+    flat_ann_size: u64,
+    generation_artifact_size: u64,
+    chunks: u64,
+    chunk_embeddings: u64,
+    sidecars: usize,
+    reflinked_files: usize,
+    copied_files: usize,
+    strictly_validated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,7 +118,7 @@ struct ValidatedLegacyGeneration {
     root: PathBuf,
     root_snapshot: DirectorySnapshot,
     ann_snapshot: DirectorySnapshot,
-    manifest: Manifest,
+    manifest: LegacyArroyManifest,
     manifest_snapshot: ArtifactSnapshot,
     generation: GenerationId,
     artifacts: BTreeMap<String, ArtifactSnapshot>,
@@ -192,6 +217,179 @@ impl Drop for FreshOutput {
         if !self.keep && self.ensure_identity().is_ok() {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+}
+
+pub(crate) fn derive_flat_int8_from_schema11_arroy_v20(
+    args: DeriveFlatInt8Args<'_>,
+) -> Result<FlatInt8DerivationReport> {
+    if SUPPORTED_SCHEMA_VERSION != 11 {
+        bail!("the Arroy-v20 flat derivation is available only in a schema-11 binary");
+    }
+    let paths = validate_projection_paths(args.source_generation_dir, args.out_dir)?;
+    let legacy = validate_arroy_generation(
+        &paths.source_root,
+        args.expected_source_generation,
+        SUPPORTED_SCHEMA_VERSION,
+    )?;
+    let reflink_supported = probe_reflink_support(&paths.output_parent)?;
+    let required_space = required_flat_derivation_space(&legacy.manifest, reflink_supported)?;
+    ensure_available_space(&paths.output_parent, required_space)?;
+
+    let mut output = FreshOutput::claim(&paths.output_root)?;
+    let result = derive_flat_int8_into_fresh_output(&legacy, &paths, required_space, &mut output);
+    match result {
+        Ok(report) => {
+            output.preserve();
+            Ok(report)
+        }
+        Err(error) => {
+            output.cleanup().with_context(|| {
+                format!(
+                    "flat-int8 derivation failed ({error:#}) and its incomplete output could not be removed"
+                )
+            })?;
+            Err(error)
+        }
+    }
+}
+
+fn derive_flat_int8_into_fresh_output(
+    legacy: &ValidatedLegacyGeneration,
+    paths: &ProjectionPaths,
+    required_space: u64,
+    output: &mut FreshOutput,
+) -> Result<FlatInt8DerivationReport> {
+    let manifest_path = output.root.join(GENERATION_MANIFEST_FILENAME);
+    if manifest_path.exists() {
+        bail!("fresh flat-int8 derivation unexpectedly contains generation.json");
+    }
+    output.ensure_identity()?;
+    ensure_available_space(&paths.output_parent, required_space)?;
+
+    let mut reflinked_files = 0usize;
+    let mut copied_files = 0usize;
+    let source_db = legacy
+        .artifacts
+        .get(LEGAL_DB_FILENAME)
+        .ok_or_else(|| anyhow!("validated Arroy-v20 database snapshot is missing"))?;
+    let destination_db = output.root.join(LEGAL_DB_FILENAME);
+    record_copy_method(
+        clone_or_copy_validated(&legacy.root, source_db, &destination_db)?,
+        &mut reflinked_files,
+        &mut copied_files,
+    );
+    for file in [
+        &legacy.manifest.model.model,
+        &legacy.manifest.model.tokenizer,
+    ] {
+        let snapshot = legacy
+            .artifacts
+            .get(&file.path)
+            .ok_or_else(|| anyhow!("validated model snapshot is missing `{}`", file.path))?;
+        record_copy_method(
+            clone_or_copy_validated(&legacy.root, snapshot, &output.root.join(&file.path))?,
+            &mut reflinked_files,
+            &mut copied_files,
+        );
+    }
+    output.ensure_identity()?;
+
+    let ann_dir = output.root.join(crate::ann::ANN_DIRECTORY);
+    fs::create_dir(&ann_dir)?;
+    let ann_snapshot = snapshot_directory(&ann_dir, "flat derivation ANN directory")?;
+    let (ann, chunks, chunk_embeddings) =
+        build_flat_sidecars_from_database(&destination_db, &output.root, &legacy.manifest)?;
+    if !same_directory_identity(
+        &ann_snapshot,
+        &snapshot_directory(&ann_dir, "flat derivation ANN directory")?,
+    ) {
+        bail!("flat derivation ANN directory was replaced");
+    }
+    if chunks != legacy.chunks || chunk_embeddings != legacy.chunk_embeddings {
+        bail!("chunk or embedding count changed during flat-int8 derivation");
+    }
+    sync_directory(&ann_dir)?;
+
+    let db_size = fs::metadata(&destination_db)?.len();
+    validate_projection_db_size(db_size, "flat-derived")?;
+    let db_sha256 = sha256_path(&destination_db)?;
+    let manifest = Manifest {
+        schema_version: SUPPORTED_SCHEMA_VERSION,
+        index_version: legacy.manifest.index_version.clone(),
+        created_at: legacy.manifest.created_at.clone(),
+        min_client_version: env!("CARGO_PKG_VERSION").to_string(),
+        model: legacy.manifest.model.clone(),
+        db: ManifestDb {
+            path: LEGAL_DB_FILENAME.to_string(),
+            sha256: db_sha256.clone(),
+            size: db_size,
+        },
+        ann,
+    };
+    crate::source::validate_manifest(&manifest)?;
+
+    // Re-open and re-hash every input artifact after the output has been
+    // derived. A replaced or in-place-mutated immutable source can never be
+    // accepted merely because its first validation passed.
+    revalidate_legacy_generation(legacy)?;
+    for file in [&manifest.model.model, &manifest.model.tokenizer] {
+        validate_regular_file(
+            &output.root.join(&file.path),
+            file.size,
+            &file.sha256,
+            false,
+        )?;
+    }
+    sync_file(&destination_db)?;
+    sync_directory(&output.root)?;
+    output.ensure_identity()?;
+
+    // generation.json is deliberately the final generation artifact.
+    crate::config::atomic_write(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)?;
+    sync_directory(&output.root)?;
+    sync_directory(&paths.output_parent)?;
+    output.ensure_identity()?;
+
+    let (_, generation) = crate::source::validate_generation_dir(&output.root)
+        .context("strictly validating completed flat-int8 generation")?;
+    let expected_generation = crate::source::generation_key(&manifest)?;
+    if generation != expected_generation {
+        bail!("flat-derived generation ID changed during final validation");
+    }
+    let flat_ann_size = manifest.ann.values().try_fold(0u64, |total, info| {
+        total
+            .checked_add(info.size)
+            .ok_or_else(|| anyhow!("flat ANN size overflow"))
+    })?;
+    let generation_artifact_size = db_size
+        .checked_add(manifest.model.model.size)
+        .and_then(|value| value.checked_add(manifest.model.tokenizer.size))
+        .and_then(|value| value.checked_add(flat_ann_size))
+        .ok_or_else(|| anyhow!("flat generation artifact size overflow"))?;
+
+    Ok(FlatInt8DerivationReport {
+        source_generation: legacy.generation.clone(),
+        generation,
+        schema_version: SUPPORTED_SCHEMA_VERSION,
+        output_dir: output.root.display().to_string(),
+        database_size: db_size,
+        database_sha256: db_sha256,
+        flat_ann_size,
+        generation_artifact_size,
+        chunks,
+        chunk_embeddings,
+        sidecars: manifest.ann.len(),
+        reflinked_files,
+        copied_files,
+        strictly_validated: true,
+    })
+}
+
+fn record_copy_method(method: CopyMethod, reflinked_files: &mut usize, copied_files: &mut usize) {
+    match method {
+        CopyMethod::Reflink => *reflinked_files += 1,
+        CopyMethod::Copy => *copied_files += 1,
     }
 }
 
@@ -299,7 +497,7 @@ fn derive_into_fresh_output(
         sha256: db_sha256,
         size: db_size,
     };
-    crate::source::validate_manifest(&manifest)?;
+    crate::legacy_arroy::validate_manifest(&manifest, SUPPORTED_SCHEMA_VERSION)?;
 
     // The source is re-opened and re-hashed after all copies so concurrent
     // replacement or in-place mutation cannot silently produce a candidate.
@@ -322,7 +520,7 @@ fn derive_into_fresh_output(
     sync_directory(&paths.output_parent)?;
     output.ensure_identity()?;
 
-    let (_, generation) = crate::source::validate_generation_dir(&output.root)
+    let generation = validate_projected_legacy_generation(&output.root, &manifest)
         .context("strictly validating completed projected generation")?;
     let expected_generation = crate::source::generation_key(&manifest)?;
     if generation != expected_generation {
@@ -351,7 +549,7 @@ struct DatabaseProjection {
 
 fn project_database(
     path: &Path,
-    legacy_manifest: &Manifest,
+    legacy_manifest: &LegacyArroyManifest,
     space_path: &Path,
 ) -> Result<DatabaseProjection> {
     let mut conn = Connection::open_with_flags(
@@ -367,7 +565,7 @@ fn project_database(
     conn.execute_batch("PRAGMA cell_size_check=ON; PRAGMA query_only=ON;")?;
     enforce_legacy_schema(&conn)?;
     validate_legacy_chunks_fts_schema(&conn)?;
-    crate::source::verify_corpus_manifest_binding(&conn, legacy_manifest)?;
+    verify_legacy_corpus_manifest_binding(&conn, legacy_manifest)?;
     verify_declared_counts(&conn)?;
     crate::db::verify_fts_relational_bindings(&conn)?;
     verify_foreign_keys(&conn)?;
@@ -506,7 +704,7 @@ fn project_database(
     crate::db::validate_chunks_fts_schema(&conn)?;
     let mut projected_manifest = legacy_manifest.clone();
     projected_manifest.schema_version = SUPPORTED_SCHEMA_VERSION;
-    crate::source::verify_corpus_manifest_binding(&conn, &projected_manifest)?;
+    verify_legacy_corpus_manifest_binding(&conn, &projected_manifest)?;
     verify_declared_counts(&conn)?;
     if crate::db::get_corpus_meta(&conn, "chunks_fts_index_sha256")?.as_deref()
         != Some(projected_fts_digest.as_str())
@@ -532,6 +730,214 @@ fn project_database(
         chunks,
         chunk_embeddings,
     })
+}
+
+fn build_flat_sidecars_from_database(
+    path: &Path,
+    output_root: &Path,
+    legacy_manifest: &LegacyArroyManifest,
+) -> Result<(
+    BTreeMap<legal_model::SourceId, crate::ann::ManifestAnn>,
+    u64,
+    u64,
+)> {
+    let mut conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening copied Arroy-v20 database {}", path.display()))?;
+    conn.busy_timeout(Duration::from_secs(60))?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.pragma_update(None, "journal_mode", "DELETE")?;
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.execute_batch("PRAGMA cell_size_check=ON; PRAGMA query_only=ON;")?;
+    enforce_schema(&conn, SUPPORTED_SCHEMA_VERSION)?;
+    crate::db::validate_chunks_fts_schema(&conn)?;
+    crate::db::verify_chunks_fts_index_digest(&conn)?;
+    verify_legacy_corpus_manifest_binding(&conn, legacy_manifest)?;
+    verify_declared_counts(&conn)?;
+    verify_legacy_semantic_install(&conn, legacy_manifest)?;
+    crate::db::verify_fts_relational_bindings(&conn)?;
+    verify_foreign_keys(&conn)?;
+    verify_ordinary_integrity(&conn)?;
+    if table_count(&conn, "embedding_cache")? != 0 {
+        bail!("Arroy-v20 database contains disposable embedding_cache rows");
+    }
+    conn.execute_batch("PRAGMA query_only=OFF")?;
+    verify_fts_integrity(&conn)?;
+
+    let chunks = table_count(&conn, "chunks")?;
+    let chunk_embeddings = table_count(&conn, "chunk_embeddings")?;
+    if chunks == 0 || chunks != chunk_embeddings {
+        bail!("Arroy-v20 database does not have one embedding for every chunk");
+    }
+
+    let mut identities = Vec::with_capacity(legacy_manifest.ann.len());
+    for (source_id, legacy_ann) in &legacy_manifest.ann {
+        let source_index_sha256 =
+            required_legacy_source_meta(&conn, source_id, "source_index_sha256")?;
+        let identity = crate::ann::compute_identity(&conn, source_id, &source_index_sha256)?;
+        if identity.embedding_set_sha256 != legacy_ann.embedding_set_sha256
+            || identity.vector_count != legacy_ann.vector_count
+        {
+            bail!(
+                "source `{source_id}` SQLite embeddings changed before flat sidecar construction"
+            );
+        }
+        identities.push((
+            source_id.clone(),
+            source_index_sha256,
+            legacy_ann.corpus_id.clone(),
+            identity,
+        ));
+    }
+
+    let binding_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for (source_id, _, legacy_corpus_id, identity) in &identities {
+        let changed = binding_tx.execute(
+            "UPDATE source_meta SET value = ?1 \
+             WHERE source_id = ?2 AND key = 'corpus_id' AND value = ?3",
+            rusqlite::params![identity.corpus_id, source_id.as_str(), legacy_corpus_id],
+        )?;
+        if changed != 1 {
+            bail!("source `{source_id}` corpus_id changed before flat binding");
+        }
+    }
+    binding_tx.commit()?;
+
+    let mut ann = BTreeMap::new();
+    for (source_id, source_index_sha256, _, identity) in &identities {
+        let info = crate::ann::build_sidecar(
+            &conn,
+            source_id,
+            output_root,
+            source_index_sha256,
+            identity,
+        )?;
+        if ann.insert(source_id.clone(), info).is_some() {
+            bail!("duplicate flat sidecar source `{source_id}`");
+        }
+    }
+
+    let provisional_manifest = Manifest {
+        schema_version: SUPPORTED_SCHEMA_VERSION,
+        index_version: legacy_manifest.index_version.clone(),
+        created_at: legacy_manifest.created_at.clone(),
+        min_client_version: env!("CARGO_PKG_VERSION").to_string(),
+        model: legacy_manifest.model.clone(),
+        db: legacy_manifest.db.clone(),
+        ann: ann.clone(),
+    };
+    crate::source::validate_manifest(&provisional_manifest)?;
+    crate::source::verify_corpus_manifest_binding(&conn, &provisional_manifest)?;
+    crate::source::verify_semantic_install(&conn, &provisional_manifest)?;
+    crate::db::verify_chunks_fts_index_digest(&conn)?;
+    crate::db::verify_fts_relational_bindings(&conn)?;
+    verify_foreign_keys(&conn)?;
+    verify_ordinary_integrity(&conn)?;
+    verify_fts_integrity(&conn)?;
+    drop(conn);
+    remove_empty_sqlite_sidecars(path)?;
+    sync_file(path)?;
+    Ok((ann, chunks, chunk_embeddings))
+}
+
+fn validate_projected_legacy_generation(
+    root: &Path,
+    expected_manifest: &LegacyArroyManifest,
+) -> Result<GenerationId> {
+    crate::legacy_arroy::validate_manifest(expected_manifest, SUPPORTED_SCHEMA_VERSION)?;
+    let metadata = fs::symlink_metadata(root)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("projected generation root must be a real directory");
+    }
+    let expected_top = BTreeSet::from([
+        crate::ann::ANN_DIRECTORY.to_string(),
+        GENERATION_MANIFEST_FILENAME.to_string(),
+        LEGAL_DB_FILENAME.to_string(),
+        expected_manifest.model.model.path.clone(),
+        expected_manifest.model.tokenizer.path.clone(),
+    ]);
+    let actual_top = directory_names(root)?;
+    if actual_top != expected_top {
+        bail!(
+            "projected legacy generation contents differ: expected {expected_top:?}, found {actual_top:?}"
+        );
+    }
+
+    let manifest_path = root.join(GENERATION_MANIFEST_FILENAME);
+    let mut manifest_file = open_regular_no_follow(&manifest_path)?;
+    let manifest_metadata = manifest_file.metadata()?;
+    reject_hard_links(&manifest_metadata, &manifest_path)?;
+    if manifest_metadata.len() == 0 || manifest_metadata.len() > MAX_MANIFEST_BYTES {
+        bail!("projected legacy manifest is empty or exceeds its size cap");
+    }
+    let mut manifest_bytes = Vec::with_capacity(usize::try_from(manifest_metadata.len())?);
+    manifest_file.read_to_end(&mut manifest_bytes)?;
+    if manifest_bytes.len() as u64 != manifest_metadata.len() {
+        bail!("projected legacy manifest changed while being read");
+    }
+    let manifest = crate::legacy_arroy::decode_manifest(&manifest_bytes, SUPPORTED_SCHEMA_VERSION)?;
+    if &manifest != expected_manifest {
+        bail!("projected legacy manifest differs from the manifest written last");
+    }
+
+    validate_regular_file(
+        &root.join(&manifest.db.path),
+        manifest.db.size,
+        &manifest.db.sha256,
+        false,
+    )?;
+    for file in [&manifest.model.model, &manifest.model.tokenizer] {
+        validate_regular_file(&root.join(&file.path), file.size, &file.sha256, false)?;
+    }
+    let ann_dir = root.join(crate::ann::ANN_DIRECTORY);
+    let ann_metadata = fs::symlink_metadata(&ann_dir)?;
+    if ann_metadata.file_type().is_symlink() || !ann_metadata.is_dir() {
+        bail!("projected legacy ANN path must be a real directory");
+    }
+    let expected_ann = manifest
+        .ann
+        .values()
+        .map(|ann| {
+            Path::new(&ann.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("projected legacy ANN path is malformed"))
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    if directory_names(&ann_dir)? != expected_ann {
+        bail!("projected legacy ANN directory does not exactly match its manifest");
+    }
+    for ann in manifest.ann.values() {
+        validate_regular_file(&root.join(&ann.path), ann.size, &ann.sha256, false)?;
+    }
+
+    let db_path = root.join(&manifest.db.path);
+    let conn = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(Duration::from_secs(60))?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.execute_batch("PRAGMA cell_size_check=ON; PRAGMA query_only=ON;")?;
+    crate::db::enforce_db_schema_version(&conn)?;
+    crate::db::validate_chunks_fts_schema(&conn)?;
+    crate::db::verify_chunks_fts_index_digest(&conn)?;
+    verify_legacy_corpus_manifest_binding(&conn, &manifest)?;
+    verify_declared_counts(&conn)?;
+    verify_legacy_semantic_install(&conn, &manifest)?;
+    crate::db::verify_fts_relational_bindings(&conn)?;
+    verify_foreign_keys(&conn)?;
+    verify_ordinary_integrity(&conn)?;
+    conn.execute_batch("PRAGMA query_only=OFF")?;
+    verify_fts_integrity(&conn)?;
+    drop(conn);
+    validate_regular_file(&db_path, manifest.db.size, &manifest.db.sha256, false)
+        .context("projected legacy database changed during strict validation")?;
+    crate::source::generation_key(&manifest)
 }
 
 fn validate_projection_paths(source: &Path, output: &Path) -> Result<ProjectionPaths> {
@@ -592,6 +998,14 @@ fn validate_legacy_generation(
     root: &Path,
     expected_generation: &GenerationId,
 ) -> Result<ValidatedLegacyGeneration> {
+    validate_arroy_generation(root, expected_generation, LEGACY_SCHEMA_VERSION)
+}
+
+fn validate_arroy_generation(
+    root: &Path,
+    expected_generation: &GenerationId,
+    expected_schema: u32,
+) -> Result<ValidatedLegacyGeneration> {
     let root_snapshot = snapshot_directory(root, "legacy generation")?;
     require_read_only(
         root,
@@ -620,8 +1034,7 @@ fn validate_legacy_generation(
         bail!("legacy generation manifest exceeds {MAX_MANIFEST_BYTES} bytes");
     }
     let manifest_bytes = read_validated_file(&manifest_path, &manifest_metadata)?;
-    let manifest = decode_legacy_manifest(&manifest_bytes)?;
-    crate::source::validate_manifest_contents(&manifest)?;
+    let manifest = crate::legacy_arroy::decode_manifest(&manifest_bytes, expected_schema)?;
     let generation = crate::source::generation_key(&manifest)?;
     if &generation != expected_generation {
         bail!(
@@ -678,9 +1091,8 @@ fn validate_legacy_generation(
     if directory_names(&ann_dir)? != expected_ann {
         bail!("legacy ANN directory does not exactly match generation.json");
     }
-    for (source_id, info) in &manifest.ann {
+    for info in manifest.ann.values() {
         let snapshot = snapshot_artifact(root, &info.path, info.size, &info.sha256)?;
-        crate::ann::verify_sidecar(&root.join(&info.path), source_id, info)?;
         artifacts.insert(info.path.clone(), snapshot);
     }
 
@@ -692,11 +1104,18 @@ fn validate_legacy_generation(
     conn.busy_timeout(Duration::from_secs(60))?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     conn.execute_batch("PRAGMA query_only=ON; PRAGMA cell_size_check=ON;")?;
-    enforce_legacy_schema(&conn)?;
-    validate_legacy_chunks_fts_schema(&conn)?;
-    crate::source::verify_corpus_manifest_binding(&conn, &manifest)?;
+    enforce_schema(&conn, expected_schema)?;
+    match expected_schema {
+        LEGACY_SCHEMA_VERSION => validate_legacy_chunks_fts_schema(&conn)?,
+        SUPPORTED_SCHEMA_VERSION => {
+            crate::db::validate_chunks_fts_schema(&conn)?;
+            crate::db::verify_chunks_fts_index_digest(&conn)?;
+        }
+        _ => bail!("unsupported Arroy derivation schema {expected_schema}"),
+    }
+    verify_legacy_corpus_manifest_binding(&conn, &manifest)?;
     verify_declared_counts(&conn)?;
-    crate::source::verify_semantic_install(&conn, &manifest)?;
+    verify_legacy_semantic_install(&conn, &manifest)?;
     crate::db::verify_fts_relational_bindings(&conn)?;
     verify_foreign_keys(&conn)?;
     verify_ordinary_integrity(&conn)?;
@@ -705,6 +1124,9 @@ fn validate_legacy_generation(
     let embedding_cache_rows = table_count(&conn, "embedding_cache")?;
     if chunks == 0 || chunks != chunk_embeddings {
         bail!("legacy generation does not have one embedding for every chunk");
+    }
+    if expected_schema == SUPPORTED_SCHEMA_VERSION && embedding_cache_rows != 0 {
+        bail!("Arroy-v20 generation retained disposable embedding_cache rows");
     }
     drop(conn);
 
@@ -722,27 +1144,258 @@ fn validate_legacy_generation(
     })
 }
 
-fn decode_legacy_manifest(bytes: &[u8]) -> Result<Manifest> {
-    let manifest: Manifest = serde_json::from_slice(bytes).context("parsing legacy manifest")?;
-    if manifest.schema_version != LEGACY_SCHEMA_VERSION {
+#[cfg(test)]
+fn decode_legacy_manifest(bytes: &[u8]) -> Result<LegacyArroyManifest> {
+    crate::legacy_arroy::decode_manifest(bytes, LEGACY_SCHEMA_VERSION)
+}
+
+fn verify_legacy_corpus_manifest_binding(
+    conn: &Connection,
+    manifest: &LegacyArroyManifest,
+) -> Result<()> {
+    for (key, expected) in [
+        ("schema_version", manifest.schema_version.to_string()),
+        ("index_version", manifest.index_version.clone()),
+        ("embedding_model_id", manifest.model.id.clone()),
+        ("last_update_at", manifest.created_at.clone()),
+    ] {
+        let actual = crate::db::get_corpus_meta(conn, key)?
+            .ok_or_else(|| anyhow!("legacy database is missing corpus_meta.{key}"))?;
+        if actual != expected {
+            bail!(
+                "legacy database corpus_meta.{key} does not match its manifest: expected `{expected}`, got `{actual}`"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn verify_legacy_semantic_install(conn: &Connection, manifest: &LegacyArroyManifest) -> Result<()> {
+    const SOURCE_META_KEYS: [&str; 10] = [
+        "chunk_embeddings_count",
+        "chunks_count",
+        "corpus_id",
+        "definitions_count",
+        "documents_by_type_json",
+        "documents_count",
+        "embedding_set_sha256",
+        "last_update_at",
+        "prefix_breakdown_json",
+        "source_index_sha256",
+    ];
+
+    let mut database_sources = BTreeSet::new();
+    let mut statement = conn.prepare("SELECT source_id FROM sources ORDER BY source_id")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        database_sources.insert(row?.parse::<legal_model::SourceId>()?);
+    }
+    let manifest_sources = manifest.ann.keys().cloned().collect::<BTreeSet<_>>();
+    let registered_sources = crate::legal_source::source_registry()
+        .source_ids()
+        .into_iter()
+        .map(str::parse)
+        .collect::<std::result::Result<BTreeSet<legal_model::SourceId>, _>>()?;
+    if database_sources != registered_sources || manifest_sources != registered_sources {
         bail!(
-            "derivation source must use exactly legacy schema {LEGACY_SCHEMA_VERSION}, got {}",
-            manifest.schema_version
+            "legacy semantic source sets differ: registered={registered_sources:?}, manifest={manifest_sources:?}, database={database_sources:?}"
         );
     }
-    Ok(manifest)
+
+    let source_meta_sources = {
+        let mut statement = conn.prepare("SELECT DISTINCT source_id FROM source_meta")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<BTreeSet<_>>>()?
+    };
+    let expected_source_text = registered_sources
+        .iter()
+        .map(|source| source.as_str().to_string())
+        .collect::<BTreeSet<_>>();
+    if source_meta_sources != expected_source_text {
+        bail!("legacy source_meta source set does not match the registered sources");
+    }
+
+    let expected_keys = SOURCE_META_KEYS
+        .into_iter()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    for (source_id, ann) in &manifest.ann {
+        let actual_keys = {
+            let mut statement =
+                conn.prepare("SELECT key FROM source_meta WHERE source_id = ?1 ORDER BY key")?;
+            let rows = statement.query_map([source_id.as_str()], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<BTreeSet<_>>>()?
+        };
+        if actual_keys != expected_keys {
+            bail!(
+                "legacy source_meta keys for `{source_id}` differ: expected={expected_keys:?}, actual={actual_keys:?}"
+            );
+        }
+
+        let documents = source_table_count(conn, "documents", source_id)?;
+        let chunks = source_table_count(conn, "chunks", source_id)?;
+        let definitions = source_table_count(conn, "definitions", source_id)?;
+        let embeddings: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chunk_embeddings AS e \
+                 JOIN chunks AS c ON c.chunk_id = e.chunk_id \
+                 WHERE c.source_id = ?1",
+                [source_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .and_then(|value| {
+                u64::try_from(value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })
+            })?;
+        if documents == 0 || chunks == 0 || chunks != embeddings || embeddings != ann.vector_count {
+            bail!(
+                "legacy semantic rows for `{source_id}` are incomplete: documents={documents}, chunks={chunks}, embeddings={embeddings}, ann={}",
+                ann.vector_count
+            );
+        }
+        for (key, expected) in [
+            ("documents_count", documents),
+            ("chunks_count", chunks),
+            ("chunk_embeddings_count", embeddings),
+            ("definitions_count", definitions),
+        ] {
+            let actual = required_legacy_source_meta(conn, source_id, key)?;
+            if actual != expected.to_string() {
+                bail!(
+                    "legacy source_meta[`{source_id}`].{key} is `{actual}`, expected `{expected}`"
+                );
+            }
+        }
+
+        let source_index_sha256 =
+            required_legacy_source_meta(conn, source_id, "source_index_sha256")?;
+        if !crate::legacy_arroy::is_lower_sha256(&source_index_sha256) {
+            bail!("legacy source `{source_id}` has malformed source_index_sha256 metadata");
+        }
+        let identity = crate::ann::compute_identity(conn, source_id, &source_index_sha256)?;
+        if identity.embedding_set_sha256 != ann.embedding_set_sha256
+            || identity.vector_count != ann.vector_count
+        {
+            bail!("legacy source `{source_id}` embedding bytes do not match its Arroy manifest");
+        }
+        let legacy_corpus_id = legacy_arroy_corpus_id(
+            source_id,
+            &source_index_sha256,
+            &manifest.model.id,
+            ann.vector_count,
+            &ann.embedding_set_sha256,
+        );
+        for (key, expected) in [
+            ("corpus_id", legacy_corpus_id.as_str()),
+            ("embedding_set_sha256", ann.embedding_set_sha256.as_str()),
+        ] {
+            let actual = required_legacy_source_meta(conn, source_id, key)?;
+            if actual != expected || (key == "corpus_id" && actual != ann.corpus_id) {
+                bail!("legacy source_meta[`{source_id}`].{key} does not match its Arroy manifest");
+            }
+        }
+
+        let updated_at = required_legacy_source_meta(conn, source_id, "last_update_at")?;
+        chrono::DateTime::parse_from_rfc3339(&updated_at)
+            .with_context(|| format!("legacy source `{source_id}` last_update_at is malformed"))?;
+        let stored_types: BTreeMap<String, u64> = serde_json::from_str(
+            &required_legacy_source_meta(conn, source_id, "documents_by_type_json")?,
+        )
+        .with_context(|| format!("parsing source `{source_id}` documents_by_type_json"))?;
+        let actual_types = source_documents_by_type(conn, source_id)?;
+        if stored_types != actual_types {
+            bail!("legacy source `{source_id}` documents_by_type_json does not match documents");
+        }
+        let prefix_breakdown: serde_json::Value = serde_json::from_str(
+            &required_legacy_source_meta(conn, source_id, "prefix_breakdown_json")?,
+        )
+        .with_context(|| format!("parsing source `{source_id}` prefix_breakdown_json"))?;
+        if !prefix_breakdown.is_array() {
+            bail!("legacy source `{source_id}` prefix_breakdown_json is not an array");
+        }
+    }
+    Ok(())
+}
+
+fn required_legacy_source_meta(
+    conn: &Connection,
+    source_id: &legal_model::SourceId,
+    key: &str,
+) -> Result<String> {
+    crate::db::get_source_meta(conn, source_id.as_str(), key)?
+        .ok_or_else(|| anyhow!("legacy source_meta[`{source_id}`].{key} is missing"))
+}
+
+fn source_table_count(
+    conn: &Connection,
+    table: &str,
+    source_id: &legal_model::SourceId,
+) -> Result<u64> {
+    let value: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM {table} WHERE source_id = ?1"),
+        [source_id.as_str()],
+        |row| row.get(0),
+    )?;
+    u64::try_from(value).with_context(|| format!("negative {table} count for `{source_id}`"))
+}
+
+fn source_documents_by_type(
+    conn: &Connection,
+    source_id: &legal_model::SourceId,
+) -> Result<BTreeMap<String, u64>> {
+    let mut statement = conn.prepare(
+        "SELECT type, COUNT(*) FROM documents \
+         WHERE source_id = ?1 GROUP BY type ORDER BY type",
+    )?;
+    let rows = statement.query_map([source_id.as_str()], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut result = BTreeMap::new();
+    for row in rows {
+        let (document_type, count) = row?;
+        result.insert(document_type, u64::try_from(count)?);
+    }
+    Ok(result)
+}
+
+fn legacy_arroy_corpus_id(
+    source_id: &legal_model::SourceId,
+    source_index_sha256: &str,
+    model_id: &str,
+    vector_count: u64,
+    embedding_set_sha256: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"australian-legal-mcp-ann-corpus-v1\0");
+    hasher.update(source_id.as_str().as_bytes());
+    hasher.update([0]);
+    hasher.update(source_index_sha256.as_bytes());
+    hasher.update([0]);
+    hasher.update(model_id.as_bytes());
+    hasher.update([0]);
+    hasher.update((crate::EMBEDDING_DIM as u64).to_le_bytes());
+    hasher.update(vector_count.to_le_bytes());
+    hasher.update(embedding_set_sha256.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 fn enforce_legacy_schema(conn: &Connection) -> Result<()> {
+    enforce_schema(conn, LEGACY_SCHEMA_VERSION)
+}
+
+fn enforce_schema(conn: &Connection, expected_schema: u32) -> Result<()> {
     let value = crate::db::get_corpus_meta(conn, "schema_version")?
         .ok_or_else(|| anyhow!("legacy database is missing corpus_meta.schema_version"))?;
     let parsed = value
         .parse::<u32>()
         .with_context(|| format!("legacy schema_version `{value}` is malformed"))?;
-    if parsed != LEGACY_SCHEMA_VERSION {
-        bail!(
-            "derivation source database must use exactly legacy schema {LEGACY_SCHEMA_VERSION}, got {parsed}"
-        );
+    if parsed != expected_schema {
+        bail!("derivation source database must use exactly schema {expected_schema}, got {parsed}");
     }
     Ok(())
 }
@@ -822,17 +1475,7 @@ fn verify_ordinary_integrity(conn: &Connection) -> Result<()> {
 }
 
 fn verify_fts_integrity(conn: &Connection) -> Result<()> {
-    let transaction = conn.unchecked_transaction()?;
-    transaction.execute(
-        "INSERT INTO title_fts(title_fts) VALUES('integrity-check')",
-        [],
-    )?;
-    transaction.execute(
-        "INSERT INTO chunks_fts(chunks_fts) VALUES('integrity-check')",
-        [],
-    )?;
-    transaction.rollback()?;
-    Ok(())
+    crate::db::verify_fts_integrity(conn)
 }
 
 fn table_count(conn: &Connection, table: &str) -> Result<u64> {
@@ -856,13 +1499,8 @@ fn ordered_rowids_match(conn: &Connection, left: &str, right: &str) -> Result<bo
     }
 }
 
-fn immutable_artifact_paths(manifest: &Manifest) -> Vec<String> {
-    let mut paths = vec![
-        manifest.model.model.path.clone(),
-        manifest.model.tokenizer.path.clone(),
-    ];
-    paths.extend(manifest.ann.values().map(|info| info.path.clone()));
-    paths
+fn immutable_artifact_paths(manifest: &LegacyArroyManifest) -> Vec<String> {
+    crate::legacy_arroy::immutable_artifact_paths(manifest)
 }
 
 fn snapshot_artifact(
@@ -1186,7 +1824,10 @@ fn directory_names(path: &Path) -> Result<BTreeSet<String>> {
         .collect()
 }
 
-fn required_projection_space(manifest: &Manifest, reflink_supported: bool) -> Result<u64> {
+fn required_projection_space(
+    manifest: &LegacyArroyManifest,
+    reflink_supported: bool,
+) -> Result<u64> {
     let database_copy_bytes = if reflink_supported {
         0
     } else {
@@ -1202,6 +1843,31 @@ fn required_projection_space(manifest: &Manifest, reflink_supported: bool) -> Re
         .ok_or_else(|| anyhow!("projection space requirement overflow"))
 }
 
+fn required_flat_derivation_space(
+    manifest: &LegacyArroyManifest,
+    reflink_supported: bool,
+) -> Result<u64> {
+    let flat_ann_bytes = manifest.ann.values().try_fold(0u64, |total, ann| {
+        total
+            .checked_add(crate::ann::expected_sidecar_size(ann.vector_count)?)
+            .ok_or_else(|| anyhow!("flat ANN space requirement overflow"))
+    })?;
+    let copied_bytes = if reflink_supported {
+        0
+    } else {
+        manifest
+            .db
+            .size
+            .checked_add(manifest.model.model.size)
+            .and_then(|value| value.checked_add(manifest.model.tokenizer.size))
+            .ok_or_else(|| anyhow!("flat derivation copy space requirement overflow"))?
+    };
+    flat_ann_bytes
+        .checked_add(copied_bytes)
+        .and_then(|value| value.checked_add(PROJECTION_SPACE_MARGIN_BYTES))
+        .ok_or_else(|| anyhow!("flat derivation space requirement overflow"))
+}
+
 fn validate_projection_db_size(size: u64, label: &str) -> Result<()> {
     if size == 0 || size > MAX_PROJECTION_DB_BYTES {
         bail!(
@@ -1211,19 +1877,8 @@ fn validate_projection_db_size(size: u64, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn checked_generation_artifact_bytes(manifest: &Manifest) -> Result<u64> {
-    manifest
-        .db
-        .size
-        .checked_add(manifest.model.model.size)
-        .and_then(|value| value.checked_add(manifest.model.tokenizer.size))
-        .and_then(|value| {
-            manifest
-                .ann
-                .values()
-                .try_fold(value, |total, info| total.checked_add(info.size))
-        })
-        .ok_or_else(|| anyhow!("generation artifact sizes overflow u64"))
+fn checked_generation_artifact_bytes(manifest: &LegacyArroyManifest) -> Result<u64> {
+    crate::legacy_arroy::checked_artifact_bytes(manifest)
 }
 
 fn probe_reflink_support(parent: &Path) -> Result<bool> {
@@ -1551,8 +2206,8 @@ mod tests {
     use crate::source::{ManifestFile, ModelInfo};
     use rusqlite::params;
 
-    fn fixture_manifest(schema_version: u32) -> Manifest {
-        Manifest {
+    fn fixture_manifest(schema_version: u32) -> LegacyArroyManifest {
+        LegacyArroyManifest {
             schema_version,
             index_version: "fixture-v19".to_string(),
             created_at: "2026-07-14T00:00:00Z".to_string(),
@@ -1580,7 +2235,7 @@ mod tests {
         }
     }
 
-    fn create_legacy_database(path: &Path) -> Result<Manifest> {
+    fn create_legacy_database(path: &Path) -> Result<LegacyArroyManifest> {
         let manifest = fixture_manifest(LEGACY_SCHEMA_VERSION);
         let conn = Connection::open(path)?;
         conn.execute_batch(&format!(
@@ -1711,6 +2366,171 @@ mod tests {
         Ok(rows)
     }
 
+    fn create_arroy_v20_flat_fixture(path: &Path) -> Result<LegacyArroyManifest> {
+        let conn = Connection::open(path)?;
+        crate::db::init_db(&conn)?;
+        let created_at = "2026-07-14T00:00:00Z".to_string();
+        let index_version = "fixture-v20".to_string();
+        let model = ModelInfo {
+            id: crate::EMBEDDING_MODEL_ID.to_string(),
+            fingerprint: crate::EMBEDDING_MODEL_FINGERPRINT.to_string(),
+            model: ManifestFile {
+                path: crate::semantic::EMBEDDING_MODEL_FILES[0]
+                    .output_name
+                    .to_string(),
+                sha256: crate::semantic::EMBEDDING_MODEL_FILES[0].sha256.to_string(),
+                size: crate::semantic::EMBEDDING_MODEL_FILES[0].size,
+            },
+            tokenizer: ManifestFile {
+                path: crate::semantic::EMBEDDING_MODEL_FILES[1]
+                    .output_name
+                    .to_string(),
+                sha256: crate::semantic::EMBEDDING_MODEL_FILES[1].sha256.to_string(),
+                size: crate::semantic::EMBEDDING_MODEL_FILES[1].size,
+            },
+        };
+
+        let sources = crate::legal_source::source_registry()
+            .source_ids()
+            .into_iter()
+            .map(str::parse::<legal_model::SourceId>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (index, source_id) in sources.iter().enumerate() {
+            let chunk_id = i64::try_from(index + 1)?;
+            let native_id = format!("fixture-{index}");
+            conn.execute(
+                "INSERT INTO sources(source_id, display_name) VALUES (?1, ?2)",
+                params![source_id.as_str(), format!("Fixture {source_id}")],
+            )?;
+            conn.execute(
+                "INSERT INTO documents(
+                     source_id, native_id, type, title, canonical_url,
+                     downloaded_at, content_hash, html
+                 ) VALUES (?1, ?2, 'fixture', ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    source_id.as_str(),
+                    native_id,
+                    format!("Fixture {source_id}"),
+                    format!("https://example.invalid/{source_id}"),
+                    created_at,
+                    format!("{index:064x}"),
+                    b"<p>fixture</p>".as_slice(),
+                ],
+            )?;
+            conn.execute(
+                "INSERT INTO chunks(chunk_id, source_id, native_id, ord, text)
+                 VALUES (?1, ?2, ?3, 0, ?4)",
+                params![
+                    chunk_id,
+                    source_id.as_str(),
+                    native_id,
+                    b"fixture".as_slice()
+                ],
+            )?;
+            conn.execute(
+                "INSERT INTO chunk_embeddings(chunk_id, embedding) VALUES (?1, ?2)",
+                params![chunk_id, vec![u8::try_from(index)?; crate::EMBEDDING_DIM]],
+            )?;
+            conn.execute(
+                "INSERT INTO title_fts(rowid, source_id, native_id, title, headings)
+                 VALUES (?1, ?2, ?3, ?4, '')",
+                params![
+                    chunk_id,
+                    source_id.as_str(),
+                    native_id,
+                    format!("Fixture {source_id}")
+                ],
+            )?;
+            conn.execute(
+                "INSERT INTO chunks_fts(rowid, text) VALUES (?1, ?2)",
+                params![chunk_id, format!("fixture text {source_id}")],
+            )?;
+        }
+        for (key, value) in [
+            ("index_version", index_version.clone()),
+            ("embedding_model_id", model.id.clone()),
+            ("last_update_at", created_at.clone()),
+            ("documents_count", sources.len().to_string()),
+            ("chunks_count", sources.len().to_string()),
+            ("chunk_embeddings_count", sources.len().to_string()),
+            ("definitions_count", "0".to_string()),
+        ] {
+            crate::db::set_corpus_meta(&conn, key, &value)?;
+        }
+        let fts_digest = crate::db::chunks_fts_index_sha256(&conn, "chunks_fts")?;
+        crate::db::set_corpus_meta(&conn, "chunks_fts_index_sha256", &fts_digest)?;
+
+        let mut ann = BTreeMap::new();
+        for (index, source_id) in sources.iter().enumerate() {
+            let source_index_sha256 = format!("{:064x}", index + 100);
+            let identity = crate::ann::compute_identity(&conn, source_id, &source_index_sha256)?;
+            let corpus_id = legacy_arroy_corpus_id(
+                source_id,
+                &source_index_sha256,
+                &model.id,
+                identity.vector_count,
+                &identity.embedding_set_sha256,
+            );
+            for (key, value) in [
+                ("documents_count", "1".to_string()),
+                ("chunks_count", "1".to_string()),
+                ("chunk_embeddings_count", "1".to_string()),
+                ("definitions_count", "0".to_string()),
+                ("documents_by_type_json", "{\"fixture\":1}".to_string()),
+                ("last_update_at", created_at.clone()),
+                ("prefix_breakdown_json", "[]".to_string()),
+                ("source_index_sha256", source_index_sha256),
+                ("corpus_id", corpus_id.clone()),
+                (
+                    "embedding_set_sha256",
+                    identity.embedding_set_sha256.clone(),
+                ),
+            ] {
+                crate::db::set_source_meta(&conn, source_id.as_str(), key, &value)?;
+            }
+            ann.insert(
+                source_id.clone(),
+                crate::legacy_arroy::LegacyArroyAnn {
+                    source_id: source_id.clone(),
+                    format: crate::legacy_arroy::ARROY_FORMAT.to_string(),
+                    format_version: crate::legacy_arroy::ARROY_FORMAT_VERSION,
+                    library: crate::legacy_arroy::ARROY_LIBRARY.to_string(),
+                    library_version: crate::legacy_arroy::ARROY_LIBRARY_VERSION.to_string(),
+                    path: crate::ann::sidecar_manifest_path(source_id),
+                    sha256: format!("{:064x}", index + 1),
+                    size: 1,
+                    corpus_id,
+                    embedding_model_id: model.id.clone(),
+                    embedding_dimension: crate::EMBEDDING_DIM as u32,
+                    embedding_set_sha256: identity.embedding_set_sha256,
+                    vector_count: identity.vector_count,
+                    seed: crate::legacy_arroy::ARROY_SEED,
+                    rng: crate::legacy_arroy::ARROY_RNG.to_string(),
+                    trees: crate::legacy_arroy::ARROY_TREES,
+                    split_after: crate::legacy_arroy::ARROY_SPLIT_AFTER,
+                    id_encoding: crate::legacy_arroy::ARROY_ID_ENCODING.to_string(),
+                    metric: crate::legacy_arroy::ARROY_METRIC.to_string(),
+                },
+            );
+        }
+        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;")?;
+        drop(conn);
+        remove_empty_sqlite_sidecars(path)?;
+        Ok(LegacyArroyManifest {
+            schema_version: SUPPORTED_SCHEMA_VERSION,
+            index_version,
+            created_at,
+            min_client_version: "0.19.0".to_string(),
+            model,
+            db: ManifestDb {
+                path: LEGAL_DB_FILENAME.to_string(),
+                sha256: sha256_path(path)?,
+                size: fs::metadata(path)?.len(),
+            },
+            ann,
+        })
+    }
+
     #[test]
     fn database_projection_preserves_keyword_bm25_ids_and_embedding_bytes() -> Result<()> {
         let root = tempfile::tempdir()?;
@@ -1791,22 +2611,52 @@ mod tests {
     }
 
     #[test]
-    fn legacy_reader_recognizes_exactly_schema10_and_denies_unknown_fields() -> Result<()> {
-        let manifest = fixture_manifest(LEGACY_SCHEMA_VERSION);
-        assert_eq!(
-            decode_legacy_manifest(&serde_json::to_vec(&manifest)?)?.schema_version,
-            LEGACY_SCHEMA_VERSION
-        );
-        for schema in [9, SUPPORTED_SCHEMA_VERSION] {
-            let mut other = manifest.clone();
-            other.schema_version = schema;
-            assert!(decode_legacy_manifest(&serde_json::to_vec(&other)?).is_err());
+    fn arroy_v20_derivation_builds_flat_sidecars_only_from_sqlite_vectors() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let database = root.path().join(LEGAL_DB_FILENAME);
+        let output = root.path().join("output");
+        fs::create_dir(&output)?;
+        let legacy = create_arroy_v20_flat_fixture(&database)?;
+        let old_corpus_ids = legacy
+            .ann
+            .iter()
+            .map(|(source, ann)| (source.clone(), ann.corpus_id.clone()))
+            .collect::<BTreeMap<_, _>>();
+
+        let (flat, chunks, embeddings) =
+            build_flat_sidecars_from_database(&database, &output, &legacy)?;
+        assert_eq!(chunks, 10);
+        assert_eq!(embeddings, 10);
+        assert_eq!(flat.len(), 10);
+        let conn = Connection::open(&database)?;
+        for (source_id, info) in &flat {
+            assert_eq!(info.format, crate::ann::ANN_FORMAT);
+            assert_eq!(info.vector_count, 1);
+            assert_ne!(info.corpus_id, old_corpus_ids[source_id]);
+            assert_eq!(
+                crate::db::get_source_meta(&conn, source_id.as_str(), "corpus_id")?.as_deref(),
+                Some(info.corpus_id.as_str())
+            );
+            crate::ann::verify_sidecar(&output.join(&info.path), source_id, info)?;
         }
-        let mut value = serde_json::to_value(&manifest)?;
-        value["unexpected"] = serde_json::Value::Bool(true);
-        assert!(decode_legacy_manifest(&serde_json::to_vec(&value)?).is_err());
-        value = serde_json::to_value(&manifest)?;
-        value["db"]["unexpected"] = serde_json::Value::Bool(true);
+        Ok(())
+    }
+
+    #[test]
+    fn schema10_projection_reader_uses_the_real_arroy_contract() -> Result<()> {
+        let bytes = include_bytes!("../tests/fixtures/generation-v19-arroy.json");
+        let manifest = decode_legacy_manifest(bytes)?;
+        assert_eq!(manifest.schema_version, LEGACY_SCHEMA_VERSION);
+        assert_eq!(
+            crate::source::generation_key(&manifest)?.as_str(),
+            "1a6beead567b55babebbe253b5ae13efcd9ce2e8ab55b60c2de4106e39f180f4"
+        );
+        let ato = manifest.ann.get(&"ato".parse()?).expect("ATO sidecar");
+        assert_eq!(ato.library, crate::legacy_arroy::ARROY_LIBRARY);
+        assert_eq!(ato.seed, crate::legacy_arroy::ARROY_SEED);
+
+        let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
+        value["ann"]["ato"]["unexpected"] = serde_json::Value::Bool(true);
         assert!(decode_legacy_manifest(&serde_json::to_vec(&value)?).is_err());
         Ok(())
     }
@@ -1967,12 +2817,12 @@ mod tests {
         manifest.model.model.size = 10;
         manifest.model.tokenizer.size = 5;
         let source: legal_model::SourceId = "ato".parse()?;
-        let ann = crate::ann::ManifestAnn {
+        let ann = crate::legacy_arroy::LegacyArroyAnn {
             source_id: source.clone(),
-            format: crate::ann::ANN_FORMAT.to_string(),
-            format_version: crate::ann::ANN_FORMAT_VERSION,
-            library: crate::ann::ANN_LIBRARY.to_string(),
-            library_version: crate::ann::ANN_LIBRARY_VERSION.to_string(),
+            format: crate::legacy_arroy::ARROY_FORMAT.to_string(),
+            format_version: crate::legacy_arroy::ARROY_FORMAT_VERSION,
+            library: crate::legacy_arroy::ARROY_LIBRARY.to_string(),
+            library_version: crate::legacy_arroy::ARROY_LIBRARY_VERSION.to_string(),
             path: crate::ann::sidecar_manifest_path(&source),
             sha256: "4".repeat(64),
             size: 20,
@@ -1981,12 +2831,12 @@ mod tests {
             embedding_dimension: crate::EMBEDDING_DIM as u32,
             embedding_set_sha256: "6".repeat(64),
             vector_count: 1,
-            seed: crate::ann::ANN_SEED,
-            rng: crate::ann::ANN_RNG.to_string(),
-            trees: crate::ann::ANN_TREES as u32,
-            split_after: crate::ann::ANN_SPLIT_AFTER as u32,
-            id_encoding: crate::ann::ANN_ID_ENCODING.to_string(),
-            metric: crate::ann::ANN_METRIC.to_string(),
+            seed: crate::legacy_arroy::ARROY_SEED,
+            rng: crate::legacy_arroy::ARROY_RNG.to_string(),
+            trees: crate::legacy_arroy::ARROY_TREES,
+            split_after: crate::legacy_arroy::ARROY_SPLIT_AFTER,
+            id_encoding: crate::legacy_arroy::ARROY_ID_ENCODING.to_string(),
+            metric: crate::legacy_arroy::ARROY_METRIC.to_string(),
         };
         manifest.ann.insert(source, ann.clone());
         assert_eq!(

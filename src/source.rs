@@ -11,7 +11,11 @@ use crate::extract::anchors_node_text;
 use crate::legal_source::{source_registry, SourceId};
 use crate::search::ensure_vector_search_ready;
 use crate::semantic::EMBEDDING_MODEL_FILES;
-use crate::{ATO_USER_AGENT, EMBEDDING_MODEL_ID, SUPPORTED_SCHEMA_VERSION};
+use crate::source_catalog::ATO_SOURCE_ID;
+use crate::{
+    ATO_USER_AGENT, DEFAULT_EXCLUDED_TYPES, EMBEDDING_MODEL_ID, LEGISLATION_TYPE_PREFIXES,
+    OLD_CONTENT_CUTOFF, SUPPORTED_SCHEMA_VERSION,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::blocking::{Client, Response};
 use reqwest::redirect::Policy;
@@ -310,33 +314,50 @@ pub(crate) fn stats() -> Result<String> {
             }
             None => compute_documents_by_type(&conn, source_id)?,
         };
-        let prefix_breakdown = match get_source_meta(&conn, source_id, "prefix_breakdown_json")? {
-            Some(cached) => serde_json::from_str::<Vec<JsonValue>>(&cached).with_context(|| {
-                format!("parsing cached prefix breakdown for source `{source_id}`")
-            })?,
-            None => collect_prefix_breakdown(&conn, source_id)?,
+        // ATO native ids have a stable hierarchical family prefix used by
+        // `doc_scope`. Other source ids are generally flat, so treating the
+        // whole native id as a prefix creates one stats entry per document.
+        let prefix_breakdown = if source_id == ATO_SOURCE_ID {
+            Some(
+                match get_source_meta(&conn, source_id, "prefix_breakdown_json")? {
+                    Some(cached) => {
+                        serde_json::from_str::<Vec<JsonValue>>(&cached).with_context(|| {
+                            format!("parsing cached prefix breakdown for source `{source_id}`")
+                        })?
+                    }
+                    None => collect_prefix_breakdown(&conn, source_id)?,
+                },
+            )
+        } else {
+            None
         };
         let source_semantic_search_ready =
             ensure_vector_search_ready(&conn, &descriptor.id).is_ok();
         semantic_search_ready &= source_semantic_search_ready;
-        source_stats.insert(
-            source_id.to_string(),
-            json!({
-                "source_id": source_id,
-                "display_name": descriptor.display_name,
-                "corpus_id": get_source_meta(&conn, source_id, "corpus_id")?,
-                "semantic_search_ready": source_semantic_search_ready,
-                "documents": source_docs,
-                "chunks": source_chunks,
-                "chunk_embeddings": source_embeddings,
-                "definitions": source_definitions,
-                "ann": active_manifest
-                    .as_ref()
-                    .and_then(|manifest| manifest.ann.get(&descriptor.id)),
-                "types": types,
-                "prefix_breakdown": prefix_breakdown,
-            }),
-        );
+        let mut source_payload = json!({
+            "source_id": source_id,
+            "display_name": descriptor.display_name,
+            "corpus_id": get_source_meta(&conn, source_id, "corpus_id")?,
+            "semantic_search_ready": source_semantic_search_ready,
+            "documents": source_docs,
+            "chunks": source_chunks,
+            "chunk_embeddings": source_embeddings,
+            "definitions": source_definitions,
+            "ann": active_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.ann.get(&descriptor.id)),
+            "types": types,
+        });
+        if let Some(prefix_breakdown) = prefix_breakdown {
+            source_payload
+                .as_object_mut()
+                .expect("source stats payload is an object")
+                .insert(
+                    "prefix_breakdown".to_string(),
+                    JsonValue::Array(prefix_breakdown),
+                );
+        }
+        source_stats.insert(source_id.to_string(), source_payload);
     }
     let payload = json!({
         "data_dir": data_dir()?.display().to_string(),
@@ -349,6 +370,16 @@ pub(crate) fn stats() -> Result<String> {
         "semantic_search_ready": semantic_search_ready,
         "search_modes": ["hybrid", "vector", "keyword"],
         "default_search_mode": "hybrid",
+        "default_search_policy": {
+            "current_only": true,
+            "ato": {
+                "excluded_types": DEFAULT_EXCLUDED_TYPES,
+                "excluded_type_labels": ["Edited_private_advice"],
+                "old_content_cutoff": OLD_CONTENT_CUTOFF,
+                "old_content_exception_types": LEGISLATION_TYPE_PREFIXES,
+                "old_content_exception_type_labels": ["Legislation_and_supporting_material"],
+            },
+        },
         "documents": docs,
         "chunks": chunks,
         "chunk_embeddings": embeddings,
@@ -738,7 +769,9 @@ pub(crate) fn validate_manifest_contents(manifest: &Manifest) -> Result<()> {
     }
     for (source_id, ann) in &manifest.ann {
         crate::ann::validate_manifest_ann(source_id, ann)?;
-        if ann.embedding_model_id != manifest.model.id {
+        if ann.embedding_model_id != manifest.model.id
+            || ann.embedding_model_fingerprint != manifest.model.fingerprint
+        {
             bail!("ANN sidecar model for source `{source_id}` does not match manifest model");
         }
     }
@@ -941,7 +974,7 @@ fn rename_across_directories(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn generation_key(manifest: &Manifest) -> Result<GenerationId> {
+pub(crate) fn generation_key(manifest: &impl Serialize) -> Result<GenerationId> {
     let mut hasher = Sha256::new();
     hasher.update(b"australian-legal-mcp-local-generation-v1\0");
     hasher.update(serde_json::to_vec(manifest)?);
@@ -1148,16 +1181,7 @@ fn validate_generation_dir_with_mode(
             }
         }
         conn.execute_batch("PRAGMA query_only=OFF")?;
-        let fts_check = conn.unchecked_transaction()?;
-        fts_check.execute(
-            "INSERT INTO title_fts(title_fts) VALUES('integrity-check')",
-            [],
-        )?;
-        fts_check.execute(
-            "INSERT INTO chunks_fts(chunks_fts) VALUES('integrity-check')",
-            [],
-        )?;
-        fts_check.rollback()?;
+        crate::db::verify_fts_integrity(&conn)?;
     }
     let foreign_keys: i64 =
         conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
@@ -1428,9 +1452,25 @@ pub(crate) fn verify_ann_db_binding(
 ) -> Result<()> {
     let corpus_id = required_source_meta(conn, source_id, "corpus_id")?;
     let embedding_set_sha256 = required_source_meta(conn, source_id, "embedding_set_sha256")?;
+    let (first_chunk_id, last_chunk_id, vector_count) = conn.query_row(
+        "SELECT MIN(e.chunk_id), MAX(e.chunk_id), COUNT(*)
+         FROM chunk_embeddings AS e
+         JOIN chunks AS c ON c.chunk_id = e.chunk_id
+         WHERE c.source_id = ?1",
+        [source_id.as_str()],
+        |row| {
+            Ok((
+                row.get::<_, Option<i64>>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )?;
     if corpus_id != info.corpus_id
         || embedding_set_sha256 != info.embedding_set_sha256
-        || u64::try_from(chunk_embedding_count(conn, source_id)?).ok() != Some(info.vector_count)
+        || u64::try_from(vector_count).ok() != Some(info.vector_count)
+        || first_chunk_id.and_then(|value| u32::try_from(value).ok()) != Some(info.first_chunk_id)
+        || last_chunk_id.and_then(|value| u32::try_from(value).ok()) != Some(info.last_chunk_id)
     {
         bail!("ANN sidecar metadata for source `{source_id}` does not match the staged database");
     }
@@ -1448,6 +1488,8 @@ fn verify_ann_db_content(
         || actual.corpus_id != info.corpus_id
         || actual.embedding_set_sha256 != info.embedding_set_sha256
         || actual.vector_count != info.vector_count
+        || actual.first_chunk_id != info.first_chunk_id
+        || actual.last_chunk_id != info.last_chunk_id
     {
         bail!("ANN sidecar embedding digest for source `{source_id}` does not match the staged database");
     }
@@ -3020,20 +3062,18 @@ mod security_tests {
                     source_id: source_id.clone(),
                     format: crate::ann::ANN_FORMAT.to_string(),
                     format_version: crate::ann::ANN_FORMAT_VERSION,
-                    library: crate::ann::ANN_LIBRARY.to_string(),
-                    library_version: crate::ann::ANN_LIBRARY_VERSION.to_string(),
                     path: crate::ann::sidecar_manifest_path(&source_id),
                     sha256: digit.repeat(64),
-                    size: 1,
+                    size: crate::ann::expected_sidecar_size(1)
+                        .expect("single-vector sidecar layout"),
                     corpus_id: format!("sha256:{}", digit.repeat(64)),
                     embedding_model_id: EMBEDDING_MODEL_ID.to_string(),
+                    embedding_model_fingerprint: crate::EMBEDDING_MODEL_FINGERPRINT.to_string(),
                     embedding_dimension: crate::EMBEDDING_DIM as u32,
                     embedding_set_sha256: digit.repeat(64),
                     vector_count: 1,
-                    seed: crate::ann::ANN_SEED,
-                    rng: crate::ann::ANN_RNG.to_string(),
-                    trees: crate::ann::ANN_TREES as u32,
-                    split_after: crate::ann::ANN_SPLIT_AFTER as u32,
+                    first_chunk_id: 1,
+                    last_chunk_id: 1,
                     id_encoding: crate::ann::ANN_ID_ENCODING.to_string(),
                     metric: crate::ann::ANN_METRIC.to_string(),
                 };

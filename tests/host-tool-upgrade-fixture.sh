@@ -10,12 +10,14 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
   && -f /fixture-input/install-host.sh \
   && -f /fixture-input/legal-mcp-host-deploy \
   && -f /fixture-input/legal-mcp-publisher-command \
+  && -f /fixture-input/host-tool-launcher-v0.19.5 \
+  && -f /fixture-input/Caddyfile \
   && -f /fixture-input/Containerfile ]] || {
   echo 'fixture requires a disposable root container and mounted inputs' >&2
   exit 2
 }
 
-version=0.19.6
+version=0.19.7
 revision=1111111111111111111111111111111111111111
 generation=1a6beead567b55babebbe253b5ae13efcd9ce2e8ab55b60c2de4106e39f180f4
 volume_uuid=11111111-2222-3333-4444-555555555555
@@ -42,6 +44,7 @@ configure_auth=/usr/local/sbin/legal-mcp-configure-auth
 update_image=/usr/local/sbin/legal-mcp-update-image
 container_template=/usr/local/libexec/legal-mcp/legal-mcp.container.template
 rendered_quadlet=/etc/containers/systemd/legal-mcp.container
+caddyfile=/etc/caddy/Caddyfile
 host_tool_launcher=/usr/local/libexec/legal-mcp/host-tool-launcher
 launcher_marker=/etc/legal-mcp/host-tool-launcher
 configure_pointer=/etc/legal-mcp/configure-auth-implementation
@@ -49,6 +52,7 @@ update_pointer=/etc/legal-mcp/update-image-implementation
 implementation_dir=/usr/local/libexec/legal-mcp/host-tools
 auth_ready=/etc/legal-mcp/auth-ready
 sudoers=/etc/sudoers.d/legal-mcp-publisher
+v0195_launcher=/fixture-input/host-tool-launcher-v0.19.5
 
 for command_name in flock getfacl groupadd mknod python3 setfacl sudo useradd visudo; do
   command -v "$command_name" >/dev/null || {
@@ -65,6 +69,8 @@ install -o root -g root -m 0755 /fixture-input/legal-mcp-host-deploy \
 install -o root -g root -m 0755 /fixture-input/legal-mcp-publisher-command \
   "$bundle/scripts/legal-mcp-publisher-command"
 install -o root -g root -m 0644 /fixture-input/Containerfile "$bundle/Containerfile"
+install -o root -g root -m 0644 /fixture-input/Caddyfile \
+  "$bundle/infra/hosting/Caddyfile"
 cat > /tmp/new-configure-auth <<'EOF'
 #!/usr/bin/bash
 printf '%s\n' new-configure-auth
@@ -92,7 +98,7 @@ if [[ "$1" = --version ]]; then
   if [[ -e /tmp/wrong-release-binary ]]; then
     printf '%s\n' 'legal-mcp 9.9.9'
   else
-    printf '%s\n' 'legal-mcp 0.19.6'
+    printf '%s\n' 'legal-mcp 0.19.7'
   fi
   exit 0
 fi
@@ -153,9 +159,8 @@ chmod 644 "$rendered_quadlet"
 printf '{"keys":[],"version":1}\n' > /etc/legal-mcp/api-keys.json
 chown legal-mcp:legal-mcp /etc/legal-mcp/api-keys.json
 chmod 400 /etc/legal-mcp/api-keys.json
-printf '%s\n' fixture-caddy > /etc/caddy/Caddyfile
-chown root:caddy /etc/caddy/Caddyfile
-chmod 640 /etc/caddy/Caddyfile
+printf '%s\n' fixture-caddy > /tmp/old-Caddyfile
+install -o root -g caddy -m 0640 /tmp/old-Caddyfile "$caddyfile"
 install -d -o root -g legal-mcp-publisher -m 0710 /var/lib/legal-mcp-publisher/.ssh
 printf '%s\n' \
   'restrict,command="/usr/local/sbin/legal-mcp-publisher-command" ssh-ed25519 AAAA fixture' \
@@ -351,6 +356,8 @@ case "$point:$target" in
   build-configure-auth:/etc/legal-mcp/.host-tools-transaction.building/configure-auth) matched=true ;;
   build-update-image:/etc/legal-mcp/.host-tools-transaction.building/update-image) matched=true ;;
   build-container-template:/etc/legal-mcp/.host-tools-transaction.building/container-template) matched=true ;;
+  build-rendered-quadlet:/etc/legal-mcp/.host-tools-transaction.building/rendered-quadlet) matched=true ;;
+  build-caddyfile:/etc/legal-mcp/.host-tools-transaction.building/Caddyfile) matched=true ;;
   build-sudoers:/etc/legal-mcp/.host-tools-transaction.building/publisher-sudoers) matched=true ;;
   build-marker:/etc/legal-mcp/.host-tools-transaction.building/marker-was-absent) matched=true ;;
   build-previous-manifest:/etc/legal-mcp/.host-tools-transaction.building/previous-sha256) matched=true ;;
@@ -434,6 +441,9 @@ case "$point:$target" in
     cmp --silent /tmp/new-container-template "$target" && matched=true
     ;;
   rendered-quadlet-installed:/etc/containers/systemd/legal-mcp.container) matched=true ;;
+  caddyfile-installed:/etc/caddy/Caddyfile)
+    cmp --silent /tmp/expected-new-Caddyfile "$target" && matched=true
+    ;;
   configure-pointer-installed:/etc/legal-mcp/configure-auth-implementation) matched=true ;;
   update-pointer-installed:/etc/legal-mcp/update-image-implementation) matched=true ;;
   launcher-marker-installed:/etc/legal-mcp/host-tool-launcher) matched=true ;;
@@ -448,6 +458,9 @@ case "$point:$target" in
     ;;
   rendered-quadlet-restored:/etc/containers/systemd/legal-mcp.container)
     cmp --silent /tmp/expected-old-rendered "$target" && matched=true
+    ;;
+  caddyfile-restored:/etc/caddy/Caddyfile)
+    cmp --silent /tmp/old-Caddyfile "$target" && matched=true
     ;;
   marker-installed:/etc/legal-mcp/host-tools) matched=true ;;
   transaction-retiring:/etc/legal-mcp/.host-tools-transaction.retiring) matched=true ;;
@@ -575,6 +588,7 @@ reset_old_state() {
   "$real_install" -o root -g root -m 0755 /tmp/old-configure-auth "$configure_auth"
   "$real_install" -o root -g root -m 0755 /tmp/old-update-image "$update_image"
   "$real_install" -o root -g root -m 0644 /tmp/old-container-template "$container_template"
+  "$real_install" -o root -g caddy -m 0640 /tmp/old-Caddyfile "$caddyfile"
   sed 's|__IMAGE_DIGEST__|ghcr.io/gunba/australian-legal-mcp@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|' \
     /tmp/old-container-template > "$rendered_quadlet"
   cp "$rendered_quadlet" /tmp/expected-old-rendered
@@ -591,6 +605,8 @@ reset_old_state() {
     "$bundle/infra/hosting/update-image.sh"
   "$real_install" -o root -g root -m 0644 /tmp/new-container-template \
     "$bundle/infra/hosting/legal-mcp.container.template"
+  "$real_install" -o root -g root -m 0644 /fixture-input/Caddyfile \
+    "$bundle/infra/hosting/Caddyfile"
   "$real_install" -o root -g root -m 0644 /fixture-input/Containerfile "$bundle/Containerfile"
   chmod 755 "$installer" "$bundle/legal-mcp"
   printf '%s\n' "$revision" > "$bundle/SOURCE_COMMIT"
@@ -639,10 +655,12 @@ assert_old_tools() {
   sed 's|__IMAGE_DIGEST__|ghcr.io/gunba/australian-legal-mcp@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|' \
     /tmp/old-container-template > /tmp/expected-old-rendered
   cmp --silent /tmp/expected-old-rendered "$rendered_quadlet"
+  cmp --silent /tmp/old-Caddyfile "$caddyfile"
   cmp --silent /tmp/old-sudoers "$sudoers"
   [[ "$(stat -c '%U:%G:%a' "$configure_auth")" = root:root:755 \
     && "$(stat -c '%U:%G:%a' "$update_image")" = root:root:755 \
-    && "$(stat -c '%U:%G:%a' "$container_template")" = root:root:644 ]]
+    && "$(stat -c '%U:%G:%a' "$container_template")" = root:root:644 \
+    && "$(stat -c '%U:%G:%a' "$caddyfile")" = root:caddy:640 ]]
   if [[ "$expected_old_marker" = present ]]; then
     cmp --silent /tmp/old-host-tools-marker /etc/legal-mcp/host-tools
   else
@@ -669,9 +687,13 @@ assert_new_tools() {
   sed 's|__IMAGE_DIGEST__|ghcr.io/gunba/australian-legal-mcp@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|' \
     "$bundle/infra/hosting/legal-mcp.container.template" > /tmp/expected-new-rendered
   cmp --silent /tmp/expected-new-rendered "$rendered_quadlet"
+  sed 's/__PUBLIC_HOST__/legal.example.com/g' \
+    "$bundle/infra/hosting/Caddyfile" > /tmp/expected-new-Caddyfile
+  cmp --silent /tmp/expected-new-Caddyfile "$caddyfile"
   [[ "$(stat -c '%U:%G:%a' "$configure_auth")" = root:root:755 \
     && "$(stat -c '%U:%G:%a' "$update_image")" = root:root:755 \
-    && "$(stat -c '%U:%G:%a' "$container_template")" = root:root:644 ]]
+    && "$(stat -c '%U:%G:%a' "$container_template")" = root:root:644 \
+    && "$(stat -c '%U:%G:%a' "$caddyfile")" = root:caddy:640 ]]
   [[ "$(stat -c '%U:%G:%a:%h:%s' "$configure_pointer")" = root:root:644:1:64 \
     && "$(stat -c '%U:%G:%a:%h:%s' "$update_pointer")" = root:root:644:1:64 ]]
   configure_sha="$(<"$configure_pointer")"
@@ -710,7 +732,7 @@ write_expected_hash_manifest() {
   local deploy_file="$1" publisher_file="$2" auth_file="$3" image_file="$4"
   local template_file="$5" rendered_file="$6" sudoers_file="$7" marker_file="$8"
   local launcher_file="$9" launcher_marker_file="${10}" auth_pointer_file="${11}"
-  local image_pointer_file="${12}" destination="${13}"
+  local image_pointer_file="${12}" caddy_file="${13}" destination="${14}"
   file_hash() { if [[ "$1" = - ]]; then printf '%s\n' -; else sha256sum "$1" | awk '{print $1}'; fi; }
   cat > "$destination" <<EOF
 HOST_DEPLOY_SHA256=$(file_hash "$deploy_file")
@@ -725,6 +747,7 @@ LAUNCHER_SHA256=$(file_hash "$launcher_file")
 LAUNCHER_MARKER_SHA256=$(file_hash "$launcher_marker_file")
 CONFIGURE_AUTH_POINTER_SHA256=$(file_hash "$auth_pointer_file")
 UPDATE_IMAGE_POINTER_SHA256=$(file_hash "$image_pointer_file")
+CADDYFILE_SHA256=$(file_hash "$caddy_file")
 EOF
 }
 
@@ -755,6 +778,8 @@ EOF
   chmod 444 /tmp/expected-new-marker
   sed 's|__IMAGE_DIGEST__|ghcr.io/gunba/australian-legal-mcp@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|' \
     "$bundle/infra/hosting/legal-mcp.container.template" > /tmp/expected-new-rendered
+  sed 's/__PUBLIC_HOST__/legal.example.com/g' \
+    "$bundle/infra/hosting/Caddyfile" > /tmp/expected-new-Caddyfile
 }
 
 assert_v2_transaction() {
@@ -762,8 +787,8 @@ assert_v2_transaction() {
   [[ "$(stat -c '%U:%G:%a' "$path")" = root:root:700 ]]
   for name in kind target-version target-revision target-sha256 previous-sha256 \
     host-deploy publisher-command configure-auth update-image container-template \
-    rendered-quadlet publisher-sudoers configure-auth-device-inode \
-    update-image-device-inode; do
+    rendered-quadlet Caddyfile publisher-sudoers host-tool-launcher-device-inode \
+    configure-auth-device-inode update-image-device-inode; do
     [[ "$(stat -c '%U:%G:%a:%h' "$path/$name")" = root:root:600:1 ]]
   done
   [[ "$(<"$path/kind")" = LEGAL_MCP_HOST_TOOLS_TRANSACTION_V2 \
@@ -775,8 +800,10 @@ assert_v2_transaction() {
   cmp --silent /tmp/old-update-image "$path/update-image"
   cmp --silent /tmp/old-container-template "$path/container-template"
   cmp --silent /tmp/expected-old-rendered "$path/rendered-quadlet"
+  cmp --silent /tmp/old-Caddyfile "$path/Caddyfile"
   cmp --silent /tmp/old-sudoers "$path/publisher-sudoers"
   [[ -f "$path/launcher-was-absent" \
+    && "$(<"$path/host-tool-launcher-device-inode")" = - \
     && "$(<"$path/configure-auth-device-inode")" =~ ^[0-9]+:[0-9]+$ \
     && "$(<"$path/update-image-device-inode")" =~ ^[0-9]+:[0-9]+$ ]]
   if [[ "$marker_state" = present ]]; then
@@ -796,6 +823,8 @@ assert_v2_transaction() {
     "$path/target-sha256"
   grep -Fxq "RENDERED_QUADLET_SHA256=$(sha256sum /tmp/expected-new-rendered | awk '{print $1}')" \
     "$path/target-sha256"
+  grep -Fxq "CADDYFILE_SHA256=$(sha256sum /tmp/expected-new-Caddyfile | awk '{print $1}')" \
+    "$path/target-sha256"
   launcher_sha="$(awk -F= '$1 == "LAUNCHER_SHA256" {print $2}' "$path/target-sha256")"
   [[ "$launcher_sha" =~ ^[0-9a-f]{64}$ ]]
   grep -Fxq "CONFIGURE_AUTH_ENTRYPOINT_SHA256=$launcher_sha" "$path/target-sha256"
@@ -803,7 +832,7 @@ assert_v2_transaction() {
   write_expected_hash_manifest /tmp/old-host-deploy /tmp/old-publisher \
     /tmp/old-configure-auth /tmp/old-update-image /tmp/old-container-template \
     /tmp/expected-old-rendered /tmp/old-sudoers "$previous_marker" \
-    - - - - /tmp/expected-previous-sha256
+    - - - - /tmp/old-Caddyfile /tmp/expected-previous-sha256
   cmp --silent /tmp/expected-previous-sha256 "$path/previous-sha256"
 }
 
@@ -826,12 +855,13 @@ touch /tmp/wrong-release-binary
 expect_upgrade_failed
 assert_old_tools
 
-# Every v0.19.6 release asset is mandatory, has its exact executable/data
+# Every v0.19.7 release asset is mandatory, has its exact executable/data
 # mode, and must be a single safe file from the version-matched bundle.
 for release_asset in \
   "$bundle/infra/hosting/configure-auth.sh" \
   "$bundle/infra/hosting/update-image.sh" \
-  "$bundle/infra/hosting/legal-mcp.container.template"; do
+  "$bundle/infra/hosting/legal-mcp.container.template" \
+  "$bundle/infra/hosting/Caddyfile"; do
   reset_old_state
   chmod 777 "$release_asset"
   expect_upgrade_failed
@@ -886,7 +916,7 @@ expect_upgrade_failed
 assert_old_tools
 
 # LIFECYCLE_LOCK was durably created by the failed v0.19.0 activation before
-# generation validation. V0.19.6 treats that exact empty root-owned file as
+# generation validation. V0.19.7 treats that exact empty root-owned file as
 # installed state, while rejecting every unsafe identity and representation.
 reset_old_state
 "$real_rm" -f -- "$lifecycle_lock"
@@ -1006,6 +1036,37 @@ sed -i 's/LEGAL_MCP_HTTP_AUTH=api-key/LEGAL_MCP_HTTP_AUTH=disabled/' \
   /etc/legal-mcp/runtime.env
 assert_old_tools
 
+# An explicit public-host operation makes a monotonic, fail-closed transition
+# to configured-dark, upgrades the complete tool/Caddy set, and never republishes
+# auth-ready or ingress. The authentication tool must perform the later proof.
+reset_old_state
+write_activated_dark_state
+sed -i 's/LEGAL_MCP_HTTP_AUTH=disabled/LEGAL_MCP_HTTP_AUTH=api-key/' \
+  /etc/legal-mcp/runtime.env
+printf '%s\n' '{"keys":[{"id":"current","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}],"version":1}' \
+  > /etc/legal-mcp/api-keys.json
+install -o root -g root -m 0444 /dev/null "$auth_ready"
+touch /tmp/service-active /tmp/caddy-enabled /tmp/caddy-active /tmp/ufw-web-open
+expect_upgrade_failed
+[[ -e "$auth_ready" && -e /tmp/service-active \
+  && -e /tmp/caddy-enabled && -e /tmp/caddy-active \
+  && -e /tmp/ufw-web-open ]]
+
+reset_old_state
+write_activated_dark_state
+sed -i 's/LEGAL_MCP_HTTP_AUTH=disabled/LEGAL_MCP_HTTP_AUTH=api-key/' \
+  /etc/legal-mcp/runtime.env
+printf '%s\n' '{"keys":[{"id":"current","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}],"version":1}' \
+  > /etc/legal-mcp/api-keys.json
+install -o root -g root -m 0444 /dev/null "$auth_ready"
+touch /tmp/service-active /tmp/caddy-enabled /tmp/caddy-active /tmp/ufw-web-open
+output="$("$installer" --upgrade-host-tools --version "$version" --from-public)"
+[[ "$output" = "host tools upgraded to $version ($revision); service and ingress remain off" ]]
+[[ ! -e "$auth_ready" && ! -e /tmp/service-active \
+  && ! -e /tmp/caddy-enabled && ! -e /tmp/caddy-active \
+  && ! -e /tmp/ufw-web-open ]]
+assert_new_tools
+
 reset_old_state
 write_activated_dark_state
 printf '{"keys":[{"id":"old","sha256":"%064d"}],"version":1}\n' 0 \
@@ -1067,6 +1128,8 @@ for host_transaction in \
   /etc/legal-mcp/.image-transaction \
   /etc/legal-mcp/.image-transaction.preparing \
   /etc/legal-mcp/.image-transaction.preparing-retired \
+  /etc/legal-mcp/.image-transaction.flat-int8-preparing \
+  /etc/legal-mcp/.image-transaction.flat-int8-preparing-retired \
   /etc/legal-mcp/.image-transaction.retiring \
   /etc/legal-mcp/.image-transaction.retired; do
   reset_old_state
@@ -1155,7 +1218,7 @@ kill_upgrade_at() {
 # retires and removes them before any live host-tool mutation.
 for point in build-directory build-directory-owner build-directory-mode \
   build-host-deploy build-publisher build-configure-auth build-update-image \
-  build-container-template build-sudoers build-metadata-written \
+  build-container-template build-rendered-quadlet build-caddyfile build-sudoers build-metadata-written \
   build-metadata-mode build-marker build-previous-manifest \
   build-target-manifest build-synced; do
   kill_upgrade_at "$point"
@@ -1226,7 +1289,7 @@ assert_old_tools
 # Every durable pre-commit mutation point is SIGKILL recoverable without phase
 # files or temporaries inside the exact-whitelisted transaction directory.
 for point in transaction-prepared publisher-locked deploy-installed \
-  container-template-installed rendered-quadlet-installed launcher-installed \
+  container-template-installed rendered-quadlet-installed caddyfile-installed launcher-installed \
   configure-launcher-installed update-launcher-installed configure-pointer-installed \
   update-pointer-installed launcher-marker-installed marker-installed; do
   kill_upgrade_at "$point"
@@ -1293,7 +1356,7 @@ assert_old_tools
 # durable; it is restored last behind a publisher-restore sentinel.
 for point in rollback-retiring rollback-retired publisher-restore \
   configure-auth-restored update-image-restored container-template-restored \
-  rendered-quadlet-restored \
+  rendered-quadlet-restored caddyfile-restored \
   publisher-restored publisher-restore-retired rollback-delete; do
   kill_upgrade_at policy-installed
   printf '%s\n' "$point" > /tmp/kill-host-tool-after
@@ -1485,6 +1548,107 @@ grep -Fxq 'interrupted host-tool upgrade rolled back' \
   && "$(stat -c '%d:%i' "$configure_auth")" = "$configure_identity" \
   && "$(stat -c '%d:%i' "$update_image")" = "$update_identity" ]]
 cmp --silent /tmp/stable-host-tools-before-recovery /etc/legal-mcp/host-tools
+
+# v0.19.5 already had stable entrypoints, but its launcher bytes predate this
+# release. The launcher triplet, marker, pointers, and exact identities are a
+# saved rollback set rather than an immutable-across-releases assumption.
+install_v0195_launcher_state() {
+  local launcher_sha
+  launcher_sha="$(sha256sum "$v0195_launcher" | awk '{print $1}')"
+  for path in "$host_tool_launcher" "$configure_auth" "$update_image"; do
+    "$real_install" -o root -g root -m 0755 "$v0195_launcher" "$path"
+  done
+  cat > "$launcher_marker" <<EOF
+LEGAL_MCP_HOST_TOOL_LAUNCHER_V1
+LAUNCHER_SHA256=$launcher_sha
+EOF
+  chown root:root "$launcher_marker"
+  chmod 444 "$launcher_marker"
+  sed -i 's/^VERSION=.*/VERSION=0.19.5/' /etc/legal-mcp/host-tools
+}
+
+assert_v0195_launcher_state() {
+  local launcher_sha path
+  launcher_sha="$(sha256sum "$v0195_launcher" | awk '{print $1}')"
+  for path in "$host_tool_launcher" "$configure_auth" "$update_image"; do
+    cmp --silent "$v0195_launcher" "$path"
+    [[ "$(stat -c '%U:%G:%a:%h' "$path")" = root:root:755:1 ]]
+  done
+  [[ "$(<"$launcher_marker")" = $'LEGAL_MCP_HOST_TOOL_LAUNCHER_V1\nLAUNCHER_SHA256='"$launcher_sha" \
+    && "$(stat -c '%U:%G:%a:%h' "$launcher_marker")" = root:root:444:1 ]]
+  grep -Fxq 'VERSION=0.19.5' /etc/legal-mcp/host-tools
+}
+
+install_v0195_launcher_state
+assert_v0195_launcher_state
+v0195_sha="$(sha256sum "$v0195_launcher" | awk '{print $1}')"
+v0195_launcher_identity="$(stat -c '%d:%i' "$host_tool_launcher")"
+v0195_configure_identity="$(stat -c '%d:%i' "$configure_auth")"
+v0195_update_identity="$(stat -c '%d:%i' "$update_image")"
+kill_upgrade_at launcher-installed preserve
+[[ -d "$transaction" && -f "$transaction/launcher-was-present" \
+  && "$(<"$transaction/host-tool-launcher-device-inode")" = "$v0195_launcher_identity" \
+  && "$(<"$transaction/configure-auth-device-inode")" = "$v0195_configure_identity" \
+  && "$(<"$transaction/update-image-device-inode")" = "$v0195_update_identity" ]]
+cmp --silent "$v0195_launcher" "$transaction/host-tool-launcher"
+cmp --silent "$v0195_launcher" "$transaction/configure-auth"
+cmp --silent "$v0195_launcher" "$transaction/update-image"
+grep -Fxq "LAUNCHER_SHA256=$v0195_sha" "$transaction/previous-sha256"
+grep -Fxq "CONFIGURE_AUTH_ENTRYPOINT_SHA256=$v0195_sha" \
+  "$transaction/previous-sha256"
+grep -Fxq "UPDATE_IMAGE_ENTRYPOINT_SHA256=$v0195_sha" \
+  "$transaction/previous-sha256"
+"$installer" --recover-host-tools --version "$version" \
+  >/tmp/v0195-launcher-recovery.stdout
+grep -Fxq 'interrupted host-tool upgrade rolled back' \
+  /tmp/v0195-launcher-recovery.stdout
+assert_v0195_launcher_state
+[[ ! -e "$transaction" ]]
+
+# Reproduce the old-launcher deadlock exactly: the upgrader owns the host lock,
+# a v0.19.5 entrypoint opens its script and blocks on that lock, and the
+# upgrader must replace all three launchers, SIGKILL the retired process by
+# saved open-file hash, reap it, and finish without waiting for the lock holder.
+mkfifo /tmp/migration-installer-ready /tmp/migration-installer-release
+printf '%s\n' pause-after-deploy > /tmp/kill-host-tool-after
+"$installer" --upgrade-host-tools --version "$version" \
+  >/tmp/v0195-live-upgrade.stdout 2>/tmp/v0195-live-upgrade.stderr &
+v0195_upgrade_pid=$!
+read -r migration_ready < /tmp/migration-installer-ready
+[[ "$migration_ready" = ready ]]
+"$configure_auth" --recover \
+  >/tmp/v0195-blocked.stdout 2>/tmp/v0195-blocked.stderr &
+v0195_blocked_pid=$!
+while :; do
+  kill -0 "$v0195_blocked_pid" 2>/dev/null || {
+    echo 'v0.19.5 launcher exited before blocking on the upgrade lock' >&2
+    exit 1
+  }
+  old_launcher_is_open=false
+  for descriptor in "/proc/$v0195_blocked_pid"/fd/*; do
+    if [[ -f "$descriptor" \
+      && "$(sha256sum "$descriptor" 2>/dev/null | awk '{print $1}')" = "$v0195_sha" ]]; then
+      old_launcher_is_open=true
+      break
+    fi
+  done
+  [[ "$old_launcher_is_open" = false ]] || break
+done
+printf '%s\n' release > /tmp/migration-installer-release
+wait "$v0195_upgrade_pid"
+set +e
+wait "$v0195_blocked_pid"
+v0195_blocked_status=$?
+set -e
+"$real_rm" -f /tmp/kill-host-tool-after /tmp/migration-installer-ready \
+  /tmp/migration-installer-release
+[[ $v0195_blocked_status -ne 0 ]]
+grep -Fxq "host tools upgraded to $version ($revision); service and ingress remain off" \
+  /tmp/v0195-live-upgrade.stdout
+assert_new_tools
+[[ "$(stat -c '%d:%i' "$host_tool_launcher")" != "$v0195_launcher_identity" \
+  && "$(stat -c '%d:%i' "$configure_auth")" != "$v0195_configure_identity" \
+  && "$(stat -c '%d:%i' "$update_image")" != "$v0195_update_identity" ]]
 
 # Execute the stable launcher in the unprivileged fixture with deterministic
 # mount-namespace adapters. The mock implementations prove a second contender

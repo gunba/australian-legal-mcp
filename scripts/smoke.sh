@@ -123,16 +123,17 @@ help_text="$("$BIN" --help 2>&1)"
 
 # Subcommands that MUST be present.
 for cmd in mcp serve activate rollback prune-generations stats verify search fetch \
-	get-definition build source-update tree-crawl snapshot-reduce link-download \
-	scrape-diff help; do
-	if grep -qE "^[[:space:]]+${cmd}[[:space:]]" <<<"$help_text"; then
+	get-definition build derive-schema11-from-schema10 \
+	derive-flat-int8-from-schema11-arroy-v20 source-update tree-crawl \
+	snapshot-reduce link-download scrape-diff help; do
+	if grep -qE "^[[:space:]]+${cmd}([[:space:]]|$)" <<<"$help_text"; then
 		ok "subcommand present: $cmd"
 	else
 		bad "subcommand missing: $cmd"
 	fi
 done
 for removed in update package-corpus publish-release; do
-	if grep -qE "^[[:space:]]+${removed}[[:space:]]" <<<"$help_text"; then
+	if grep -qE "^[[:space:]]+${removed}([[:space:]]|$)" <<<"$help_text"; then
 		bad "removed subcommand unexpectedly present: $removed"
 	else
 		ok "removed subcommand absent: $removed"

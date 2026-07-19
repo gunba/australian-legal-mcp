@@ -29,11 +29,12 @@ to the Akamai/Linode VPS. A one-shot copy of the exact serving image validates
 and activates it. The serving container never scrapes, embeds, builds, or
 publishes corpus/model artifacts, and the image contains no corpus. GitHub
 Releases are binary-only; GHCR images are digest-pinned and attested. V20 is
-active on the current Linode, but authentication is disabled,
-`legal-mcp.service` is inactive, Caddy is disabled/inactive, and UFW 80/443 are
-closed. One known v0.19.2 authentication transaction remains for explicit
-one-shot recovery; there is no deployment or image transaction or upload
-authorization. Do not describe it as live.
+active and live on the current Linode behind authenticated Caddy TLS. API-key
+cutover, exact routes, reboot recovery, all-seven-tool/all-ten-source retrieval,
+and key rotation/revocation passed on 2026-07-19. No deployment,
+authentication, image, host-tool, upload, or upload-authorization transaction
+remains. Do not expose plaintext credentials or describe the temporary Linode
+hostname as permanent production DNS.
 
 ## Design principles
 
@@ -129,9 +130,11 @@ and CUDA fallback, profiles `1x1` through `64x512`, and
 `Represent this sentence for searching relevant passages: `. Split losslessly
 at 512 tokens; store normalized int8 first-256-dimension vectors.
 
-ANN proposes candidates; SQLite vectors are authoritative for exact reranking.
-Keep deterministic Arroy construction and source-qualified schema 11. Schema
-11 makes `chunks_fts` a contentless-delete FTS5 table while preserving the
+Each source has one deterministic exact flat int8 sidecar with a fixed 4 KiB
+header, sorted u32 chunk IDs, and contiguous 256-byte vectors. A bounded global
+four-thread scan pool proposes exact top candidates; SQLite vectors remain
+authoritative for reranking. Keep source-qualified schema 11. Schema 11 makes
+`chunks_fts` a contentless-delete FTS5 table while preserving the
 authoritative chunk text in `chunks` and binding FTS postings/BM25 metadata by
 digest.
 
@@ -158,22 +161,23 @@ scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
 
-Software is 0.19.6. V20
-`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` is active
-locally and on the Linode after the v0.19.2 publisher-tool repair and
-activation succeeded. Retain its local v19 parent with the matching v0.18.1
-binary/image as the schema-10 fallback; the schema-11 binary must not attempt
-to roll back to schema 10.
+Software is 0.19.7. Chunker-format-6 flat-int8 v22
+`937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939` is active
+and strictly verified locally. Arroy v20
+`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` remains
+active on the Linode until the coordinated image/generation cutover. Retain the
+local v19 parent with its matching v0.18.1 binary/image as the schema-10
+disaster-recovery fallback; the schema-11 binary must not attempt to roll back
+to schema 10.
 
-V0.19.6 hard-cuts host tools to one V2 transaction. It accepts either the
-prepared-bootstrap or activated-dark state and atomically binds the publisher
-helper, wrapper, sudoers, auth/image helpers, installed Quadlet template, and
-V2 marker/hashes to the exact version, `SOURCE_COMMIT`, release bytes, and
-shared host lock. Recovery must use the same bundle. It fixes generated-Quadlet
-auth state handling and leaves the application and ingress off. Do not claim a
-v0.19.6 release exists: once its immutable bundle is available, verify it,
-upgrade with `--upgrade-host-tools --version 0.19.6`, configure authentication,
-then move the image by verified digest.
+Immutable v0.19.6 release assets and OCI attestations exist and were
+independently verified. Its V2 host-tool transaction accepts only
+prepared-bootstrap or activated-dark state, binds exact release bytes and the
+shared host lock, and recovers only with the same bundle. The live host remains
+on verified v0.19.5 host tools and the immutable v0.19.0 runtime image because
+the latter contains the same Rust/crate source as v0.19.6; aligning those
+version labels is a future activated-dark maintenance operation, not a reason
+to interrupt the working endpoint.
 
 Manual recovery uses `activate`, `verify`, `rollback`, and
 `prune-generations`. There is no runtime `update`, corpus download, corpus/model
@@ -215,7 +219,7 @@ LEGAL_MCP_DATA_DIR="$PWD/data/runtime" scripts/smoke.sh
 
 Also prove failed activation preserves the prior pointer, rollback, pruning,
 exact-generation `/readyz`, service restart persistence, all-source retrieval,
-and per-source ANN recall ≥ 0.99 at 50.
+and sampled per-source top-50 IDs/raw scores exactly match a SQLite reference.
 
 ## Troubleshooting
 

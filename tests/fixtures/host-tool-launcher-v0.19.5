@@ -1,0 +1,626 @@
+#!/usr/bin/env bash
+# Stable lock-first dispatcher for immutable authentication and image helpers.
+set -euo pipefail
+umask 077
+ulimit -c 0
+export LC_ALL=C
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+LOCK_FILE=/run/lock/legal-mcp-host-transaction.lock
+CANONICAL=/usr/local/libexec/legal-mcp/host-tool-launcher
+CONFIGURE=/usr/local/sbin/legal-mcp-configure-auth
+UPDATE=/usr/local/sbin/legal-mcp-update-image
+MARKER=/etc/legal-mcp/host-tool-launcher
+CONFIGURE_POINTER=/etc/legal-mcp/configure-auth-implementation
+UPDATE_POINTER=/etc/legal-mcp/update-image-implementation
+IMPLEMENTATION_DIR=/usr/local/libexec/legal-mcp/host-tools
+HOST_TOOLS_MARKER=/etc/legal-mcp/host-tools
+HOST_DEPLOY=/usr/local/sbin/legal-mcp-host-deploy
+PUBLISHER=/usr/local/sbin/legal-mcp-publisher-command
+SUDOERS=/etc/sudoers.d/legal-mcp-publisher
+TEMPLATE=/usr/local/libexec/legal-mcp/legal-mcp.container.template
+QUADLET=/etc/containers/systemd/legal-mcp.container
+IMAGE=/etc/legal-mcp/image
+AUTH_READY=/etc/legal-mcp/auth-ready
+AUTH_PERMIT=/run/legal-mcp/auth-configuring
+DISPATCH=/run/legal-mcp/host-tool-launcher-dispatch
+DISPATCH_RETIRING=${DISPATCH}.retiring
+DISPATCH_RETIRED=${DISPATCH}.retired
+
+absent() { [[ ! -e "$1" && ! -L "$1" ]]; }
+
+require_file() {
+  local path="$1" owner="$2" group="$3" mode="$4" size="${5:--}"
+  [[ -f "$path" && ! -L "$path" \
+    && "$(stat -c '%U:%G:%a:%h' "$path")" = "$owner:$group:$mode:1" ]] || return 1
+  [[ "$size" = - || "$(stat -c '%s' "$path")" = "$size" ]] || return 1
+}
+
+start_time() {
+  python3 - "$1" <<'PY'
+import pathlib, sys
+value = pathlib.Path(f"/proc/{sys.argv[1]}/stat").read_text()
+fields = value.rpartition(") ")[2].split()
+if len(fields) < 20 or not fields[19].isdigit():
+    raise SystemExit(1)
+print(fields[19])
+PY
+}
+
+strict_auth_ready() {
+  if require_file "$AUTH_READY" root root 444 0 \
+    && [[ "$(getfacl --absolute-names --numeric --omit-header "$AUTH_READY")" \
+      = $'user::r--\ngroup::r--\nother::r--' ]]; then return 0; fi
+  require_file "$AUTH_PERMIT" root root 400 || return 1
+  [[ "$(getfacl --absolute-names --numeric --omit-header "$AUTH_PERMIT")" \
+    = $'user::r--\ngroup::---\nother::---' ]] || return 1
+  local permit_pid permit_start actual_start uid_line cmdline
+  read -r permit_pid permit_start < "$AUTH_PERMIT" || return 1
+  [[ "$permit_pid" =~ ^[1-9][0-9]*$ && "$permit_start" =~ ^[1-9][0-9]*$ \
+    && "$(wc -w < "$AUTH_PERMIT")" = 2 ]] || return 1
+  actual_start="$(start_time "$permit_pid" 2>/dev/null)" || return 1
+  [[ "$actual_start" = "$permit_start" ]] || return 1
+  uid_line="$(awk '$1 == "Uid:" {print $2 ":" $3 ":" $4 ":" $5}' "/proc/$permit_pid/status")" || return 1
+  [[ "$uid_line" = 0:0:0:0 ]] || return 1
+  cmdline="$(tr '\0' '\n' < "/proc/$permit_pid/cmdline")" || return 1
+  grep -Fxq -- '--legal-mcp-launcher-internal' <<< "$cmdline" \
+    && grep -Fxq configure-auth <<< "$cmdline"
+}
+
+if [[ "${1:-}" = --check-auth-ready ]]; then
+  [[ $# -eq 1 && $EUID -eq 0 ]] || exit 1
+  strict_auth_ready
+  exit
+fi
+
+require_launcher_set() {
+  local -a values
+  require_file "$MARKER" root root 444 || return 1
+  mapfile -t values < "$MARKER"
+  [[ ${#values[@]} -eq 2 \
+    && "${values[0]}" = LEGAL_MCP_HOST_TOOL_LAUNCHER_V1 \
+    && "${values[1]}" =~ ^LAUNCHER_SHA256=([0-9a-f]{64})$ ]] || return 1
+  LAUNCHER_SHA256="${BASH_REMATCH[1]}"
+  local path
+  for path in "$CANONICAL" "$CONFIGURE" "$UPDATE"; do
+    require_file "$path" root root 755 || return 1
+    [[ "$(sha256sum "$path" | awk '{print $1}')" = "$LAUNCHER_SHA256" ]] || return 1
+  done
+}
+
+read_implementation() {
+  local pointer="$1" name="$2" value path
+  require_file "$pointer" root root 644 64 || return 1
+  [[ "$(getfacl --absolute-names --numeric --omit-header "$pointer")" \
+    = $'user::rw-\ngroup::r--\nother::r--' ]] || return 1
+  value="$(<"$pointer")"
+  [[ "$value" =~ ^[0-9a-f]{64}$ ]] || return 1
+  path="$IMPLEMENTATION_DIR/$name.$value"
+  require_file "$path" root root 755 || return 1
+  [[ "$(sha256sum "$path" | awk '{print $1}')" = "$value" ]] || return 1
+  printf '%s\n' "$value"
+}
+
+require_v2_release_binding() {
+  local configure_digest="$1" update_digest="$2" rendered
+  local deploy_sha publisher_sha template_sha sudoers_sha image
+  local -a values image_values
+  require_file "$HOST_TOOLS_MARKER" root root 444 || return 1
+  mapfile -t values < "$HOST_TOOLS_MARKER"
+  [[ ${#values[@]} -eq 9 \
+    && "${values[0]}" = LEGAL_MCP_HOST_TOOLS_V2 \
+    && "${values[1]}" =~ ^VERSION=[0-9]+\.[0-9]+\.[0-9]+$ \
+    && "${values[2]}" =~ ^SOURCE_COMMIT=[0-9a-f]{40}$ \
+    && "${values[3]}" =~ ^HOST_DEPLOY_SHA256=([0-9a-f]{64})$ ]] || return 1
+  deploy_sha="${BASH_REMATCH[1]}"
+  [[ "${values[4]}" =~ ^PUBLISHER_COMMAND_SHA256=([0-9a-f]{64})$ ]] || return 1
+  publisher_sha="${BASH_REMATCH[1]}"
+  [[ "${values[5]}" = "CONFIGURE_AUTH_SHA256=$configure_digest" \
+    && "${values[6]}" = "UPDATE_IMAGE_SHA256=$update_digest" \
+    && "${values[7]}" =~ ^CONTAINER_TEMPLATE_SHA256=([0-9a-f]{64})$ ]] || return 1
+  template_sha="${BASH_REMATCH[1]}"
+  [[ "${values[8]}" =~ ^SUDOERS_SHA256=([0-9a-f]{64})$ ]] || return 1
+  sudoers_sha="${BASH_REMATCH[1]}"
+  require_file "$HOST_DEPLOY" root root 755 || return 1
+  require_file "$PUBLISHER" root root 755 || return 1
+  require_file "$SUDOERS" root root 440 || return 1
+  require_file "$TEMPLATE" root root 644 || return 1
+  require_file "$QUADLET" root root 644 || return 1
+  require_file "$IMAGE" root root 600 || return 1
+  [[ "$(sha256sum "$HOST_DEPLOY" | awk '{print $1}')" = "$deploy_sha" \
+    && "$(sha256sum "$PUBLISHER" | awk '{print $1}')" = "$publisher_sha" \
+    && "$(sha256sum "$SUDOERS" | awk '{print $1}')" = "$sudoers_sha" \
+    && "$(sha256sum "$TEMPLATE" | awk '{print $1}')" = "$template_sha" ]] || return 1
+  mapfile -t image_values < "$IMAGE"
+  [[ ${#image_values[@]} -eq 1 \
+    && "${image_values[0]}" =~ ^ghcr\.io/gunba/australian-legal-mcp@sha256:[0-9a-f]{64}$ ]] || return 1
+  image="${image_values[0]}"
+  [[ "$(grep -o '__IMAGE_DIGEST__' "$TEMPLATE" | wc -l)" = 1 \
+    && "$(grep -Fxc 'ExecCondition=/usr/local/libexec/legal-mcp/host-tool-launcher --check-auth-ready' \
+      "$TEMPLATE")" = 1 ]] || return 1
+  rendered="$(mktemp /run/legal-mcp-launcher-quadlet.XXXXXX)"
+  sed "s|__IMAGE_DIGEST__|$image|g" "$TEMPLATE" > "$rendered"
+  if ! cmp --silent "$rendered" "$QUADLET"; then
+    rm -f "$rendered"
+    return 1
+  fi
+  rm -f "$rendered"
+}
+
+require_dispatch() {
+  local expected_pid="$1" expected_start="$2" expected_role="$3"
+  [[ -d "$DISPATCH" && ! -L "$DISPATCH" \
+    && "$(stat -c '%U:%G:%a' "$DISPATCH")" = root:root:700 ]] || return 1
+  local name
+  for name in pid start-time role configure-auth update-image; do
+    require_file "$DISPATCH/$name" root root 600 || return 1
+  done
+  [[ "$(<"$DISPATCH/pid")" = "$expected_pid" \
+    && "$(<"$DISPATCH/start-time")" = "$expected_start" \
+    && "$(<"$DISPATCH/role")" = "$expected_role" ]] || return 1
+  [[ -z "$(find "$DISPATCH" -mindepth 1 -maxdepth 1 \
+    ! -name pid ! -name start-time ! -name role ! -name configure-auth \
+    ! -name update-image -print -quit)" ]] || return 1
+}
+
+delete_dispatch_retirement() {
+  local path="$1"
+  absent "$path" && return 0
+  [[ -d "$path" && ! -L "$path" \
+    && "$(stat -c '%U:%G:%a' "$path")" = root:root:700 ]] || return 1
+  rm -rf --one-file-system -- "$path"
+  absent "$path"
+  sync -f /run/legal-mcp
+}
+
+reconcile_dispatch() {
+  if ! absent "$DISPATCH_RETIRING"; then
+    absent "$DISPATCH_RETIRED" || return 1
+    mv -T "$DISPATCH_RETIRING" "$DISPATCH_RETIRED"
+    sync -f /run/legal-mcp
+  fi
+  delete_dispatch_retirement "$DISPATCH_RETIRED"
+  if absent "$DISPATCH"; then
+    rm -f -- "$AUTH_PERMIT"
+    sync -f /run/legal-mcp
+    return 0
+  fi
+  [[ -d "$DISPATCH" && ! -L "$DISPATCH" \
+    && "$(stat -c '%U:%G:%a' "$DISPATCH")" = root:root:700 ]] || return 1
+  require_file "$DISPATCH/pid" root root 600 || return 1
+  require_file "$DISPATCH/start-time" root root 600 || return 1
+  local pid saved_start live_start
+  pid="$(<"$DISPATCH/pid")"
+  saved_start="$(<"$DISPATCH/start-time")"
+  [[ "$pid" =~ ^[1-9][0-9]*$ && "$saved_start" =~ ^[1-9][0-9]*$ ]] || return 1
+  live_start="$(start_time "$pid" 2>/dev/null || true)"
+  [[ -z "$live_start" || "$live_start" != "$saved_start" ]] || {
+    echo 'another immutable host-tool dispatch is active' >&2
+    return 1
+  }
+  rm -f -- "$AUTH_PERMIT"
+  sync -f /run/legal-mcp
+  absent "$DISPATCH_RETIRING" && absent "$DISPATCH_RETIRED" || return 1
+  mv -T "$DISPATCH" "$DISPATCH_RETIRING"
+  sync -f /run/legal-mcp
+  mv -T "$DISPATCH_RETIRING" "$DISPATCH_RETIRED"
+  sync -f /run/legal-mcp
+  delete_dispatch_retirement "$DISPATCH_RETIRED"
+}
+
+retire_dispatch() {
+  absent "$DISPATCH_RETIRING" && absent "$DISPATCH_RETIRED" || return 1
+  mv -T "$DISPATCH" "$DISPATCH_RETIRING"
+  sync -f /run/legal-mcp
+  mv -T "$DISPATCH_RETIRING" "$DISPATCH_RETIRED"
+  sync -f /run/legal-mcp
+  delete_dispatch_retirement "$DISPATCH_RETIRED"
+}
+
+auth_contract_ready() {
+  local runtime=/etc/legal-mcp/runtime.env verifier=/etc/legal-mcp/api-keys.json
+  local -a auth_values
+  require_file "$runtime" root root 600 || return 1
+  mapfile -t auth_values < <(awk -F= '$1 == "LEGAL_MCP_HTTP_AUTH" {print $2}' "$runtime")
+  [[ ${#auth_values[@]} -eq 1 \
+    && ( "${auth_values[0]}" = api-key || "${auth_values[0]}" = entra \
+      || "${auth_values[0]}" = entra+api-key ) ]] || return 1
+  require_file "$verifier" legal-mcp legal-mcp 400 || return 1
+  python3 - "$verifier" "${auth_values[0]}" <<'PY'
+import json, pathlib, sys
+value = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+if not isinstance(value, dict) or set(value) != {"keys", "version"} or value["version"] != 1:
+    raise SystemExit(1)
+keys = value["keys"]
+if not isinstance(keys, list) or len(keys) > 32:
+    raise SystemExit(1)
+if "api-key" in sys.argv[2] and not keys:
+    raise SystemExit(1)
+PY
+}
+
+strict_ready_marker() {
+  require_file "$AUTH_READY" root root 444 0 \
+    && [[ "$(getfacl --absolute-names --numeric --omit-header "$AUTH_READY")" \
+      = $'user::r--\ngroup::r--\nother::r--' ]]
+}
+
+auth_journal_states_absent() {
+  local found
+  found="$(find /etc/legal-mcp -mindepth 1 -maxdepth 1 \
+    -name '.auth-transaction*' -print -quit)" || return 1
+  [[ -z "$found" ]]
+}
+
+auth_journal_state_present() {
+  local found
+  found="$(find /etc/legal-mcp -mindepth 1 -maxdepth 1 \
+    -name '.auth-transaction*' -print -quit)" || return 1
+  [[ -n "$found" ]]
+}
+
+read_enablement() {
+  local unit="$1" output status
+  if output="$(systemctl is-enabled "$unit" 2>/dev/null)"; then status=0; else status=$?; fi
+  case "$status:$output" in
+    0:generated|0:enabled|1:disabled) printf '%s\n' "$output" ;;
+    *) return 1 ;;
+  esac
+}
+
+read_activity() {
+  local unit="$1" output status
+  if output="$(systemctl is-active "$unit" 2>/dev/null)"; then status=0; else status=$?; fi
+  case "$status:$output" in
+    0:active|3:inactive) printf '%s\n' "$output" ;;
+    *) return 1 ;;
+  esac
+}
+
+require_ufw_state() {
+  local expected="$1" admin report
+  require_file /etc/legal-mcp/admin-source-ip root root 600 || return 1
+  admin="$(</etc/legal-mcp/admin-source-ip)"
+  [[ "$admin" =~ ^[0-9A-Fa-f:.]{2,45}$ ]] || return 1
+  report="$(ufw status verbose)" || return 1
+  printf '%s\n' "$report" | python3 /dev/fd/3 "$admin" "$expected" 3<<'PY'
+import re, sys
+admin, expected = sys.argv[1:]
+report = sys.stdin.read().splitlines()
+if "Status: active" not in report:
+    raise SystemExit(1)
+if not any(re.fullmatch(r"Default: deny \(incoming\), allow \(outgoing\), (?:disabled|deny) \(routed\)", line) for line in report):
+    raise SystemExit(1)
+rules = []
+for line in report:
+    for action in ("ALLOW IN", "DENY IN", "REJECT IN", "LIMIT IN"):
+        if action in line:
+            left, right = line.split(action, 1)
+            rules.append((left.strip(), action, right.split("#", 1)[0].strip()))
+            break
+if any(action != "ALLOW IN" for _, action, _ in rules):
+    raise SystemExit(1)
+ssh = [(target, source) for target, _, source in rules if target == "22/tcp"]
+if ssh != [("22/tcp", admin)]:
+    raise SystemExit(1)
+web = [(target, source) for target, _, source in rules if target != "22/tcp"]
+allowed = {"80/tcp", "80/tcp (v6)", "443/tcp", "443/tcp (v6)"}
+if any(target not in allowed or not source.startswith("Anywhere") for target, source in web):
+    raise SystemExit(1)
+if len({target for target, _ in web}) != len(web):
+    raise SystemExit(1)
+ports = {target.split("/", 1)[0] for target, _ in web}
+if (expected == "closed" and web) or (expected == "open" and ports != {"80", "443"}):
+    raise SystemExit(1)
+if expected not in {"closed", "open"}:
+    raise SystemExit(1)
+PY
+}
+
+require_listener_state() {
+  local expected="$1" listeners
+  listeners="$(ss --listening --tcp --numeric --no-header)" || return 1
+  printf '%s\n' "$listeners" | python3 /dev/fd/3 "$expected" 3<<'PY'
+import re, sys
+expected = sys.argv[1]
+entries = []
+for line in sys.stdin.read().splitlines():
+    if not line.strip():
+        continue
+    fields = line.split()
+    if len(fields) < 4:
+        raise SystemExit(1)
+    match = re.fullmatch(r"(.+):([0-9]+)", fields[3])
+    if not match:
+        raise SystemExit(1)
+    address, port = match.group(1), int(match.group(2))
+    if address.startswith("[") and address.endswith("]"):
+        address = address[1:-1]
+    if port in (80, 443, 51235):
+        entries.append((address, port))
+if len(entries) != len(set(entries)):
+    raise SystemExit(1)
+service = [(address, port) for address, port in entries if port == 51235]
+web = [(address, port) for address, port in entries if port in (80, 443)]
+if expected == "none":
+    if entries:
+        raise SystemExit(1)
+elif expected == "public":
+    if service != [("127.0.0.1", 51235)] or {port for _, port in web} != {80, 443}:
+        raise SystemExit(1)
+    if any(address not in {"*", "0.0.0.0", "::"} for address, _ in web):
+        raise SystemExit(1)
+    if sum(port == 80 for _, port in web) not in (1, 2) or sum(port == 443 for _, port in web) not in (1, 2):
+        raise SystemExit(1)
+else:
+    raise SystemExit(1)
+PY
+}
+
+closed_surface_ready() {
+  absent "$AUTH_READY" \
+    && [[ "$(read_enablement legal-mcp.service)" = generated \
+      && "$(read_activity legal-mcp.service)" = inactive \
+      && "$(read_enablement caddy.service)" = disabled \
+      && "$(read_activity caddy.service)" = inactive ]] \
+    && require_ufw_state closed \
+    && require_listener_state none
+}
+
+public_auth_ready() {
+  local marker_state="$1"
+  auth_contract_ready || return 1
+  case "$marker_state" in
+    present) strict_ready_marker || return 1 ;;
+    absent) absent "$AUTH_READY" || return 1 ;;
+    *) return 1 ;;
+  esac
+  [[ "$(read_enablement legal-mcp.service)" = generated \
+    && "$(read_activity legal-mcp.service)" = active \
+    && "$(read_enablement caddy.service)" = enabled \
+    && "$(read_activity caddy.service)" = active ]] \
+    && require_ufw_state open \
+    && require_listener_state public
+}
+
+disabled_dark_recovery_ready() {
+  local runtime=/etc/legal-mcp/runtime.env verifier=/etc/legal-mcp/api-keys.json
+  local -a auth_values
+  require_file "$runtime" root root 600 || return 1
+  require_file "$verifier" legal-mcp legal-mcp 400 || return 1
+  mapfile -t auth_values < <(awk -F= '$1 == "LEGAL_MCP_HTTP_AUTH" {print $2}' "$runtime")
+  [[ ${#auth_values[@]} -eq 1 && "${auth_values[0]}" = disabled ]] || return 1
+  python3 - "$verifier" <<'PY'
+import json, pathlib, sys
+if json.loads(pathlib.Path(sys.argv[1]).read_bytes()) != {"keys": [], "version": 1}:
+    raise SystemExit(1)
+PY
+  auth_journal_states_absent && closed_surface_ready
+}
+
+auth_state_snapshot() {
+  local state runtime_sha verifier_sha caddy_sha
+  if disabled_dark_recovery_ready; then
+    state=dark
+  elif auth_journal_states_absent && public_auth_ready present; then
+    state=public
+  else
+    return 1
+  fi
+  require_file /etc/caddy/Caddyfile root caddy 640 || return 1
+  runtime_sha="$(sha256sum /etc/legal-mcp/runtime.env | awk '{print $1}')"
+  verifier_sha="$(sha256sum /etc/legal-mcp/api-keys.json | awk '{print $1}')"
+  caddy_sha="$(sha256sum /etc/caddy/Caddyfile | awk '{print $1}')"
+  [[ "$runtime_sha$verifier_sha$caddy_sha" =~ ^[0-9a-f]{192}$ ]] || return 1
+  printf '%s:%s:%s:%s\n' "$state" "$runtime_sha" "$verifier_sha" "$caddy_sha"
+}
+
+remove_auth_ready() {
+  absent "$AUTH_READY" && return 0
+  strict_ready_marker || return 1
+  rm -f -- "$AUTH_READY"
+  sync -f /etc/legal-mcp
+  absent "$AUTH_READY"
+}
+
+remove_auth_permit() {
+  rm -f -- "$AUTH_PERMIT"
+  sync -f /run/legal-mcp
+  absent "$AUTH_PERMIT"
+}
+
+force_auth_closed() {
+  local failed=false
+  remove_auth_ready || failed=true
+  systemctl disable --now caddy.service >/dev/null 2>&1 || failed=true
+  ufw --force delete allow 80/tcp >/dev/null 2>&1 || true
+  ufw --force delete allow 443/tcp >/dev/null 2>&1 || true
+  systemctl stop legal-mcp.service >/dev/null 2>&1 || failed=true
+  closed_surface_ready || failed=true
+  [[ "$failed" = false ]]
+}
+
+publish_auth_ready() {
+  local temporary
+  absent "$AUTH_READY" || return 1
+  temporary="$(mktemp /etc/legal-mcp/.auth-ready.XXXXXX)"
+  : > "$temporary"
+  chown root:root "$temporary"
+  chmod 444 "$temporary"
+  sync -f "$temporary"
+  mv -fT "$temporary" "$AUTH_READY"
+  sync -f /etc/legal-mcp
+  strict_ready_marker
+}
+
+write_auth_permit() {
+  local pid="$1" process_start="$2" temporary
+  temporary="$(mktemp /run/legal-mcp/.auth-configuring.XXXXXX)"
+  printf '%s %s\n' "$pid" "$process_start" > "$temporary"
+  chown root:root "$temporary"
+  chmod 400 "$temporary"
+  sync -f "$temporary"
+  mv -fT "$temporary" "$AUTH_PERMIT"
+  sync -f /run/legal-mcp
+}
+
+if [[ "${1:-}" = --legal-mcp-launcher-internal ]]; then
+  [[ $EUID -eq 0 && $# -ge 4 && "$(readlink -f "$0")" = "$CANONICAL" ]] || exit 1
+  role="$2"
+  configure_digest="$3"
+  update_digest="$4"
+  shift 4
+  [[ ( "$role" = configure-auth || "$role" = update-image ) \
+    && "$configure_digest" =~ ^[0-9a-f]{64}$ \
+    && "$update_digest" =~ ^[0-9a-f]{64}$ ]] || exit 1
+  current_start="$(start_time "$$")"
+  configure_recover_only=false
+  if [[ "$role" = configure-auth && $# -eq 1 && "$1" = --recover ]]; then
+    configure_recover_only=true
+  fi
+  require_dispatch "$$" "$current_start" "$role"
+  [[ "$(<"$DISPATCH/configure-auth")" = "$configure_digest" \
+    && "$(<"$DISPATCH/update-image")" = "$update_digest" \
+    && "$(read_implementation "$CONFIGURE_POINTER" configure-auth)" = "$configure_digest" \
+    && "$(read_implementation "$UPDATE_POINTER" update-image)" = "$update_digest" ]] || exit 1
+  mount --bind "$IMPLEMENTATION_DIR/configure-auth.$configure_digest" "$CONFIGURE"
+  mount -o remount,bind,ro,nodev,nosuid "$CONFIGURE"
+  mount --bind "$IMPLEMENTATION_DIR/update-image.$update_digest" "$UPDATE"
+  mount -o remount,bind,ro,nodev,nosuid "$UPDATE"
+  status=0
+  if [[ "$role" = configure-auth ]]; then
+    preserve_prior_state=false
+    if [[ "$configure_recover_only" = true ]]; then
+      "$CONFIGURE" --recover || status=$?
+      if [[ $status -eq 0 ]]; then
+        if disabled_dark_recovery_ready; then
+          : # Exact disabled recovery is successful but deliberately not auth-ready.
+        elif public_auth_ready present || public_auth_ready absent; then
+          if absent "$AUTH_READY"; then
+            publish_auth_ready || status=1
+          fi
+          if [[ $status -eq 0 ]] && auth_journal_state_present; then
+            "$CONFIGURE" --finalize-auth-ready || status=$?
+          fi
+          if [[ $status -eq 0 ]] \
+            && { ! public_auth_ready present || ! auth_journal_states_absent; }; then
+            status=1
+          fi
+        else
+          status=1
+        fi
+      fi
+    else
+      prior_snapshot="$(auth_state_snapshot)" || status=1
+      if [[ $status -eq 0 ]]; then
+        prepare_status=0
+        "$CONFIGURE" --prepare-auth-dispatch || prepare_status=$?
+        if [[ $prepare_status -ne 0 ]]; then
+          status=$prepare_status
+          if auth_journal_states_absent \
+            && [[ "$(auth_state_snapshot 2>/dev/null || true)" = "$prior_snapshot" ]]; then
+            preserve_prior_state=true
+          fi
+        elif ! auth_journal_state_present; then
+          status=1
+        elif ! remove_auth_ready; then
+          status=1
+        else
+          "$CONFIGURE" "$@" || status=$?
+          if [[ $status -eq 0 ]]; then
+            if public_auth_ready absent && auth_journal_state_present; then
+              publish_auth_ready || status=1
+            else
+              status=1
+            fi
+          fi
+          if [[ $status -eq 0 ]]; then
+            "$CONFIGURE" --finalize-auth-ready || status=$?
+          fi
+          if [[ $status -eq 0 ]] \
+            && { ! public_auth_ready present || ! auth_journal_states_absent; }; then
+            status=1
+          fi
+        fi
+      fi
+    fi
+    remove_auth_permit || status=1
+    if [[ $status -ne 0 && "$preserve_prior_state" = false ]]; then
+      force_auth_closed || status=1
+    fi
+  else
+    "$UPDATE" "$@" || status=$?
+  fi
+  retire_dispatch || status=1
+  exit "$status"
+fi
+
+[[ $EUID -eq 0 ]] || { echo 'host-tool launcher must run as root' >&2; exit 2; }
+case "$(basename "$0")" in
+  legal-mcp-configure-auth) role=configure-auth ;;
+  legal-mcp-update-image) role=update-image ;;
+  *) echo 'invoke the installed authentication or image launcher' >&2; exit 2 ;;
+esac
+if [[ "$role" = configure-auth ]]; then
+  for argument in "$@"; do
+    case "$argument" in
+      --prepare-auth-dispatch|--finalize-auth-ready|--legal-mcp-launcher-internal)
+        echo 'internal authentication handoff command is not a public launcher argument' >&2
+        exit 2
+        ;;
+    esac
+  done
+fi
+require_file "$LOCK_FILE" root legal-mcp-publisher 640 || {
+  echo 'host transaction lock is missing or unsafe' >&2
+  exit 1
+}
+exec 9<>"$LOCK_FILE"
+flock -x 9
+require_launcher_set || { echo 'stable host-tool launcher set is invalid' >&2; exit 1; }
+reconcile_dispatch || exit 1
+for transaction in \
+  /etc/legal-mcp/.host-tools-transaction.building \
+  /etc/legal-mcp/.host-tools-transaction.building-retired \
+  /etc/legal-mcp/.host-tools-transaction.preparing \
+  /etc/legal-mcp/.host-tools-transaction.preparing-retired \
+  /etc/legal-mcp/.host-tools-transaction \
+  /etc/legal-mcp/.host-tools-transaction.retiring \
+  /etc/legal-mcp/.host-tools-transaction.retired \
+  /etc/legal-mcp/.host-tools-transaction.rollback-retiring \
+  /etc/legal-mcp/.host-tools-transaction.rollback-retired \
+  /etc/legal-mcp/.host-tools-transaction.publisher-restore \
+  /etc/legal-mcp/.host-tools-transaction.publisher-restore-retired; do
+  absent "$transaction" || { echo 'host-tool transaction recovery is required' >&2; exit 1; }
+done
+configure_digest="$(read_implementation "$CONFIGURE_POINTER" configure-auth)" || {
+  echo 'configure-auth implementation pointer is invalid' >&2; exit 1;
+}
+update_digest="$(read_implementation "$UPDATE_POINTER" update-image)" || {
+  echo 'update-image implementation pointer is invalid' >&2; exit 1;
+}
+require_v2_release_binding "$configure_digest" "$update_digest" || {
+  echo 'V2 host-tool marker, launchers, template, and rendered Quadlet are not exact' >&2
+  exit 1
+}
+process_start="$(start_time "$$")"
+preparing="${DISPATCH}.preparing.$$"
+absent "$preparing" && absent "$DISPATCH" || exit 1
+install -d -o root -g root -m 0700 "$preparing"
+printf '%s\n' "$$" > "$preparing/pid"
+printf '%s\n' "$process_start" > "$preparing/start-time"
+printf '%s\n' "$role" > "$preparing/role"
+printf '%s\n' "$configure_digest" > "$preparing/configure-auth"
+printf '%s\n' "$update_digest" > "$preparing/update-image"
+chown root:root "$preparing"/*
+chmod 600 "$preparing"/*
+sync -f "$preparing"
+mv -T "$preparing" "$DISPATCH"
+sync -f /run/legal-mcp
+if [[ "$role" = configure-auth ]]; then
+  write_auth_permit "$$" "$process_start"
+fi
+export LEGAL_MCP_HOST_TRANSACTION_LOCK_FD=9
+exec /usr/bin/unshare --mount --propagation private -- \
+  "$CANONICAL" --legal-mcp-launcher-internal "$role" \
+  "$configure_digest" "$update_digest" "$@"

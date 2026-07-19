@@ -81,13 +81,17 @@ jobs:
           python3 -m py_compile \
             scripts/azure_generation_transport.py \
             scripts/manage-api-keys.py \
+            scripts/render-agent-audit.py \
             scripts/render-microsoft-integrations.py \
+            scripts/run-harbourgrid-eval.py \
             scripts/test-remote-mcp.py
+          python3 -c 'import json; value=json.load(open("tests/evals/harbourgrid.json")); assert value["schema_version"] == 1 and len(value["expected_tools"]) == 7 and value["search_cases"]'
           python3 -m unittest \
             tests/test_azure_generation_transport.py \
             tests/test_configure_azure_host.py \
             tests/test_manage_api_keys.py \
             tests/test_remote_mcp.py \
+            tests/test_render_agent_audit.py \
             tests/test_render_microsoft_integrations.py
           az bicep build --file infra/azure/main.bicep --stdout \
             > "$RUNNER_TEMP/azure-main.json"
@@ -98,6 +102,7 @@ jobs:
             -v "$RUNNER_TEMP/Caddyfile:/etc/caddy/Caddyfile:ro" \
             caddy@sha256:98eb57d882ccd5213d1688764db10c1ca2c58a1ca3a6717a3411ad798f7a423a \
             caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          tests/caddy-log-redaction-fixture.sh
           cargo run --locked -- export-mcp-tools \
             --output "$RUNNER_TEMP/mcp-tools.json"
           python3 scripts/render-microsoft-integrations.py \
@@ -149,10 +154,22 @@ jobs:
             ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \
             -ceu 'export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null; apt-get install --yes --no-install-recommends acl libcap2-bin passwd python3 util-linux >/dev/null; /activation-fixture'
           docker run --rm --user 0:0 --entrypoint /bin/bash \
+            --volume "$PWD/tests/flat-int8-host-cutover-fixture.sh:/fixture:ro" \
+            --volume "$PWD/infra/hosting/update-image.sh:/update-image:ro" \
+            --volume "$PWD/infra/linode/install-host.sh:/install-host:ro" \
+            --volume "$PWD/infra/hosting/legal-mcp.container.template:/container-template:ro" \
+            --volume "$PWD/infra/hosting/Caddyfile:/Caddyfile:ro" \
+            --volume "$PWD/scripts/legal-mcp-host-deploy:/host-deploy:ro" \
+            --volume "$PWD/scripts/legal-mcp-publisher-command:/publisher-command:ro" \
+            ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \
+            -ceu 'export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null; apt-get install --yes --no-install-recommends acl passwd python3 rsync sudo util-linux >/dev/null; /fixture'
+          docker run --rm --user 0:0 --entrypoint /bin/bash \
             --volume "$PWD/tests/host-tool-upgrade-fixture.sh:/fixture:ro" \
             --volume "$PWD/infra/linode/install-host.sh:/fixture-input/install-host.sh:ro" \
             --volume "$PWD/scripts/legal-mcp-host-deploy:/fixture-input/legal-mcp-host-deploy:ro" \
             --volume "$PWD/scripts/legal-mcp-publisher-command:/fixture-input/legal-mcp-publisher-command:ro" \
+            --volume "$PWD/tests/fixtures/host-tool-launcher-v0.19.5:/fixture-input/host-tool-launcher-v0.19.5:ro" \
+            --volume "$PWD/infra/hosting/Caddyfile:/fixture-input/Caddyfile:ro" \
             --volume "$PWD/Containerfile:/fixture-input/Containerfile:ro" \
             ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \
             -ceu 'export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null; apt-get install --yes --no-install-recommends acl passwd python3 rsync sudo util-linux >/dev/null; /fixture'

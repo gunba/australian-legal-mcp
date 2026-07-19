@@ -5,8 +5,8 @@
 //! shape. Readiness is deterministic — we read the `legal-mcp listening
 //! on ...` line from stderr before issuing requests.
 
-use std::io::{BufRead, BufReader};
-use std::net::TcpListener;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
@@ -59,9 +59,17 @@ fn start_server(data_dir: &std::path::Path) -> Result<Server> {
 }
 
 fn start_server_with_auth(data_dir: &std::path::Path, auth: TestAuth) -> Result<Server> {
+    start_server_with_auth_and_workers(data_dir, auth, None)
+}
+
+fn start_server_with_auth_and_workers(
+    data_dir: &std::path::Path,
+    auth: TestAuth,
+    workers: Option<usize>,
+) -> Result<Server> {
     let mut last_error = None;
     for _ in 0..3 {
-        match start_server_once(data_dir, auth) {
+        match start_server_once(data_dir, auth, workers) {
             Ok(server) => return Ok(server),
             Err(error) => last_error = Some(error),
         }
@@ -69,7 +77,11 @@ fn start_server_with_auth(data_dir: &std::path::Path, auth: TestAuth) -> Result<
     Err(last_error.unwrap_or_else(|| anyhow!("server startup failed")))
 }
 
-fn start_server_once(data_dir: &std::path::Path, auth: TestAuth) -> Result<Server> {
+fn start_server_once(
+    data_dir: &std::path::Path,
+    auth: TestAuth,
+    workers: Option<usize>,
+) -> Result<Server> {
     let port = pick_free_port()?;
     let url = format!("http://127.0.0.1:{port}/mcp");
 
@@ -79,6 +91,9 @@ fn start_server_once(data_dir: &std::path::Path, auth: TestAuth) -> Result<Serve
         .env("LEGAL_MCP_DATA_DIR", data_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    if let Some(workers) = workers {
+        command.env("LEGAL_MCP_HTTP_WORKERS", workers.to_string());
+    }
     match auth {
         TestAuth::Disabled => {}
         TestAuth::Entra => {
@@ -546,6 +561,93 @@ fn enforces_streamable_http_headers_origins_and_health() -> Result<()> {
     assert_eq!(forbidden_origin.status().as_u16(), 403);
 
     let base = server.url.trim_end_matches("/mcp");
+    let live = client.get(format!("{base}/livez")).send()?;
+    assert_eq!(live.status().as_u16(), 200);
+    assert_eq!(
+        live.headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        live.headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&live.text()?)?,
+        json!({"status": "ok", "generation": null})
+    );
+
+    let ready = client.get(format!("{base}/readyz")).send()?;
+    assert_eq!(ready.status().as_u16(), 503);
+    assert_eq!(
+        ready
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&ready.text()?)?,
+        json!({"status": "not-ready", "generation": null})
+    );
+    assert_eq!(
+        client
+            .post(format!("{base}/readyz"))
+            .send()?
+            .status()
+            .as_u16(),
+        405
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/readyz?probe=1"))
+            .send()?
+            .status()
+            .as_u16(),
+        404
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/readyz/"))
+            .send()?
+            .status()
+            .as_u16(),
+        404
+    );
+    Ok(())
+}
+
+#[test]
+fn health_routes_bypass_a_saturated_worker() -> Result<()> {
+    let dir = tempdir()?;
+    let server = start_server_with_auth_and_workers(dir.path(), TestAuth::Disabled, Some(1))?;
+    let authority = server
+        .url
+        .strip_prefix("http://")
+        .and_then(|value| value.strip_suffix("/mcp"))
+        .ok_or_else(|| anyhow!("test server URL is malformed"))?;
+    let mut stalled = BufReader::new(TcpStream::connect(authority)?);
+    stalled
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(5)))?;
+    stalled.get_mut().write_all(
+        format!(
+            "POST /mcp HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2025-06-18\r\nContent-Length: 4096\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )?;
+    stalled.get_mut().flush()?;
+    let mut status = String::new();
+    stalled.read_line(&mut status)?;
+    assert_eq!(status.trim_end(), "HTTP/1.1 100 Continue");
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let base = server.url.trim_end_matches("/mcp");
     assert_eq!(
         client
             .get(format!("{base}/livez"))
@@ -562,6 +664,16 @@ fn enforces_streamable_http_headers_origins_and_health() -> Result<()> {
             .as_u16(),
         503
     );
+    assert_eq!(
+        client
+            .post(format!("{base}/readyz"))
+            .send()?
+            .status()
+            .as_u16(),
+        405
+    );
+
+    stalled.get_mut().shutdown(Shutdown::Both)?;
     Ok(())
 }
 

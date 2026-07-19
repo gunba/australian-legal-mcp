@@ -1592,6 +1592,7 @@ fn serialize_html_node(
                     | "h6"
                     | "hr"
                     | "i"
+                    | "img"
                     | "ins"
                     | "li"
                     | "ol"
@@ -1627,6 +1628,17 @@ fn serialize_html_node(
                         output.push('"');
                     }
                 }
+                if tag == "img" {
+                    for name in ["data-asset-ref", "data-media-type", "alt", "title"] {
+                        if let Some(value) = element.attr(name) {
+                            output.push(' ');
+                            output.push_str(name);
+                            output.push_str("=\"");
+                            escape_attribute(value, output);
+                            output.push('"');
+                        }
+                    }
+                }
                 if tag == "a" {
                     if let Some(href) = element.attr("href") {
                         if let Ok(mut url) = base.join(href) {
@@ -1655,7 +1667,7 @@ fn serialize_html_node(
             for child in node.children() {
                 serialize_html_node(child, base, rules, links, output)?;
             }
-            if allowed && !matches!(tag, "br" | "hr") {
+            if allowed && !matches!(tag, "br" | "hr" | "img") {
                 output.push_str("</");
                 output.push_str(tag);
                 output.push('>');
@@ -2350,6 +2362,22 @@ mod tests {
         )?;
         assert!(html.contains(&format!(r#"data-doc-id="{target}""#)));
         assert!(!html.contains("href="));
+        Ok(())
+    }
+
+    #[test]
+    fn internal_link_rewrite_preserves_typed_images_but_never_source_urls() -> Result<()> {
+        let html = rewrite_internal_document_links(
+            r#"<article><p>Formula <img data-asset-ref="frl:C2004A05138/sha256-formula" data-media-type="image/png" alt="x &amp; y" title="Formula" src="https://untrusted.invalid/formula.png"></p></article>"#,
+            "https://www.legislation.gov.au/C2004A05138/latest/text",
+            &BTreeMap::new(),
+        )?;
+        assert!(html.contains(r#"data-asset-ref="frl:C2004A05138/sha256-formula""#));
+        assert!(html.contains(r#"data-media-type="image/png""#));
+        assert!(html.contains(r#"alt="x &amp; y""#));
+        assert!(html.contains(r#"title="Formula""#));
+        assert!(!html.contains("src="));
+        assert!(!html.contains("</img>"));
         Ok(())
     }
 

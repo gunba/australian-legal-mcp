@@ -8,7 +8,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 [[ $EUID -eq 0 && -x /configure-auth && -x /install-host ]] || exit 2
 
-version=0.19.6
+version=0.19.7
 revision=1111111111111111111111111111111111111111
 generation=a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3
 old_image="ghcr.io/gunba/australian-legal-mcp@sha256:$(printf 'a%.0s' {1..64})"
@@ -102,6 +102,13 @@ chmod 644 "$quadlet"
 
 cat > /etc/caddy/Caddyfile <<'EOF'
 {
+	log default {
+		format filter {
+			request delete
+			wrap json
+		}
+	}
+
 	servers {
 		timeouts {
 			read_body 30s
@@ -177,6 +184,10 @@ https_routes = [
         {"body": "not found", "handler": "static_response", "status_code": 404}
     ]}]}]},
 ]
+logging = {"logs": {"default": {"encoder": {
+    "fields": {"request": {"filter": "delete"}}, "format": "filter",
+    "wrap": {"format": "json"},
+}}}}
 value = {"apps": {"http": {"servers": {
     "srv0": {"listen": [":443"], **timeouts, "routes": [{"match": [{"host": [host]}],
         "handle": [{"handler": "subroute", "routes": https_routes}], "terminal": True}]},
@@ -184,7 +195,7 @@ value = {"apps": {"http": {"servers": {
         "handle": [{"handler": "subroute", "routes": [{"handle": [
             {"body": "not found", "handler": "static_response", "status_code": 404}
         ]}]}], "terminal": True}]},
-}}}}
+}}}, "logging": logging}
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(value, handle, separators=(",", ":"))
 PY
@@ -566,6 +577,26 @@ for _ in $(seq 1 100); do
   kill -0 "$server_pid"
   sleep 0.02
 done
+
+# The host-tool --from-public transition and coordinated image cutover retain
+# configured authentication while removing publication authority. A later
+# production launcher recovery republishes that exact configuration without
+# rotating or reconstructing its runtime, verifier, or Caddy bytes.
+set_public_api_state
+cp "$runtime" /tmp/configured-dark-runtime
+cp "$api_keys" /tmp/configured-dark-api-keys
+cp /etc/caddy/Caddyfile /tmp/configured-dark-Caddyfile
+rm -f "$auth_ready" /tmp/service-active /tmp/caddy-active /tmp/caddy-enabled \
+  /tmp/ufw-80 /tmp/ufw-443
+configured_dark_recovery="$(printf '%s\n' "$token" | run_auth --recover)"
+[[ "$configured_dark_recovery" = 'closed committed-public authentication restored; auth-ready publication is pending' \
+  && ! -e "$transaction" \
+  && "$(stat -c '%U:%G:%a:%h:%s' "$auth_ready")" = root:root:444:1:0 \
+  && -e /tmp/service-active && -e /tmp/caddy-active \
+  && -e /tmp/caddy-enabled && -e /tmp/ufw-80 && -e /tmp/ufw-443 ]]
+cmp --silent /tmp/configured-dark-runtime "$runtime"
+cmp --silent /tmp/configured-dark-api-keys "$api_keys"
+cmp --silent /tmp/configured-dark-Caddyfile /etc/caddy/Caddyfile
 
 : > "$log"
 set_dark_state

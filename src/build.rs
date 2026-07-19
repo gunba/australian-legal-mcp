@@ -5,7 +5,7 @@
 //! scope because the hosting machine activates locally transferred builds.
 
 use crate::chunker::CHUNKER_FORMAT_VERSION;
-use crate::db::{init_db, open_write_at, set_corpus_meta};
+use crate::db::{decompress_text, init_db, open_write_at, set_corpus_meta};
 use crate::pipeline::finalise_source_ann;
 use crate::semantic::{SemanticModelPaths, EMBEDDING_MODEL_FILES};
 use crate::source::{verify_semantic_install, Manifest, ManifestDb, ManifestFile, ModelInfo};
@@ -16,10 +16,11 @@ use crate::{
 use anyhow::{anyhow, bail, Context, Result};
 use legal_model::SourceId;
 use rusqlite::{Connection, OptionalExtension};
-use serde_json::{json, Value as JsonValue};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub(crate) struct BuildCorpusArgs<'a> {
@@ -30,6 +31,305 @@ pub(crate) struct BuildCorpusArgs<'a> {
     pub(crate) out_dir: &'a Path,
     pub(crate) zstd_level: i32,
     pub(crate) profile_enabled: bool,
+}
+
+const BUILD_STATE_SCHEMA_VERSION: u32 = 2;
+const WORKSPACE_LOCK_FILENAME: &str = ".source-update.lock";
+const WORKSPACE_STAGING_DIRECTORY: &str = "staging";
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BuildState {
+    schema_version: u32,
+    corpus_schema_version: u32,
+    embedding_model_id: String,
+    embedding_model_fingerprint: String,
+    embedding_dim: usize,
+    embedding_input_max_tokens: usize,
+    chunker_format_version: u32,
+    zstd_level: i32,
+    source_workspaces: BTreeMap<String, SourceWorkspaceBinding>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SourceWorkspaceBinding {
+    path: String,
+    state: WorkspaceTreeFingerprint,
+    content: WorkspaceTreeFingerprint,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceTreeFingerprint {
+    files: u64,
+    bytes: u64,
+    sha256: String,
+}
+
+struct WorkspaceTreeHasher {
+    hasher: Sha256,
+    files: u64,
+    bytes: u64,
+}
+
+impl WorkspaceTreeHasher {
+    fn new(domain: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(domain);
+        Self {
+            hasher,
+            files: 0,
+            bytes: 0,
+        }
+    }
+
+    fn hash_directory(&mut self, relative: &str) {
+        self.hasher.update(b"directory\0");
+        hash_fingerprint_field(&mut self.hasher, relative.as_bytes());
+    }
+
+    fn hash_file(&mut self, root: &Path, path: &Path, metadata: &fs::Metadata) -> Result<()> {
+        let relative = workspace_relative_path(root, path)?;
+        self.hasher.update(b"file\0");
+        hash_fingerprint_field(&mut self.hasher, relative.as_bytes());
+        self.hasher.update(metadata.len().to_le_bytes());
+
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        }
+        let mut file = options
+            .open(path)
+            .with_context(|| format!("opening source workspace file {}", path.display()))?;
+        let opened = file.metadata()?;
+        if !opened.is_file() || opened.len() != metadata.len() {
+            bail!(
+                "source workspace file changed while being opened: {}",
+                path.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+                bail!(
+                    "source workspace file was replaced while being opened: {}",
+                    path.display()
+                );
+            }
+        }
+        let mut read_total = 0u64;
+        let mut buffer = [0u8; 1024 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            self.hasher.update(&buffer[..read]);
+            read_total = read_total
+                .checked_add(u64::try_from(read)?)
+                .ok_or_else(|| anyhow!("source workspace byte count overflow"))?;
+        }
+        if read_total != metadata.len() || file.metadata()?.len() != metadata.len() {
+            bail!(
+                "source workspace file changed while being fingerprinted: {}",
+                path.display()
+            );
+        }
+        self.files = self
+            .files
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("source workspace file count overflow"))?;
+        self.bytes = self
+            .bytes
+            .checked_add(read_total)
+            .ok_or_else(|| anyhow!("source workspace byte count overflow"))?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> WorkspaceTreeFingerprint {
+        self.hasher.update(b"summary\0");
+        self.hasher.update(self.files.to_le_bytes());
+        self.hasher.update(self.bytes.to_le_bytes());
+        WorkspaceTreeFingerprint {
+            files: self.files,
+            bytes: self.bytes,
+            sha256: format!("{:x}", self.hasher.finalize()),
+        }
+    }
+}
+
+fn fingerprint_source_workspaces(
+    workspaces: &BTreeMap<SourceId, PathBuf>,
+) -> Result<BTreeMap<String, SourceWorkspaceBinding>> {
+    workspaces
+        .iter()
+        .map(|(source, workspace)| {
+            let binding = fingerprint_source_workspace(workspace)
+                .with_context(|| format!("fingerprinting source workspace `{source}`"))?;
+            Ok((source.as_str().to_string(), binding))
+        })
+        .collect()
+}
+
+fn fingerprint_source_workspace(workspace: &Path) -> Result<SourceWorkspaceBinding> {
+    let metadata = fs::symlink_metadata(workspace)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("source workspace must be a real non-symlink directory");
+    }
+    let canonical = workspace.canonicalize()?;
+    if canonical != workspace {
+        bail!(
+            "source workspace path must already be canonical: {}",
+            workspace.display()
+        );
+    }
+    let path = canonical
+        .to_str()
+        .ok_or_else(|| anyhow!("source workspace path is not UTF-8"))?
+        .to_string();
+    let mut state = WorkspaceTreeHasher::new(b"australian-legal-mcp-workspace-state-v1\0");
+    let mut content = WorkspaceTreeHasher::new(b"australian-legal-mcp-workspace-content-v1\0");
+    for entry in sorted_directory_entries(&canonical)? {
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow!("source workspace contains a non-UTF-8 top-level name"))?;
+        let entry_path = entry.path();
+        let metadata = fs::symlink_metadata(&entry_path)?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "source workspace contains a symlink: {}",
+                entry_path.display()
+            );
+        }
+        if name == WORKSPACE_LOCK_FILENAME {
+            if !metadata.is_file() {
+                bail!("source workspace lock path is not a regular file");
+            }
+            continue;
+        }
+        if name == WORKSPACE_STAGING_DIRECTORY {
+            if !metadata.is_dir() {
+                bail!("source workspace staging path is not a directory");
+            }
+            continue;
+        }
+        if metadata.is_file() {
+            state.hash_file(&canonical, &entry_path, &metadata)?;
+        } else if metadata.is_dir() {
+            content.hash_directory(&workspace_relative_path(&canonical, &entry_path)?);
+            fingerprint_content_directory(&canonical, &entry_path, &mut content)?;
+        } else {
+            bail!(
+                "source workspace contains a special file: {}",
+                entry_path.display()
+            );
+        }
+    }
+    Ok(SourceWorkspaceBinding {
+        path,
+        state: state.finish(),
+        content: content.finish(),
+    })
+}
+
+fn fingerprint_content_directory(
+    root: &Path,
+    directory: &Path,
+    hasher: &mut WorkspaceTreeHasher,
+) -> Result<()> {
+    for entry in sorted_directory_entries(directory)? {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "source workspace content contains a symlink: {}",
+                path.display()
+            );
+        }
+        if metadata.is_dir() {
+            hasher.hash_directory(&workspace_relative_path(root, &path)?);
+            fingerprint_content_directory(root, &path, hasher)?;
+        } else if metadata.is_file() {
+            hasher.hash_file(root, &path, &metadata)?;
+        } else {
+            bail!(
+                "source workspace content contains a special file: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn sorted_directory_entries(path: &Path) -> Result<Vec<fs::DirEntry>> {
+    let mut entries = fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+    Ok(entries)
+}
+
+fn workspace_relative_path(root: &Path, path: &Path) -> Result<String> {
+    let relative = path.strip_prefix(root)?;
+    let components = relative
+        .components()
+        .map(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("source workspace contains a non-UTF-8 path"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if components.is_empty() {
+        bail!("source workspace fingerprint path is empty");
+    }
+    Ok(components.join("/"))
+}
+
+fn hash_fingerprint_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn validate_or_create_build_state(
+    build_state_path: &Path,
+    db_path: &Path,
+    expected: &BuildState,
+) -> Result<()> {
+    match fs::symlink_metadata(build_state_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!("build state must be a regular non-symlink file");
+            }
+            if metadata.len() == 0 || metadata.len() > 16 * 1024 * 1024 {
+                bail!("build state is empty or exceeds its size cap");
+            }
+            let actual: BuildState = serde_json::from_slice(&fs::read(build_state_path)?)
+                .with_context(|| format!("parsing {}", build_state_path.display()))?;
+            if &actual != expected {
+                bail!(
+                    "build state {} does not match this build or its exact source workspace bytes; choose a fresh output directory",
+                    build_state_path.display()
+                );
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if db_path.exists() {
+                bail!(
+                    "refusing to reuse uncheckpointed corpus database {}; choose a fresh output directory",
+                    db_path.display()
+                );
+            }
+            atomic_write(build_state_path, &serde_json::to_vec_pretty(expected)?)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 
 fn seed_embedding_cache(
@@ -64,8 +364,11 @@ fn seed_embedding_cache(
         bail!("embedding cache seed model `{model_id}` does not match `{EMBEDDING_MODEL_ID}`");
     }
     let invalid: i64 = seed.query_row(
-        "SELECT COUNT(*) FROM embedding_cache
-         WHERE model_id = ?1 AND length(embedding) != ?2",
+        "SELECT
+             (SELECT COUNT(*) FROM embedding_cache
+              WHERE model_id = ?1 AND length(embedding) != ?2)
+           + (SELECT COUNT(*) FROM chunk_embeddings
+              WHERE length(embedding) != ?2)",
         rusqlite::params![EMBEDDING_MODEL_ID, EMBEDDING_DIM as i64],
         |row| row.get(0),
     )?;
@@ -90,6 +393,51 @@ fn seed_embedding_cache(
     let detach_result = target.execute_batch("DETACH DATABASE embedding_seed;");
     copy_result?;
     detach_result?;
+
+    // Runtime generations intentionally clear their disposable embedding
+    // cache. Reconstruct exact cache keys from their authoritative chunk text
+    // and vectors so a chunker/source-only rebuild reuses every unchanged
+    // embedding without model execution.
+    target.execute("ATTACH DATABASE ?1 AS embedding_seed", [seed_utf8])?;
+    let authoritative_copy = (|| -> Result<()> {
+        let transaction = target.unchecked_transaction()?;
+        {
+            let mut select = transaction.prepare(
+                "SELECT c.text, e.embedding
+                 FROM embedding_seed.chunks AS c
+                 JOIN embedding_seed.chunk_embeddings AS e
+                   ON e.chunk_id = c.chunk_id
+                 ORDER BY c.chunk_id",
+            )?;
+            let mut insert = transaction.prepare(
+                "INSERT OR IGNORE INTO main.embedding_cache(model_id, text_sha256, embedding)
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            let mut rows = select.query([])?;
+            while let Some(row) = rows.next()? {
+                let compressed = row.get::<_, Vec<u8>>(0)?;
+                let embedding = row.get::<_, Vec<u8>>(1)?;
+                if embedding.len() != EMBEDDING_DIM {
+                    bail!(
+                        "embedding cache seed contains an authoritative vector with length {}, expected {EMBEDDING_DIM}",
+                        embedding.len()
+                    );
+                }
+                let text = decompress_text(compressed)?;
+                let text_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+                insert.execute(rusqlite::params![
+                    EMBEDDING_MODEL_ID,
+                    text_sha256,
+                    embedding
+                ])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    })();
+    let authoritative_detach = target.execute_batch("DETACH DATABASE embedding_seed;");
+    authoritative_copy?;
+    authoritative_detach?;
     let after: i64 =
         target.query_row("SELECT COUNT(*) FROM embedding_cache", [], |row| row.get(0))?;
     usize::try_from(after.saturating_sub(before)).context("embedding cache seed count overflow")
@@ -143,66 +491,40 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         .values()
         .map(|workspace| crate::source_update::lock_workspace_shared(workspace))
         .collect::<Result<Vec<_>>>()?;
+    let source_workspace_bindings = fingerprint_source_workspaces(&canonical_workspaces)?;
     let semantic_model_paths = SemanticModelPaths::from_model_dir(model_dir)?;
 
     fs::create_dir_all(out_dir)
         .with_context(|| format!("creating out_dir {}", out_dir.display()))?;
     let manifest_path = out_dir.join(crate::config::GENERATION_MANIFEST_FILENAME);
     let build_state_path = out_dir.join("build-state.json");
-    if manifest_path.exists() {
-        if build_state_path.exists() {
-            // The manifest is published before the checkpoint is removed so a
-            // crash can never destroy resumability. A generation containing
-            // build-state.json is not activatable; remove only that incomplete
-            // publication marker and resume from the durable checkpoint.
-            fs::remove_file(&manifest_path).with_context(|| {
-                format!("removing interrupted manifest {}", manifest_path.display())
-            })?;
-            sync_parent(&manifest_path)?;
-        } else {
-            bail!(
-                "refusing to mutate completed corpus output {}; choose a fresh output directory",
-                out_dir.display()
-            );
-        }
+    let expected_build_state = BuildState {
+        schema_version: BUILD_STATE_SCHEMA_VERSION,
+        corpus_schema_version: SUPPORTED_SCHEMA_VERSION,
+        embedding_model_id: EMBEDDING_MODEL_ID.to_string(),
+        embedding_model_fingerprint: EMBEDDING_MODEL_FINGERPRINT.to_string(),
+        embedding_dim: EMBEDDING_DIM,
+        embedding_input_max_tokens: EMBEDDING_INPUT_MAX_TOKENS,
+        chunker_format_version: CHUNKER_FORMAT_VERSION,
+        zstd_level,
+        source_workspaces: source_workspace_bindings.clone(),
+    };
+    if manifest_path.exists() && !build_state_path.exists() {
+        bail!(
+            "refusing to mutate completed corpus output {}; choose a fresh output directory",
+            out_dir.display()
+        );
     }
-
-    // The database is the durable source-level checkpoint. A source transaction either commits
-    // completely or rolls back, and every resume revalidates committed normalized documents from
-    // the local source workspaces before reusing their rows.
-    let expected_build_state = json!({
-        "schema_version": 1,
-        "corpus_schema_version": SUPPORTED_SCHEMA_VERSION,
-        "embedding_model_id": EMBEDDING_MODEL_ID,
-        "embedding_model_fingerprint": EMBEDDING_MODEL_FINGERPRINT,
-        "embedding_dim": EMBEDDING_DIM,
-        "embedding_input_max_tokens": EMBEDDING_INPUT_MAX_TOKENS,
-        "chunker_format_version": CHUNKER_FORMAT_VERSION,
-        "zstd_level": zstd_level,
-        "source_workspaces": canonical_workspaces.iter().map(|(source, workspace)| {
-            (source.as_str().to_string(), workspace.display().to_string())
-        }).collect::<BTreeMap<_, _>>(),
-    });
-    if build_state_path.exists() {
-        let actual: JsonValue = serde_json::from_slice(&fs::read(&build_state_path)?)
-            .with_context(|| format!("parsing {}", build_state_path.display()))?;
-        if actual != expected_build_state {
-            bail!(
-                "build state {} does not match this build; choose a fresh output directory",
-                build_state_path.display()
-            );
-        }
-    } else {
-        if db_path.exists() {
-            bail!(
-                "refusing to reuse uncheckpointed corpus database {}; choose a fresh output directory",
-                db_path.display()
-            );
-        }
-        atomic_write(
-            &build_state_path,
-            &serde_json::to_vec_pretty(&expected_build_state)?,
-        )?;
+    validate_or_create_build_state(&build_state_path, db_path, &expected_build_state)?;
+    if manifest_path.exists() {
+        // The manifest is published before the checkpoint is removed so a
+        // crash can never destroy resumability. A generation containing
+        // build-state.json is not activatable; remove only that incomplete
+        // publication marker after the exact source fingerprints match.
+        fs::remove_file(&manifest_path).with_context(|| {
+            format!("removing interrupted manifest {}", manifest_path.display())
+        })?;
+        sync_parent(&manifest_path)?;
     }
 
     let mut conn = open_write_at(db_path)
@@ -399,6 +721,13 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
     conn.execute_batch("VACUUM")?;
     crate::source::verify_corpus_manifest_binding(&conn, &manifest)?;
     verify_semantic_install(&conn, &manifest)?;
+    verify_final_build_fts(&conn)?;
+    let final_workspace_bindings = fingerprint_source_workspaces(&canonical_workspaces)?;
+    if final_workspace_bindings != source_workspace_bindings {
+        bail!(
+            "source workspace state or content changed during the build; the checkpoint remains resumable only from its original exact bytes"
+        );
+    }
 
     for file in EMBEDDING_MODEL_FILES {
         let source = model_dir.join(file.path);
@@ -434,6 +763,23 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
         "legal-mcp build: done - {documents_count} docs written to {} in {total_elapsed:.1}s",
         db_path.display()
     );
+    Ok(())
+}
+
+fn verify_final_build_fts(conn: &Connection) -> Result<()> {
+    crate::db::validate_chunks_fts_schema(conn)?;
+    crate::db::verify_chunks_fts_index_digest(conn)?;
+    // This includes exact FTS/source row identity and non-overlapping source
+    // rowid partitions for both chunk and title indexes.
+    crate::db::verify_fts_relational_bindings(conn)?;
+    let foreign_keys: i64 =
+        conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if foreign_keys != 0 {
+        bail!("completed build has {foreign_keys} foreign-key violations");
+    }
+    crate::db::verify_fts_integrity(conn)?;
     Ok(())
 }
 
@@ -555,6 +901,20 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 mod security_tests {
     use super::*;
 
+    fn fixture_build_state(source: &str, binding: SourceWorkspaceBinding) -> BuildState {
+        BuildState {
+            schema_version: BUILD_STATE_SCHEMA_VERSION,
+            corpus_schema_version: SUPPORTED_SCHEMA_VERSION,
+            embedding_model_id: EMBEDDING_MODEL_ID.to_string(),
+            embedding_model_fingerprint: EMBEDDING_MODEL_FINGERPRINT.to_string(),
+            embedding_dim: EMBEDDING_DIM,
+            embedding_input_max_tokens: EMBEDDING_INPUT_MAX_TOKENS,
+            chunker_format_version: CHUNKER_FORMAT_VERSION,
+            zstd_level: 3,
+            source_workspaces: BTreeMap::from([(source.to_string(), binding)]),
+        }
+    }
+
     #[test]
     fn atomic_write_replaces_only_with_complete_bytes() -> Result<()> {
         let root = tempfile::tempdir()?;
@@ -594,6 +954,147 @@ mod security_tests {
             })?,
             1
         );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_generation_vectors_seed_cache_by_exact_chunk_text() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let seed_path = root.path().join("seed.db");
+        let target_path = root.path().join("target.db");
+        let seed = open_write_at(&seed_path)?;
+        init_db(&seed)?;
+        set_corpus_meta(&seed, "embedding_model_id", EMBEDDING_MODEL_ID)?;
+        seed.execute(
+            "INSERT INTO sources(source_id, display_name) VALUES ('ato', 'ATO')",
+            [],
+        )?;
+        seed.execute(
+            "INSERT INTO documents(
+                 source_id, native_id, type, title, canonical_url, downloaded_at,
+                 content_hash, html
+             ) VALUES ('ato', 'DOC', 'TXR', 'Document',
+                 'https://example.invalid/doc', '2026-01-01T00:00:00Z', 'hash', X'00')",
+            [],
+        )?;
+        let text = "authoritative unchanged chunk";
+        seed.execute(
+            "INSERT INTO chunks(chunk_id, source_id, native_id, ord, text)
+             VALUES (1, 'ato', 'DOC', 0, ?1)",
+            [crate::db::compress_text(text)?],
+        )?;
+        seed.execute(
+            "INSERT INTO chunk_embeddings(chunk_id, embedding) VALUES (1, ?1)",
+            [vec![7_u8; EMBEDDING_DIM]],
+        )?;
+        drop(seed);
+
+        let target = open_write_at(&target_path)?;
+        init_db(&target)?;
+        assert_eq!(seed_embedding_cache(&target, &target_path, &seed_path)?, 1);
+        let expected_hash = format!("{:x}", Sha256::digest(text.as_bytes()));
+        let stored: (String, Vec<u8>) = target.query_row(
+            "SELECT text_sha256, embedding FROM embedding_cache
+             WHERE model_id = ?1",
+            [EMBEDDING_MODEL_ID],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(stored, (expected_hash, vec![7_u8; EMBEDDING_DIM]));
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_resume_rejects_changed_workspace_state_or_content() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let workspace = root.path().join("workspace");
+        let documents = workspace.join("documents");
+        fs::create_dir_all(&documents)?;
+        fs::write(
+            workspace.join(WORKSPACE_LOCK_FILENAME),
+            b"lock bytes are excluded",
+        )?;
+        fs::write(workspace.join("state.json"), b"{\"version\":1}\n")?;
+        fs::write(documents.join("one.json"), b"{\"body\":\"one\"}\n")?;
+
+        let original_binding = fingerprint_source_workspace(&workspace.canonicalize()?)?;
+        let original = fixture_build_state("ato", original_binding.clone());
+        let checkpoint = root.path().join("build-state.json");
+        let database = root.path().join(crate::config::LEGAL_DB_FILENAME);
+        validate_or_create_build_state(&checkpoint, &database, &original)?;
+        fs::write(&database, b"interrupted SQLite checkpoint")?;
+
+        fs::write(
+            workspace.join(WORKSPACE_LOCK_FILENAME),
+            b"a different lock file is still excluded",
+        )?;
+        assert_eq!(
+            fingerprint_source_workspace(&workspace.canonicalize()?)?,
+            original_binding
+        );
+        validate_or_create_build_state(&checkpoint, &database, &original)?;
+
+        fs::write(documents.join("one.json"), b"{\"body\":\"changed\"}\n")?;
+        let changed_content = fixture_build_state(
+            "ato",
+            fingerprint_source_workspace(&workspace.canonicalize()?)?,
+        );
+        let error = validate_or_create_build_state(&checkpoint, &database, &changed_content)
+            .expect_err("changed document bytes must reject resume");
+        assert!(error.to_string().contains("exact source workspace bytes"));
+
+        fs::write(documents.join("one.json"), b"{\"body\":\"one\"}\n")?;
+        fs::write(workspace.join("state.json"), b"{\"version\":2}\n")?;
+        let changed_state = fixture_build_state(
+            "ato",
+            fingerprint_source_workspace(&workspace.canonicalize()?)?,
+        );
+        assert!(validate_or_create_build_state(&checkpoint, &database, &changed_state).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_fingerprint_rejects_symlinked_content() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir()?;
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace)?;
+        fs::write(workspace.join("state.json"), b"{}")?;
+        let target = root.path().join("target");
+        fs::write(&target, b"content")?;
+        symlink(&target, workspace.join("documents"))?;
+        assert!(fingerprint_source_workspace(&workspace.canonicalize()?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn final_build_gate_rejects_overlapping_source_partitions() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        init_db(&conn)?;
+        conn.execute_batch(
+            "INSERT INTO sources(source_id, display_name) VALUES ('ato', 'ATO'), ('frl', 'FRL');
+             INSERT INTO documents(
+                 source_id, native_id, type, title, canonical_url, downloaded_at,
+                 content_hash, html
+             ) VALUES
+                 ('ato', 'a', 'fixture', 'A', 'https://example.invalid/a', '2026-01-01T00:00:00Z', 'a', X'00'),
+                 ('frl', 'b', 'fixture', 'B', 'https://example.invalid/b', '2026-01-01T00:00:00Z', 'b', X'00'),
+                 ('ato', 'c', 'fixture', 'C', 'https://example.invalid/c', '2026-01-01T00:00:00Z', 'c', X'00');
+             INSERT INTO chunks(chunk_id, source_id, native_id, ord, text) VALUES
+                 (1, 'ato', 'a', 0, X'00'),
+                 (2, 'frl', 'b', 0, X'00'),
+                 (3, 'ato', 'c', 0, X'00');
+             INSERT INTO chunks_fts(rowid, text) VALUES (1, 'a'), (2, 'b'), (3, 'c');
+             INSERT INTO title_fts(rowid, source_id, native_id, title, headings) VALUES
+                 (1, 'ato', 'a', 'A', ''),
+                 (2, 'frl', 'b', 'B', ''),
+                 (3, 'ato', 'c', 'C', '');",
+        )?;
+        let digest = crate::db::chunks_fts_index_sha256(&conn, "chunks_fts")?;
+        set_corpus_meta(&conn, "chunks_fts_index_sha256", &digest)?;
+        let error = verify_final_build_fts(&conn).unwrap_err();
+        assert!(error.to_string().contains("overlap rowid ranges"));
         Ok(())
     }
 }

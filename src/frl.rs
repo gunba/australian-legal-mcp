@@ -4701,6 +4701,26 @@ mod tests {
         assert!(epub_html.contains("<strong>beta</strong> and <em>delta</em> epsilon"));
         assert!(docx_html.contains("<strong>rule</strong> applies"));
         assert!(!docx_html.contains("PAGE"));
+
+        let render_chunks = |html: &str| -> Result<String> {
+            Ok(crate::chunker::chunk_html_with_token_count(
+                html,
+                None,
+                crate::chunker::EMBED_MAX_TOKENS,
+                |text| Ok(text.split_whitespace().count().max(1)),
+            )?
+            .into_iter()
+            .map(|chunk| chunk.text)
+            .collect::<Vec<_>>()
+            .join("\n"))
+        };
+        let asset_marker = "[asset:frl:A0001/sha256-111d58ef8ef321b2f4e97801899f03f9ef0c4b00ead9fb641d868e59b6c77f5b]";
+        let epub_chunks = render_chunks(&epub_html)?;
+        let docx_chunks = render_chunks(&docx_html)?;
+        assert!(epub_chunks.contains(&format!("[image: Seal] {asset_marker}")));
+        assert!(docx_chunks.contains(asset_marker));
+        assert_eq!(epub_chunks.matches(asset_marker).count(), 1);
+        assert_eq!(docx_chunks.matches(asset_marker).count(), 1);
         Ok(())
     }
 

@@ -339,6 +339,50 @@ pub(crate) fn verify_fts_relational_bindings(conn: &Connection) -> Result<()> {
     )? {
         bail!("title_fts identities do not exactly match documents");
     }
+    verify_source_rowid_partitions(conn)?;
+    Ok(())
+}
+
+pub(crate) fn verify_fts_integrity(conn: &Connection) -> Result<()> {
+    let transaction = conn.unchecked_transaction()?;
+    transaction.execute(
+        "INSERT INTO title_fts(title_fts) VALUES('integrity-check')",
+        [],
+    )?;
+    transaction.execute(
+        "INSERT INTO chunks_fts(chunks_fts) VALUES('integrity-check')",
+        [],
+    )?;
+    transaction.rollback()?;
+    Ok(())
+}
+
+fn verify_source_rowid_partitions(conn: &Connection) -> Result<()> {
+    for (table, rowid) in [("chunks", "chunk_id"), ("title_fts", "rowid")] {
+        let sql = format!(
+            "SELECT source_id, MIN({rowid}), MAX({rowid}), COUNT(*) \
+             FROM {table} GROUP BY source_id ORDER BY MIN({rowid}), source_id"
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let ranges = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        for pair in ranges.windows(2) {
+            let (source_id, first, last, _count) = &pair[0];
+            let (next_source_id, next_first, next_last, _next_count) = &pair[1];
+            if first <= next_last && next_first <= last {
+                bail!(
+                    "generation FTS sources `{source_id}` and `{next_source_id}` overlap rowid ranges in `{table}`: {first}-{last} and {next_first}-{next_last}"
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -931,6 +975,34 @@ mod tests {
         )?;
         let error = verify_fts_relational_bindings(&conn).unwrap_err();
         assert!(error.to_string().contains("rowids"));
+        Ok(())
+    }
+
+    #[test]
+    fn fts_relational_bindings_require_isolated_source_partitions() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        init_db(&conn)?;
+        conn.execute_batch(
+            "INSERT INTO sources(source_id, display_name) VALUES ('ato', 'ATO'), ('frl', 'FRL');
+             INSERT INTO documents(
+                 source_id, native_id, type, title, canonical_url, downloaded_at,
+                 content_hash, html
+             ) VALUES
+                 ('ato', 'a', 'ruling', 'A', 'https://example.invalid/a', '2026-01-01T00:00:00Z', 'a', X'00'),
+                 ('frl', 'b', 'Act', 'B', 'https://example.invalid/b', '2026-01-01T00:00:00Z', 'b', X'00'),
+                 ('ato', 'c', 'ruling', 'C', 'https://example.invalid/c', '2026-01-01T00:00:00Z', 'c', X'00');
+             INSERT INTO chunks(chunk_id, source_id, native_id, ord, text) VALUES
+                 (1, 'ato', 'a', 0, X'00'),
+                 (2, 'frl', 'b', 0, X'00'),
+                 (3, 'ato', 'c', 0, X'00');
+             INSERT INTO chunks_fts(rowid, text) VALUES (1, 'a'), (2, 'b'), (3, 'c');
+             INSERT INTO title_fts(rowid, source_id, native_id, title, headings) VALUES
+                 (1, 'ato', 'a', 'A', ''),
+                 (2, 'frl', 'b', 'B', ''),
+                 (3, 'ato', 'c', 'C', '');",
+        )?;
+        let error = verify_fts_relational_bindings(&conn).unwrap_err();
+        assert!(error.to_string().contains("overlap rowid ranges"));
         Ok(())
     }
 
