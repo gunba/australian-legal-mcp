@@ -89,10 +89,229 @@ enough to expose directly; proxy mode is also valid if `directTools` is
 omitted. The 180-second timeout accommodates first model load and the unusually
 large global `stats` response.
 
+A project `.mcp.json` or `.pi/mcp.json` can override a global server definition
+field by field. Do not use a secret-bearing global definition from an untrusted
+workspace: a same-named project entry could replace its URL while inheriting the
+header. The enterprise-vault procedure below uses a dedicated Pi directory and
+a launcher that rejects both project override paths before startup.
+
 This workstation is configured under the collision-free name
 `australian-legal-remote`; the superseded user-global local ATO server and ATO
 Pi package were removed. The credential remains redacted from repository files
 and terminal output.
+
+### Enterprise Windows laptop: Pi in a Desktop Obsidian vault
+
+Use this layout when the Obsidian vault is the agent workspace but its contents
+are synchronised between devices. The MCP credential and Pi sessions remain in
+the Windows user profile and **must not** be stored in the vault.
+
+Before setup, obtain approval under the organisation's AI, legal-data, and
+software-installation policies. Use a new revocable key issued specifically for
+the enterprise laptop; do not copy another client's key. Start with synthetic
+or public facts, not employer, client, personal, or legally privileged data.
+
+The adapter is a full-privilege Pi extension. The organisation should review
+and allowlist exactly `pi-mcp-adapter@2.11.0` and its dependency tree, preferably
+through its approved npm registry. Also note that the adapter's project MCP
+files override user definitions field by field. A project file could otherwise
+replace the URL while inheriting a global secret header. The dedicated launcher
+below therefore refuses to start when the vault contains `.mcp.json` or
+`.pi\mcp.json`; Pi's project-trust prompt is not a substitute for this check.
+
+1. Install current Node.js LTS and Git for Windows through the organisation's
+   managed software channel. Pi requires Bash on Windows and automatically uses
+   `C:\Program Files\Git\bin\bash.exe` when Git for Windows is installed. Do not
+   disable TLS verification to bypass an enterprise proxy.
+2. Open PowerShell and resolve the actual Desktop location. This works when the
+   enterprise redirects Desktop into OneDrive. Change only `$vaultName` if the
+   vault has another name.
+
+   ```powershell
+   $vaultName = 'Obsidian'
+   $desktop = [Environment]::GetFolderPath('Desktop')
+   $vault = Join-Path $desktop $vaultName
+   if (-not (Test-Path -LiteralPath $vault -PathType Container)) {
+       throw "Obsidian vault not found: $vault"
+   }
+
+   $agentDir = Join-Path $HOME '.pi\australian-legal-enterprise'
+   $sessionDir = Join-Path $agentDir 'sessions'
+   $vaultFull = [IO.Path]::GetFullPath($vault).TrimEnd('\') + '\'
+   $agentFull = [IO.Path]::GetFullPath($agentDir).TrimEnd('\') + '\'
+   if ($agentFull.StartsWith($vaultFull, [StringComparison]::OrdinalIgnoreCase)) {
+       throw 'The private Pi directory resolves inside the synced vault.'
+   }
+   if (Test-Path -LiteralPath $agentDir) {
+       throw "Private Pi directory already exists; review it instead of overwriting: $agentDir"
+   }
+
+   New-Item -ItemType Directory -Path $sessionDir -Force | Out-Null
+   $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+   & icacls $agentDir /inheritance:r /grant:r "${identity}:(OI)(CI)F" | Out-Null
+   if ($LASTEXITCODE -ne 0) {
+       Remove-Item -LiteralPath $agentDir -Recurse -Force
+       throw 'Could not make the private Pi directory user-only.'
+   }
+   $unexpected = (Get-Acl -LiteralPath $agentDir).Access | Where-Object {
+       $_.AccessControlType -eq 'Allow' -and
+       $_.IdentityReference.Value -ne $identity
+   }
+   if ($unexpected) {
+       Remove-Item -LiteralPath $agentDir -Recurse -Force
+       throw 'The private Pi directory has an unexpected allow entry.'
+   }
+   ```
+
+3. Select the dedicated Pi directory for this PowerShell process, then install
+   the pinned, organisation-approved Pi build and reviewed adapter. Do not add
+   `-l`; project-local installation would write package state beneath the synced
+   vault.
+
+   ```powershell
+   $env:PI_CODING_AGENT_DIR = $agentDir
+   $env:PI_CODING_AGENT_SESSION_DIR = $sessionDir
+   npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.80.10
+   Set-Location -LiteralPath $agentDir
+   pi install npm:pi-mcp-adapter@2.11.0 --no-approve
+   pi --version
+   pi list
+   ```
+
+4. Create the private MCP override. This refuses to replace an existing file,
+   writes first into the already-private directory, verifies the file ACL, and
+   publishes it with an atomic same-directory rename. Replace the endpoint only
+   when the project documents a stable successor hostname.
+
+   ```powershell
+   $mcpPath = Join-Path $agentDir 'mcp.json'
+   if (Test-Path -LiteralPath $mcpPath) {
+       throw "Refusing to replace existing MCP configuration: $mcpPath"
+   }
+   $tempPath = Join-Path $agentDir ('.mcp.' + [guid]::NewGuid().ToString('N') + '.tmp')
+   $secureKey = Read-Host 'Paste the dedicated enterprise-laptop MCP key' -AsSecureString
+   $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureKey)
+   try {
+       $key = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+       if ([string]::IsNullOrWhiteSpace($key)) { throw 'The MCP key is empty.' }
+       $config = [ordered]@{
+           mcpServers = [ordered]@{
+               'australian-legal-remote' = [ordered]@{
+                   url = 'https://139-144-99-80.ip.linodeusercontent.com/mcp'
+                   headers = [ordered]@{ 'X-API-Key' = $key }
+                   lifecycle = 'lazy'
+                   requestTimeoutMs = 180000
+                   directTools = $true
+               }
+           }
+       }
+       $json = $config | ConvertTo-Json -Depth 8
+       [IO.File]::WriteAllText($tempPath, $json, [Text.UTF8Encoding]::new($false))
+       & icacls $tempPath /inheritance:r /grant:r "${identity}:F" | Out-Null
+       if ($LASTEXITCODE -ne 0) { throw 'Could not restrict the MCP file ACL.' }
+       $unexpected = (Get-Acl -LiteralPath $tempPath).Access | Where-Object {
+           $_.AccessControlType -eq 'Allow' -and
+           $_.IdentityReference.Value -ne $identity
+       }
+       if ($unexpected) { throw 'The MCP file has an unexpected allow entry.' }
+       Move-Item -LiteralPath $tempPath -Destination $mcpPath
+   }
+   catch {
+       Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+       throw
+   }
+   finally {
+       [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+       Remove-Variable key, secureKey, config, json -ErrorAction SilentlyContinue
+   }
+   ```
+
+5. Write a private launcher outside the vault. It fixes both Pi paths, checks
+   that neither path is inside the vault, and rejects project MCP overrides
+   before Pi or the adapter starts.
+
+   ```powershell
+   $vaultPathFile = Join-Path $agentDir 'obsidian-vault-path.txt'
+   [IO.File]::WriteAllText($vaultPathFile, $vault, [Text.UTF8Encoding]::new($false))
+   & icacls $vaultPathFile /inheritance:r /grant:r "${identity}:F" | Out-Null
+   if ($LASTEXITCODE -ne 0) { throw 'Could not restrict the vault-path ACL.' }
+
+   $launcher = Join-Path $agentDir 'Start-ObsidianPi.ps1'
+   $launcherText = @'
+   $ErrorActionPreference = 'Stop'
+   $agentDir = $PSScriptRoot
+   $sessionDir = Join-Path $agentDir 'sessions'
+   $vault = [IO.File]::ReadAllText(
+       (Join-Path $agentDir 'obsidian-vault-path.txt'),
+       [Text.Encoding]::UTF8
+   ).Trim()
+   if (-not (Test-Path -LiteralPath $vault -PathType Container)) {
+       throw "Obsidian vault not found: $vault"
+   }
+   $sharedMcpPath = Join-Path $HOME '.config\mcp\mcp.json'
+   if (Test-Path -LiteralPath $sharedMcpPath) {
+       throw "Refusing user-global shared MCP configuration in the isolated profile: $sharedMcpPath"
+   }
+   $vaultFull = [IO.Path]::GetFullPath($vault).TrimEnd('\') + '\'
+   foreach ($path in @(
+       (Join-Path $vault '.mcp.json'),
+       (Join-Path $vault '.pi\mcp.json')
+   )) {
+       if (Test-Path -LiteralPath $path) {
+           throw "Refusing a synced project MCP override: $path"
+       }
+   }
+   $agentFull = [IO.Path]::GetFullPath($agentDir).TrimEnd('\') + '\'
+   if ($agentFull.StartsWith($vaultFull, [StringComparison]::OrdinalIgnoreCase)) {
+       throw 'The private Pi directory resolves inside the synced vault.'
+   }
+   $env:PI_CODING_AGENT_DIR = $agentDir
+   $env:PI_CODING_AGENT_SESSION_DIR = $sessionDir
+   Set-Location -LiteralPath $vault
+   & pi --no-approve --no-context-files --no-builtin-tools
+   exit $LASTEXITCODE
+   '@
+   [IO.File]::WriteAllText($launcher, $launcherText, [Text.UTF8Encoding]::new($false))
+   & icacls $launcher /inheritance:r /grant:r "${identity}:F" | Out-Null
+   if ($LASTEXITCODE -ne 0) { throw 'Could not restrict the launcher ACL.' }
+   ```
+
+   If the organisation blocks unsigned PowerShell scripts, have this launcher
+   reviewed and signed; do not bypass execution policy. Always start this
+   workspace through the launcher rather than bare `pi`:
+
+   ```powershell
+   & "$HOME\.pi\australian-legal-enterprise\Start-ObsidianPi.ps1"
+   ```
+
+   This is intentionally an MCP-only profile: `--no-approve` ignores synced
+   project packages, `--no-context-files` ignores vault instructions, and
+   `--no-builtin-tools` removes Pi's unsandboxed filesystem/shell tools while
+   retaining extension tools. The launcher also rejects the user-global shared
+   `~/.config/mcp/mcp.json`, so only the dedicated agent directory's seven-tool
+   server is available. Attach a specific synthetic note with Pi's `@` file
+   picker when needed; the agent cannot browse the rest of the mixed
+   personal/work vault. Use a separately reviewed sandboxed profile if an agent
+   ever needs broader vault access.
+
+6. In Pi, run `/login` and select an organisation-approved model/provider if
+   authentication is not already configured. Restart after the adapter's first
+   installation, launch it again through the wrapper, then run:
+
+   ```text
+   /mcp reconnect australian-legal-remote
+   ```
+
+7. Run the [verification prompt](#verification-prompt). The MCP panel must show
+   exactly seven Australian Legal tools. The synced validation pack is at
+   `Tax\Australian Legal MCP\Validation` in the Obsidian vault. If the
+   connection fails behind a corporate proxy, ask IT to allow the documented
+   HTTPS hostname on port 443; do not weaken certificate validation or move the
+   key into the vault.
+
+For a macOS or Linux enterprise laptop, use the same vault/private-config
+separation with the commands in [Pi](#pi), then launch `pi` after changing into
+`$HOME/Desktop/Obsidian` (or the actual Obsidian vault path).
 
 ## Claude Code
 

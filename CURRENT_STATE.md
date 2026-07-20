@@ -146,9 +146,17 @@ and all-ten-source hybrid retrieval. V19 remains installed as the rollback
 source for a paired v0.18.1 binary/image fallback; the schema-11 binary does not
 accept schema 10.
 
-Post-validation cleanup removed superseded local build/cache material without
-removing source truth or the v19 fallback. Project usage fell from 298 GiB to
-197 GiB and free disk increased from 76 GiB to 153 GiB.
+The initial post-validation cleanup removed superseded local build/cache
+material without removing source truth or the v19 fallback. After the v22
+validation, a second reviewed cleanup removed the superseded packaged v19 build,
+disposable embedding/TensorRT/Azure caches, Cargo debug/cross/package outputs,
+the downloaded OpenTofu provider cache, completed acquisition-attempt runs, and
+one-off build/benchmark scratch files. Allocated project usage fell from about
+300 GiB immediately before that cleanup to about 203 GiB. Btrfs reflink sharing
+means the filesystem gained about 23 GiB rather than the full logical reduction.
+The active v22, v21 rollback parent, hosted Arroy v20 source, v19 DR corpus,
+prepared flat-v20 cutover copy, canonical source workspaces, models, deployment
+state, logs, and validation evidence were retained.
 
 ## V22 local corpus
 
