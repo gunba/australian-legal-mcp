@@ -31,7 +31,7 @@ RUN apt-get update \
  && rm "/tmp/${archive}"
 
 FROM docker.io/library/debian@sha256:63a496b5d3b99214b39f5ed70eb71a61e590a77979c79cbee4faf991f8c0783e
-ARG VERSION=0.19.7
+ARG VERSION=0.19.8
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="Australian Legal MCP" \
       org.opencontainers.image.description="Source-grounded Australian legal MCP server" \

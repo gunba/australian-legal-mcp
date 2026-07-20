@@ -17,7 +17,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
   exit 2
 }
 
-version=0.19.7
+version=0.19.8
 revision=1111111111111111111111111111111111111111
 old_revision=2222222222222222222222222222222222222222
 old_digest="ghcr.io/gunba/australian-legal-mcp@sha256:$(printf 'a%.0s' {1..64})"
@@ -75,7 +75,7 @@ case "$1" in
     if [[ -e /tmp/wrong-release-binary ]]; then
       printf '%s\n' 'legal-mcp 9.9.9'
     else
-      printf '%s\n' 'legal-mcp 0.19.7'
+      printf '%s\n' 'legal-mcp 0.19.8'
     fi
     ;;
   verify-runtime)
@@ -471,8 +471,8 @@ STATUS
   fi
   exit 0
 fi
-if [[ "$*" == '--force delete allow 80/tcp' \
-  || "$*" == '--force delete allow 443/tcp' ]]; then
+if [[ "$*" == '--force delete allow 80/tcp comment Caddy ACME HTTP' \
+  || "$*" == '--force delete allow 443/tcp comment Australian Legal MCP HTTPS' ]]; then
   [[ ! -e /tmp/fail-ufw-delete ]] || exit 88
   rm -f /tmp/ufw-web-open
   exit 0
@@ -532,7 +532,7 @@ case "\$1" in
           if [[ -e /tmp/wrong-oci-description ]]; then printf '%s\n' Wrong; else printf '%s\n' 'Source-grounded Australian legal MCP server'; fi
         elif [[ "\$format" == *'.version'* ]]; then
           if [[ "\$image" = "\$new_image" ]]; then
-            if [[ -e /tmp/wrong-oci-version ]]; then printf '%s\n' 9.9.9; else printf '%s\n' 0.19.7; fi
+            if [[ -e /tmp/wrong-oci-version ]]; then printf '%s\n' 9.9.9; else printf '%s\n' 0.19.8; fi
           else
             printf '%s\n' 0.18.1
           fi
@@ -573,7 +573,7 @@ case "\$1" in
     done
     case "\$command" in
       --version)
-        if [[ -e /tmp/wrong-oci-binary ]]; then printf '%s\n' 'legal-mcp 9.9.9'; else printf '%s\n' 'legal-mcp 0.19.7'; fi
+        if [[ -e /tmp/wrong-oci-binary ]]; then printf '%s\n' 'legal-mcp 9.9.9'; else printf '%s\n' 'legal-mcp 0.19.8'; fi
         ;;
       verify-runtime) printf '%s\n' '{"onnx_runtime_ready":true}' ;;
       '')
@@ -944,7 +944,7 @@ reset_baseline
 touch /tmp/ufw-web-open /tmp/caddy-active /tmp/caddy-enabled
 expect_update_failed
 assert_old_state
-grep -Fq 'ufw:--force delete allow 80/tcp' "$log"
+grep -Fq 'ufw:--force delete allow 80/tcp comment Caddy ACME HTTP' "$log"
 
 reset_baseline
 touch /tmp/service-active

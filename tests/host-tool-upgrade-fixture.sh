@@ -17,7 +17,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
   exit 2
 }
 
-version=0.19.7
+version=0.19.8
 revision=1111111111111111111111111111111111111111
 generation=1a6beead567b55babebbe253b5ae13efcd9ce2e8ab55b60c2de4106e39f180f4
 volume_uuid=11111111-2222-3333-4444-555555555555
@@ -98,7 +98,7 @@ if [[ "$1" = --version ]]; then
   if [[ -e /tmp/wrong-release-binary ]]; then
     printf '%s\n' 'legal-mcp 9.9.9'
   else
-    printf '%s\n' 'legal-mcp 0.19.7'
+    printf '%s\n' 'legal-mcp 0.19.8'
   fi
   exit 0
 fi
@@ -245,8 +245,8 @@ STATUS
   fi
   exit 0
 fi
-if [[ "$*" == '--force delete allow 80/tcp' \
-  || "$*" == '--force delete allow 443/tcp' ]]; then
+if [[ "$*" == '--force delete allow 80/tcp comment Caddy ACME HTTP' \
+  || "$*" == '--force delete allow 443/tcp comment Australian Legal MCP HTTPS' ]]; then
   [[ ! -e /tmp/fail-ufw-delete ]] || exit 90
   rm -f /tmp/ufw-web-open
   exit 0
@@ -855,7 +855,7 @@ touch /tmp/wrong-release-binary
 expect_upgrade_failed
 assert_old_tools
 
-# Every v0.19.7 release asset is mandatory, has its exact executable/data
+# Every v0.19.8 release asset is mandatory, has its exact executable/data
 # mode, and must be a single safe file from the version-matched bundle.
 for release_asset in \
   "$bundle/infra/hosting/configure-auth.sh" \
@@ -916,7 +916,7 @@ expect_upgrade_failed
 assert_old_tools
 
 # LIFECYCLE_LOCK was durably created by the failed v0.19.0 activation before
-# generation validation. V0.19.7 treats that exact empty root-owned file as
+# generation validation. V0.19.8 treats that exact empty root-owned file as
 # installed state, while rejecting every unsafe identity and representation.
 reset_old_state
 "$real_rm" -f -- "$lifecycle_lock"

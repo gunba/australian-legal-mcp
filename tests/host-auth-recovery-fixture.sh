@@ -8,7 +8,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 [[ $EUID -eq 0 && -x /configure-auth && -x /install-host ]] || exit 2
 
-version=0.19.7
+version=0.19.8
 revision=1111111111111111111111111111111111111111
 generation=a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3
 old_image="ghcr.io/gunba/australian-legal-mcp@sha256:$(printf 'a%.0s' {1..64})"
@@ -291,8 +291,8 @@ STATUS
   [[ ! -e /tmp/ufw-extra ]] || printf '%s\n' '9999/tcp                   ALLOW IN    Anywhere'
   exit 0
 fi
-if [[ "$*" = '--force delete allow 80/tcp' ]]; then rm -f /tmp/ufw-80; exit 0; fi
-if [[ "$*" = '--force delete allow 443/tcp' ]]; then rm -f /tmp/ufw-443; exit 0; fi
+if [[ "$*" = '--force delete allow 80/tcp comment Caddy ACME HTTP' ]]; then rm -f /tmp/ufw-80; exit 0; fi
+if [[ "$*" = '--force delete allow 443/tcp comment Australian Legal MCP HTTPS' ]]; then rm -f /tmp/ufw-443; exit 0; fi
 if [[ "$1" = allow && "$2" = 80/tcp ]]; then touch /tmp/ufw-80; exit 0; fi
 if [[ "$1" = allow && "$2" = 443/tcp ]]; then touch /tmp/ufw-443; exit 0; fi
 exit 1

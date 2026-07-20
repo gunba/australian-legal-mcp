@@ -14,7 +14,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
   exit 2
 }
 
-version=0.19.7
+version=0.19.8
 revision=1111111111111111111111111111111111111111
 old_revision=2222222222222222222222222222222222222222
 old_generation=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -276,7 +276,8 @@ if [[ "$1" = status ]]; then
   fi
   exit 0
 fi
-if [[ "$*" = '--force delete allow 80/tcp' || "$*" = '--force delete allow 443/tcp' ]]; then
+if [[ "$*" = '--force delete allow 80/tcp comment Caddy ACME HTTP' \
+  || "$*" = '--force delete allow 443/tcp comment Australian Legal MCP HTTPS' ]]; then
   rm -f /tmp/ufw-web-open
   /usr/local/sbin/fixture-kill ufw-dark
   exit 0

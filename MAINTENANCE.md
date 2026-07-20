@@ -16,11 +16,13 @@ non-replaceable release is created. Linux requires glibc 2.27+; Windows requires
 the Microsoft Visual C++ 2015–2022 Redistributable. Publish and independently
 verify `SHA256SUMS` for every archive.
 
-The software tree is version 0.19.7. The prior immutable v0.19.6 release,
-checksums, `SOURCE_COMMIT`, Linux runtime, OCI digest, and attestations were
-independently verified. V0.19.7 retains the V2 host transaction and adds the
-transactional historical-launcher upgrade plus the coordinated, recoverable
-Arroy-to-flat-int8 image/generation cutover.
+The software tree is version 0.19.8. The immutable v0.19.7 release, checksums,
+`SOURCE_COMMIT`, Linux runtime, OCI digest, and attestations were independently
+verified but were not deployed after live preflight exposed that plain
+`ufw status` omits the `IN` token required by the strict rule parser, so public
+web rules were misclassified as absent. V0.19.8 retains the V2 host transaction
+and coordinated recoverable Arroy-to-flat-int8 cutover while inspecting verbose
+UFW status and removing the exact rules, including their configured comments.
 
 ## Canonical local data
 

@@ -86,7 +86,7 @@ scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
 
-Software is 0.19.7. Chunker-format-6 flat-int8 v22
+Software is 0.19.8. Chunker-format-6 flat-int8 v22
 `937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939` is active
 and strictly verified locally. Arroy v20
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` remains

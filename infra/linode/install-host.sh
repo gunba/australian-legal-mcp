@@ -757,8 +757,8 @@ force_auth_closed() {
   local failed=false
   remove_auth_ready || failed=true
   systemctl disable --now caddy.service >/dev/null 2>&1 || failed=true
-  ufw --force delete allow 80/tcp >/dev/null 2>&1 || true
-  ufw --force delete allow 443/tcp >/dev/null 2>&1 || true
+  ufw --force delete allow 80/tcp comment 'Caddy ACME HTTP' >/dev/null 2>&1 || true
+  ufw --force delete allow 443/tcp comment 'Australian Legal MCP HTTPS' >/dev/null 2>&1 || true
   systemctl stop legal-mcp.service >/dev/null 2>&1 || failed=true
   closed_surface_ready || failed=true
   [[ "$failed" = false ]]
@@ -1406,7 +1406,7 @@ read_systemctl_activity() {
 
 ufw_rule_state() {
   local port="$1" report status
-  if report="$(ufw status)"; then
+  if report="$(ufw status verbose)"; then
     :
   else
     status=$?
@@ -1428,7 +1428,7 @@ ufw_rule_state() {
 }
 
 close_public_ingress() {
-  local port state enabled activity
+  local port state enabled activity comment
   systemctl disable --now caddy.service >/dev/null 2>&1 || {
     echo 'could not disable and stop Caddy' >&2
     return 1
@@ -1436,7 +1436,12 @@ close_public_ingress() {
   for port in 80 443; do
     state="$(ufw_rule_state "$port")" || return 1
     if [[ "$state" = present ]]; then
-      ufw --force delete allow "$port/tcp" >/dev/null 2>&1 || {
+      case "$port" in
+        80) comment='Caddy ACME HTTP' ;;
+        443) comment='Australian Legal MCP HTTPS' ;;
+        *) return 1 ;;
+      esac
+      ufw --force delete allow "$port/tcp" comment "$comment" >/dev/null 2>&1 || {
         echo "could not remove UFW public rule for port $port" >&2
         return 1
       }

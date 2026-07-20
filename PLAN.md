@@ -60,10 +60,11 @@ MCP surface remains exactly `search`, `get_chunks`, `get_asset`,
   policy, RFC 9728 metadata/challenges, and Copilot templates.
 - Added version-matched host-tool upgrade, explicit publisher abort, and
   fail-closed empty-host image cutover operations for the v20 transition.
-  V0.19.7 transactionally upgrades the historical launcher and adds the exact
-  configured-dark state required for a coordinated Arroy-image/generation to
-  flat-int8-image/generation cutover, including recovery after every modelled
-  SIGKILL phase.
+  V0.19.8 transactionally upgrades the historical launcher, detects the live
+  rules through verbose UFW status, removes the exact commented web rules, and
+  adds the configured-dark state required for a coordinated
+  Arroy-image/generation to flat-int8-image/generation cutover, including
+  recovery after every modelled SIGKILL phase.
 - Restricted the locked-parent activation exception to one exact networkless
   `activate` invocation with `CAP_DAC_OVERRIDE`; the hosted service and every
   other lifecycle command remain capability-free. Disposable fixtures prove
