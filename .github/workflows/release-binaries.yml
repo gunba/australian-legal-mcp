@@ -79,6 +79,13 @@ jobs:
             rhysd/actionlint@sha256:2ef3ed94025747bd876118bfcae405d13532a07904d5ee0d70948110ef32f71d
           tests/deploy-generation-abort-fixture.sh
           tests/host-installer-publisher-contract-fixture.sh
+          if ! command -v podman >/dev/null; then
+            sudo apt-get update >/dev/null
+            sudo apt-get install --yes --no-install-recommends podman >/dev/null
+          fi
+          sudo env LEGAL_MCP_DISPOSABLE_PODMAN_FIXTURE=1 \
+            LEGAL_MCP_EXPECT_PODMAN_MAJOR_MINOR=4.9 \
+            tests/podman-capability-contract-fixture.sh "$PWD"
           docker run --rm --user 0:0 --cap-add=NET_ADMIN --entrypoint /bin/bash \
             --volume "$PWD:/repo:ro" \
             ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \
@@ -108,6 +115,8 @@ jobs:
             --volume "$PWD/infra/linode/install-host.sh:/install-host:ro" \
             --volume "$PWD/infra/hosting/legal-mcp.container.template:/container-template:ro" \
             --volume "$PWD/infra/hosting/Caddyfile:/Caddyfile:ro" \
+            --volume "$PWD/tests/fixtures/v0.19.8/update-image.sh:/v0198-update-image:ro" \
+            --volume "$PWD/tests/fixtures/v0.19.8/configure-auth.sh:/v0198-configure-auth:ro" \
             --volume "$PWD/scripts/legal-mcp-host-deploy:/host-deploy:ro" \
             --volume "$PWD/scripts/legal-mcp-publisher-command:/publisher-command:ro" \
             ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \

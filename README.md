@@ -166,7 +166,7 @@ legal-mcp prune-generations --keep-inactive 1
 There is no runtime `update`, corpus downloader, offline bundle, corpus package,
 or GitHub corpus-release path.
 
-Software is version 0.19.8. The active local generation is chunker-format-6
+Software is version 0.19.9. The active local generation is chunker-format-6
 v22 `937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939`.
 It contains 409,528 documents, 6,986,040 chunks/embeddings, and 20,169
 definitions in schema 11. Its 19,758,231,552-byte `legal.db` has SHA-256
@@ -244,20 +244,19 @@ scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
 
-V20 is active and serving through authenticated TLS at the temporary Linode
-hostname documented in [CLIENT_SETUP.md](CLIENT_SETUP.md). API-key cutover,
+V20 remains active on the configured-dark Linode after the v0.19.8 cutover
+rejected Podman 4.9's nullable capability field and restored the exact prior
+pair. The sealed v22 target and pending v0.19.8 journal are retained. V0.19.9
+uses live process capability sets and includes the exact compatibility bridge
+for the unchanged v0.19.8 recovery code documented in [DEPLOYMENT.md](DEPLOYMENT.md). API-key cutover,
 all-seven-tool/all-ten-source retrieval, exact public routes, reboot recovery,
-and key overlap/revocation were proved on 2026-07-19. The sole current client
-key ID is `second-client`; plaintext credentials are not stored in this
-repository. No deployment, authentication, image, host-tool, upload, or upload
-authorization transaction remains.
+and key overlap/revocation were proved before maintenance. The sole current
+client key ID is `second-client`; plaintext credentials are not stored in this
+repository.
 
-Immutable v0.19.6 release assets and OCI attestations were independently
-verified. The running v0.19.0 image contains the same Rust/crate source as
-v0.19.6; intervening changes are host/release tooling and version metadata. A
-future image/host-tool alignment is an activated-dark maintenance operation,
-not a serving-runtime correctness dependency. See [DEPLOYMENT.md](DEPLOYMENT.md)
-for the operational contract.
+Immutable v0.19.8 release assets and OCI attestations were independently
+verified. The host uses its V2 tools and the v0.19.0 rollback image until the
+v0.19.9 recovery, upgrade, and coordinated retry complete.
 
 The maintainer pipeline requires the pinned model in
 `data/models/mdbr-leaf-ir-standard`, CUDA/TensorRT ONNX Runtime, Google

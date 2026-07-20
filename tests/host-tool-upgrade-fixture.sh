@@ -17,9 +17,10 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
   exit 2
 }
 
-version=0.19.8
+version=0.19.9
 revision=1111111111111111111111111111111111111111
 generation=1a6beead567b55babebbe253b5ae13efcd9ce2e8ab55b60c2de4106e39f180f4
+prepared_generation=937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939
 volume_uuid=11111111-2222-3333-4444-555555555555
 bundle=/bundle
 installer=$bundle/infra/linode/install-host.sh
@@ -98,7 +99,7 @@ if [[ "$1" = --version ]]; then
   if [[ -e /tmp/wrong-release-binary ]]; then
     printf '%s\n' 'legal-mcp 9.9.9'
   else
-    printf '%s\n' 'legal-mcp 0.19.8'
+    printf '%s\n' 'legal-mcp 0.19.9'
   fi
   exit 0
 fi
@@ -561,6 +562,23 @@ write_activated_dark_state() {
   expected_old_marker=present
 }
 
+write_activated_prepared_state() {
+  local prepared_upload="/srv/legal-mcp/uploads/$prepared_generation"
+  write_activated_dark_state
+  expected_host_state=activated-prepared
+  "$real_install" -d -o legal-mcp-publisher -g legal-mcp-publisher -m 0700 \
+    "$prepared_upload"
+  printf '%s\n' sealed-flat-int8 > "$prepared_upload/generation.json"
+  chown legal-mcp-publisher:legal-mcp-publisher "$prepared_upload/generation.json"
+  chmod 600 "$prepared_upload/generation.json"
+  printf '%s\n%s\nprepared\n' "$prepared_generation" "$generation" > "$journal"
+  chown root:root "$journal"
+  chmod 600 "$journal"
+  printf '%s\n' "$prepared_generation" > "$authorization"
+  chown root:legal-mcp-publisher "$authorization"
+  chmod 440 "$authorization"
+}
+
 reset_old_state() {
   "$real_rm" -rf -- "$transaction" "$building" "$building_retired" \
     "$preparing" "$preparing_retired" "$retiring" "$retired" \
@@ -637,6 +655,17 @@ assert_host_state() {
   if [[ "$expected_host_state" = prepared ]]; then
     [[ -d "$upload" && -f "$journal" && -f "$authorization" \
       && ! -e /srv/legal-mcp/lifecycle/active-generation ]]
+  elif [[ "$expected_host_state" = activated-prepared ]]; then
+    mapfile -t prepared_journal < "$journal"
+    [[ -f /srv/legal-mcp/lifecycle/active-generation \
+      && "$(</srv/legal-mcp/lifecycle/active-generation)" = "$generation" \
+      && -d "/srv/legal-mcp/generations/$generation" \
+      && -d "/srv/legal-mcp/uploads/$prepared_generation" \
+      && ${#prepared_journal[@]} -eq 3 \
+      && "${prepared_journal[0]}" = "$prepared_generation" \
+      && "${prepared_journal[1]}" = "$generation" \
+      && "${prepared_journal[2]}" = prepared \
+      && "$(<"$authorization")" = "$prepared_generation" ]]
   else
     [[ -f /srv/legal-mcp/lifecycle/active-generation \
       && "$(</srv/legal-mcp/lifecycle/active-generation)" = "$generation" \
@@ -855,7 +884,7 @@ touch /tmp/wrong-release-binary
 expect_upgrade_failed
 assert_old_tools
 
-# Every v0.19.8 release asset is mandatory, has its exact executable/data
+# Every v0.19.9 release asset is mandatory, has its exact executable/data
 # mode, and must be a single safe file from the version-matched bundle.
 for release_asset in \
   "$bundle/infra/hosting/configure-auth.sh" \
@@ -916,7 +945,7 @@ expect_upgrade_failed
 assert_old_tools
 
 # LIFECYCLE_LOCK was durably created by the failed v0.19.0 activation before
-# generation validation. V0.19.8 treats that exact empty root-owned file as
+# generation validation. V0.19.9 treats that exact empty root-owned file as
 # installed state, while rejecting every unsafe identity and representation.
 reset_old_state
 "$real_rm" -f -- "$lifecycle_lock"
@@ -1469,9 +1498,17 @@ write_expected_v2_target_files
 cmp --silent /tmp/expected-new-marker /etc/legal-mcp/host-tools
 visudo -cf "$sudoers" >/dev/null
 
-# The successful activated-dark path has no upload, corpus transaction, or
-# authorization to preserve. It installs the same exact V2 file set while
-# leaving service and ingress off.
+# A cutover rollback restores one exact ordinary prepared generation beside
+# the still-active prior generation. Host-tool upgrade preserves that sealed
+# upload, journal, and authorization so the corrected image can retry it.
+reset_old_state
+write_activated_prepared_state
+output="$("$installer" --upgrade-host-tools --version "$version")"
+[[ "$output" = "host tools upgraded to $version ($revision); service and ingress remain off" ]]
+assert_new_tools
+
+# The successful activated-dark path with no prepared upload installs the same
+# exact V2 file set while leaving service and ingress off.
 reset_old_state
 write_activated_dark_state
 output="$("$installer" --upgrade-host-tools --version "$version")"

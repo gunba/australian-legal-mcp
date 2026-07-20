@@ -16,13 +16,17 @@ non-replaceable release is created. Linux requires glibc 2.27+; Windows requires
 the Microsoft Visual C++ 2015–2022 Redistributable. Publish and independently
 verify `SHA256SUMS` for every archive.
 
-The software tree is version 0.19.8. The immutable v0.19.7 release, checksums,
-`SOURCE_COMMIT`, Linux runtime, OCI digest, and attestations were independently
-verified but were not deployed after live preflight exposed that plain
-`ufw status` omits the `IN` token required by the strict rule parser, so public
-web rules were misclassified as absent. V0.19.8 retains the V2 host transaction
-and coordinated recoverable Arroy-to-flat-int8 cutover while inspecting verbose
-UFW status and removing the exact rules, including their configured comments.
+The software tree is version 0.19.9. Immutable v0.19.8 release assets and its
+OCI digest were independently verified. Its host tools repaired the verbose-UFW
+rule detection and reached the coordinated cutover, but Podman 4.9 represented
+`.EffectiveCaps` as `null`; the strict verifier rejected it and restored the
+exact Arroy generation/image pair configured-dark with the v22 upload retained.
+V0.19.9 proves the bounding, effective, inheritable, and permitted sets of every
+running container process through `podman top`. It also contains one exact
+v0.19.8 recovery bridge that leaves the old launcher, updater, and pointers
+unchanged while translating only that incompatible observation after the
+stronger live-process proof succeeds. The unchanged updater then advances and
+retires its own journal.
 
 ## Canonical local data
 
@@ -225,17 +229,15 @@ other command. See [DEPLOYMENT.md](DEPLOYMENT.md) for OpenTofu, volume identity,
 authentication, readiness, rollback, and VPS replacement; see
 [MICROSOFT_COPILOT.md](MICROSOFT_COPILOT.md) for Entra/Copilot.
 
-V20 is active and live on the current Linode behind API-key-authenticated TLS.
-All seven tools, all ten source partitions, exact routes, reboot recovery, and
-key rotation/revocation passed on 2026-07-19. No deployment, authentication,
-image, host-tool, upload, or upload-authorization transaction remains.
+V20 remains active on the configured-dark Linode. The exact pending v0.19.8
+cutover and sealed v22 upload remain; service, Caddy, web UFW rules, and
+`auth-ready` are off. All seven tools, all ten source partitions, exact routes,
+reboot recovery, and key rotation/revocation passed before maintenance.
 
-The live host uses verified v0.19.5 V2 host tools and the immutable v0.19.0
-runtime image. The latter contains the same Rust/crate source as v0.19.6;
-intervening changes are host/release tooling and version metadata. V0.19.6 is
-retained for the next activated-dark maintenance window. Its V2 upgrade accepts
-only prepared-bootstrap or activated-dark state, requires exact version,
-`SOURCE_COMMIT`, and release bytes, and recovers only with the same bundle.
+The host uses exact v0.19.8 V2 tools and the immutable v0.19.0 rollback image.
+The v0.19.9 release bridge must finish and retire the old cutover before a
+normal v0.19.9 host-tool upgrade preserves the restored ordinary prepared v22
+upload for the corrected cutover retry.
 
 ## Build semantics
 

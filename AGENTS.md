@@ -28,13 +28,14 @@ and can be delta-copied into staging on an external XFS/reflink volume attached
 to the Akamai/Linode VPS. A one-shot copy of the exact serving image validates
 and activates it. The serving container never scrapes, embeds, builds, or
 publishes corpus/model artifacts, and the image contains no corpus. GitHub
-Releases are binary-only; GHCR images are digest-pinned and attested. V20 is
-active and live on the current Linode behind authenticated Caddy TLS. API-key
-cutover, exact routes, reboot recovery, all-seven-tool/all-ten-source retrieval,
-and key rotation/revocation passed on 2026-07-19. No deployment,
-authentication, image, host-tool, upload, or upload-authorization transaction
-remains. Do not expose plaintext credentials or describe the temporary Linode
-hostname as permanent production DNS.
+Releases are binary-only; GHCR images are digest-pinned and attested. V20
+remains the active Linode generation, but production is configured-dark while
+the exact pending v0.19.8 cutover is recovered and retried with v0.19.9. The
+sealed v22 upload and journal remain; Caddy, service, web UFW rules, and
+`auth-ready` are off. API-key cutover, exact routes, reboot recovery,
+all-seven-tool/all-ten-source retrieval, and key rotation/revocation passed
+before maintenance. Do not expose plaintext credentials or describe the
+temporary Linode hostname as permanent production DNS.
 
 ## Design principles
 
@@ -161,7 +162,7 @@ scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
 
-Software is 0.19.8. Chunker-format-6 flat-int8 v22
+Software is 0.19.9. Chunker-format-6 flat-int8 v22
 `937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939` is active
 and strictly verified locally. Arroy v20
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` remains
@@ -170,14 +171,13 @@ local v19 parent with its matching v0.18.1 binary/image as the schema-10
 disaster-recovery fallback; the schema-11 binary must not attempt to roll back
 to schema 10.
 
-Immutable v0.19.6 release assets and OCI attestations exist and were
-independently verified. Its V2 host-tool transaction accepts only
-prepared-bootstrap or activated-dark state, binds exact release bytes and the
-shared host lock, and recovers only with the same bundle. The live host remains
-on verified v0.19.5 host tools and the immutable v0.19.0 runtime image because
-the latter contains the same Rust/crate source as v0.19.6; aligning those
-version labels is a future activated-dark maintenance operation, not a reason
-to interrupt the working endpoint.
+Immutable v0.19.8 release assets and OCI attestations were independently
+verified. Its host tools are installed on the configured-dark Linode. The
+cutover restored Arroy v20 after Podman 4.9 returned `EffectiveCaps=null` and
+left the exact v0.19.8 journal pending with sealed v22. V0.19.9 uses live
+bounding/effective/inheritable/permitted process sets and its exact release
+bridge must retire that journal before the normal host-tool upgrade and cutover
+retry. The runtime image remains immutable v0.19.0 until then.
 
 Manual recovery uses `activate`, `verify`, `rollback`, and
 `prune-generations`. There is no runtime `update`, corpus download, corpus/model

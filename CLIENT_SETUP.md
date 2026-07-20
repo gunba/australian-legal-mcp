@@ -1,12 +1,14 @@
 # Client setup
 
 Australian Legal MCP is a public Streamable HTTP endpoint with authenticated,
-read-only legal-research tools. The current validation endpoint is:
+read-only legal-research tools. The validation endpoint, currently offline during configured-dark maintenance,
+is:
 
 ```text
 https://139-144-99-80.ip.linodeusercontent.com/mcp
 ```
 
+Do not run client validation until the recovery runbook records republication.
 This Linode hostname is temporary. Replace it with the organisation's stable
 DNS name before a durable production integration.
 
@@ -20,7 +22,7 @@ federates sources or defaults to ATO.
 
 ## Authentication and secret handling
 
-The live test deployment currently uses an individually revocable API key:
+When republished, the test deployment uses an individually revocable API key:
 
 ```http
 X-API-Key: KEY_ID.BASE64URL_SECRET
