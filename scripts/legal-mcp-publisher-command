@@ -6,6 +6,11 @@ umask 077
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
+# SSH and administrative test harnesses may inherit a directory the publisher
+# cannot traverse. Use a fixed public directory so absolute-path transaction
+# checks and rrsync never depend on caller-owned working-directory access.
+cd /
+
 original="${SSH_ORIGINAL_COMMAND:-}"
 [[ -n "$original" && ${#original} -le 4096 && "$original" != *$'\n'* && "$original" != *$'\r'* ]] || {
   echo 'publisher command is missing or malformed' >&2
