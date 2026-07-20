@@ -5,9 +5,9 @@
 > Revalidate this adapter before any Azure return; it is preserved to retain
 > the hardened Bicep, Blob, identity, and recovery work.
 
-The current local and Linode serving generation is schema-11 v20. The Linode
-host is live behind API-key-authenticated Caddy TLS. Azure has not received the
-generation and no Azure resource exists.
+The current Linode generation is schema-11 v20, while local v22 is ready for
+the pending coordinated cutover. The Linode is configured-dark during recovery;
+Azure has not received either generation and no Azure resource exists.
 
 This preserved adapter would use Azure when the enterprise deployment decision
 requires it; Microsoft 365 Copilot itself does not require Azure hosting.

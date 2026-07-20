@@ -160,7 +160,7 @@ state, logs, and validation evidence were retained.
 
 ## V22 local corpus
 
-The software tree is 0.19.8. The active local generation is
+The software tree is 0.19.9. The active local generation is
 `937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939`:
 
 - minimum client 0.19.7, index `2026.07.19`, schema 11, and chunker format 6;
@@ -253,10 +253,14 @@ The host deployment contract now also provides a transactional,
 version-matched `--upgrade-host-tools` operation, a publisher-accessible
 explicit and idempotent `abort`, and a fail-closed
 `update-image.sh --bootstrap-empty-host` image cutover. Upload or activation
-failure never triggers abort automatically. V0.19.8 upgrades the historical
+failure never triggers abort automatically. V0.19.8 upgraded the historical
 v0.19.5 launcher transactionally, detects rules through verbose UFW status,
 closes the exact commented web rules, and accepts prepared-bootstrap,
 configured-dark, or activated-dark state as explicitly defined by the operation.
+V0.19.9 replaces Podman's nullable `EffectiveCaps` field with an exact live
+four-set process proof and adds a release-bound bridge for the one pending
+v0.19.8 cutover. The launcher and updater bytes stay immutable; that unchanged
+updater advances and retires its own journal under the shared host lock.
 Under the shared host lock it atomically covers the publisher helper, wrapper,
 sudoers, `configure-auth`, `update-image`, installed Quadlet template, and V2
 marker/hashes; exact version, `SOURCE_COMMIT`, and release bytes are mandatory,
@@ -284,19 +288,20 @@ reviewed OpenTofu plan created one Sydney `g6-standard-4` instance, one encrypte
 bootstrapped with verified v0.18.1 artifacts and subsequently cut over to the
 v0.19.0 empty-host software contract. The v0.19.2 publisher-tool repair and
 activation then succeeded, and v20
-`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` is active
-and live on the Linode. API-key authentication, exact Caddy routes, all seven
-tools, all ten source partitions, reboot recovery, and API-key
-overlap/revocation passed on 2026-07-19. The sole current key ID is
-`second-client`. No deployment, authentication, image, host-tool, upload, or
-upload-authorization transaction remains.
+`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` remains
+the active Linode generation after the v0.19.8 cutover rejected Podman 4.9's
+`EffectiveCaps=null` observation and rolled back. The host now has exact
+v0.19.8 V2 tools and the immutable v0.19.0 runtime image. Service, Caddy, web
+UFW ingress, and `auth-ready` are off. The v22 target remains sealed with the
+pending v0.19.8 cutover journal in configured-dark state; no target decision was
+committed. API-key authentication, exact Caddy routes, all seven tools, all ten
+source partitions, reboot recovery, and API-key overlap/revocation had passed
+before maintenance. The sole current key ID is `second-client`.
 
-Immutable v0.19.6 release assets and OCI attestations were independently
-verified. The live host uses v0.19.5 V2 host tools and the immutable v0.19.0
-runtime image. V0.19.0 and v0.19.6 contain identical Rust/crate source;
-intervening changes are hosting/release tooling and version metadata. Alignment
-is deferred to a future activated-dark maintenance window rather than risking
-the healthy endpoint. No Azure resource or Entra tenant object exists. Azure
+Immutable v0.19.8 release assets, OCI digest, runtime, and attestations were
+independently verified. V0.19.9 recovery must retire that exact pending journal
+before normal host-tool upgrade and cutover retry. No Azure resource or Entra
+tenant object exists. Azure
 Bicep/Blob work remains preserved as a secondary future provider path in
 [docs/AZURE_FUTURE.md](docs/AZURE_FUTURE.md).
 

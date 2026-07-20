@@ -5,18 +5,18 @@ disposable; the corpus lives on a detachable, encrypted Block Storage volume
 and is never baked into an image.
 
 Schema-11 v20
-`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` is active
-and live on the Linode behind API-key-authenticated Caddy TLS. Exact public
-routes, all-seven-tool/all-ten-source retrieval, reboot recovery, and key
-rotation/revocation passed on 2026-07-19. The sole current client key ID is
-`second-client`; no plaintext key is stored in this repository. No deployment,
-authentication, image, host-tool, upload, or upload-authorization transaction
-remains.
+`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` remains
+active on the configured-dark Linode. The exact v0.19.8 cutover transaction and
+sealed v22 upload remain for the v0.19.9 recovery path. Service, Caddy, web UFW
+rules, and `auth-ready` are off. Exact public routes,
+all-seven-tool/all-ten-source retrieval, reboot recovery, and key
+rotation/revocation passed before maintenance. The sole current client key ID
+is `second-client`; no plaintext key is stored in this repository.
 
-Immutable software 0.19.6 and its OCI attestations were independently verified.
-The live host uses verified v0.19.5 host tools and the immutable v0.19.0 runtime
-image, which contains the same Rust/crate source as v0.19.6. Version alignment
-is reserved for a future activated-dark maintenance window.
+Immutable software 0.19.8 and its OCI attestations were independently verified.
+The host uses exact v0.19.8 V2 tools and the immutable v0.19.0 rollback image.
+After bridge recovery, host tools advance normally to v0.19.9 before the
+coordinated image/generation retry.
 
 The same image and mounted-generation contract can later run on an Azure VM.
 Azure-specific work is retained in [docs/AZURE_FUTURE.md](docs/AZURE_FUTURE.md),
@@ -113,15 +113,14 @@ SHA-512 manifest; the installer verifies both before package, firewall, or
 volume mutation:
 
 ```bash
-gh release download v0.19.6 --repo gunba/australian-legal-mcp \
+gh release download v0.19.9 --repo gunba/australian-legal-mcp \
   --pattern 'legal-mcp-*' --pattern SHA256SUMS
 sha256sum --check SHA256SUMS
 ```
 
-This v0.19.6 command is valid only after that immutable patch release exists.
-The existing host was bootstrapped from the separately verified v0.18.1 bundle,
-cut over with v0.19.0, and repaired/activated with v0.19.2 publisher tools; do
-not relabel those historical evidence sets as v0.19.6.
+Run that command only after the immutable v0.19.9 release exists and verify its
+attestation independently. Historical v0.18.1, v0.19.0, v0.19.2, and v0.19.8
+evidence remains labelled with the software that produced it.
 
 Verify the attestation before deployment:
 
@@ -268,7 +267,7 @@ authorization or corpus/image transaction.
 The current host's one known unversioned v0.19.2 authentication journal was
 successfully recovered before the V2 upgrade. The following command is retained
 only as historical recovery procedure for that exact legacy state; do not run
-it on the live transaction-free host:
+it on the current V2 host or its pending v0.19.8 transaction:
 
 ```bash
 sudo infra/hosting/configure-auth.sh --recover
@@ -281,20 +280,19 @@ or one dead-PID v0.19.2 preparation. It leaves service and ingress off and does
 not make legacy journals part of normal V2 recovery. Remove this documented
 exception after the host migration evidence is retained.
 
-For a future activated-dark maintenance window, confirm that no auth
-transaction remains and run the exact independently verified target bundle. The
-version shown here is the verified v0.19.6 example; do not run it merely to
-align labels on the currently healthy public service:
+After the exact v0.19.8 bridge has retired its image transaction, run the
+independently verified v0.19.9 bundle while the host remains configured-dark:
 
 ```bash
-sudo infra/linode/install-host.sh --upgrade-host-tools --version 0.19.6
+sudo infra/linode/install-host.sh --upgrade-host-tools --version 0.19.9
 ```
 
-If that future operation is interrupted, recover from the same exact bundle
-before continuing:
+This upgrade accepts and preserves the one exact ordinary prepared v22 upload
+beside active v20. If interrupted, recover from the same exact bundle before
+continuing:
 
 ```bash
-sudo infra/linode/install-host.sh --recover-host-tools --version 0.19.6
+sudo infra/linode/install-host.sh --recover-host-tools --version 0.19.9
 ```
 
 The hard-cut V2 transaction holds the shared host lock and atomically replaces
@@ -457,7 +455,7 @@ Linux release bundle:
 ```bash
 sudo infra/hosting/update-image.sh \
   --image ghcr.io/gunba/australian-legal-mcp@sha256:NEW_DIGEST \
-  --version 0.19.6 \
+  --version X.Y.Z \
   --template infra/hosting/legal-mcp.container.template
 ```
 
@@ -517,8 +515,34 @@ Before the durable target decision, rollback also restores the flat generation's
 ordinary prepared upload, journal, ownership, and upload authorization. After
 that decision, recovery can only finish the target pair.
 
-This operation is implemented for the pending format transition and has not
-been run on the hosted service.
+One immutable v0.19.8 transaction can remain pending after Podman 4.9 reports
+`EffectiveCaps=null`. Recover only that exact transaction from the complete,
+independently verified v0.19.9 Linux bundle, streaming the existing API probe
+key on standard input:
+
+```bash
+sudo /path/to/v0.19.9/infra/linode/install-host.sh \
+  --recover-v0198-flat-int8 --version 0.19.9 \
+  < /root/one-time-probe-key
+```
+
+The bridge validates the exact v0.19.8 host tools, generations, image pins,
+rollback journal, and configured-dark boundary. In a private mount namespace it
+runs the unchanged v0.19.8 stable launcher and updater. Every Podman operation
+is delegated unchanged except the incompatible `EffectiveCaps` query, which is
+answered only after `podman top` proves empty bounding, effective, inheritable,
+and permitted sets for every process. It never edits the cutover journal or
+installed tool bytes. It resumes partial retirement deletion, recreates only
+the exact volatile upload authorization from the durable prepared journal after
+a reboot, and re-enters the old launcher even after transaction deletion so
+stale dispatch/permit state is retired. After it restores and retires the
+saved-pair transaction, upgrade host tools normally to v0.19.9; that upgrade
+preserves the active-prior plus ordinary-prepared-v22 state. Then restart the
+cutover with the v0.19.9 digest. Rerun the same bridge after interruption; never
+remove its state by hand.
+
+The hosted v0.19.8 attempt exercised automatic rollback and left the exact
+saved pair configured-dark for this recovery path.
 
 ## 8. Verification and operations
 

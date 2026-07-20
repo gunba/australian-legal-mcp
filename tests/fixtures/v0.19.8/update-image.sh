@@ -3138,31 +3138,8 @@ cutover_verify_offline_pair() {
     "$image" verify --quiet >/dev/null
 }
 
-cutover_verify_running_capabilities() {
-  local report
-  report="$(podman top australian-legal-mcp capbnd capeff capinh capprm)" || {
-    echo 'could not inspect running container capability sets' >&2
-    return 1
-  }
-  if ! python3 - "$report" <<'PY'
-import sys
-
-lines = sys.argv[1].splitlines()
-expected_header = "BOUNDING CAPS EFFECTIVE CAPS INHERITED CAPS PERMITTED CAPS"
-if not lines or " ".join(lines[0].split()) != expected_header or len(lines) < 2:
-    raise SystemExit(1)
-for line in lines[1:]:
-    fields = line.split()
-    if fields != ["none", "none", "none", "none"]:
-        raise SystemExit(1)
-PY
-  then
-    return 1
-  fi
-}
-
 cutover_verify_running_constraints() {
-  local expected_image_id="$1" image_id user root_read_only network port mounts
+  local expected_image_id="$1" image_id user root_read_only network port mounts caps
   image_id="$(canonical_image_id \
     "$(podman inspect australian-legal-mcp --format '{{.Image}}')")" || return 1
   user="$(podman inspect australian-legal-mcp --format '{{.Config.User}}')" || return 1
@@ -3170,16 +3147,13 @@ cutover_verify_running_constraints() {
   network="$(podman inspect australian-legal-mcp --format '{{.HostConfig.NetworkMode}}')" || return 1
   port="$(podman port australian-legal-mcp 51235/tcp)" || return 1
   mounts="$(podman inspect australian-legal-mcp --format '{{json .Mounts}}')" || return 1
+  caps="$(podman inspect australian-legal-mcp --format '{{json .EffectiveCaps}}')" || return 1
   [[ "$image_id" = "$expected_image_id" \
     && "$user" = 971:971 && "$root_read_only" = true && "$network" = bridge \
-    && "$port" = 127.0.0.1:51235 ]] || {
-      echo 'running cutover container violates its exact image/user/network contract' >&2
+    && "$port" = 127.0.0.1:51235 && "$caps" = '[]' ]] || {
+      echo 'running cutover container violates its exact image/user/network/capability contract' >&2
       return 1
     }
-  cutover_verify_running_capabilities || {
-    echo 'running cutover container has a malformed or non-empty capability set' >&2
-    return 1
-  }
   python3 - "$mounts" <<'PY'
 import json, sys
 mounts = json.loads(sys.argv[1])

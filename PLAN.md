@@ -63,7 +63,9 @@ MCP surface remains exactly `search`, `get_chunks`, `get_asset`,
   V0.19.8 transactionally upgrades the historical launcher, detects the live
   rules through verbose UFW status, removes the exact commented web rules, and
   adds the configured-dark state required for a coordinated
-  Arroy-image/generation to flat-int8-image/generation cutover, including
+  Arroy-image/generation to flat-int8-image/generation cutover. V0.19.9 proves
+  all live process capability sets through Podman and provides an exact bridge
+  that leaves v0.19.8 code immutable while that code retires its journal, retaining
   recovery after every modelled SIGKILL phase.
 - Restricted the locked-parent activation exception to one exact networkless
   `activate` invocation with `CAP_DAC_OVERRIDE`; the hosted service and every
@@ -105,11 +107,10 @@ Microsoft v2.4 schema validation; bridged non-root/read-only container probes; z
 HIGH/CRITICAL image findings; Caddy validation; strict disk/mount guards;
 packaged ONNX loading; and a clean offline Linode provider plan. The live
 instance/volume boundary now also proves Ubuntu 24.04, XFS/reflink volume
-adoption and restricted SSH. V20 is active and live behind
-API-key-authenticated TLS. Exact routes, all seven tools, all ten sources,
-reboot recovery, and key overlap/revocation passed on 2026-07-19. No deployment,
-authentication, image, host-tool, upload, or upload-authorization transaction
-remains.
+adoption and restricted SSH. V20 remains active but configured-dark while the
+exact pending v0.19.8 cutover and sealed v22 upload are recovered with v0.19.9.
+Exact routes, all seven tools, all ten sources, reboot recovery, and key
+overlap/revocation passed before maintenance.
 
 ## Phase 2 — disposable Linode infrastructure
 
