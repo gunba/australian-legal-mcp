@@ -1,0 +1,148 @@
+{
+  "active_generation": "937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939",
+  "counts": {
+    "chunk_embeddings": 6986040,
+    "chunks": 6986040,
+    "definitions": 20169,
+    "documents": 409528
+  },
+  "endpoint": "http://127.0.0.1:52139/mcp",
+  "evaluation": "HarbourGrid R&D and cross-border IP restructure",
+  "failures": [],
+  "metrics_ms": {
+    "hybrid_warm_p95": 516.406,
+    "keyword_warm_p95": 363.234,
+    "retrieval_p95": 11.636
+  },
+  "passed": true,
+  "records": [
+    {
+      "case": "initialize",
+      "latency_ms": 1.763
+    },
+    {
+      "case": "tools-list",
+      "latency_ms": 0.469
+    },
+    {
+      "bytes": 42070,
+      "case": "stats",
+      "latency_ms": 1028.571
+    },
+    {
+      "case": "rd-core-activities",
+      "get_chunks_ms": 1.057,
+      "mode": "keyword",
+      "search_ms": [
+        158.909,
+        157.259,
+        156.343
+      ],
+      "source": "frl"
+    },
+    {
+      "case": "rd-clawback-feedstock",
+      "get_chunks_ms": 1.076,
+      "mode": "keyword",
+      "search_ms": [
+        86.326,
+        89.794,
+        86.554
+      ],
+      "source": "frl"
+    },
+    {
+      "case": "rd-explanatory-material",
+      "get_chunks_ms": 1.003,
+      "mode": "keyword",
+      "search_ms": [
+        77.568,
+        74.98,
+        76.766
+      ],
+      "source": "ato"
+    },
+    {
+      "case": "transfer-pricing-pcg",
+      "get_chunks_ms": 4.88,
+      "mode": "hybrid",
+      "search_ms": [
+        516.406,
+        561.356,
+        506.466
+      ],
+      "source": "ato"
+    },
+    {
+      "case": "corporate-residence-ruling",
+      "get_chunks_ms": 1.225,
+      "mode": "keyword",
+      "search_ms": [
+        233.363,
+        232.966,
+        245.76
+      ],
+      "source": "ato"
+    },
+    {
+      "case": "singapore-treaty",
+      "get_chunks_ms": 1.686,
+      "mode": "keyword",
+      "search_ms": [
+        358.321,
+        363.234,
+        367.197
+      ],
+      "source": "ato"
+    },
+    {
+      "case": "moreton-rd-case",
+      "get_chunks_ms": 1.204,
+      "mode": "hybrid",
+      "search_ms": [
+        314.767,
+        329.673,
+        311.452
+      ],
+      "source": "federal-court"
+    },
+    {
+      "case": "chevron-transfer-pricing",
+      "get_chunks_ms": 1.134,
+      "mode": "hybrid",
+      "search_ms": [
+        412.927,
+        443.855,
+        441.468
+      ],
+      "source": "federal-court"
+    },
+    {
+      "case": "bywater-residence",
+      "get_chunks_ms": 2.008,
+      "mode": "hybrid",
+      "search_ms": [
+        185.998,
+        196.566,
+        224.394
+      ],
+      "source": "high-court"
+    },
+    {
+      "case": "hart-part-iva",
+      "get_chunks_ms": 1.349,
+      "mode": "hybrid",
+      "search_ms": [
+        420.979,
+        396.92,
+        407.596
+      ],
+      "source": "high-court"
+    },
+    {
+      "case": "ready-during-load",
+      "latency_ms": 0.618
+    }
+  ],
+  "schema_version": 1
+}

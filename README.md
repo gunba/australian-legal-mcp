@@ -285,7 +285,9 @@ tofu -chdir=infra/linode validate
 LEGAL_MCP_DATA_DIR="$PWD/data/runtime" scripts/smoke.sh
 ```
 
-See [MAINTENANCE.md](MAINTENANCE.md) for maintainer operations,
+See [CLIENT_SETUP.md](CLIENT_SETUP.md) for client and enterprise Obsidian/Pi
+setup, [docs/validation](docs/validation/README.md) for benchmark and HarbourGrid
+validation evidence, [MAINTENANCE.md](MAINTENANCE.md) for maintainer operations,
 [CURRENT_STATE.md](CURRENT_STATE.md) for the implementation snapshot,
 [DEPLOYMENT.md](DEPLOYMENT.md) for Akamai/Linode OCI hosting, and
 [MICROSOFT_COPILOT.md](MICROSOFT_COPILOT.md) for Entra/Copilot onboarding.

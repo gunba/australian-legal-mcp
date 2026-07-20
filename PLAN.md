@@ -177,8 +177,13 @@ preview paths, not production dependencies.
 
 ## Cleanup gate
 
-Superseded local build/cache cleanup reduced project usage from 298 GiB to 197
-GiB and increased free disk from 76 GiB to 153 GiB. Retain v19 until Linode
-VPS replacement, exact readiness, Copilot token validation, and rollback are
-proven. Delete no cloud bootstrap/rollback artifact or sole source
-of source truth or validation evidence before those gates pass.
+The post-v22 reviewed cleanup removed superseded packaged build output,
+disposable caches, Cargo debug/cross/package artifacts, completed acquisition
+attempts, provider downloads, and one-off scratch work. Allocated project usage
+fell from about 300 GiB to about 203 GiB; Btrfs reflink sharing yielded about 23
+GiB of additional filesystem free space. Retain the active v22, v21 rollback
+parent, hosted Arroy v20 source, v19 DR corpus, prepared flat-v20 cutover copy,
+canonical sources/models, deployment state, logs, and validation evidence until
+the corresponding hosted cutover, replacement, and rollback gates pass. Delete
+no cloud bootstrap/rollback artifact or sole source of source truth or
+validation evidence before those gates pass.
