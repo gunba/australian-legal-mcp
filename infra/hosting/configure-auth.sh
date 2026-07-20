@@ -79,7 +79,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-EXPECTED_HOST_TOOL_VERSION=0.19.7
+EXPECTED_HOST_TOOL_VERSION=0.19.8
 HOST_TOOLS_MARKER=/etc/legal-mcp/host-tools
 IMAGE_FILE=/etc/legal-mcp/image
 RUNTIME_ENV=/etc/legal-mcp/runtime.env
@@ -341,11 +341,16 @@ PY
 }
 
 close_public_ingress() {
-  local port failed=false
+  local port comment failed=false
   systemctl disable --now caddy.service >/dev/null 2>&1 || failed=true
   for port in 80 443; do
     if ufw_has_web_rule "$port"; then
-      ufw --force delete allow "$port/tcp" >/dev/null 2>&1 || failed=true
+      case "$port" in
+        80) comment='Caddy ACME HTTP' ;;
+        443) comment='Australian Legal MCP HTTPS' ;;
+        *) failed=true; continue ;;
+      esac
+      ufw --force delete allow "$port/tcp" comment "$comment" >/dev/null 2>&1 || failed=true
     fi
   done
   require_caddy_state disabled inactive || failed=true
@@ -461,7 +466,7 @@ validate_host_tools_v2() {
     && "${marker[1]}" = "VERSION=$EXPECTED_HOST_TOOL_VERSION" \
     && "${marker[2]}" =~ ^SOURCE_COMMIT=[0-9a-f]{40}$ \
     && "${marker[3]}" =~ ^HOST_DEPLOY_SHA256=([0-9a-f]{64})$ ]] || {
-    echo 'installed V2 host-tool marker is not the exact v0.19.7 contract' >&2
+    echo 'installed V2 host-tool marker is not the exact v0.19.8 contract' >&2
     return 1
   }
   deploy_sha="${BASH_REMATCH[1]}"

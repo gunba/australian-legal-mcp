@@ -152,7 +152,7 @@ read_systemctl_activity() {
 
 ufw_rule_state() {
   local port="$1" report status
-  if report="$(ufw status)"; then
+  if report="$(ufw status verbose)"; then
     :
   else
     status=$?
@@ -238,12 +238,17 @@ ufw_is_fail_closed() {
 }
 
 close_ingress() {
-  local port state enabled activity
+  local port state enabled activity comment
   systemctl disable --now caddy.service >/dev/null 2>&1 || return 1
   for port in 80 443; do
     state="$(ufw_rule_state "$port")" || return 1
     if [[ "$state" = present ]]; then
-      ufw --force delete allow "$port/tcp" >/dev/null 2>&1 || return 1
+      case "$port" in
+        80) comment='Caddy ACME HTTP' ;;
+        443) comment='Australian Legal MCP HTTPS' ;;
+        *) return 1 ;;
+      esac
+      ufw --force delete allow "$port/tcp" comment "$comment" >/dev/null 2>&1 || return 1
     fi
   done
   enabled="$(read_systemctl_enablement caddy.service)" || return 1

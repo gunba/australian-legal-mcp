@@ -166,7 +166,7 @@ legal-mcp prune-generations --keep-inactive 1
 There is no runtime `update`, corpus downloader, offline bundle, corpus package,
 or GitHub corpus-release path.
 
-Software is version 0.19.7. The active local generation is chunker-format-6
+Software is version 0.19.8. The active local generation is chunker-format-6
 v22 `937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939`.
 It contains 409,528 documents, 6,986,040 chunks/embeddings, and 20,169
 definitions in schema 11. Its 19,758,231,552-byte `legal.db` has SHA-256

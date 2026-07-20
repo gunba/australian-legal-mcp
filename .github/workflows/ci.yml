@@ -134,6 +134,10 @@ jobs:
         run: |
           tests/deploy-generation-abort-fixture.sh
           tests/host-installer-publisher-contract-fixture.sh
+          docker run --rm --user 0:0 --cap-add=NET_ADMIN --entrypoint /bin/bash \
+            --volume "$PWD:/repo:ro" \
+            ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \
+            -ceu 'export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null; apt-get install --yes --no-install-recommends python3 ufw >/dev/null; /repo/tests/ufw-commented-rule-fixture.sh'
           docker run --rm --user 0:0 --entrypoint /bin/bash \
             --volume "$PWD/tests/host-rrsync-options-fixture.sh:/fixture:ro" \
             --volume "$PWD/tests/host-auth-recovery-fixture.sh:/auth-fixture:ro" \

@@ -160,7 +160,7 @@ state, logs, and validation evidence were retained.
 
 ## V22 local corpus
 
-The software tree is 0.19.7. The active local generation is
+The software tree is 0.19.8. The active local generation is
 `937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939`:
 
 - minimum client 0.19.7, index `2026.07.19`, schema 11, and chunker format 6;
@@ -253,8 +253,9 @@ The host deployment contract now also provides a transactional,
 version-matched `--upgrade-host-tools` operation, a publisher-accessible
 explicit and idempotent `abort`, and a fail-closed
 `update-image.sh --bootstrap-empty-host` image cutover. Upload or activation
-failure never triggers abort automatically. V0.19.7 upgrades the historical
-v0.19.5 launcher transactionally and accepts prepared-bootstrap,
+failure never triggers abort automatically. V0.19.8 upgrades the historical
+v0.19.5 launcher transactionally, detects rules through verbose UFW status,
+closes the exact commented web rules, and accepts prepared-bootstrap,
 configured-dark, or activated-dark state as explicitly defined by the operation.
 Under the shared host lock it atomically covers the publisher helper, wrapper,
 sudoers, `configure-auth`, `update-image`, installed Quadlet template, and V2
