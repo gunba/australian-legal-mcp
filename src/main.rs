@@ -35,6 +35,7 @@ mod frl;
 mod generation_projection;
 mod html;
 mod http_auth;
+mod legacy_arroy;
 mod legal_source;
 mod official_sources;
 mod pipeline;
@@ -296,7 +297,7 @@ enum Command {
         source: SourceId,
         #[arg(short, long, default_value_t = DEFAULT_K)]
         k: usize,
-        /// Exact corpus type codes or `*` globs; discover codes with `legal-mcp stats`.
+        /// Exact corpus type codes or `*` globs; discover codes at `source_stats.<source>.types` in `legal-mcp stats`.
         #[arg(long, value_delimiter = ',')]
         types: Vec<String>,
         #[arg(long)]
@@ -356,6 +357,20 @@ enum Command {
     /// or ANN reconstruction. The source generation is never modified.
     DeriveSchema11FromSchema10 {
         /// Exact installed schema-10 generation directory.
+        #[arg(long)]
+        source_generation_dir: PathBuf,
+        /// Required typed generation ID derived from the source generation.json.
+        #[arg(long)]
+        expected_source_generation: GenerationId,
+        /// Nonexistent same-filesystem directory for the complete candidate.
+        #[arg(long)]
+        out_dir: PathBuf,
+    },
+    /// Derive one fresh flat-int8 schema-11 generation from an exact immutable
+    /// schema-11 Arroy-v20 generation. Sidecars are rebuilt directly from the
+    /// stored SQLite int8 vectors; no model is loaded or executed.
+    DeriveFlatInt8FromSchema11ArroyV20 {
+        /// Exact installed schema-11 Arroy-v20 generation directory.
         #[arg(long)]
         source_generation_dir: PathBuf,
         /// Required typed generation ID derived from the source generation.json.
@@ -780,6 +795,21 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
+        Command::DeriveFlatInt8FromSchema11ArroyV20 {
+            source_generation_dir,
+            expected_source_generation,
+            out_dir,
+        } => {
+            let report = generation_projection::derive_flat_int8_from_schema11_arroy_v20(
+                generation_projection::DeriveFlatInt8Args {
+                    source_generation_dir: &source_generation_dir,
+                    expected_source_generation: &expected_source_generation,
+                    out_dir: &out_dir,
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
         Command::SourceUpdate {
             workspaces,
             run_dir,
@@ -1155,6 +1185,30 @@ fn healthcheck(port: u16) -> Result<()> {
     Ok(())
 }
 
+fn execute_http_request(request: tiny_http::Request, state: &ServerState, queued_at: Instant) {
+    let request_id = state.request_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+    let method = format!("{:?}", request.method());
+    let path = request.url().split('?').next().unwrap_or("/").to_string();
+    let queue_ms = queued_at.elapsed().as_millis();
+    let started = Instant::now();
+    let outcome = handle_http(request, state, request_id);
+    eprintln!(
+        "{}",
+        json!({
+            "event": "http-request",
+            "request_id": request_id,
+            "method": method,
+            "path": path,
+            "queue_ms": queue_ms,
+            "duration_ms": started.elapsed().as_millis(),
+            "outcome": if outcome.is_ok() { "ok" } else { "handler-error" },
+        })
+    );
+    if let Err(err) = outcome {
+        eprintln!("legal-mcp http handler error request_id={request_id}: {err}");
+    }
+}
+
 fn serve(
     choice: config::PortChoice,
     network_scope: HttpNetworkScope,
@@ -1223,26 +1277,7 @@ fn serve(
                     let Ok((request, queued_at)) = queued else {
                         break;
                     };
-                    let request_id = state.request_sequence.fetch_add(1, Ordering::Relaxed) + 1;
-                    let method = format!("{:?}", request.method());
-                    let path = request.url().split('?').next().unwrap_or("/").to_string();
-                    let started = Instant::now();
-                    let outcome = handle_http(request, &state, request_id);
-                    eprintln!(
-                        "{}",
-                        json!({
-                            "event": "http-request",
-                            "request_id": request_id,
-                            "method": method,
-                            "path": path,
-                            "queue_ms": queued_at.elapsed().as_millis(),
-                            "duration_ms": started.elapsed().as_millis(),
-                            "outcome": if outcome.is_ok() { "ok" } else { "handler-error" },
-                        })
-                    );
-                    if let Err(err) = outcome {
-                        eprintln!("legal-mcp http handler error request_id={request_id}: {err}");
-                    }
+                    execute_http_request(request, &state, queued_at);
                 }
                 let _ = worker_done_sender.send(());
             })
@@ -1254,6 +1289,10 @@ fn serve(
         let Some(request) = server.recv_timeout(Duration::from_millis(250))? else {
             continue;
         };
+        if matches!(request.url(), "/livez" | "/readyz") {
+            execute_http_request(request, &state, Instant::now());
+            continue;
+        }
         match sender.try_send((request, Instant::now())) {
             Ok(()) => {}
             Err(mpsc::TrySendError::Full((request, _))) => {
@@ -2395,7 +2434,7 @@ fn server_instructions() -> (String, bool) {
         .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
     {
         Some(s) if s["semantic_search_ready"].as_bool() == Some(true) => (format!(
-            "Australian legal corpus. Documents: {}, chunks: {}. Index: {}. Default search excludes EV edited private advice, withdrawn rulings, and content dated before {} except legislation prefixes PAC/REG/RPC/RRG; override with current_only=false and include_old=true.\n\n{}",
+            "Australian legal corpus. Documents: {}, chunks: {}. Index: {}. Searches exclude withdrawn material by default. ATO searches additionally exclude EV edited private advice and pre-{} non-legislation; override with current_only=false and include_old=true.\n\n{}",
             s["documents"].as_i64().unwrap_or(0),
             s["chunks"].as_i64().unwrap_or(0),
             s["index_version"].as_str().unwrap_or("?"),
@@ -2502,7 +2541,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "get_doc_anchors",
-            "description": "Return anchors, links, history, and citations.",
+            "description": "Return anchors, links, PiT-qualified ATO history URLs, and citations.",
             "annotations": read_only_annotations.clone(),
             "inputSchema": {
                 "type": "object",
@@ -2548,7 +2587,7 @@ fn tool_descriptors() -> JsonValue {
         },
         {
             "name": "stats",
-            "description": "Return counts, index metadata, and search policy.",
+            "description": "Return compact stats, default policy, and source_stats.<source>.types.",
             "annotations": read_only_annotations,
             "inputSchema": {
                 "type": "object",
@@ -2587,8 +2626,6 @@ mod tests {
     use crate::semantic::*;
     use crate::source::*;
     use chrono::Utc;
-    use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
     use rusqlite::types::Value;
     use rusqlite::Connection;
     use std::collections::{HashMap, HashSet};
@@ -2710,14 +2747,61 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn flat_derivation_cli_requires_a_typed_arroy_v20_generation() {
+        let generation = "b".repeat(64);
+        let cli = Cli::try_parse_from([
+            "legal-mcp",
+            "derive-flat-int8-from-schema11-arroy-v20",
+            "--source-generation-dir",
+            "/data/runtime/generations/v20",
+            "--expected-source-generation",
+            &generation,
+            "--out-dir",
+            "/data/builds/flat-v21",
+        ])
+        .expect("valid flat derivation arguments");
+        let Command::DeriveFlatInt8FromSchema11ArroyV20 {
+            source_generation_dir,
+            expected_source_generation,
+            out_dir,
+        } = cli.command
+        else {
+            panic!("expected flat derivation command");
+        };
+        assert_eq!(
+            source_generation_dir,
+            PathBuf::from("/data/runtime/generations/v20")
+        );
+        assert_eq!(expected_source_generation.as_str(), generation);
+        assert_eq!(out_dir, PathBuf::from("/data/builds/flat-v21"));
+        assert!(Cli::try_parse_from([
+            "legal-mcp",
+            "derive-flat-int8-from-schema11-arroy-v20",
+            "--source-generation-dir",
+            "/data/runtime/generations/v20",
+            "--expected-source-generation",
+            "v20",
+            "--out-dir",
+            "/data/builds/flat-v21",
+        ])
+        .is_err());
+    }
+
     // ----- W1.1 SIMD parity -----
 
     #[test]
     fn dot_i8_matches_scalar_reference() -> Result<()> {
-        let mut rng = StdRng::seed_from_u64(42);
+        let mut state = 42u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        };
         for _ in 0..100 {
-            let q: [i8; EMBEDDING_DIM] = std::array::from_fn(|_| rng.gen());
-            let d: Vec<u8> = (0..EMBEDDING_DIM).map(|_| rng.gen::<u8>()).collect();
+            let q: [i8; EMBEDDING_DIM] = std::array::from_fn(|_| next() as i8);
+            let d: Vec<u8> = (0..EMBEDDING_DIM).map(|_| next()).collect();
             let scalar = dot_i8_scalar_reference(&q, &d)?;
             let actual = dot_i8(&q, &d)?;
             assert!(
@@ -2950,6 +3034,93 @@ mod tests {
              VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
             params![chunk_id, TEST_SOURCE_ID, doc_id, ord, compress_text(text)?],
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn stats_omits_flat_prefix_breakdowns_and_exposes_types_and_policy() -> Result<()> {
+        let _lock = lock_test_db();
+        let (dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
+        for descriptor in source_registry().descriptors() {
+            let source_id = descriptor.id.as_str();
+            if source_id != TEST_SOURCE_ID {
+                conn.execute(
+                    "INSERT INTO sources(source_id, display_name) VALUES (?1, ?2)",
+                    params![source_id, descriptor.display_name],
+                )?;
+            }
+            for key in [
+                "documents_count",
+                "chunks_count",
+                "chunk_embeddings_count",
+                "definitions_count",
+            ] {
+                set_source_meta(&conn, source_id, key, "0")?;
+            }
+            set_source_meta(&conn, source_id, "documents_by_type_json", "{}")?;
+        }
+        for key in [
+            "documents_count",
+            "chunks_count",
+            "chunk_embeddings_count",
+            "definitions_count",
+        ] {
+            set_corpus_meta(&conn, key, "0")?;
+        }
+        set_source_meta(
+            &conn,
+            TEST_SOURCE_ID,
+            "documents_by_type_json",
+            r#"{"PAC":3,"EV":1}"#,
+        )?;
+        set_source_meta(
+            &conn,
+            TEST_SOURCE_ID,
+            "prefix_breakdown_json",
+            r#"[{"prefix":"PAC","doc_count":3,"description":"Legislation"}]"#,
+        )?;
+        set_source_meta(&conn, "frl", "documents_by_type_json", r#"{"Act":2}"#)?;
+        set_source_meta(
+            &conn,
+            "frl",
+            "prefix_breakdown_json",
+            "deliberately invalid and potentially enormous legacy metadata",
+        )?;
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            let payload: JsonValue = serde_json::from_str(&stats()?)?;
+            assert_eq!(
+                payload["source_stats"]["ato"]["types"],
+                json!({"EV": 1, "PAC": 3})
+            );
+            assert_eq!(payload["source_stats"]["frl"]["types"], json!({"Act": 2}));
+            assert_eq!(
+                payload["source_stats"]["ato"]["prefix_breakdown"],
+                json!([{"prefix": "PAC", "doc_count": 3, "description": "Legislation"}])
+            );
+            assert!(
+                payload["source_stats"]["frl"]
+                    .get("prefix_breakdown")
+                    .is_none(),
+                "flat source prefix metadata must not be parsed or emitted"
+            );
+            assert_eq!(
+                payload["default_search_policy"],
+                json!({
+                    "current_only": true,
+                    "ato": {
+                        "excluded_types": ["EV"],
+                        "excluded_type_labels": ["Edited_private_advice"],
+                        "old_content_cutoff": "2000-01-01",
+                        "old_content_exception_types": ["PAC", "REG", "RPC", "RRG"],
+                        "old_content_exception_type_labels": ["Legislation_and_supporting_material"],
+                    },
+                })
+            );
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -3663,20 +3834,17 @@ mod tests {
             source_id: source_id.clone(),
             format: ANN_FORMAT.to_string(),
             format_version: ANN_FORMAT_VERSION,
-            library: ANN_LIBRARY.to_string(),
-            library_version: ANN_LIBRARY_VERSION.to_string(),
             path: crate::ann::sidecar_manifest_path(&source_id),
             sha256: digest_character.repeat(64),
-            size: 1,
+            size: crate::ann::expected_sidecar_size(1).expect("single-vector sidecar layout"),
             corpus_id: format!("sha256:{}", digest_character.repeat(64)),
             embedding_model_id: EMBEDDING_MODEL_ID.to_string(),
+            embedding_model_fingerprint: EMBEDDING_MODEL_FINGERPRINT.to_string(),
             embedding_dimension: EMBEDDING_DIM as u32,
             embedding_set_sha256: digest_character.repeat(64),
             vector_count: 1,
-            seed: ANN_SEED,
-            rng: ANN_RNG.to_string(),
-            trees: ANN_TREES as u32,
-            split_after: ANN_SPLIT_AFTER as u32,
+            first_chunk_id: 1,
+            last_chunk_id: 1,
             id_encoding: ANN_ID_ENCODING.to_string(),
             metric: ANN_METRIC.to_string(),
         }
@@ -4429,7 +4597,7 @@ mod tests {
     }
 
     #[test]
-    fn lexical_search_keeps_best_bm25_match_first() -> Result<()> {
+    fn lexical_search_keeps_strict_best_bm25_match() -> Result<()> {
         let _lock = lock_test_db();
         let (_dir, db) = make_test_db()?;
         let conn = open_write_at(&db)?;
@@ -4449,9 +4617,8 @@ mod tests {
         let source = test_source();
         let filter = test_doc_filter(&source, false, true);
         let hits = lexical_search(&conn, &source, "common distinctive", &filter, 10)?;
-        assert_eq!(hits.len(), 3, "OR semantics should retain partial matches");
+        assert_eq!(hits.len(), 1, "two-term searches remain strict");
         assert_eq!(hits[0].chunk_id, 1);
-        assert!(hits[0].score > hits[1].score);
         Ok(())
     }
 
@@ -4656,7 +4823,7 @@ mod tests {
             .expect_err("unknown exact type should fail");
             let message = err.to_string();
             assert!(message.contains("case"));
-            assert!(message.contains("stats.types"));
+            assert!(message.contains("stats.source_stats.ato.types"));
             Ok(())
         })?;
         Ok(())
@@ -4870,7 +5037,7 @@ mod tests {
                 TEST_SOURCE_ID,
                 "DOC_PIT",
                 0_i64,
-                "TR_1996_X",
+                "TR/1996/1",
                 "19960320000001"
             ],
         )?;
@@ -4880,16 +5047,49 @@ mod tests {
             let json_str = get_doc_anchors(DocumentId::new(test_source(), "DOC_PIT")?)?;
             let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
             let history = parsed["historical_versions"].as_array().unwrap();
-            assert_eq!(history.len(), 1);
             assert_eq!(
-                history[0]["document"],
-                json!({"source": TEST_SOURCE_ID, "native_id": "TR_1996_X"})
+                history,
+                &vec![json!({
+                    "label": "Original ruling",
+                    "document": {"source": TEST_SOURCE_ID, "native_id": "TR/1996/1"},
+                    "pit": "19960320000001",
+                    "date": "1996-03-20",
+                    "uri": "legal://ato/TR%2F1996%2F1?pit=19960320000001",
+                    "canonical_url": "https://www.ato.gov.au/law/view/document?docid=TR%2F1996%2F1&PiT=19960320000001",
+                })]
             );
-            assert_eq!(history[0]["pit"], json!("19960320000001"));
-            assert_eq!(history[0]["date"], json!("1996-03-20"));
             Ok(())
         })?;
         Ok(())
+    }
+
+    #[test]
+    fn get_doc_anchors_preserves_malformed_ato_pit_without_links() -> Result<()> {
+        let _lock = lock_test_db();
+        let (dir, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
+        insert_doc_with_nav_flags(&conn, "DOC_PIT_MALFORMED", 0, 0, 1)?;
+        conn.execute(
+            "INSERT INTO doc_anchors
+                (source_id, native_id, ord, kind, label, target_source_id,
+                 target_native_id, target_chunk_id, target_pit)
+             VALUES (?1, ?2, 0, 'history', 'Legacy value', ?1, ?3, NULL, 'legacy')",
+            params![TEST_SOURCE_ID, "DOC_PIT_MALFORMED", "TR/LEGACY/1"],
+        )?;
+        drop(conn);
+
+        with_data_dir(dir.path(), || -> Result<()> {
+            let value: JsonValue = serde_json::from_str(&get_doc_anchors(DocumentId::new(
+                test_source(),
+                "DOC_PIT_MALFORMED",
+            )?)?)?;
+            let history = &value["historical_versions"][0];
+            assert_eq!(history["pit"], json!("legacy"));
+            assert!(history.get("date").is_none());
+            assert!(history.get("uri").is_none());
+            assert!(history.get("canonical_url").is_none());
+            Ok(())
+        })
     }
 
     #[test]

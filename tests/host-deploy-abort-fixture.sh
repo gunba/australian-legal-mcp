@@ -271,6 +271,8 @@ fi
 for transaction in \
   /etc/legal-mcp/.auth-transaction \
   /etc/legal-mcp/.image-transaction.preparing \
+  /etc/legal-mcp/.image-transaction.flat-int8-preparing \
+  /etc/legal-mcp/.image-transaction.flat-int8-preparing-retired \
   /etc/legal-mcp/.image-transaction \
   /etc/legal-mcp/.image-transaction.retiring \
   /etc/legal-mcp/.host-tools-transaction.preparing \

@@ -32,6 +32,16 @@ class _Server:
 
 
 class RemoteMcpProbeTests(unittest.TestCase):
+    def test_authenticated_http_error_is_reported_before_body_parsing(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "authenticated initialize failed with HTTP 401"):
+            remote.require_success_json(401, b"unauthorized", "initialize")
+
+    def test_authenticated_success_requires_object_json(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "returned invalid JSON"):
+            remote.require_success_json(200, b"not-json", "tools/list")
+        with self.assertRaisesRegex(SystemExit, "non-object JSON"):
+            remote.require_success_json(200, b"[]", "tools/list")
+
     def test_authenticated_requests_never_follow_redirects(self) -> None:
         received_credentials = []
 

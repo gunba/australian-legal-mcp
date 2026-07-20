@@ -31,14 +31,15 @@ RUN apt-get update \
  && rm "/tmp/${archive}"
 
 FROM docker.io/library/debian@sha256:63a496b5d3b99214b39f5ed70eb71a61e590a77979c79cbee4faf991f8c0783e
-ARG VERSION=0.19.6
+ARG VERSION=0.19.7
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="Australian Legal MCP" \
       org.opencontainers.image.description="Source-grounded Australian legal MCP server" \
       org.opencontainers.image.source="https://github.com/gunba/australian-legal-mcp" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="MIT" \
+      io.australian-legal-mcp.ann-format="flat-int8-v1"
 RUN apt-get update \
  && apt-get install --yes --no-install-recommends ca-certificates libgomp1 libstdc++6 \
  && rm -rf /var/lib/apt/lists/* \

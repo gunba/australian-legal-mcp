@@ -32,6 +32,18 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 OPENER = urllib.request.build_opener(NoRedirect())
 
 
+def require_success_json(status: int, body: bytes, operation: str) -> dict:
+    if status != 200:
+        raise SystemExit(f"authenticated {operation} failed with HTTP {status}")
+    try:
+        value = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"authenticated {operation} returned invalid JSON") from error
+    if not isinstance(value, dict):
+        raise SystemExit(f"authenticated {operation} returned a non-object JSON response")
+    return value
+
+
 def request(
     url: str,
     *,
@@ -188,21 +200,19 @@ def main() -> int:
             },
         },
     )
-    initialized = json.loads(body)
-    if status != 200 or initialized.get("result", {}).get("serverInfo", {}).get(
-        "name"
-    ) != "australian-legal-mcp":
-        raise SystemExit(f"authenticated initialize failed with HTTP {status}")
+    initialized = require_success_json(status, body, "initialize")
+    if initialized.get("result", {}).get("serverInfo", {}).get("name") != "australian-legal-mcp":
+        raise SystemExit("authenticated initialize returned the wrong server identity")
     status, _, body = request(
         args.endpoint,
         token=token,
         api_key=api_key,
         body={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
     )
-    listed = json.loads(body)
+    listed = require_success_json(status, body, "tools/list")
     remote_tools = listed.get("result", {}).get("tools", [])
     names = {tool.get("name") for tool in remote_tools if isinstance(tool, dict)}
-    if status != 200 or remote_tools != expected_tools:
+    if remote_tools != expected_tools:
         raise SystemExit("authenticated tools/list differs from the exact rendered snapshot")
     print(
         json.dumps(

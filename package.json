@@ -1,6 +1,6 @@
 {
   "name": "australian-legal-mcp",
-  "version": "0.19.6",
+  "version": "0.19.7",
   "private": true,
   "description": "Source-grounded search and retrieval across Australian legal sources.",
   "license": "MIT",

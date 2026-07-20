@@ -29,6 +29,8 @@ journal=/srv/legal-mcp/lifecycle/.deployment-transaction
 pointer=/srv/legal-mcp/lifecycle/active-generation
 authorization=/run/legal-mcp/authorized-upload
 lifecycle_lock=/srv/legal-mcp/lifecycle/LIFECYCLE_LOCK
+cutover_transaction=/etc/legal-mcp/.image-transaction
+auth_ready=/etc/legal-mcp/auth-ready
 podman_log=/tmp/host-deploy-activation-podman.log
 capability_log=/tmp/host-deploy-activation-capabilities.log
 
@@ -46,6 +48,8 @@ install -o root -g legal-mcp-publisher -m 0640 /dev/null \
 install -d -o root -g root -m 0755 /etc/legal-mcp
 printf '%s\n' "$image" > /etc/legal-mcp/image
 chmod 600 /etc/legal-mcp/image
+printf '%s\n' 192.0.2.1 > /etc/legal-mcp/admin-source-ip
+chmod 600 /etc/legal-mcp/admin-source-ip
 install -d -o root -g legal-mcp -m 0750 /srv/legal-mcp
 setfacl --remove-all /srv/legal-mcp
 setfacl --modify user:legal-mcp-publisher:--x /srv/legal-mcp
@@ -94,9 +98,18 @@ chmod 755 /usr/bin/flock
 
 cat > /usr/bin/systemctl <<'EOF'
 #!/usr/bin/bash
+unit="${2:-}"
 case "$1" in
+  is-enabled)
+    if [[ "$unit" = legal-mcp.service ]]; then printf 'generated\n'; exit 0; fi
+    printf 'disabled\n'; exit 1
+    ;;
   is-active)
-    activity="$(</tmp/legal-mcp-service-activity)"
+    if [[ "$unit" = legal-mcp.service ]]; then
+      activity="$(</tmp/legal-mcp-service-activity)"
+    else
+      activity=inactive
+    fi
     printf '%s\n' "$activity"
     [[ "$activity" = active ]] && exit 0
     exit 3
@@ -113,13 +126,26 @@ case "$1" in
     ;;
 esac
 EOF
+cat > /usr/sbin/ufw <<'EOF'
+#!/usr/bin/bash
+[[ "$*" = 'status verbose' ]] || exit 2
+cat <<'STATUS'
+Status: active
+Default: deny (incoming), allow (outgoing), disabled (routed)
+22/tcp                     ALLOW IN    192.0.2.1
+STATUS
+EOF
+cat > /usr/bin/ss <<'EOF'
+#!/usr/bin/bash
+exit 0
+EOF
 cat > /usr/bin/curl <<'EOF'
 #!/usr/bin/bash
 [[ -f /srv/legal-mcp/lifecycle/active-generation ]]
 generation="$(</srv/legal-mcp/lifecycle/active-generation)"
 printf '{"status":"ok","generation":"%s"}\n' "$generation"
 EOF
-chmod 755 /usr/bin/systemctl /usr/bin/curl
+chmod 755 /usr/bin/systemctl /usr/sbin/ufw /usr/bin/ss /usr/bin/curl
 
 # The Podman fake validates the complete one-shot security profile, then uses
 # setpriv to reproduce the requested effective/bounding capability set before
@@ -295,8 +321,10 @@ reset_fixture() {
   find /srv/legal-mcp/uploads -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
   find /srv/legal-mcp/generations -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
   rm -f -- "$journal" "$journal.preparing" "$pointer" "$authorization" \
+    "$auth_ready" \
     /tmp/activation-child-ready /tmp/activation-child-release \
     /tmp/report-activation-flock-attempt
+  rm -rf -- "$cutover_transaction"
   printf 'inactive\n' > /tmp/legal-mcp-service-activity
   printf 'normal\n' > /tmp/podman-activation-mode
   : > "$podman_log"
@@ -308,6 +336,25 @@ prepare_transaction() {
   make_upload
   write_journal "$old_generation" prepared
   make_authorization
+}
+
+make_cutover_transaction() {
+  install -d -o root -g root -m 0700 "$cutover_transaction"
+  printf '%s\n' LEGAL_MCP_FLAT_INT8_CUTOVER_TRANSACTION_V1 \
+    > "$cutover_transaction/kind"
+  printf '%s\n' PUBLICATION_STATE=configured-dark \
+    > "$cutover_transaction/state"
+  printf '%s\n' "$image" > "$cutover_transaction/saved-image"
+  printf '%s\n' "$image" > "$cutover_transaction/target-image"
+  printf '%s\n' pending > "$cutover_transaction/retirement-outcome"
+  chown root:root "$cutover_transaction"/*
+  chmod 600 "$cutover_transaction"/*
+}
+
+run_cutover_action() {
+  exec 8<> /run/lock/legal-mcp-host-transaction.lock
+  LEGAL_MCP_HOST_TRANSACTION_LOCK_FD=8 LEGAL_MCP_FLAT_INT8_CUTOVER=1 \
+    /host-deploy "$1" "$generation"
 }
 
 assert_upload_restored() {
@@ -504,5 +551,67 @@ if grep -Fq 'AddCapability=' /legal-mcp.container.template \
   echo 'service Quadlet unexpectedly grants an activation capability' >&2
   exit 1
 fi
+
+# The root coordinator can take over exactly one prepared journal while the
+# service/auth boundary is dark. The publisher-facing ordinary action cannot
+# operate on the typed journal, and rollback/reattivation remain idempotent.
+reset_fixture
+install -d -o root -g legal-mcp -m 0555 "/srv/legal-mcp/generations/$previous"
+printf '%s' "$previous" > "$pointer"
+prepare_transaction "$previous"
+make_cutover_transaction
+output="$(run_cutover_action cutover-activate)"
+[[ "$output" = cutover-activated-dark && "$(<"$pointer")" = "$generation" ]]
+mapfile -t transaction < "$journal"
+[[ ${#transaction[@]} -eq 4 \
+  && "${transaction[0]}" = "$generation" \
+  && "${transaction[1]}" = "$previous" \
+  && "${transaction[2]}" = activated \
+  && "${transaction[3]}" = flat-int8-cutover ]]
+output="$(run_cutover_action cutover-rollback)"
+[[ "$output" = cutover-rolled-back-dark && "$(<"$pointer")" = "$previous" ]]
+mapfile -t transaction < "$journal"
+[[ "${transaction[2]}" = rolled-back && "${transaction[3]}" = flat-int8-cutover ]]
+if /host-deploy activate "$generation" \
+  >/tmp/typed-publisher.stdout 2>/tmp/typed-publisher.stderr; then
+  echo 'ordinary publisher activation accepted a cutover-bound journal' >&2
+  exit 1
+fi
+grep -Fq 'foreign host transaction' /tmp/typed-publisher.stderr
+[[ "$(<"$pointer")" = "$previous" ]]
+rm -rf -- "$cutover_transaction"
+if /host-deploy activate "$generation" \
+  >/tmp/typed-publisher.stdout 2>/tmp/typed-publisher.stderr; then
+  echo 'ordinary publisher activation accepted a retired cutover binding' >&2
+  exit 1
+fi
+grep -Fq 'explicit root coordinator' /tmp/typed-publisher.stderr
+make_cutover_transaction
+printf '%s\n' saved > "$cutover_transaction/retirement-outcome"
+output="$(run_cutover_action cutover-commit)"
+[[ "$output" = cutover-rollback-committed && "$(<"$pointer")" = "$previous" \
+  && -d "$upload" && ! -e "$installed" ]]
+mapfile -t transaction < "$journal"
+[[ ${#transaction[@]} -eq 3 \
+  && "${transaction[0]}" = "$generation" \
+  && "${transaction[1]}" = "$previous" \
+  && "${transaction[2]}" = prepared \
+  && "$(stat -c '%U:%G:%a' "$upload")" = legal-mcp-publisher:legal-mcp-publisher:700 ]]
+rm -rf -- "$cutover_transaction"
+output="$(/host-deploy prepare "$generation")"
+[[ "$output" = prepared ]]
+
+reset_fixture
+install -d -o root -g legal-mcp -m 0555 "/srv/legal-mcp/generations/$previous"
+printf '%s' "$previous" > "$pointer"
+prepare_transaction "$previous"
+make_cutover_transaction
+output="$(run_cutover_action cutover-activate)"
+[[ "$output" = cutover-activated-dark && "$(<"$pointer")" = "$generation" ]]
+printf '%s\n' target > "$cutover_transaction/retirement-outcome"
+output="$(run_cutover_action cutover-commit)"
+[[ "$output" = cutover-committed && ! -e "$journal" ]]
+grep -Fxq 'verify:0000000000000000' "$capability_log"
+grep -Fxq 'prune-generations:0000000000000000' "$capability_log"
 
 echo host-deploy-activation-fixture-ok

@@ -238,7 +238,9 @@ pub(crate) fn has_descendant_with_tag(
 ///   <a name="X"> where X is referenced: "text [anchor:X]"
 ///   any element with id="X" referenced (fallback): "text [anchor:X]"
 ///   <span data-asset-ref="X">: "[asset:X]"
-///   <img alt="...">: "[image: alt]" when alt is non-empty, else dropped
+///   <img data-asset-ref="X" alt="...">: "[image: alt] [asset:X]" when alt
+///     is non-empty, otherwise "[asset:X]"
+///   other <img alt="...">: "[image: alt]" when alt is non-empty, else dropped
 ///   <strong>/<b> containing <em>/<i> (or vice versa): "***term***"
 ///   <strong>/<b>: **text**, <em>/<i>: *text*
 ///   <h1>-<h6>:    "# text" / "## text" / ... on their own line
@@ -315,6 +317,14 @@ pub(crate) fn render_node(
                     if !alt.is_empty() {
                         buf.push_str("[image: ");
                         buf.push_str(alt);
+                        buf.push(']');
+                    }
+                    if let Some(asset_ref) = el.attr("data-asset-ref") {
+                        if !alt.is_empty() {
+                            buf.push(' ');
+                        }
+                        buf.push_str("[asset:");
+                        buf.push_str(asset_ref);
                         buf.push(']');
                     }
                     return;
@@ -836,6 +846,17 @@ pub(crate) fn assets_html_escape(s: &str) -> String {
 #[cfg(test)]
 mod security_tests {
     use super::*;
+
+    #[test]
+    fn subtree_text_preserves_frl_image_assets_and_alt_semantics_once() {
+        let html = scraper::Html::parse_fragment(
+            r#"<p>Formula <img data-asset-ref="frl:C2024A00001/sha256-one" alt="x + y"> and <img data-asset-ref="frl:C2024A00001/sha256-two" alt=""> end.</p>"#,
+        );
+        assert_eq!(
+            subtree_text(&html, &HashSet::new()),
+            "Formula [image: x + y] [asset:frl:C2024A00001/sha256-one] and [asset:frl:C2024A00001/sha256-two] end."
+        );
+    }
 
     #[test]
     fn ato_identity_normalizes_source_series_without_changing_section_case() {

@@ -1,6 +1,7 @@
 # Current state
 
-Updated 2026-07-18 on branch `codex/v0192-lifecycle-lock-contract`.
+Updated 2026-07-19 after the chunker-format-6 flat-int8 rebuild, local
+verification, HarbourGrid evaluation, and hosted-cutover recovery tests.
 
 ## Implemented product
 
@@ -14,8 +15,9 @@ Updated 2026-07-18 on branch `codex/v0192-lifecycle-lock-contract`.
   exact stored official URLs, definitions, links, assets, and point-in-time
   fetch URIs. Chunk FTS is contentless-delete and its postings/BM25 metadata
   are digest-bound; authoritative text remains in `chunks`.
-- BM25 plus mdbr-leaf-ir semantic retrieval. ANN proposes candidates and SQLite
-  normalized int8 first-256-dimension vectors exact-rerank them.
+- BM25 plus mdbr-leaf-ir semantic retrieval. A source-scoped mmap flat int8
+  sidecar is scanned exactly by one bounded four-thread pool, and SQLite
+  normalized first-256-dimension vectors authoritatively rerank the candidates.
 - Streamable HTTP rejects batches, validates protocol/content/origin/body limits,
   acknowledges notifications and response objects with 202, uses bounded
   workers/backpressure, emits structured request logs, exposes `/livez` and
@@ -118,7 +120,7 @@ strict Clippy, audit/deny, npm allowlisting, and workspace packaging pass.
 
 ## V20 corpus
 
-The software tree is 0.19.6. The active local generation is
+The deployed Linode generation is
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`:
 
 - minimum client 0.19.0, index `2026.07.14`, schema 11, and the unchanged
@@ -128,12 +130,15 @@ The software tree is 0.19.6. The active local generation is
   `26143e8908fc879a7e03af158cf014101d846c93f5d48d2b1687e48b2cc5fe90`;
 - approximately 37.42 GiB for the complete generation;
 - zero embedding-cache rows; and
-- index metadata plus model, tokenizer, and all ten ANN manifest bindings
-  identical to v19.
+- index metadata plus model, tokenizer, and all ten historical Arroy manifest
+  bindings identical to v19.
 
 V20 was deterministically projected from the immutable v19 schema-10 parent.
-The projection used SQLite FTS tokenization over existing chunk text to replace
-the contentful chunk index with schema 11 contentless-delete FTS. It performed
+Its historical Arroy sidecars are deliberately rejected by the hard-cut flat
+sidecar binary and must be rebuilt into a new complete generation before that
+binary is activated. The projection used SQLite FTS tokenization over existing
+chunk text to replace the contentful chunk index with schema 11
+contentless-delete FTS. It performed
 no acquisition, OCR, rechunking, model tokenization, model execution,
 re-embedding, or ANN rebuild. The database is 20,253,507,584 bytes smaller than
 v19. Full activation and verification passed, followed by all 76 smoke checks
@@ -144,6 +149,27 @@ accept schema 10.
 Post-validation cleanup removed superseded local build/cache material without
 removing source truth or the v19 fallback. Project usage fell from 298 GiB to
 197 GiB and free disk increased from 76 GiB to 153 GiB.
+
+## V22 local corpus
+
+The software tree is 0.19.7. The active local generation is
+`937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939`:
+
+- minimum client 0.19.7, index `2026.07.19`, schema 11, and chunker format 6;
+- 409,528 documents, 6,986,040 chunks/embeddings, and 20,169 definitions;
+- 19,758,231,552-byte `legal.db`, SHA-256
+  `c8e77a7dbf61a8b185592c07bb47b0cc324bfc2cce2b9e2663f5c4716483b851`;
+- ten deterministic source-scoped flat-int8 sidecars totalling 1,816,430,592
+  bytes; and
+- strict CPU verification with `semantic_search_ready=true`.
+
+The rebuild seeded its exact `(model_id, chunk_text_sha256)` cache from the
+active v21 SQLite `chunk_embeddings`. Unchanged text reused authoritative
+vectors; only changed chunk text was encoded. Chunker format 6 preserves typed
+FRL formula images through internal-link rewriting. The HarbourGrid evaluation
+passed with zero failures, including formula text, typed asset discovery,
+`get_asset`, all expected authorities, warm keyword p95 363.234 ms, warm hybrid
+p95 516.406 ms, retrieval p95 11.636 ms, and readiness under concurrent load.
 
 ## Local lifecycle and hosted cutover
 
@@ -158,8 +184,9 @@ Implemented hard cut:
 - `scripts/maintainer-sync.sh` journals/resumes local work and atomically
   exchanges complete full source sets;
 - `Containerfile` produces a corpus-free linux/amd64 image from digest-pinned
-  Rust/Debian bases with bundled SQLite, Arroy/heed search, tokenizer/reranking
-  code, ONNX Runtime 1.25.0, native runtimes, CA certificates, and fixed
+  Rust/Debian bases with bundled SQLite, mmap flat-int8 search,
+  tokenizer/reranking code, ONNX Runtime 1.25.0, native runtimes, CA
+  certificates, and fixed
   unprivileged UID/GID 971;
 - the long-running OCI service uses a read-only root, zero capabilities,
   `no-new-privileges`, bounded resources, separate read-only
@@ -205,18 +232,22 @@ Implemented hard cut:
   from the exact seven read-only descriptors. Entra works unchanged on Linode
   and remains the Microsoft 365 identity path.
 
-Schema-11 support adds one maintainer-only
-`derive-schema11-from-schema10` command. It requires the exact typed immutable
-schema-10 parent and a fresh same-filesystem output, validates before and after
-projection, rebuilds only chunk FTS storage, clears the disposable cache, and
-writes the new manifest last.
+Schema-11 support includes maintainer-only
+`derive-schema11-from-schema10` and
+`derive-flat-int8-from-schema11-arroy-v20` commands. The first requires the exact
+typed immutable schema-10 parent and a fresh same-filesystem output, validates
+before and after projection, rebuilds only chunk FTS storage, clears the
+disposable cache, and writes the new manifest last. The one-shot v20 converter
+strictly validates the typed immutable Arroy generation and derives flat
+sidecars solely from authoritative SQLite vectors without model execution.
 
 The host deployment contract now also provides a transactional,
 version-matched `--upgrade-host-tools` operation, a publisher-accessible
 explicit and idempotent `abort`, and a fail-closed
 `update-image.sh --bootstrap-empty-host` image cutover. Upload or activation
-failure never triggers abort automatically. V0.19.6 hard-cuts the upgrade to a
-V2 transaction that accepts either prepared-bootstrap or activated-dark state.
+failure never triggers abort automatically. V0.19.7 upgrades the historical
+v0.19.5 launcher transactionally and accepts prepared-bootstrap,
+configured-dark, or activated-dark state as explicitly defined by the operation.
 Under the shared host lock it atomically covers the publisher helper, wrapper,
 sudoers, `configure-auth`, `update-image`, installed Quadlet template, and V2
 marker/hashes; exact version, `SOURCE_COMMIT`, and release bytes are mandatory,
@@ -245,30 +276,33 @@ bootstrapped with verified v0.18.1 artifacts and subsequently cut over to the
 v0.19.0 empty-host software contract. The v0.19.2 publisher-tool repair and
 activation then succeeded, and v20
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` is active
-on the Linode. Authentication remains disabled, the generated
-`legal-mcp.service` is inactive, Caddy is disabled/inactive, and UFW 80/443 are
-closed. One known v0.19.2 authentication transaction remains for explicit
-one-shot recovery; there is no deployment or image transaction or upload
-authorization. No Azure resource or Entra tenant object exists.
-Azure Bicep/Blob work remains preserved as a secondary future provider path in
+and live on the Linode. API-key authentication, exact Caddy routes, all seven
+tools, all ten source partitions, reboot recovery, and API-key
+overlap/revocation passed on 2026-07-19. The sole current key ID is
+`second-client`. No deployment, authentication, image, host-tool, upload, or
+upload-authorization transaction remains.
+
+Immutable v0.19.6 release assets and OCI attestations were independently
+verified. The live host uses v0.19.5 V2 host tools and the immutable v0.19.0
+runtime image. V0.19.0 and v0.19.6 contain identical Rust/crate source;
+intervening changes are hosting/release tooling and version metadata. Alignment
+is deferred to a future activated-dark maintenance window rather than risking
+the healthy endpoint. No Azure resource or Entra tenant object exists. Azure
+Bicep/Blob work remains preserved as a secondary future provider path in
 [docs/AZURE_FUTURE.md](docs/AZURE_FUTURE.md).
 
-## Remaining proof before completion
+## Remaining optional enterprise and disaster-recovery work
 
-1. Push the reviewed branch and require its pinned cross-platform CI/release
-   contract checks to pass before merge.
-2. Once the immutable v0.19.6 artifacts exist, independently verify the Linux
-   release bundle, checksums, `SOURCE_COMMIT`, and GHCR digest. From those exact
-   bytes, run the V2 host-tools upgrade against the activated-dark host,
-   configure authentication, then move the running image to the verified digest
-   through the normal authenticated image transaction. Do not represent the
-   release or publication as complete before that evidence exists.
-3. Prove reboot, rollback, volume detach/reattach, image rollback, authentication
-   rotation, and disposable VPS replacement before removing retained evidence.
-4. Create the tenant resource and connector app registrations, exercise a real
-   delegated token, and test Copilot Studio consent/tool invocation/DLP.
-5. Test the optional direct Microsoft 365 declarative-agent SSO registration in
-   a licensed tenant before any enterprise pilot.
+1. Replace the temporary Linode hostname with stable owned DNS.
+2. Create the Entra resource and caller app registrations, exercise a real
+   delegated token, and test Copilot Studio consent, tool invocation, and DLP.
+3. Test the optional direct Microsoft 365 declarative-agent SSO registration in
+   a licensed tenant.
+4. During separately reviewed maintenance, prove volume detach/reattach,
+   disposable VPS replacement, and an image rollback without risking the only
+   live corpus host.
+5. Align host-tool/image version labels only from an exact activated-dark state;
+   runtime source correctness does not depend on this cosmetic alignment.
 
 High Court historical coverage remains bounded by the official site's available
 digitized collection. OALCC is reference-only clean-room research evidence.

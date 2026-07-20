@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "name": "HarbourGrid R&D and cross-border IP restructure",
+  "expected_tools": [
+    "search",
+    "get_chunks",
+    "get_asset",
+    "get_doc_anchors",
+    "get_definition",
+    "stats",
+    "fetch"
+  ],
+  "maximum_stats_bytes": 200000,
+  "latency_slo_ms": {
+    "keyword_warm_p95": 1000,
+    "hybrid_warm_p95": 2000,
+    "retrieval_p95": 1000,
+    "ready_during_load": 1000
+  },
+  "search_cases": [
+    {
+      "id": "rd-core-activities",
+      "source": "frl",
+      "mode": "keyword",
+      "query": "355-25 core R&D activities experimental activities hypothesis experiment observation evaluation logical conclusions",
+      "doc_scope": "C2004A05138",
+      "expected_documents": ["C2004A05138"],
+      "expected_text": ["355-25", "core R&D activities"]
+    },
+    {
+      "id": "rd-clawback-feedstock",
+      "source": "frl",
+      "mode": "keyword",
+      "query": "355-450 feedstock adjustment recoupment clawback amount formula",
+      "doc_scope": "C2004A05138",
+      "expected_documents": ["C2004A05138"],
+      "expected_text": ["355-450", "formula"],
+      "requires_asset": true
+    },
+    {
+      "id": "rd-explanatory-material",
+      "source": "ato",
+      "mode": "keyword",
+      "query": "uniform R&D recoupment feedstock clawback adjustment",
+      "doc_scope": "NEM/EM202033/NAT/ATO/00007",
+      "expected_documents": ["NEM/EM202033/NAT/ATO/00007"],
+      "expected_text": ["clawback"]
+    },
+    {
+      "id": "transfer-pricing-pcg",
+      "source": "ato",
+      "mode": "hybrid",
+      "query": "intangible migration related party licence royalty transfer pricing risk",
+      "doc_scope": "COG/PCG20241/NAT/ATO/00001",
+      "expected_documents": ["COG/PCG20241/NAT/ATO/00001"],
+      "expected_text": ["intangible"]
+    },
+    {
+      "id": "corporate-residence-ruling",
+      "source": "ato",
+      "mode": "keyword",
+      "query": "central management and control corporate residence",
+      "doc_scope": "TXR/TR20185/NAT/ATO/00001",
+      "expected_documents": ["TXR/TR20185/NAT/ATO/00001"],
+      "expected_text": ["central management and control"]
+    },
+    {
+      "id": "singapore-treaty",
+      "source": "ato",
+      "mode": "keyword",
+      "query": "Singapore agreement royalties resident principal purpose MLI",
+      "doc_scope": "MLI/MLI-SINGAPORE-AGREEMENT",
+      "expected_documents": ["MLI/MLI-SINGAPORE-AGREEMENT"],
+      "expected_text": ["Singapore"]
+    },
+    {
+      "id": "moreton-rd-case",
+      "source": "federal-court",
+      "mode": "hybrid",
+      "query": "Moreton Resources Innovation Science Australia R&D activities",
+      "doc_scope": "fca/full/2019/2019fcafc0120",
+      "expected_documents": ["fca/full/2019/2019fcafc0120"],
+      "expected_text": ["Moreton"]
+    },
+    {
+      "id": "chevron-transfer-pricing",
+      "source": "federal-court",
+      "mode": "hybrid",
+      "query": "Chevron transfer pricing arm's length conditions",
+      "doc_scope": "fca/full/2017/2017fcafc0062",
+      "expected_documents": ["fca/full/2017/2017fcafc0062"],
+      "expected_text": ["Chevron"]
+    },
+    {
+      "id": "bywater-residence",
+      "source": "high-court",
+      "mode": "hybrid",
+      "query": "Bywater central management and control corporate residence",
+      "doc_scope": "[2016] HCA 45",
+      "expected_documents": ["[2016] HCA 45"],
+      "expected_text": ["Bywater"]
+    },
+    {
+      "id": "hart-part-iva",
+      "source": "high-court",
+      "mode": "hybrid",
+      "query": "Hart Part IVA tax benefit dominant purpose",
+      "doc_scope": "[2004] HCA 26",
+      "expected_documents": ["[2004] HCA 26"],
+      "expected_text": ["Hart"]
+    }
+  ],
+  "definition_case": {
+    "source": "ato",
+    "term": "royalty"
+  },
+  "fetch_case": {
+    "uri": "legal://ato/TXR%2FTR20185%2FNAT%2FATO%2F00001"
+  }
+}

@@ -17,7 +17,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
   exit 2
 }
 
-version=0.19.6
+version=0.19.7
 revision=1111111111111111111111111111111111111111
 old_revision=2222222222222222222222222222222222222222
 old_digest="ghcr.io/gunba/australian-legal-mcp@sha256:$(printf 'a%.0s' {1..64})"
@@ -75,7 +75,7 @@ case "$1" in
     if [[ -e /tmp/wrong-release-binary ]]; then
       printf '%s\n' 'legal-mcp 9.9.9'
     else
-      printf '%s\n' 'legal-mcp 0.19.6'
+      printf '%s\n' 'legal-mcp 0.19.7'
     fi
     ;;
   verify-runtime)
@@ -136,6 +136,13 @@ chown legal-mcp:legal-mcp /etc/legal-mcp/api-keys.json
 chmod 400 /etc/legal-mcp/api-keys.json
 cat > /etc/caddy/Caddyfile <<'EOF'
 {
+	log default {
+		format filter {
+			request delete
+			wrap json
+		}
+	}
+
 	servers {
 		timeouts {
 			read_body 30s
@@ -297,6 +304,10 @@ https_routes = [
         {"body": "not found", "handler": "static_response", "status_code": 404}
     ]}]}]},
 ]
+logging = {"logs": {"default": {"encoder": {
+    "fields": {"request": {"filter": "delete"}}, "format": "filter",
+    "wrap": {"format": "json"},
+}}}}
 value = {"apps": {"http": {"servers": {
     "srv0": {"listen": [":443"], **timeouts, "routes": [{"match": [{"host": [host]}],
         "handle": [{"handler": "subroute", "routes": https_routes}], "terminal": True}]},
@@ -304,7 +315,7 @@ value = {"apps": {"http": {"servers": {
         "handle": [{"handler": "subroute", "routes": [{"handle": [
             {"body": "not found", "handler": "static_response", "status_code": 404}
         ]}]}], "terminal": True}]},
-}}}}
+}}}, "logging": logging}
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(value, handle, separators=(",", ":"))
 overbroad = copy.deepcopy(value)
@@ -513,9 +524,15 @@ case "\$1" in
           else
             emit_image_id /tmp/old-image-id
           fi
+        elif [[ "\$format" = '{{.Digest}}' ]]; then
+          if [[ -e /tmp/wrong-oci-digest ]]; then printf 'sha256:%064d\n' 9; else printf '%s\n' "\${image##*@}"; fi
+        elif [[ "\$format" == *'.title'* ]]; then
+          if [[ -e /tmp/wrong-oci-title ]]; then printf '%s\n' Wrong; else printf '%s\n' 'Australian Legal MCP'; fi
+        elif [[ "\$format" == *'.description'* ]]; then
+          if [[ -e /tmp/wrong-oci-description ]]; then printf '%s\n' Wrong; else printf '%s\n' 'Source-grounded Australian legal MCP server'; fi
         elif [[ "\$format" == *'.version'* ]]; then
           if [[ "\$image" = "\$new_image" ]]; then
-            if [[ -e /tmp/wrong-oci-version ]]; then printf '%s\n' 9.9.9; else printf '%s\n' 0.19.6; fi
+            if [[ -e /tmp/wrong-oci-version ]]; then printf '%s\n' 9.9.9; else printf '%s\n' 0.19.7; fi
           else
             printf '%s\n' 0.18.1
           fi
@@ -531,6 +548,10 @@ case "\$1" in
           else
             printf '%s\n' '$old_revision'
           fi
+        elif [[ "\$format" == *'.licenses'* ]]; then
+          if [[ -e /tmp/wrong-oci-licenses ]]; then printf '%s\n' Wrong; else printf '%s\n' MIT; fi
+        elif [[ "\$format" == *'io.australian-legal-mcp.ann-format'* ]]; then
+          if [[ -e /tmp/wrong-oci-ann-format ]]; then printf '%s\n' arroy; else printf '%s\n' flat-int8-v1; fi
         else
           exit 93
         fi
@@ -552,7 +573,7 @@ case "\$1" in
     done
     case "\$command" in
       --version)
-        if [[ -e /tmp/wrong-oci-binary ]]; then printf '%s\n' 'legal-mcp 9.9.9'; else printf '%s\n' 'legal-mcp 0.19.6'; fi
+        if [[ -e /tmp/wrong-oci-binary ]]; then printf '%s\n' 'legal-mcp 9.9.9'; else printf '%s\n' 'legal-mcp 0.19.7'; fi
         ;;
       verify-runtime) printf '%s\n' '{"onnx_runtime_ready":true}' ;;
       '')
@@ -875,7 +896,7 @@ exec {foreign_lock_fd}>&-
 direct_lock_record="$(</tmp/direct-host-lock-record)"
 [[ "${direct_lock_record%%:*}" != "$foreign_lock_fd" \
   && "${direct_lock_record#*:}" = "$(stat -Lc '%d:%i' "$host_transaction_lock")" ]]
-grep -Fq 'required host file is missing or unsafe: /etc/legal-mcp/auth-ready' \
+grep -Fq 'required host file is missing or unsafe: /srv/legal-mcp/lifecycle/active-generation' \
   /tmp/normal-image.stderr
 printf '%s\n' 'malicious=1' '__IMAGE_DIGEST__' \
   > "$bundle/infra/hosting/alternate.container.template"
@@ -900,7 +921,9 @@ touch /tmp/wrong-release-binary
 expect_update_failed
 assert_old_state
 
-for failure in wrong-oci-source wrong-oci-revision wrong-oci-version wrong-oci-binary; do
+for failure in wrong-oci-title wrong-oci-description wrong-oci-source \
+  wrong-oci-revision wrong-oci-version wrong-oci-licenses \
+  wrong-oci-ann-format wrong-oci-digest wrong-oci-binary; do
   reset_baseline
   touch "/tmp/$failure"
   expect_update_failed

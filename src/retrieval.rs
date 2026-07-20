@@ -244,14 +244,24 @@ pub(crate) fn fetch(uri_string: &str) -> Result<String> {
     }
 }
 
-/// Live-fetch an ATO document outside the local corpus. Returns the same
-/// `{uri, canonical_url, title, source, chunks}` shape as other retrieval
-/// responses.
-pub(crate) fn fetch_ato_doc(doc_id: &str, pit: Option<&str>, view: Option<&str>) -> Result<String> {
+/// Construct the official ATO document URL used by live fetch and PiT
+/// breadcrumbs. `Url::query_pairs_mut` provides one encoding path for native
+/// ids and qualifiers, and `DocUri` applies the same qualifier validation as
+/// the public `legal://` fetch surface.
+pub(crate) fn ato_document_url(
+    document: &DocumentId,
+    pit: Option<&str>,
+    view: Option<&str>,
+) -> Result<Url> {
+    DocUri::new(
+        document.clone(),
+        pit.map(str::to_string),
+        view.map(str::to_string),
+    )?;
     let mut url = Url::parse("https://www.ato.gov.au/law/view/document")?;
     {
         let mut query = url.query_pairs_mut();
-        query.append_pair("docid", doc_id);
+        query.append_pair("docid", &document.native_id);
         if let Some(p) = pit.filter(|s| !s.is_empty()) {
             query.append_pair("PiT", p);
         }
@@ -259,6 +269,17 @@ pub(crate) fn fetch_ato_doc(doc_id: &str, pit: Option<&str>, view: Option<&str>)
             query.append_pair("db", v);
         }
     }
+    Ok(url)
+}
+
+/// Live-fetch an ATO document outside the local corpus. Returns the same
+/// `{uri, canonical_url, title, source, chunks}` shape as other retrieval
+/// responses.
+pub(crate) fn fetch_ato_doc(doc_id: &str, pit: Option<&str>, view: Option<&str>) -> Result<String> {
+    let source = SourceId::new("ato")?;
+    validate_source(&source)?;
+    let document = DocumentId::new(source, doc_id)?;
+    let url = ato_document_url(&document, pit, view)?;
 
     let client = reqwest::blocking::Client::builder()
         .user_agent(ATO_USER_AGENT)
@@ -308,9 +329,6 @@ pub(crate) fn fetch_ato_doc(doc_id: &str, pit: Option<&str>, view: Option<&str>)
     // chunks aren't persisted and carry no chunk_id; all of them come
     // back inline in this one response.
     let chunks = chunk_html(&cleaned.html, cleaned.title.as_deref(), EMBED_MAX_TOKENS);
-    let source = SourceId::new("ato")?;
-    validate_source(&source)?;
-    let document = DocumentId::new(source, doc_id)?;
     let chunk_json: Vec<JsonValue> = chunks
         .iter()
         .map(|c| -> Result<JsonValue> {
@@ -1318,20 +1336,36 @@ pub(crate) fn get_doc_anchors(document: DocumentId) -> Result<String> {
                     .parse::<SourceId>()
                     .with_context(|| format!("invalid stored anchor source `{source}`"))?;
                 validate_source(&source)?;
+                let target_document = DocumentId { source, native_id };
                 let mut entry = serde_json::Map::new();
                 entry.insert("label".to_string(), JsonValue::String(label));
                 entry.insert(
                     "document".to_string(),
-                    serde_json::to_value(DocumentId { source, native_id })?,
+                    serde_json::to_value(&target_document)?,
                 );
-                if let Some(url) = canonical_url {
-                    entry.insert("canonical_url".to_string(), JsonValue::String(url));
-                }
                 if let Some(pit) = target_pit.as_deref() {
                     entry.insert("pit".to_string(), JsonValue::String(pit.to_string()));
                     if let Some(date) = pit_to_date(pit) {
                         entry.insert("date".to_string(), JsonValue::String(date));
                     }
+                    if target_document.source.as_str() == "ato" {
+                        // Older ATO pages occasionally carry malformed PiT
+                        // metadata. Preserve those history entries, but only
+                        // emit actionable links when the qualifier satisfies
+                        // the canonical public URI contract.
+                        if let Ok(uri) =
+                            DocUri::new(target_document.clone(), Some(pit.to_string()), None)
+                        {
+                            let url = ato_document_url(&target_document, Some(pit), None)?;
+                            entry.insert("uri".to_string(), JsonValue::String(uri.to_uri_string()));
+                            entry
+                                .insert("canonical_url".to_string(), JsonValue::String(url.into()));
+                        }
+                    } else if let Some(url) = canonical_url {
+                        entry.insert("canonical_url".to_string(), JsonValue::String(url));
+                    }
+                } else if let Some(url) = canonical_url {
+                    entry.insert("canonical_url".to_string(), JsonValue::String(url));
                 }
                 historical_versions.push(JsonValue::Object(entry));
             }

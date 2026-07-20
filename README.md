@@ -35,8 +35,9 @@ never scrapes, embeds, builds, or publishes corpus/model artifacts. GitHub
 Releases remain binary-only; a separately attested GHCR image contains runtime
 software but no corpus or model artifacts.
 
-Semantic search uses mdbr-leaf-ir ANN candidates followed by exact reranking
-from authoritative normalized int8 vectors in SQLite. Bodies remain cleaned
+Semantic search exactly scans a source-scoped mmap flat int8 sidecar through one
+bounded four-thread pool, then reranks selected candidates from authoritative
+normalized int8 vectors in SQLite. Bodies remain cleaned
 structural HTML; FTS and embeddings use source-derived plain text. Schema 11
 stores chunk keyword postings in a contentless-delete FTS5 table while
 authoritative chunk text remains in `chunks`.
@@ -87,26 +88,20 @@ Redistributable because the official ONNX Runtime DLL imports `MSVCP140` and
 from the extracted directory before installation to prove the packaged shared
 library loads on that host.
 
-For local stdio development, clone and install the package metadata:
+The hosted Streamable HTTP service is the default client path; it does not
+require the Australian Legal MCP plugin or a local corpus. See
+[CLIENT_SETUP.md](CLIENT_SETUP.md) for tested setup instructions for Pi, Claude
+Code, Codex, ChatGPT, Claude custom connectors, the OpenAI Responses API, and
+Microsoft Copilot. The live validation endpoint currently uses individually
+revocable API keys; cloud connectors and end-user enterprise integrations must
+use the documented OAuth/Entra path.
 
-```bash
-git clone https://github.com/gunba/australian-legal-mcp.git
-claude plugin install ./australian-legal-mcp
-```
-
-Pi can use the same local adapter:
-
-```bash
-pi install npm:pi-mcp-adapter
-pi install ./australian-legal-mcp
-```
-
-The local registration is:
+Local maintainers may still register the binary directly over stdio:
 
 ```json
 {
   "mcpServers": {
-    "australian-legal": {
+    "australian-legal-local": {
       "command": "legal-mcp",
       "args": ["mcp"]
     }
@@ -114,10 +109,8 @@ The local registration is:
 }
 ```
 
-An enterprise client uses the Entra-protected HTTPS `/mcp` endpoint regardless
-of whether the image currently runs on Linode or Azure. API keys are supported
-for individually identified automation clients, but not as a substitute for
-Copilot delegated user identity. Never expose container port 51235 publicly.
+Local stdio requires the complete local runtime generation selected by
+`LEGAL_MCP_DATA_DIR`. Never expose container port 51235 publicly.
 
 ## Search policy
 
@@ -173,14 +166,20 @@ legal-mcp prune-generations --keep-inactive 1
 There is no runtime `update`, corpus downloader, offline bundle, corpus package,
 or GitHub corpus-release path.
 
-Software is version 0.19.6. The active local v20 generation is
-`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`.
-It retains all 409,528 documents, 6,968,250 chunks/embeddings, and 20,170
-definitions in schema 11. Its 19,746,840,576-byte `legal.db` has SHA-256
-`26143e8908fc879a7e03af158cf014101d846c93f5d48d2b1687e48b2cc5fe90`;
-the complete generation is approximately 37.42 GiB. The v19 schema-10 parent
-remains installed with its matching v0.18.1 binary/image as a fallback; the
-schema-11 binary deliberately rejects schema 10.
+Software is version 0.19.7. The active local generation is chunker-format-6
+v22 `937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939`.
+It contains 409,528 documents, 6,986,040 chunks/embeddings, and 20,169
+definitions in schema 11. Its 19,758,231,552-byte `legal.db` has SHA-256
+`c8e77a7dbf61a8b185592c07bb47b0cc324bfc2cce2b9e2663f5c4716483b851`;
+ten source-scoped flat-int8 sidecars total 1,816,430,592 bytes. Strict CPU
+verification and the HarbourGrid retrieval/latency evaluation pass. The rebuild
+preserves typed FRL formula images through internal-link rewriting, and exact
+chunk-text hashes reuse authoritative vectors from the previous generation.
+
+The v20 Arroy generation remains the current hosted corpus until the separately
+reviewed coordinated image/generation cutover. The v19 schema-10 parent remains
+installed with its matching v0.18.1 binary/image as a disaster-recovery
+fallback; the schema-11 binary deliberately rejects schema 10.
 
 Maintainers may project an exact immutable schema-10 generation without a
 source or model rebuild:
@@ -194,7 +193,11 @@ target/release/legal-mcp derive-schema11-from-schema10 \
 
 This command uses SQLite FTS tokenization to rebuild only chunk FTS storage. It
 does not acquire sources, run OCR, rechunk, tokenize for the model, execute the
-model, re-embed, or rebuild ANN sidecars.
+model, re-embed, or rebuild sidecars. It accepts only generations already using
+the current flat format. The separate maintainer-only
+`derive-flat-int8-from-schema11-arroy-v20` command is the one-shot, strictly
+validated conversion path for the immutable schema-11 v20 Arroy generation; it
+derives the flat sidecars exclusively from authoritative SQLite int8 vectors.
 
 ## Maintainer data and builds
 
@@ -241,21 +244,20 @@ scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
 
-V20 is now active on the Linode after the v0.19.2 publisher-tool repair and
-activation succeeded, but the host remains fail-closed and is not serving.
-Authentication is disabled, `legal-mcp.service` is inactive, Caddy is
-disabled/inactive, and UFW 80/443 are closed. One known v0.19.2 authentication
-transaction remains for explicit one-shot recovery; no deployment or image
-transaction or upload authorization exists.
+V20 is active and serving through authenticated TLS at the temporary Linode
+hostname documented in [CLIENT_SETUP.md](CLIENT_SETUP.md). API-key cutover,
+all-seven-tool/all-ten-source retrieval, exact public routes, reboot recovery,
+and key overlap/revocation were proved on 2026-07-19. The sole current client
+key ID is `second-client`; plaintext credentials are not stored in this
+repository. No deployment, authentication, image, host-tool, upload, or upload
+authorization transaction remains.
 
-V0.19.6 implements a hard-cut V2 host-tools transaction for either a prepared
-bootstrap or this activated-dark state. It atomically binds the publisher
-helper/wrapper/sudoers, auth and image helpers, installed Quadlet template, and
-V2 marker/hashes to the exact release identity and shared host lock; recovery
-uses the same bundle and leaves service/ingress off. Once the v0.19.6 release
-exists, verify its bundle, run `--upgrade-host-tools --version 0.19.6`, configure
-authentication, then move the image by verified digest. See
-[DEPLOYMENT.md](DEPLOYMENT.md) for the operational sequence.
+Immutable v0.19.6 release assets and OCI attestations were independently
+verified. The running v0.19.0 image contains the same Rust/crate source as
+v0.19.6; intervening changes are host/release tooling and version metadata. A
+future image/host-tool alignment is an activated-dark maintenance operation,
+not a serving-runtime correctness dependency. See [DEPLOYMENT.md](DEPLOYMENT.md)
+for the operational contract.
 
 The maintainer pipeline requires the pinned model in
 `data/models/mdbr-leaf-ir-standard`, CUDA/TensorRT ONNX Runtime, Google

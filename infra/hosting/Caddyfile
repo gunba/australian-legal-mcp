@@ -1,6 +1,16 @@
 # Rendered by the provider host installer. Podman publishes the Rust service
 # only on host loopback; Caddy exposes MCP and OAuth resource metadata only.
 {
+	# Reverse-proxy failures attach the complete request object to Caddy's
+	# runtime error logger independently of access logging. Drop that object so
+	# authentication material and research requests can never enter a log sink.
+	log default {
+		format filter {
+			request delete
+			wrap json
+		}
+	}
+
 	servers {
 		timeouts {
 			read_body 30s

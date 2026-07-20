@@ -4,19 +4,19 @@ The hosted target is one Akamai Cloud (Linode) VPS in Sydney. The host is
 disposable; the corpus lives on a detachable, encrypted Block Storage volume
 and is never baked into an image.
 
-The host is currently fail-closed and not serving. The v0.19.2 publisher-tool
-repair and activation succeeded, so v20
+Schema-11 v20
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` is active
-on the Linode. Authentication remains disabled, the generated
-`legal-mcp.service` is inactive, Caddy is disabled/inactive, and UFW 80/443 are
-closed. One known v0.19.2 authentication transaction remains for the explicit
-one-shot recovery below; there is no deployment or image transaction or upload
-authorization.
+and live on the Linode behind API-key-authenticated Caddy TLS. Exact public
+routes, all-seven-tool/all-ten-source retrieval, reboot recovery, and key
+rotation/revocation passed on 2026-07-19. The sole current client key ID is
+`second-client`; no plaintext key is stored in this repository. No deployment,
+authentication, image, host-tool, upload, or upload-authorization transaction
+remains.
 
-Software 0.19.6 implements the next hard-cut host-tools transaction, but this
-document does not claim its release or publication has occurred. V2 accepts
-either prepared-bootstrap or activated-dark state and leaves service and
-ingress off.
+Immutable software 0.19.6 and its OCI attestations were independently verified.
+The live host uses verified v0.19.5 host tools and the immutable v0.19.0 runtime
+image, which contains the same Rust/crate source as v0.19.6. Version alignment
+is reserved for a future activated-dark maintenance window.
 
 The same image and mounted-generation contract can later run on an Azure VM.
 Azure-specific work is retained in [docs/AZURE_FUTURE.md](docs/AZURE_FUTURE.md),
@@ -43,8 +43,8 @@ The image contains:
 
 - the `legal-mcp` server, search, tokenisation, exact reranking, and all seven MCP
   tools;
-- bundled SQLite (via `rusqlite`), Arroy/heed vector-search code, and normalized
-  int8 exact reranking support;
+- bundled SQLite (via `rusqlite`), mmap flat-int8 exact-scan code, and
+  normalized int8 authoritative reranking support;
 - ONNX Runtime 1.25.0, `libgomp`, C/C++ runtime libraries, and CA certificates;
 - a fixed unprivileged `971:971` runtime identity.
 
@@ -242,8 +242,9 @@ Also retain the Akamai Cloud Firewall. UFW is defence in depth, not a substitute
 
 The current host completed its initial install with v0.18.1, its empty-host
 software cutover with v0.19.0, and its publisher-tool repair plus v20 activation
-with v0.19.2. Do not rerun the initial installer against it; use the
-activated-dark host-tools upgrade below.
+with v0.19.2. Do not rerun the initial installer against it. Use the
+host-tools upgrade below only after a separately reviewed operation has placed
+the host in its exact activated-dark maintenance state.
 
 ## 4. Upgrade host tools on active-dark v20
 
@@ -264,10 +265,10 @@ The host must remain activated-dark for this operation: authentication disabled,
 UFW with 80/443 closed, no listener on 80/443/51235, empty uploads, and no upload
 authorization or corpus/image transaction.
 
-The current host has one known unversioned v0.19.2 authentication journal. After
-the immutable v0.19.6 release exists, independently verify its checksums,
-`SOURCE_COMMIT`, release bytes, binary version, and OCI digest. From that exact
-unpacked Linux bundle, run this one-shot recovery **before** the V2 upgrade:
+The current host's one known unversioned v0.19.2 authentication journal was
+successfully recovered before the V2 upgrade. The following command is retained
+only as historical recovery procedure for that exact legacy state; do not run
+it on the live transaction-free host:
 
 ```bash
 sudo infra/hosting/configure-auth.sh --recover
@@ -280,13 +281,17 @@ or one dead-PID v0.19.2 preparation. It leaves service and ingress off and does
 not make legacy journals part of normal V2 recovery. Remove this documented
 exception after the host migration evidence is retained.
 
-Confirm that no auth transaction remains, then use the same verified bundle:
+For a future activated-dark maintenance window, confirm that no auth
+transaction remains and run the exact independently verified target bundle. The
+version shown here is the verified v0.19.6 example; do not run it merely to
+align labels on the currently healthy public service:
 
 ```bash
 sudo infra/linode/install-host.sh --upgrade-host-tools --version 0.19.6
 ```
 
-If interrupted, recover from the same exact bundle before continuing:
+If that future operation is interrupted, recover from the same exact bundle
+before continuing:
 
 ```bash
 sudo infra/linode/install-host.sh --recover-host-tools --version 0.19.6
@@ -473,6 +478,47 @@ sudo /path/to/the-same-release-bundle/infra/hosting/update-image.sh --recover \
 Retain that version-matched release bundle until the transaction has completed;
 its recovery code owns the transaction format. Never deploy by tag, mutate a running container, or install native libraries
 into it.
+
+### One-time Arroy-v20 to flat-int8 cutover
+
+The hard sidecar-format transition is not an ordinary image update or publisher
+activation. First leave the fully uploaded flat-int8 generation in the exact
+`prepared` corpus deployment transaction. Then, from the same release whose V2
+host tools are installed, invoke the one root/admin operation (stream a valid
+probe key on standard input when the configured mode contains `api-key`):
+
+```bash
+sudo /usr/local/sbin/legal-mcp-update-image --flat-int8-cutover \
+  --generation TARGET_FLAT_GENERATION \
+  --expected-current-generation a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3 \
+  --image ghcr.io/gunba/australian-legal-mcp@sha256:TARGET_DIGEST \
+  --version X.Y.Z \
+  --template /path/to/exact-release/infra/hosting/legal-mcp.container.template
+```
+
+The launcher holds `/run/lock/legal-mcp-host-transaction.lock`, rejects foreign
+auth/image/host-tool work, verifies the exact release, labels, digest, template,
+Arroy prior and flat target, then makes auth-ready, service, and ingress dark
+before changing either member of the pair. The publisher has no cutover or
+image operation. Do not run its ordinary `activate` command for this prepared
+generation.
+
+After interruption or reboot, do not delete or edit either journal. Re-enter
+the same installed launcher; it deterministically finishes a fully proved
+commit or restores and proves the prior generation plus image/template pair
+before reopening ingress:
+
+```bash
+sudo /usr/local/sbin/legal-mcp-update-image \
+  --recover --flat-int8-cutover
+```
+
+Before the durable target decision, rollback also restores the flat generation's
+ordinary prepared upload, journal, ownership, and upload authorization. After
+that decision, recovery can only finish the target pair.
+
+This operation is implemented for the pending format transition and has not
+been run on the hosted service.
 
 ## 8. Verification and operations
 

@@ -12,6 +12,7 @@ use crate::extract::{
     CurrencyInfo, Definition, DefinitionChunk,
 };
 use crate::semantic::EMBEDDING_BATCH_SIZE;
+use crate::source_catalog::ATO_SOURCE_ID;
 use crate::{ServerState, EMBEDDING_DIM, EMBEDDING_MODEL_ID};
 use anyhow::{anyhow, bail, Context, Result};
 #[cfg(test)]
@@ -1057,12 +1058,19 @@ fn refresh_metadata(
         "documents_by_type_json",
         &serde_json::to_string(&documents_by_type)?,
     )?;
-    set_source_meta(
-        conn,
-        source_id.as_str(),
-        "prefix_breakdown_json",
-        &serde_json::to_string(&source_prefix_breakdown(conn, source_id)?)?,
-    )?;
+    if source_id.as_str() == ATO_SOURCE_ID {
+        set_source_meta(
+            conn,
+            source_id.as_str(),
+            "prefix_breakdown_json",
+            &serde_json::to_string(&ato_prefix_breakdown(conn, source_id)?)?,
+        )?;
+    } else {
+        conn.execute(
+            "DELETE FROM source_meta WHERE source_id = ?1 AND key = 'prefix_breakdown_json'",
+            [source_id.as_str()],
+        )?;
+    }
 
     if source_embeddings == 0 {
         conn.execute(
@@ -1102,10 +1110,10 @@ fn source_documents_by_type(
     Ok(counts)
 }
 
-fn source_prefix_breakdown(
-    conn: &Connection,
-    source_id: &SourceId,
-) -> Result<Vec<serde_json::Value>> {
+fn ato_prefix_breakdown(conn: &Connection, source_id: &SourceId) -> Result<Vec<serde_json::Value>> {
+    if source_id.as_str() != ATO_SOURCE_ID {
+        bail!("prefix breakdown is only defined for hierarchical ATO native ids");
+    }
     let mut statement = conn.prepare(
         "SELECT native_id, title FROM documents
          WHERE source_id = ?1 ORDER BY native_id",

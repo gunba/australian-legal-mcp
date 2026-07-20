@@ -9,11 +9,12 @@ maintainer host. Validated generations are activated locally and can be
 CoW-seeded and rsynced by changed blocks to an external XFS/reflink volume on
 the Akamai/Linode host. A corpus-free OCI image serves and validates them. The
 runtime never scrapes, embeds, builds, packages, or publishes corpus/model
-artifacts. GitHub Releases contain software binaries only. V20 is active on the
-current Linode, but authentication is disabled, `legal-mcp.service` is
-inactive, Caddy is disabled/inactive, UFW 80/443 are closed, and there is no
-deployment, auth, or image transaction or upload authorization. The host is not
-serving.
+artifacts. GitHub Releases contain software binaries only. V20 is active and
+live on the current Linode behind API-key-authenticated Caddy TLS. Exact routes,
+all-seven-tool/all-ten-source retrieval, reboot recovery, and key
+rotation/revocation passed on 2026-07-19. No deployment, authentication, image,
+host-tool, upload, or upload-authorization transaction remains. The Linode
+hostname is temporary test DNS, not a permanent production identity.
 
 Persistent project data is
 `data/{sources,source-snapshots,models,builds,runtime,cache,runs,logs,validation,archive}`.
@@ -85,21 +86,21 @@ scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
 
-Software is 0.19.6. V20
-`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` is active
-locally and on the Linode after the v0.19.2 publisher-tool repair and
-activation succeeded. Retain local v19 with the matching v0.18.1 binary/image
-as its schema-10 fallback; the schema-11 binary cannot roll back to schema 10.
+Software is 0.19.7. Chunker-format-6 flat-int8 v22
+`937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939` is active
+and strictly verified locally. Arroy v20
+`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` remains
+active on the Linode until the coordinated image/generation cutover. Retain
+local v19 with its matching v0.18.1 binary/image as the schema-10
+disaster-recovery fallback; the schema-11 binary cannot roll back to schema 10.
 
-V0.19.6 implements one hard-cut V2 host-tools transaction for either a
-prepared-bootstrap or activated-dark host. It atomically covers the publisher
-helper/wrapper/sudoers, `configure-auth`, `update-image`, installed Quadlet
-template, and V2 marker/hashes; exact version, `SOURCE_COMMIT`, release bytes,
-and the shared host lock are mandatory, and recovery uses the same bundle.
-Generated-Quadlet auth state is handled without enabling or disabling the unit.
-The operation leaves service and ingress off. Once the v0.19.6 release bundle
-exists, verify it, upgrade with `--upgrade-host-tools --version 0.19.6`,
-configure auth, then move the image by verified digest.
+Immutable v0.19.6 release assets and OCI attestations were independently
+verified. Its hard-cut V2 transaction accepts only prepared-bootstrap or
+activated-dark hosts, binds exact release bytes and the shared host lock, and
+recovers only with the same bundle. The live host intentionally remains on
+verified v0.19.5 host tools and the immutable v0.19.0 runtime image; v0.19.0 and
+v0.19.6 contain identical Rust/crate source, so version alignment is a future
+activated-dark maintenance task rather than a serving dependency.
 
 The unpacked model is under `data/models/mdbr-leaf-ir-standard`. Maintainer
 builds use deterministic FP32 ONNX, TensorRT FP16, CUDA fallback, lossless

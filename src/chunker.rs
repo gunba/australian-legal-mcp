@@ -21,7 +21,7 @@ use tokenizers::Tokenizer;
 
 // Checkpoints pin CHUNKER_FORMAT_VERSION; changing output shape
 // forces an explicit fresh build instead of resuming stale chunk records.
-pub(crate) const CHUNKER_FORMAT_VERSION: u32 = 4;
+pub(crate) const CHUNKER_FORMAT_VERSION: u32 = 6;
 pub(crate) const EMBED_MAX_TOKENS: usize = EMBEDDING_INPUT_MAX_TOKENS;
 
 #[derive(Debug, Clone, Serialize)]

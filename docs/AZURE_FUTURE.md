@@ -5,10 +5,9 @@
 > Revalidate this adapter before any Azure return; it is preserved to retain
 > the hardened Bicep, Blob, identity, and recovery work.
 
-The current local serving generation is schema-11 v20; Azure has not received
-it and no Azure resource exists. The Linode host is also not serving: it has no
-active generation, authentication, application service, active Caddy service,
-or ingress.
+The current local and Linode serving generation is schema-11 v20. The Linode
+host is live behind API-key-authenticated Caddy TLS. Azure has not received the
+generation and no Azure resource exists.
 
 This preserved adapter would use Azure when the enterprise deployment decision
 requires it; Microsoft 365 Copilot itself does not require Azure hosting.
@@ -46,11 +45,12 @@ Official references:
 
 ## Why this storage design
 
-The active local v20 generation is approximately 37.42 GiB and includes a
-19,746,840,576-byte SQLite database, ten ANN sidecars, the model, and tokenizer.
-SQLite/Arroy require local random reads, locking, and same-filesystem atomic
-renames. BlobFuse, Azure Files, App Service storage, and Container Apps network
-storage are not the live database.
+The active local v22 generation is approximately 21 GiB and includes a
+19,758,231,552-byte SQLite database, ten flat-int8 sidecars totalling
+1,816,430,592 bytes, the model, and tokenizer. SQLite and mmap flat-vector
+sidecars require local reads, locking, and same-filesystem atomic renames.
+BlobFuse, Azure Files, App Service storage, and Container Apps network storage
+are not the live database.
 
 Blob is a distribution and disaster-recovery store only. The transport:
 
@@ -186,7 +186,7 @@ The systemd service:
 - performs bounded installed-state checks before start, then exits unless model
   execution succeeds while the server initializes.
 
-## 3. Upload once and activate v20
+## 3. Upload once and activate the local generation
 
 Build the CPU release locally if necessary, ensure `ORT_DYLIB_PATH` points to a
 compatible local ONNX Runtime, then deploy:
@@ -201,11 +201,10 @@ scripts/deploy-generation-azure.sh \
   --blob-base-url 'https://<account>.blob.core.windows.net/corpus'
 ```
 
-The first invocation strictly verifies active v20 generation
-`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`,
-compresses/uploads its unique chunks, restores it with the VM managed identity, validates every reconstructed
-file, activates it atomically, starts the service, checks exact-generation
-readiness, and rolls back on failure. A root-owned durable transaction journal
+The first invocation strictly verifies the selected active local generation,
+compresses/uploads its unique chunks, restores it with the VM managed identity,
+validates every reconstructed file, activates it atomically, starts the service,
+checks exact-generation readiness, and rolls back on failure. A root-owned durable transaction journal
 also recovers interruption, reboot, or SSH loss after pointer activation;
 bootstrap failure restores the no-active-generation state. Interrupted
 upload/restore is resumable. The publisher SSH key is forced to the one strict

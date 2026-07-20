@@ -16,11 +16,11 @@ non-replaceable release is created. Linux requires glibc 2.27+; Windows requires
 the Microsoft Visual C++ 2015–2022 Redistributable. Publish and independently
 verify `SHA256SUMS` for every archive.
 
-The software tree is version 0.19.6. V0.19.6 hard-cuts host tools to one V2
-transaction and fixes authentication handling for the generated Quadlet.
-Do not install its host tools or image until the immutable release bundle,
-checksums, `SOURCE_COMMIT`, release bytes, and OCI digest have been verified;
-this documentation does not assert that release or publication has occurred.
+The software tree is version 0.19.7. The prior immutable v0.19.6 release,
+checksums, `SOURCE_COMMIT`, Linux runtime, OCI digest, and attestations were
+independently verified. V0.19.7 retains the V2 host transaction and adds the
+transactional historical-launcher upgrade plus the coordinated, recoverable
+Arroy-to-flat-int8 image/generation cutover.
 
 ## Canonical local data
 
@@ -181,8 +181,10 @@ its artifacts, rebuilds only the chunk FTS5 storage as contentless-delete,
 removes the disposable embedding cache, writes `generation.json` last, and
 strictly validates the result. SQLite necessarily performs FTS tokenization of
 the already stored chunk text. The path performs no acquisition, OCR,
-rechunking, model tokenization, model execution, re-embedding, or ANN rebuild;
-model, tokenizer, and all ten ANN artifacts remain byte-identical.
+rechunking, model tokenization, model execution, re-embedding, or sidecar rebuild;
+model, tokenizer, and all ten flat sidecars remain byte-identical. The command
+accepts only the current flat format and is not a conversion path for historical
+Arroy generations.
 
 The script durably journals pending acquisition/build/activation work in
 `data/runs/pending-generation.json`, resumes the same build output, performs
@@ -221,19 +223,17 @@ other command. See [DEPLOYMENT.md](DEPLOYMENT.md) for OpenTofu, volume identity,
 authentication, readiness, rollback, and VPS replacement; see
 [MICROSOFT_COPILOT.md](MICROSOFT_COPILOT.md) for Entra/Copilot.
 
-V20 is active on the current Linode after the v0.19.2 publisher-tool repair and
-activation succeeded. Authentication remains disabled, `legal-mcp.service` is
-inactive, Caddy is disabled/inactive, UFW 80/443 are closed, and there is no
-deployment, auth, or image transaction or upload authorization.
+V20 is active and live on the current Linode behind API-key-authenticated TLS.
+All seven tools, all ten source partitions, exact routes, reboot recovery, and
+key rotation/revocation passed on 2026-07-19. No deployment, authentication,
+image, host-tool, upload, or upload-authorization transaction remains.
 
-The v0.19.6 V2 upgrade accepts either prepared-bootstrap or activated-dark
-state. Under the shared host transaction lock it atomically replaces and
-hash-binds the publisher helper/wrapper/sudoers, installed `configure-auth` and
-`update-image`, installed Quadlet template, and V2 marker. Exact version,
-`SOURCE_COMMIT`, and release bytes are required. Recover only with the same
-bundle; both success and recovery leave service and ingress off. Follow
-[DEPLOYMENT.md](DEPLOYMENT.md): verify the v0.19.6 bundle, upgrade host tools,
-configure authentication, then move the image by verified digest.
+The live host uses verified v0.19.5 V2 host tools and the immutable v0.19.0
+runtime image. The latter contains the same Rust/crate source as v0.19.6;
+intervening changes are host/release tooling and version metadata. V0.19.6 is
+retained for the next activated-dark maintenance window. Its V2 upgrade accepts
+only prepared-bootstrap or activated-dark state, requires exact version,
+`SOURCE_COMMIT`, and release bytes, and recovers only with the same bundle.
 
 ## Build semantics
 
@@ -244,16 +244,17 @@ Every generation starts from one complete committed source set. The build:
 3. splits text losslessly and reuses exact model/text vectors;
 4. encodes missing vectors in bounded batches;
 5. derives metadata, links, definitions, citations, and FTS rows;
-6. builds deterministic source-keyed Arroy sidecars;
+6. builds deterministic source-keyed flat int8 sidecars;
 7. clears the disposable embedding cache and finalizes SQLite;
 8. copies and re-verifies pinned model files atomically;
 9. writes `generation.json` last while retaining resumable state until durable;
 10. validates exact registry, DB, model, ANN, FTS, and hash bindings before
     immutable activation.
 
-SQLite int8 vectors remain authoritative. ANN proposes candidates; exact SQLite
-reranking preserves stable scores/ties. Arroy construction pins crate version,
-ChaCha12 RNG, seed, tree/split parameters, insertion order, and Rayon count.
+Each sidecar has a fixed 4 KiB little-endian header, a sorted u32 chunk-ID
+plane, and an aligned contiguous 256-byte int8 vector plane. One bounded global
+four-thread pool scans eligible rows exactly; SQLite rereads and reranks the
+selected candidates with raw integer dots and chunk-ID tie order.
 
 ## Verification gate
 
@@ -278,4 +279,5 @@ The production gate also exercises `activate`, failed activation, `verify`,
 `rollback`, pruning, CoW/delta hosted deployment, hardened OCI/API-key behavior,
 exact-generation `/readyz`, service restart persistence, and representative
 keyword/vector/hybrid retrieval across
-all ten sources. Per-source ANN recall must remain at least 0.99 at 50.
+all ten sources. Sampled per-source top-50 IDs and raw integer scores must
+exactly match the SQLite reference.

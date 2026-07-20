@@ -34,17 +34,20 @@ MCP surface remains exactly `search`, `get_chunks`, `get_asset`,
 
 - Ten official adapters, adaptive acquisition, bounded Federal Chrome CDP,
   transactional workspaces, strict source quality, schema 11, cleaned HTML,
-  links/assets/definitions, deterministic FTS/vector ranking, and ANN recall at
-  least 0.99 at 50. Schema 11 uses digest-bound contentless-delete chunk FTS.
+  links/assets/definitions, deterministic FTS/vector ranking, and exact flat
+  int8 top-50 equality against SQLite. Schema 11 uses digest-bound
+  contentless-delete chunk FTS.
 - Pinned mdbr-leaf-ir FP32 graph, exact tokenizer, TensorRT FP16/CUDA local build,
   and CPU serving path.
-- Validated/active local v20
-  `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`:
-  409,528 documents, 6,968,250 chunks/embeddings, 20,170 definitions, a
-  19,746,840,576-byte schema-11 DB, exact model/ten-ANN bindings, all-source
-  hybrid retrieval, rollback, pruning, and graceful bounded Streamable HTTP.
-  The schema-10 v19 parent and matching v0.18.1 binary/image remain the local
-  fallback; the schema-11 binary deliberately rejects it.
+- Validated/active local chunker-format-6 v22
+  `937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939`:
+  409,528 documents, 6,986,040 chunks/embeddings, 20,169 definitions, a
+  19,758,231,552-byte schema-11 DB, exact model/ten-flat-sidecar bindings,
+  preserved typed FRL formula assets, all-source retrieval, rollback, pruning,
+  and graceful bounded Streamable HTTP. The HarbourGrid evaluation passes
+  authority, formula, `get_asset`, latency, and loaded-readiness gates. The
+  schema-10 v19 parent and matching v0.18.1 binary/image remain the local
+  disaster-recovery fallback; the schema-11 binary deliberately rejects it.
 - Added deterministic schema-10 projection. SQLite tokenizes existing text only
   to rebuild FTS; acquisition, OCR, rechunking, model tokenization/execution,
   re-embedding, and ANN reconstruction do not run.
@@ -57,9 +60,10 @@ MCP surface remains exactly `search`, `get_chunks`, `get_asset`,
   policy, RFC 9728 metadata/challenges, and Copilot templates.
 - Added version-matched host-tool upgrade, explicit publisher abort, and
   fail-closed empty-host image cutover operations for the v20 transition.
-  V0.19.6 hard-cuts the upgrade to one exact, recoverable V2 transaction for
-  prepared-bootstrap or activated-dark state, including auth/image helpers and
-  the installed Quadlet template.
+  V0.19.7 transactionally upgrades the historical launcher and adds the exact
+  configured-dark state required for a coordinated Arroy-image/generation to
+  flat-int8-image/generation cutover, including recovery after every modelled
+  SIGKILL phase.
 - Restricted the locked-parent activation exception to one exact networkless
   `activate` invocation with `CAP_DAC_OVERRIDE`; the hosted service and every
   other lifecycle command remain capability-free. Disposable fixtures prove
@@ -93,19 +97,18 @@ LEGAL_MCP_DATA_DIR="$PWD/data/runtime" scripts/smoke.sh
 cargo package --workspace --locked --allow-dirty
 ```
 
-Local evidence includes full v20 activation/verification, 76 smoke checks,
-all-ten-source hybrid retrieval, valid/invalid signed-token and API-key tests,
+Local evidence includes full v22 activation/verification, a zero-failure
+HarbourGrid evaluation, all-ten-source retrieval, valid/invalid signed-token and API-key tests,
 resource metadata and 401/403 challenges, exact seven descriptors, official
 Microsoft v2.4 schema validation; bridged non-root/read-only container probes; zero fixed
 HIGH/CRITICAL image findings; Caddy validation; strict disk/mount guards;
 packaged ONNX loading; and a clean offline Linode provider plan. The live
 instance/volume boundary now also proves Ubuntu 24.04, XFS/reflink volume
-adoption and restricted SSH. V20 is active on the host after the v0.19.2
-publisher-tool repair and activation, but authentication is disabled,
-`legal-mcp.service` is inactive, Caddy is disabled/inactive, and UFW 80/443 are
-closed. One known v0.19.2 authentication transaction remains for explicit
-one-shot recovery; no deployment or image transaction or upload authorization
-exists.
+adoption and restricted SSH. V20 is active and live behind
+API-key-authenticated TLS. Exact routes, all seven tools, all ten sources,
+reboot recovery, and key overlap/revocation passed on 2026-07-19. No deployment,
+authentication, image, host-tool, upload, or upload-authorization transaction
+remains.
 
 ## Phase 2 — disposable Linode infrastructure
 
@@ -115,21 +118,20 @@ exists.
    public 80/443/51235 are closed.
 2. **Completed:** bootstrapped the host, cut it over to the v0.19.0 empty-host
    contract, and fully staged v20.
-3. **Completed:** the v0.19.2 publisher-tool repair and activation succeeded;
-   v20 is active with authentication, application service, Caddy, and UFW web
-   ingress still off and no transaction or upload authorization remaining.
-4. Once v0.19.6 artifacts exist, independently verify the release bundle,
-   checksums, `SOURCE_COMMIT`, and OCI digest. Run
-   `--upgrade-host-tools --version 0.19.6` from those exact bytes; the V2
-   transaction must leave the activated host dark.
-5. Configure API-key and/or Entra auth, then move the running image to the
-   verified v0.19.6 digest through the normal authenticated image transaction.
-   Do not claim release or publication before the immutable artifacts exist.
-6. Test reboot, changed/unchanged generation deltas, readiness rollback,
-   API-key rotation/revocation, image rollback, volume detach/reattach, and VPS
-   replacement without another full upload.
-7. Record compute/volume cost, p50/p95 latency, CPU, RSS, page cache, queue
-   rejection, and disk extent growth.
+3. **Completed:** recovered the legacy authentication journal, upgraded to V2
+   v0.19.5 host tools, configured API-key authentication, and opened only exact
+   Caddy 80/443 ingress.
+4. **Completed:** proved all seven tools, all ten source partitions, reboot
+   recovery, API-key overlap and revocation, exact listeners/UFW, TLS, and a
+   transaction-free final state.
+5. **Completed:** published and independently verified immutable v0.19.6 assets
+   and OCI attestations. The live v0.19.0 image has identical Rust/crate source;
+   label alignment is deferred to activated-dark maintenance.
+6. **Optional DR proof:** test changed/unchanged generation deltas, image
+   rollback, volume detach/reattach, and VPS replacement without another full
+   upload.
+7. Record ongoing compute/volume cost, p50/p95 latency, CPU, RSS, page cache,
+   queue rejection, and disk extent growth.
 
 Exit criterion: the disposable VPS can be recreated from OpenTofu + an attested
 image digest + the retained volume, while 51235 never becomes public.
@@ -167,7 +169,7 @@ preview paths, not production dependencies.
 
 - Resize or move to dedicated CPU only for sustained CPU/latency evidence.
 - Add read-only replicas and a suitable managed edge/gateway only when one VPS
-  is insufficient; never put SQLite/Arroy on network/FUSE storage.
+  is insufficient; never put SQLite or mmap vector sidecars on network/FUSE storage.
 - Move the same attested OCI digest and volume contract to an Azure VM only for
   a real production decision; then re-enable the preserved managed-identity,
   Blob, monitoring, and DR adapters.

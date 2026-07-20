@@ -99,10 +99,22 @@ jobs:
             ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \
             -ceu 'export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null; apt-get install --yes --no-install-recommends acl libcap2-bin passwd python3 util-linux >/dev/null; /activation-fixture'
           docker run --rm --user 0:0 --entrypoint /bin/bash \
+            --volume "$PWD/tests/flat-int8-host-cutover-fixture.sh:/fixture:ro" \
+            --volume "$PWD/infra/hosting/update-image.sh:/update-image:ro" \
+            --volume "$PWD/infra/linode/install-host.sh:/install-host:ro" \
+            --volume "$PWD/infra/hosting/legal-mcp.container.template:/container-template:ro" \
+            --volume "$PWD/infra/hosting/Caddyfile:/Caddyfile:ro" \
+            --volume "$PWD/scripts/legal-mcp-host-deploy:/host-deploy:ro" \
+            --volume "$PWD/scripts/legal-mcp-publisher-command:/publisher-command:ro" \
+            ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \
+            -ceu 'export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null; apt-get install --yes --no-install-recommends acl passwd python3 rsync sudo util-linux >/dev/null; /fixture'
+          docker run --rm --user 0:0 --entrypoint /bin/bash \
             --volume "$PWD/tests/host-tool-upgrade-fixture.sh:/fixture:ro" \
             --volume "$PWD/infra/linode/install-host.sh:/fixture-input/install-host.sh:ro" \
             --volume "$PWD/scripts/legal-mcp-host-deploy:/fixture-input/legal-mcp-host-deploy:ro" \
             --volume "$PWD/scripts/legal-mcp-publisher-command:/fixture-input/legal-mcp-publisher-command:ro" \
+            --volume "$PWD/tests/fixtures/host-tool-launcher-v0.19.5:/fixture-input/host-tool-launcher-v0.19.5:ro" \
+            --volume "$PWD/infra/hosting/Caddyfile:/fixture-input/Caddyfile:ro" \
             --volume "$PWD/Containerfile:/fixture-input/Containerfile:ro" \
             ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \
             -ceu 'export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null; apt-get install --yes --no-install-recommends acl passwd python3 rsync sudo util-linux >/dev/null; /fixture'
@@ -484,6 +496,8 @@ jobs:
             = '${{ needs.validate.outputs.commit }}'
           test "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" \
             = 'https://github.com/gunba/australian-legal-mcp'
+          test "$(docker image inspect "$image" --format '{{index .Config.Labels "io.australian-legal-mcp.ann-format"}}')" \
+            = 'flat-int8-v1'
           container="$(docker create "$image")"
           cleanup_container() {
             if [[ -n "$container" ]]; then docker rm -f "$container" >/dev/null 2>&1 || true; fi
