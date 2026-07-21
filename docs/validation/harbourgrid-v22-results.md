@@ -52,12 +52,14 @@ These are end-to-end evaluator measurements and should not be compared directly 
 After the v0.19.10 cutover, the same evaluator passed with zero failures against
 the live service. A three-repetition host-loopback run measured keyword p95
 720.831 ms, hybrid p95 1,133.475 ms, retrieval p95 12.203 ms, and private
-readiness under load. A three-repetition public-TLS run measured keyword p95
-887.163 ms, hybrid p95 1,299.434 ms, and retrieval p95 219.703 ms. During the
-public load, Caddy returned the required 404 for the deliberately unexposed
-`/readyz` route in 158.645 ms; private readiness is tested on host loopback.
-All seven tools, all ten sources, formulas, typed assets, and expected
-authorities passed in both runtime paths.
+readiness under load. The final v0.19.11 public-TLS run again had zero failures:
+keyword p95 was 584.989 ms, hybrid p95 910.471 ms, and retrieval p95 757.606 ms.
+Caddy returned the required 404 for the deliberately unexposed `/readyz` route;
+private readiness returned 200 on host loopback. Three post-reboot exact
+Moreton document-scoped keyword requests completed end to end in 561.877–628.965
+ms, replacing the roughly 11-second full-source scan path. All seven tools, all
+ten sources, formulas, typed assets, and expected authorities passed before and
+after the v0.19.11 reboot.
 
 ## Search architecture evidence
 

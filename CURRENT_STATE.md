@@ -1,7 +1,8 @@
 # Current state
 
-Updated 2026-07-21 after the immutable v0.19.10 release, hosted flat-int8 v22
-cutover, API-key revocation, public HarbourGrid evaluation, and reboot proof.
+Updated 2026-07-21 after the immutable v0.19.11 release, hosted flat-int8 v22
+runtime rollout, API-key revocation, public HarbourGrid evaluation, and reboot
+proof.
 
 ## Implemented product
 
@@ -299,10 +300,11 @@ verified v0.19.10 preserved that source mount policy, used executable private
 file binds only inside its recovery namespace, proved all four live process
 capability sets empty, and let the unchanged v0.19.8 code retire its journal.
 
-Exact v0.19.10 host tools then committed v22
-`937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939`
-with image
-`ghcr.io/gunba/australian-legal-mcp@sha256:86fb49a110e8c814a21b184e9db5f1775c271a65c3f3c4171618dd882e5107f9`.
+Exact v0.19.10 host tools committed v22
+`937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939`.
+Immutable v0.19.11 then advanced the host tools and same-generation runtime to
+commit `893b06c20e5fc2f33ca7633e636023ccb5762745` and image
+`ghcr.io/gunba/australian-legal-mcp@sha256:43be03afbdd78c509053200d0f61b35a1519e9d95f303b917f8023f4ae2a7470`.
 Arroy v20 is the sole hosted rollback; every image/auth/host-tool/corpus journal
 and compatibility-adapter path is absent. The service is public through exact
 Caddy routes, port 51235 is host-loopback-only, and live bounding, effective,

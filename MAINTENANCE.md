@@ -16,12 +16,13 @@ non-replaceable release is created. Linux requires glibc 2.27+; Windows requires
 the Microsoft Visual C++ 2015–2022 Redistributable. Publish and independently
 verify `SHA256SUMS` for every archive.
 
-The software tree is version 0.19.11. Immutable v0.19.10 release assets, OCI
-digest, labels, runtime, and attestation were independently verified. V0.19.11
-adds document-scoped FTS narrowing and a public-route-aware HarbourGrid probe;
-it does not change the corpus. Its host-tool contract advances normally to
-v0.19.11 and removes the completed one-time bridge surface; only the retained
-immutable v0.19.10 bundle owns that historical recovery. The one-time
+The software tree is version 0.19.11. Immutable v0.19.11 release assets, OCI
+digest, labels, runtime, and attestation were independently verified and are
+live. V0.19.11 adds document-scoped FTS narrowing and a public-route-aware
+HarbourGrid probe; it does not change the corpus. Its host-tool contract
+advanced normally to v0.19.11 and removes the completed one-time bridge surface;
+only the retained immutable v0.19.10 bundle owns that historical recovery. The
+one-time
 compatibility bridge kept production `/run` `noexec`, made only its two private
 adapter file binds executable inside the recovery mount namespace, proved the
 bounding, effective, inheritable, and permitted sets through `podman top`, and

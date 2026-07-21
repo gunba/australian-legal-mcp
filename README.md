@@ -248,8 +248,10 @@ scripts/deploy-generation.sh \
 
 Flat-int8 v22
 `937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939`
-is active on the Linode with exact v0.19.11 host tools and the independently
-verified image digest. The v0.19.10 bridge retired the exact v0.19.8 recovery
+is active on the Linode with exact v0.19.11 host tools and independently
+verified image
+`ghcr.io/gunba/australian-legal-mcp@sha256:43be03afbdd78c509053200d0f61b35a1519e9d95f303b917f8023f4ae2a7470`.
+The v0.19.10 bridge retired the exact v0.19.8 recovery
 transaction while keeping `/run` `noexec`; the corrected paired cutover then
 retired its own journal. Arroy v20 remains as the sole hosted rollback
 generation.

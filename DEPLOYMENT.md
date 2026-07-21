@@ -40,7 +40,7 @@ image transaction:
 
 ```bash
 sudo /usr/local/sbin/legal-mcp-update-image \
-  --image ghcr.io/gunba/australian-legal-mcp@sha256:V01911_DIGEST \
+  --image ghcr.io/gunba/australian-legal-mcp@sha256:43be03afbdd78c509053200d0f61b35a1519e9d95f303b917f8023f4ae2a7470 \
   --version 0.19.11 \
   --template /var/lib/legal-mcp-release/v0.19.11/infra/hosting/legal-mcp.container.template \
   < /path/to/current-probe-key
@@ -149,9 +149,11 @@ gh release download v0.19.11 --repo gunba/australian-legal-mcp \
 sha256sum --check SHA256SUMS
 ```
 
-Run that command only after the immutable v0.19.11 release exists and verify its
-attestation independently. Historical v0.18.1, v0.19.0, v0.19.2, v0.19.8, and v0.19.10
-evidence remains labelled with the software that produced it.
+Immutable v0.19.11 exists at commit
+`893b06c20e5fc2f33ca7633e636023ccb5762745`; its checksums, attestation, labels,
+and hardened runtime were independently verified before deployment. Historical
+v0.18.1, v0.19.0, v0.19.2, v0.19.8, and v0.19.10 evidence remains labelled with
+the software that produced it.
 
 Verify the attestation before deployment:
 
