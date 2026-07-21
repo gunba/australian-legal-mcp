@@ -138,10 +138,13 @@ passed after cutover.
    private/public HarbourGrid plus all tools and sources.
 7. **Completed:** issued `enterprise-laptop`, revoked `second-client`, restored
    only exact authenticated routes, and passed a full host reboot proof.
-8. **Optional DR proof:** test changed/unchanged generation deltas, image
+8. **Completed:** rotated client-specific access to `local-pi` and `work-laptop`,
+   revoked `enterprise-laptop`, and proved both new keys plus the current Pi MCP
+   connection without placing credentials in the repository or Obsidian vault.
+9. **Optional DR proof:** test changed/unchanged generation deltas, image
    rollback, volume detach/reattach, and VPS replacement without another full
    upload.
-9. Record ongoing compute/volume cost, p50/p95 latency, CPU, RSS, page cache,
+10. Record ongoing compute/volume cost, p50/p95 latency, CPU, RSS, page cache,
    queue rejection, and disk extent growth.
 
 Exit criterion: the disposable VPS can be recreated from OpenTofu + an attested

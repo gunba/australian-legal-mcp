@@ -32,8 +32,9 @@ Releases are binary-only; GHCR images are digest-pinned and attested. Flat-int8
 v22 is active on the Linode with the exact v0.19.11 runtime image and host tools. The
 service is public only through exact authenticated Caddy routes; host port
 51235 remains loopback-only. Recovery and cutover journals are retired, Arroy
-v20 is the sole hosted rollback generation, and the sole current API-key ID is
-`enterprise-laptop`. Private/public HarbourGrid, all-seven-tool/all-ten-source,
+v20 is the sole hosted rollback generation. Current API-key IDs are `local-pi`
+and `work-laptop`; the prior `enterprise-laptop` key is revoked. Private/public
+HarbourGrid, all-seven-tool/all-ten-source,
 capability, revocation, and reboot proofs passed after cutover. Do not expose
 plaintext credentials or describe the temporary Linode hostname as permanent
 production DNS.
@@ -178,7 +179,8 @@ v0.19.10 bundle's one-time v0.19.8 recovery bridge retired the old transaction
 without changing v0.19.8 bytes, and the corrected cutover retired its own
 journal. Live bounding,
 effective, inheritable, and permitted capability sets are all empty. The prior
-`second-client` key is revoked; never restore it. The completed v0.19.8 bridge
+`second-client` and `enterprise-laptop` keys are revoked; never restore them.
+The completed v0.19.8 bridge
 surface was removed in v0.19.11; historical recovery remains owned only by the
 retained immutable v0.19.10 bundle.
 

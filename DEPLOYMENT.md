@@ -16,9 +16,9 @@ is the sole hosted rollback generation.
 
 Private/public HarbourGrid, exact public routes,
 all-seven-tool/all-ten-source retrieval, live empty capability sets, reboot
-recovery, and key revocation passed after cutover. The sole current client key
-ID is `enterprise-laptop`; `second-client` is revoked. No plaintext key is
-stored in this repository.
+recovery, and key revocation passed after cutover. Current client key IDs are
+`local-pi` and `work-laptop`; `enterprise-laptop` and `second-client` are
+revoked. No plaintext key is stored in this repository or the Obsidian vault.
 
 V0.19.11 is a same-generation runtime and host-tool alignment after the v22
 cutover. From the independently verified v0.19.11 bundle, first advance host

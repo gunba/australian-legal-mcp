@@ -310,9 +310,10 @@ and compatibility-adapter path is absent. The service is public through exact
 Caddy routes, port 51235 is host-loopback-only, and live bounding, effective,
 inheritable, and permitted capability sets are empty. Private and public
 HarbourGrid, typed formulas/assets, all seven tools, all ten source partitions,
-route denial, API-key revocation, and reboot recovery passed. The sole current
-key ID is `enterprise-laptop`; `second-client` returns 401 and must remain
-revoked.
+route denial, API-key revocation, and reboot recovery passed. Current key IDs
+are `local-pi` and `work-laptop`. The current Pi install passed an authenticated
+v22 stats call with `local-pi`; `enterprise-laptop` and `second-client` return
+401 and must remain revoked.
 
 The HarbourGrid historical agent memorandum has completed substantive technical
 QA. It remains useful evaluation evidence but is not board-ready without the

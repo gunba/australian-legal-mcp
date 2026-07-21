@@ -258,9 +258,10 @@ generation.
 
 Private and public HarbourGrid, all-seven-tool/all-ten-source retrieval, exact
 Caddy routes, live empty capability sets, API-key revocation, and reboot
-recovery passed on v22. The sole current client key ID is
-`enterprise-laptop`; `second-client` is revoked. Plaintext credentials are not
-stored in this repository.
+recovery passed on v22. Current client key IDs are `local-pi` and
+`work-laptop`; `enterprise-laptop` and `second-client` are revoked. The current
+Pi install passed an authenticated v22 stats call. Plaintext credentials are
+not stored in this repository or the Obsidian vault.
 
 The maintainer pipeline requires the pinned model in
 `data/models/mdbr-leaf-ir-standard`, CUDA/TensorRT ONNX Runtime, Google

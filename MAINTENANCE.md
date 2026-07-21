@@ -238,8 +238,8 @@ runtime image. Arroy v20 is the sole hosted rollback generation; all transaction
 journals and compatibility-adapter residue are absent. All seven tools, all ten
 source partitions, formula assets, exact routes, private/public HarbourGrid,
 live empty capability sets, reboot recovery, and API-key revocation passed after
-cutover. The sole current key ID is `enterprise-laptop`; `second-client` must
-remain revoked.
+cutover. Current key IDs are `local-pi` and `work-laptop`; `enterprise-laptop`
+and `second-client` must remain revoked.
 
 ## Build semantics
 
