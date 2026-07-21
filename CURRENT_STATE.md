@@ -326,8 +326,6 @@ Bicep/Blob work remains preserved as a secondary future provider path in
 4. During separately reviewed maintenance, prove volume detach/reattach,
    disposable VPS replacement, and an image rollback without risking the only
    live corpus host.
-5. Align host-tool/image version labels only from an exact activated-dark state;
-   runtime source correctness does not depend on this cosmetic alignment.
 
 High Court historical coverage remains bounded by the official site's available
 digitized collection. OALCC is reference-only clean-room research evidence.

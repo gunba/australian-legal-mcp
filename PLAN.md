@@ -110,7 +110,7 @@ Microsoft v2.4 schema validation; bridged non-root/read-only container probes; z
 HIGH/CRITICAL image findings; Caddy validation; strict disk/mount guards;
 packaged ONNX loading; and a clean offline Linode provider plan. The live
 instance/volume boundary now also proves Ubuntu 24.04, XFS/reflink volume
-adoption and restricted SSH. Exact v0.19.10 host tools and the v0.19.11 runtime image serve v22;
+adoption and restricted SSH. Exact v0.19.11 host tools and runtime image serve v22;
 Arroy v20 is the sole hosted rollback and every cutover/recovery journal is
 retired. Exact routes, private/public HarbourGrid, all seven tools, all ten
 sources, live empty capability sets, API-key revocation, and reboot recovery

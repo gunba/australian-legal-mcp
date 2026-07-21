@@ -19,7 +19,9 @@ verify `SHA256SUMS` for every archive.
 The software tree is version 0.19.11. Immutable v0.19.10 release assets, OCI
 digest, labels, runtime, and attestation were independently verified. V0.19.11
 adds document-scoped FTS narrowing and a public-route-aware HarbourGrid probe;
-it does not change the corpus or host-tool transaction contract. The one-time
+it does not change the corpus. Its host-tool contract advances normally to
+v0.19.11 and removes the completed one-time bridge surface; only the retained
+immutable v0.19.10 bundle owns that historical recovery. The one-time
 compatibility bridge kept production `/run` `noexec`, made only its two private
 adapter file binds executable inside the recovery mount namespace, proved the
 bounding, effective, inheritable, and permitted sets through `podman top`, and
@@ -230,8 +232,8 @@ other command. See [DEPLOYMENT.md](DEPLOYMENT.md) for OpenTofu, volume identity,
 authentication, readiness, rollback, and VPS replacement; see
 [MICROSOFT_COPILOT.md](MICROSOFT_COPILOT.md) for Entra/Copilot.
 
-Flat-int8 v22 is active on the public Linode with exact v0.19.10 host tools and
-the v0.19.11 runtime image. Arroy v20 is the sole hosted rollback generation; all transaction
+Flat-int8 v22 is active on the public Linode with exact v0.19.11 host tools and
+runtime image. Arroy v20 is the sole hosted rollback generation; all transaction
 journals and compatibility-adapter residue are absent. All seven tools, all ten
 source partitions, formula assets, exact routes, private/public HarbourGrid,
 live empty capability sets, reboot recovery, and API-key revocation passed after

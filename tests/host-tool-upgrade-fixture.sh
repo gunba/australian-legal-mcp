@@ -17,7 +17,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
   exit 2
 }
 
-version=0.19.10
+version=0.19.11
 revision=1111111111111111111111111111111111111111
 generation=1a6beead567b55babebbe253b5ae13efcd9ce2e8ab55b60c2de4106e39f180f4
 prepared_generation=937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939
@@ -99,7 +99,7 @@ if [[ "$1" = --version ]]; then
   if [[ -e /tmp/wrong-release-binary ]]; then
     printf '%s\n' 'legal-mcp 9.9.9'
   else
-    printf '%s\n' 'legal-mcp 0.19.10'
+    printf '%s\n' 'legal-mcp 0.19.11'
   fi
   exit 0
 fi
@@ -884,7 +884,7 @@ touch /tmp/wrong-release-binary
 expect_upgrade_failed
 assert_old_tools
 
-# Every v0.19.10 release asset is mandatory, has its exact executable/data
+# Every v0.19.11 release asset is mandatory, has its exact executable/data
 # mode, and must be a single safe file from the version-matched bundle.
 for release_asset in \
   "$bundle/infra/hosting/configure-auth.sh" \
@@ -945,7 +945,7 @@ expect_upgrade_failed
 assert_old_tools
 
 # LIFECYCLE_LOCK was durably created by the failed v0.19.0 activation before
-# generation validation. V0.19.10 treats that exact empty root-owned file as
+# generation validation. V0.19.11 treats that exact empty root-owned file as
 # installed state, while rejecting every unsafe identity and representation.
 reset_old_state
 "$real_rm" -f -- "$lifecycle_lock"

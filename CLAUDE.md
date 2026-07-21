@@ -10,7 +10,7 @@ CoW-seeded and rsynced by changed blocks to an external XFS/reflink volume on
 the Akamai/Linode host. A corpus-free OCI image serves and validates them. The
 runtime never scrapes, embeds, builds, packages, or publishes corpus/model
 artifacts. GitHub Releases contain software binaries only. Flat-int8 v22 is
-active on the Linode with exact v0.19.10 host tools and the v0.19.11 runtime image. Caddy exposes
+active on the Linode with exact v0.19.11 host tools and runtime image. Caddy exposes
 only the authenticated public routes while port 51235 remains loopback-only;
 all recovery/cutover journals are retired. Private/public HarbourGrid,
 all-seven-tool/all-ten-source, capability, revocation, and reboot proofs passed.

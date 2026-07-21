@@ -29,7 +29,7 @@ to the Akamai/Linode VPS. A one-shot copy of the exact serving image validates
 and activates it. The serving container never scrapes, embeds, builds, or
 publishes corpus/model artifacts, and the image contains no corpus. GitHub
 Releases are binary-only; GHCR images are digest-pinned and attested. Flat-int8
-v22 is active on the Linode with the exact v0.19.11 runtime image and v0.19.10 host tools. The
+v22 is active on the Linode with the exact v0.19.11 runtime image and host tools. The
 service is public only through exact authenticated Caddy routes; host port
 51235 remains loopback-only. Recovery and cutover journals are retired, Arroy
 v20 is the sole hosted rollback generation, and the sole current API-key ID is
@@ -177,7 +177,9 @@ verified. Its exact host tools and digest-pinned image are live. The one-time
 v0.19.8 recovery bridge retired the old transaction without changing v0.19.8
 bytes, and the corrected cutover retired its own journal. Live bounding,
 effective, inheritable, and permitted capability sets are all empty. The prior
-`second-client` key is revoked; never restore it.
+`second-client` key is revoked; never restore it. The completed v0.19.8 bridge
+surface was removed in v0.19.11; historical recovery remains owned only by the
+retained immutable v0.19.10 bundle.
 
 Manual recovery uses `activate`, `verify`, `rollback`, and
 `prune-generations`. There is no runtime `update`, corpus download, corpus/model
