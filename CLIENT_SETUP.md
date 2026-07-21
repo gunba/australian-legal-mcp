@@ -484,13 +484,13 @@ After setup, ask the client:
 Expected generation:
 
 ```text
-a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3
+937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939
 ```
 
-A successful connection must show 409,528 documents, 6,968,250 chunks and
-embeddings, 20,170 definitions, and all ten sources. Treat any different
+A successful connection must show 409,528 documents, 6,986,040 chunks and
+embeddings, 20,169 definitions, and all ten sources. Treat any different
 identity as the wrong server or corpus.
 
-Documentation links and product behaviour were checked on 2026-07-19; provider
+Documentation links and product behaviour were checked on 2026-07-21; provider
 UIs and plan availability can change, so recheck the linked official guidance
 before an enterprise rollout.

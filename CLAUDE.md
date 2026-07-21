@@ -96,10 +96,11 @@ sole hosted rollback generation. Retain local v19 with its matching v0.18.1
 binary/image as the schema-10 disaster-recovery fallback; the schema-11 binary
 cannot roll back to schema 10.
 
-Immutable v0.19.10 release assets and OCI attestations were independently
-verified. Its exact host tools and digest-pinned image are live. The one-time
-bridge retired the v0.19.8 transaction without changing the old bytes, and the
-corrected cutover retired its own journal. Live bounding, effective,
+Immutable v0.19.11 release assets and OCI attestations were independently
+verified. Its exact host tools and digest-pinned image are live. The retained
+v0.19.10 bundle's one-time bridge retired the v0.19.8 transaction without
+changing the old bytes, and the corrected cutover retired its own journal. Live
+bounding, effective,
 inheritable, and permitted capability sets are empty. The prior
 `second-client` key is revoked and must not be restored.
 
