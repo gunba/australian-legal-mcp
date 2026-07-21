@@ -314,6 +314,11 @@ route denial, API-key revocation, and reboot recovery passed. The sole current
 key ID is `enterprise-laptop`; `second-client` returns 401 and must remain
 revoked.
 
+The HarbourGrid historical agent memorandum has completed substantive technical
+QA. It remains useful evaluation evidence but is not board-ready without the
+corrections and citation refresh recorded in
+[the technical review](docs/validation/harbourgrid-memorandum-technical-review.md).
+
 No Azure resource or Entra tenant object exists. Azure
 Bicep/Blob work remains preserved as a secondary future provider path in
 [docs/AZURE_FUTURE.md](docs/AZURE_FUTURE.md).
