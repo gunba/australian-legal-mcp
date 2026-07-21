@@ -27,9 +27,9 @@ transition to configured-dark before the same operation:
   sudo infra/linode/install-host.sh --upgrade-host-tools --version X.Y.Z --from-public
   sudo infra/linode/install-host.sh --recover-host-tools --version X.Y.Z --from-public
 
-V0.19.9 can run the immutable v0.19.8 updater for its exact pending flat-int8
+V0.19.10 can run the immutable v0.19.8 updater for its exact pending flat-int8
 cutover without changing that launcher, updater, or its pointers:
-  sudo infra/linode/install-host.sh --recover-v0198-flat-int8 --version 0.19.9
+  sudo infra/linode/install-host.sh --recover-v0198-flat-int8 --version 0.19.10
 EOF
   exit 2
 }
@@ -1079,8 +1079,8 @@ run_v0198_flat_int8_recovery() (
     target-active-generation
   )
 
-  [[ "$requested_version" = 0.19.9 ]] || {
-    echo 'the v0.19.8 cutover bridge exists only in the exact v0.19.9 release' >&2
+  [[ "$requested_version" = 0.19.10 ]] || {
+    echo 'the v0.19.8 cutover bridge exists only in the exact v0.19.10 release' >&2
     return 1
   }
   load_host_tool_bundle "$requested_version"
@@ -1454,9 +1454,9 @@ FLOCK_ADAPTER
   # shellcheck disable=SC2016
   /usr/bin/unshare --mount --propagation private -- /usr/bin/bash -ceu '
     mount --bind "$LEGAL_MCP_V0198_PODMAN_ADAPTER" /usr/bin/podman
-    mount -o remount,bind,ro,nodev,nosuid /usr/bin/podman
+    mount -o remount,bind,ro,nodev,nosuid,exec /usr/bin/podman
     mount --bind "$LEGAL_MCP_V0198_FLOCK_ADAPTER" /usr/bin/flock
-    mount -o remount,bind,ro,nodev,nosuid /usr/bin/flock
+    mount -o remount,bind,ro,nodev,nosuid,exec /usr/bin/flock
     exec /usr/local/sbin/legal-mcp-update-image --recover --flat-int8-cutover
   ' || status=$?
   rm -f "$adapter" "$flock_adapter"

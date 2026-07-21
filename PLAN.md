@@ -63,7 +63,7 @@ MCP surface remains exactly `search`, `get_chunks`, `get_asset`,
   V0.19.8 transactionally upgrades the historical launcher, detects the live
   rules through verbose UFW status, removes the exact commented web rules, and
   adds the configured-dark state required for a coordinated
-  Arroy-image/generation to flat-int8-image/generation cutover. V0.19.9 proves
+  Arroy-image/generation to flat-int8-image/generation cutover. V0.19.10 proves
   all live process capability sets through Podman and provides an exact bridge
   that leaves v0.19.8 code immutable while that code retires its journal, retaining
   recovery after every modelled SIGKILL phase.
@@ -108,7 +108,7 @@ HIGH/CRITICAL image findings; Caddy validation; strict disk/mount guards;
 packaged ONNX loading; and a clean offline Linode provider plan. The live
 instance/volume boundary now also proves Ubuntu 24.04, XFS/reflink volume
 adoption and restricted SSH. V20 remains active but configured-dark while the
-exact pending v0.19.8 cutover and sealed v22 upload are recovered with v0.19.9.
+exact pending v0.19.8 cutover and sealed v22 upload are recovered with v0.19.10.
 Exact routes, all seven tools, all ten sources, reboot recovery, and key
 overlap/revocation passed before maintenance.
 

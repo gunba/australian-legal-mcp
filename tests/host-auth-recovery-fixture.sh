@@ -8,7 +8,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 [[ $EUID -eq 0 && -x /configure-auth && -x /install-host ]] || exit 2
 
-version=0.19.9
+version=0.19.10
 revision=1111111111111111111111111111111111111111
 generation=a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3
 old_image="ghcr.io/gunba/australian-legal-mcp@sha256:$(printf 'a%.0s' {1..64})"
