@@ -1,9 +1,10 @@
 # HarbourGrid v22 validation results
 
-- **Validated:** 19–20 July 2026
-- **Software:** `legal-mcp 0.19.7`
-- **Local generation:** `937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939`
-- **Status:** local release candidate only; the hosted service remains on the separately documented v20 generation until the coordinated cutover.
+- **Validated:** 19–21 July 2026
+- **Build validation software:** `legal-mcp 0.19.7`
+- **Hosted serving software:** `legal-mcp 0.19.11` (v0.19.10 performed the paired cutover)
+- **Generation:** `937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939`
+- **Status:** active locally and on the authenticated Linode service; Arroy v20 is the sole hosted rollback.
 
 ## Corpus build and identity
 
@@ -48,6 +49,16 @@ V22 passed all three checks. Retrieval contained the provision text, exposed a t
 
 These are end-to-end evaluator measurements and should not be compared directly with the isolated flat-sidecar microbenchmark.
 
+After the v0.19.10 cutover, the same evaluator passed with zero failures against
+the live service. A three-repetition host-loopback run measured keyword p95
+720.831 ms, hybrid p95 1,133.475 ms, retrieval p95 12.203 ms, and private
+readiness under load. A three-repetition public-TLS run measured keyword p95
+887.163 ms, hybrid p95 1,299.434 ms, and retrieval p95 219.703 ms. During the
+public load, Caddy returned the required 404 for the deliberately unexposed
+`/readyz` route in 158.645 ms; private readiness is tested on host loopback.
+All seven tools, all ten sources, formulas, typed assets, and expected
+authorities passed in both runtime paths.
+
 ## Search architecture evidence
 
 Every request requires one explicit source. Keyword and title FTS execute inside that source's validated row-ID partition; vector search scans only that source's deterministic mmap flat-int8 sidecar. Ranking and tie ordering remain deterministic. Source partitions are validated against interleaving and fail closed.
@@ -80,7 +91,6 @@ Before merge:
 
 ## Remaining boundaries
 
-- Production has not yet been cut over from its Arroy v20 image/generation pair.
 - FRL historical-compilation/provision navigation remains less complete than ATO point-in-time breadcrumbs.
 - AAT/ART coverage is not present.
 - The temporary hosted hostname is not permanent production DNS.

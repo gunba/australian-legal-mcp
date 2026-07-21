@@ -28,14 +28,15 @@ and can be delta-copied into staging on an external XFS/reflink volume attached
 to the Akamai/Linode VPS. A one-shot copy of the exact serving image validates
 and activates it. The serving container never scrapes, embeds, builds, or
 publishes corpus/model artifacts, and the image contains no corpus. GitHub
-Releases are binary-only; GHCR images are digest-pinned and attested. V20
-remains the active Linode generation, but production is configured-dark while
-the exact pending v0.19.8 cutover is recovered and retried with v0.19.10. The
-sealed v22 upload and journal remain; Caddy, service, web UFW rules, and
-`auth-ready` are off. API-key cutover, exact routes, reboot recovery,
-all-seven-tool/all-ten-source retrieval, and key rotation/revocation passed
-before maintenance. Do not expose plaintext credentials or describe the
-temporary Linode hostname as permanent production DNS.
+Releases are binary-only; GHCR images are digest-pinned and attested. Flat-int8
+v22 is active on the Linode with the exact v0.19.11 runtime image and host tools. The
+service is public only through exact authenticated Caddy routes; host port
+51235 remains loopback-only. Recovery and cutover journals are retired, Arroy
+v20 is the sole hosted rollback generation, and the sole current API-key ID is
+`enterprise-laptop`. Private/public HarbourGrid, all-seven-tool/all-ten-source,
+capability, revocation, and reboot proofs passed after cutover. Do not expose
+plaintext credentials or describe the temporary Linode hostname as permanent
+production DNS.
 
 ## Design principles
 
@@ -162,22 +163,23 @@ scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
 
-Software is 0.19.10. Chunker-format-6 flat-int8 v22
+Software is 0.19.11. Exact document-scoped FTS narrowing preserves wildcard
+and case-insensitive scope semantics. Chunker-format-6 flat-int8 v22
 `937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939` is active
-and strictly verified locally. Arroy v20
-`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` remains
-active on the Linode until the coordinated image/generation cutover. Retain the
-local v19 parent with its matching v0.18.1 binary/image as the schema-10
-disaster-recovery fallback; the schema-11 binary must not attempt to roll back
-to schema 10.
+and strictly verified locally and on the Linode. Arroy v20
+`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` is the
+sole hosted rollback generation. Retain the local v19 parent with its matching
+v0.18.1 binary/image as the schema-10 disaster-recovery fallback; the schema-11
+binary must not attempt to roll back to schema 10.
 
-Immutable v0.19.8 release assets and OCI attestations were independently
-verified. Its host tools are installed on the configured-dark Linode. The
-cutover restored Arroy v20 after Podman 4.9 returned `EffectiveCaps=null` and
-left the exact v0.19.8 journal pending with sealed v22. V0.19.10 uses live
-bounding/effective/inheritable/permitted process sets and its exact release
-bridge must retire that journal before the normal host-tool upgrade and cutover
-retry. The runtime image remains immutable v0.19.0 until then.
+Immutable v0.19.10 release assets and OCI attestations were independently
+verified. Its exact host tools and digest-pinned image are live. The one-time
+v0.19.8 recovery bridge retired the old transaction without changing v0.19.8
+bytes, and the corrected cutover retired its own journal. Live bounding,
+effective, inheritable, and permitted capability sets are all empty. The prior
+`second-client` key is revoked; never restore it. The completed v0.19.8 bridge
+surface was removed in v0.19.11; historical recovery remains owned only by the
+retained immutable v0.19.10 bundle.
 
 Manual recovery uses `activate`, `verify`, `rollback`, and
 `prune-generations`. There is no runtime `update`, corpus download, corpus/model

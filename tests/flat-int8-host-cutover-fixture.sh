@@ -9,13 +9,12 @@ export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 [[ $EUID -eq 0 && -x /update-image && -x /host-deploy && -f /install-host \
-  && -f /container-template && -f /Caddyfile && -f /publisher-command \
-  && -x /v0198-update-image && -x /v0198-configure-auth ]] || {
+  && -f /container-template && -f /Caddyfile && -f /publisher-command ]] || {
   echo 'fixture requires the production hosting inputs in a disposable root container' >&2
   exit 2
 }
 
-version=0.19.10
+version=0.19.11
 revision=1111111111111111111111111111111111111111
 old_revision=2222222222222222222222222222222222222222
 old_generation=a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3
@@ -29,7 +28,6 @@ transaction=/etc/legal-mcp/.image-transaction
 journal=/srv/legal-mcp/lifecycle/.deployment-transaction
 pointer=/srv/legal-mcp/lifecycle/active-generation
 auth_ready=/etc/legal-mcp/auth-ready
-authorization=/run/legal-mcp/authorized-upload
 image_file=/etc/legal-mcp/image
 template=/usr/local/libexec/legal-mcp/legal-mcp.container.template
 quadlet=/etc/containers/systemd/legal-mcp.container
@@ -605,25 +603,11 @@ EOF
 cat > /usr/bin/mount <<'EOF'
 #!/usr/bin/bash
 if [[ "$1" = --bind && $# -eq 3 ]]; then
-  if [[ "$3" = /usr/bin/podman || "$3" = /usr/bin/flock ]]; then
-    name="${3##*/}"
-    cp -p "$3" "/tmp/${name}-before-v0198-adapter"
-    temporary="$(mktemp "/usr/bin/.${name}-adapter.XXXXXX")"
-    install -o root -g root -m 0500 "$2" "$temporary"
-    /usr/bin/mv.fixture-real -fT "$temporary" "$3"
-  else
-    install -o root -g root -m 0755 "$2" "$3"
-  fi
+  install -o root -g root -m 0755 "$2" "$3"
   exit 0
 fi
 if [[ "$1" = -o && $# -eq 3 ]]; then
-  case "$3" in
-    /usr/bin/podman|/usr/bin/flock)
-      [[ "$2" = remount,bind,ro,nodev,nosuid,exec ]]
-      touch "/tmp/${3##*/}-adapter-exec-bind"
-      ;;
-    *) [[ "$2" = remount,bind,ro,nodev,nosuid ]] ;;
-  esac
+  [[ "$2" = remount,bind,ro,nodev,nosuid ]]
   exit 0
 fi
 exit 1
@@ -688,8 +672,7 @@ reset_baseline() {
     /srv/legal-mcp/state/* "$journal" /srv/legal-mcp/lifecycle/.deployment-transaction.preparing \
     "$pointer" "$auth_ready" /tmp/kill-cutover-at /tmp/fail-target-verify \
     /tmp/target-accepts-arroy /tmp/capability-present /tmp/capability-malformed \
-    /tmp/effective-caps-queried /tmp/podman-adapter-exec-bind \
-    /tmp/flock-adapter-exec-bind \
+    /tmp/effective-caps-queried \
     /tmp/service-active /tmp/caddy-active /tmp/caddy-enabled /tmp/ufw-web-open
   restore_public_launchers
   install -o root -g root -m 0755 /tmp/legal-mcp-publisher-command \
@@ -820,62 +803,6 @@ assert_published_failure_is_closed() {
   done
 }
 
-bind_pending_transaction_to_v0198() {
-  local v0198_revision=312646c34cff43f3154b43a6feb7e7f4306f30bc
-  local v0198_configure=3ece47e0f27525e45188130e6ac4215fa8276f1ddaa564544653f3daed84921e
-  local v0198_update=01ab7064e6d759f4f71bcf7fbeef1e04262cd262bd87f0755306f5c62664eac8
-  local deploy_sha publisher_sha template_sha sudoers_sha launcher_sha
-  install -o root -g root -m 0755 /v0198-configure-auth \
-    "$implementation_dir/configure-auth.$v0198_configure"
-  install -o root -g root -m 0755 /v0198-update-image \
-    "$implementation_dir/update-image.$v0198_update"
-  install -o root -g root -m 0755 /publisher-command \
-    /usr/local/sbin/legal-mcp-publisher-command
-  printf '%s' "$v0198_configure" > /etc/legal-mcp/configure-auth-implementation
-  printf '%s' "$v0198_update" > /etc/legal-mcp/update-image-implementation
-  chmod 644 /etc/legal-mcp/configure-auth-implementation \
-    /etc/legal-mcp/update-image-implementation
-  deploy_sha="$(sha256sum /usr/local/sbin/legal-mcp-host-deploy | awk '{print $1}')"
-  publisher_sha="$(sha256sum /usr/local/sbin/legal-mcp-publisher-command | awk '{print $1}')"
-  template_sha="$(sha256sum "$template" | awk '{print $1}')"
-  sudoers_sha="$(sha256sum /etc/sudoers.d/legal-mcp-publisher | awk '{print $1}')"
-  launcher_sha="$(sha256sum "$launcher" | awk '{print $1}')"
-  [[ "$deploy_sha" = 4e6c6181a9528852de4e22e559b71076b7d0b8ac716f35d2c5d7264ec35a4533 \
-    && "$publisher_sha" = 4db458fa316e104ba4de412fdf9d4b7d5120677eba153eadd944dea37b36ad47 \
-    && "$template_sha" = d323504b206938ed713271cfe6a98c263f3ad513cc6a96593aa56686352a5225 \
-    && "$sudoers_sha" = a6dd6f1ea819516df66eb3cc5f7fc4999432c36c9beb27ebdfb5d6ec3ec48d70 \
-    && "$launcher_sha" = 1d4bd49a571dcd9fc4c437c2cfb8470b182a556ecb381c4be5726ccaec9575da ]]
-  cat > /etc/legal-mcp/host-tools <<EOF
-LEGAL_MCP_HOST_TOOLS_V2
-VERSION=0.19.8
-SOURCE_COMMIT=$v0198_revision
-HOST_DEPLOY_SHA256=$deploy_sha
-PUBLISHER_COMMAND_SHA256=$publisher_sha
-CONFIGURE_AUTH_SHA256=$v0198_configure
-UPDATE_IMAGE_SHA256=$v0198_update
-CONTAINER_TEMPLATE_SHA256=$template_sha
-SUDOERS_SHA256=$sudoers_sha
-EOF
-  chmod 444 /etc/legal-mcp/host-tools
-  printf '%s\n' 0.19.8 > "$transaction/target-version"
-  printf '%s\n' "$v0198_revision" > "$transaction/target-revision"
-  printf '%s\n' "$v0198_update" > "$transaction/updater-sha256"
-  cat > "$transaction/release-sha256" <<EOF
-UPDATE_IMAGE_SHA256=$v0198_update
-CONFIGURE_AUTH_SHA256=$v0198_configure
-HOST_DEPLOY_SHA256=$deploy_sha
-PUBLISHER_COMMAND_SHA256=$publisher_sha
-CONTAINER_TEMPLATE_SHA256=$template_sha
-HOST_TOOLS_MARKER_SHA256=$(sha256sum /etc/legal-mcp/host-tools | awk '{print $1}')
-HOST_TOOL_LAUNCHER_SHA256=$launcher_sha
-HOST_TOOL_LAUNCHER_MARKER_SHA256=$(sha256sum /etc/legal-mcp/host-tool-launcher | awk '{print $1}')
-CONFIGURE_AUTH_POINTER_SHA256=$(sha256sum /etc/legal-mcp/configure-auth-implementation | awk '{print $1}')
-UPDATE_IMAGE_POINTER_SHA256=$(sha256sum /etc/legal-mcp/update-image-implementation | awk '{print $1}')
-EOF
-  chmod 600 "$transaction/target-version" "$transaction/target-revision" \
-    "$transaction/updater-sha256" "$transaction/release-sha256"
-}
-
 # Foreign auth/image/host-tool work is rejected before any darkening or corpus mutation.
 for foreign in /etc/legal-mcp/.auth-transaction \
   /etc/legal-mcp/.image-transaction.preparing /etc/legal-mcp/.image-transaction \
@@ -933,186 +860,6 @@ for capability_state in capability-present capability-malformed; do
   [[ "$recovery_output" == *'rolled back both generation and image/template'* ]]
   assert_dark_pair saved
 done
-
-restore_v0198_adapter_targets() {
-  local name
-  for name in podman flock; do
-    if [[ -e "/tmp/${name}-before-v0198-adapter" ]]; then
-      /usr/bin/mv.fixture-real -fT "/tmp/${name}-before-v0198-adapter" "/usr/bin/$name"
-    fi
-  done
-}
-
-# The immutable v0.19.8 updater used Podman's null EffectiveCaps field and
-# therefore cannot retire its own otherwise-valid rollback. The v0.19.10
-# release bridge runs that exact updater through its stable launcher, changing
-# only the one incompatible observation after a live four-set capability proof.
-# Production uses API-key authentication. Prove that the bridge propagates its
-# standard input into the unchanged updater, while still rejecting a live
-# capability after the valid key is accepted.
-reset_baseline
-/usr/bin/mv.fixture-real /usr/bin/python3 /usr/bin/python3.fixture-real
-cat > /usr/bin/python3 <<'EOF'
-#!/usr/bin/bash
-if [[ "${1:-}" = -c && "${2:-}" = *urllib.request* ]]; then
-  cat >/dev/null
-  exit 0
-fi
-exec /usr/bin/python3.fixture-real "$@"
-EOF
-chmod 755 /usr/bin/python3
-sed -i 's/LEGAL_MCP_HTTP_AUTH=entra/LEGAL_MCP_HTTP_AUTH=api-key/' \
-  /etc/legal-mcp/runtime.env
-touch /tmp/capability-present
-if run_cutover >/tmp/v0198-api-pending.stdout 2>/tmp/v0198-api-pending.stderr; then
-  echo 'failed to create the API-key pending cutover recovery state' >&2
-  exit 1
-fi
-/usr/bin/rm.fixture-real -f /tmp/capability-present
-bind_pending_transaction_to_v0198
-if "$bundle/infra/linode/install-host.sh" --recover-v0198-flat-int8 \
-  --version 0.19.10 </dev/null >/tmp/v0198-bridge-no-key.stdout \
-  2>/tmp/v0198-bridge-no-key.stderr; then
-  echo 'v0.19.8 bridge accepted missing API-key probe input' >&2
-  exit 1
-fi
-restore_v0198_adapter_targets
-restore_public_launchers
-grep -Fq 'requires a probe key on standard input' /tmp/v0198-bridge-no-key.stderr
-touch /tmp/capability-present
-if "$bundle/infra/linode/install-host.sh" --recover-v0198-flat-int8 \
-  --version 0.19.10 >/tmp/v0198-bridge-cap.stdout \
-  2>/tmp/v0198-bridge-cap.stderr <<< "$probe_key"; then
-  echo 'v0.19.8 bridge accepted a live process capability' >&2
-  exit 1
-fi
-restore_v0198_adapter_targets
-restore_public_launchers
-[[ -e /tmp/effective-caps-queried \
-  && -d "$transaction" && "$(<"$transaction/retirement-outcome")" = pending ]]
-/usr/bin/rm.fixture-real -f /tmp/capability-present
-/usr/bin/rm.fixture-real -f /usr/bin/python3
-/usr/bin/mv.fixture-real /usr/bin/python3.fixture-real /usr/bin/python3
-
-reset_baseline
-touch /tmp/capability-present
-if run_cutover >/tmp/v0198-pending.stdout 2>/tmp/v0198-pending.stderr; then
-  echo 'failed to create the exact pending cutover recovery state' >&2
-  exit 1
-fi
-/usr/bin/rm.fixture-real -f /tmp/capability-present
-bind_pending_transaction_to_v0198
-expect_v0198_bridge_rejected() {
-  local requested_version="${1:-0.19.10}"
-  if "$bundle/infra/linode/install-host.sh" --recover-v0198-flat-int8 \
-    --version "$requested_version" </dev/null >/tmp/v0198-negative.stdout \
-    2>/tmp/v0198-negative.stderr; then
-    echo 'unsafe v0.19.8 bridge state was accepted' >&2
-    exit 1
-  fi
-  restore_v0198_adapter_targets
-  restore_public_launchers
-  [[ -d "$transaction" && "$(<"$transaction/retirement-outcome")" = pending ]]
-}
-
-expect_v0198_bridge_rejected 0.19.8
-printf '%s\n' 0000000000000000000000000000000000000000 \
-  > "$transaction/target-revision"
-expect_v0198_bridge_rejected
-printf '%s\n' 312646c34cff43f3154b43a6feb7e7f4306f30bc \
-  > "$transaction/target-revision"
-printf '%s\n' changed >> \
-  "$implementation_dir/update-image.01ab7064e6d759f4f71bcf7fbeef1e04262cd262bd87f0755306f5c62664eac8"
-expect_v0198_bridge_rejected
-install -o root -g root -m 0755 /v0198-update-image \
-  "$implementation_dir/update-image.01ab7064e6d759f4f71bcf7fbeef1e04262cd262bd87f0755306f5c62664eac8"
-mkdir -m 700 /etc/legal-mcp/.auth-transaction
-expect_v0198_bridge_rejected
-/usr/bin/rm.fixture-real -rf /etc/legal-mcp/.auth-transaction
-printf '%s\n' invalid > "$journal"
-expect_v0198_bridge_rejected
-printf '%s\n%s\nrolled-back\nflat-int8-cutover\n' \
-  "$target_generation" "$old_generation" > "$journal"
-printf '%s\n' stale > /run/legal-mcp-v0198-podman-adapter
-chmod 500 /run/legal-mcp-v0198-podman-adapter
-expect_v0198_bridge_rejected
-/usr/bin/rm.fixture-real -f /run/legal-mcp-v0198-podman-adapter
-touch /tmp/capability-malformed
-expect_v0198_bridge_rejected
-/usr/bin/rm.fixture-real -f /tmp/capability-malformed
-
-launcher_before="$(sha256sum "$launcher" | awk '{print $1}')"
-old_updater_before="$(sha256sum "$implementation_dir/update-image.01ab7064e6d759f4f71bcf7fbeef1e04262cd262bd87f0755306f5c62664eac8" | awk '{print $1}')"
-/usr/bin/rm.fixture-real -rf /tmp/v0198-transaction-copy
-cp -a "$transaction" /tmp/v0198-transaction-copy
-printf '%s\n' transaction-retiring > /tmp/kill-cutover-at
-if "$bundle/infra/linode/install-host.sh" --recover-v0198-flat-int8 \
-  --version 0.19.10 >/tmp/v0198-bridge-kill.stdout \
-  2>/tmp/v0198-bridge-kill.stderr <<< "$probe_key"; then
-  echo 'v0.19.8 bridge transaction-retiring kill point returned success' >&2
-  exit 1
-fi
-restore_v0198_adapter_targets
-restore_public_launchers
-[[ -d "$transaction.retiring" \
-  && "$(<"$transaction.retiring/retirement-outcome")" = saved ]]
-recovery_output="$("$bundle/infra/linode/install-host.sh" \
-  --recover-v0198-flat-int8 --version 0.19.10 <<< "$probe_key")"
-restore_v0198_adapter_targets
-restore_public_launchers
-[[ "$recovery_output" == *'exact v0.19.8 flat-int8 transaction recovered'* \
-  && -e /tmp/effective-caps-queried \
-  && -e /tmp/podman-adapter-exec-bind \
-  && -e /tmp/flock-adapter-exec-bind \
-  && "$(sha256sum "$launcher" | awk '{print $1}')" = "$launcher_before" \
-  && "$(sha256sum "$implementation_dir/update-image.01ab7064e6d759f4f71bcf7fbeef1e04262cd262bd87f0755306f5c62664eac8" | awk '{print $1}')" \
-    = "$old_updater_before" ]]
-assert_dark_pair saved
-# A SIGKILL can interrupt recursive deletion after arbitrary transaction files
-# are gone. The unchanged updater owns deletion-only resumption; the bridge
-# restores volatile upload authorization after a reboot before invoking it.
-install -d -o root -g root -m 0700 "$transaction.retired"
-install -o root -g root -m 0600 /tmp/v0198-transaction-copy/kind \
-  "$transaction.retired/kind"
-/usr/bin/rm.fixture-real -f "$authorization"
-partial_output="$("$bundle/infra/linode/install-host.sh" \
-  --recover-v0198-flat-int8 --version 0.19.10 </dev/null)"
-restore_v0198_adapter_targets
-restore_public_launchers
-[[ "$partial_output" == *'transaction recovered'* \
-  && ! -e "$transaction.retired" \
-  && "$(<"$authorization")" = "$target_generation" ]]
-
-# If the whole launcher is killed after transaction deletion, a later bridge
-# run must reconcile its dispatch/permit rather than merely accepting corpus
-# postconditions. It must also recreate authorization lost with /run on reboot.
-install -d -o root -g root -m 0700 /run/legal-mcp/host-tool-launcher-dispatch
-printf '%s\n' 999999 > /run/legal-mcp/host-tool-launcher-dispatch/pid
-printf '%s\n' 1 > /run/legal-mcp/host-tool-launcher-dispatch/start-time
-chown root:root /run/legal-mcp/host-tool-launcher-dispatch/*
-chmod 600 /run/legal-mcp/host-tool-launcher-dispatch/*
-printf '%s\n' '999999 1' > /run/legal-mcp/flat-int8-cutover-starting
-chown root:root /run/legal-mcp/flat-int8-cutover-starting
-chmod 400 /run/legal-mcp/flat-int8-cutover-starting
-/usr/bin/rm.fixture-real -f "$authorization"
-install -o root -g legal-mcp-publisher -m 0440 /dev/null \
-  /run/legal-mcp/authorized-upload.v0198-preparing
-printf '%s\n' interrupted-adapter > /run/legal-mcp-v0198-podman-adapter
-printf '%s\n' interrupted-adapter > /run/legal-mcp-v0198-flock-adapter
-chmod 500 /run/legal-mcp-v0198-podman-adapter \
-  /run/legal-mcp-v0198-flock-adapter
-idempotent_output="$("$bundle/infra/linode/install-host.sh" \
-  --recover-v0198-flat-int8 --version 0.19.10 <<< "$probe_key")"
-[[ "$idempotent_output" == *'was already recovered'* \
-  && "$(<"$authorization")" = "$target_generation" \
-  && ! -e /run/legal-mcp/authorized-upload.v0198-preparing \
-  && ! -e /run/legal-mcp/host-tool-launcher-dispatch \
-  && ! -e /run/legal-mcp/flat-int8-cutover-starting \
-  && ! -e /run/legal-mcp-v0198-podman-adapter \
-  && ! -e /run/legal-mcp-v0198-flock-adapter ]]
-restore_v0198_adapter_targets
-restore_public_launchers
-assert_dark_pair saved
 
 reset_baseline
 success_output="$(run_cutover)"

@@ -4,19 +4,50 @@ The hosted target is one Akamai Cloud (Linode) VPS in Sydney. The host is
 disposable; the corpus lives on a detachable, encrypted Block Storage volume
 and is never baked into an image.
 
-Schema-11 v20
-`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` remains
-active on the configured-dark Linode. The exact v0.19.8 cutover transaction and
-sealed v22 upload remain for the v0.19.10 recovery path. Service, Caddy, web UFW
-rules, and `auth-ready` are off. Exact public routes,
-all-seven-tool/all-ten-source retrieval, reboot recovery, and key
-rotation/revocation passed before maintenance. The sole current client key ID
-is `second-client`; no plaintext key is stored in this repository.
+Schema-11 flat-int8 v22
+`937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939`
+is active on the Linode. The host uses exact v0.19.11 V2 tools and the
+independently verified digest-pinned v0.19.11 runtime image. Service, Caddy, exact web
+UFW rules, and `auth-ready` are live; application port 51235 remains
+loopback-only. All image, auth, host-tool, and corpus journals are retired.
+Arroy v20
+`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`
+is the sole hosted rollback generation.
 
-Immutable software 0.19.8 and its OCI attestations were independently verified.
-The host uses exact v0.19.8 V2 tools and the immutable v0.19.0 rollback image.
-After bridge recovery, host tools advance normally to v0.19.10 before the
-coordinated image/generation retry.
+Private/public HarbourGrid, exact public routes,
+all-seven-tool/all-ten-source retrieval, live empty capability sets, reboot
+recovery, and key revocation passed after cutover. The sole current client key
+ID is `enterprise-laptop`; `second-client` is revoked. No plaintext key is
+stored in this repository.
+
+V0.19.11 is a same-generation runtime and host-tool alignment after the v22
+cutover. From the independently verified v0.19.11 bundle, first advance host
+tools with one explicit public-to-configured-dark transition. Then explicitly
+republish the unchanged current authentication state; this proves the new host
+tools while the known-good v0.19.10 image remains the runtime rollback:
+
+```bash
+sudo /var/lib/legal-mcp-release/v0.19.11/infra/linode/install-host.sh \
+  --upgrade-host-tools --version 0.19.11 --from-public
+sudo /usr/local/sbin/legal-mcp-configure-auth --recover \
+  < /path/to/current-probe-key
+```
+
+If the host-tool transaction is interrupted, use `--recover-host-tools
+--version 0.19.11` from the same bundle; it never republishes automatically.
+Once v0.19.11 tools and public authentication are proved, run their ordinary
+image transaction:
+
+```bash
+sudo /usr/local/sbin/legal-mcp-update-image \
+  --image ghcr.io/gunba/australian-legal-mcp@sha256:V01911_DIGEST \
+  --version 0.19.11 \
+  --template /var/lib/legal-mcp-release/v0.19.11/infra/hosting/legal-mcp.container.template \
+  < /path/to/current-probe-key
+```
+
+The completed v0.19.8 compatibility bridge is absent from v0.19.11. Its only
+valid implementation remains the retained immutable v0.19.10 bundle.
 
 The same image and mounted-generation contract can later run on an Azure VM.
 Azure-specific work is retained in [docs/AZURE_FUTURE.md](docs/AZURE_FUTURE.md),
@@ -113,13 +144,13 @@ SHA-512 manifest; the installer verifies both before package, firewall, or
 volume mutation:
 
 ```bash
-gh release download v0.19.10 --repo gunba/australian-legal-mcp \
+gh release download v0.19.11 --repo gunba/australian-legal-mcp \
   --pattern 'legal-mcp-*' --pattern SHA256SUMS
 sha256sum --check SHA256SUMS
 ```
 
-Run that command only after the immutable v0.19.10 release exists and verify its
-attestation independently. Historical v0.18.1, v0.19.0, v0.19.2, and v0.19.8
+Run that command only after the immutable v0.19.11 release exists and verify its
+attestation independently. Historical v0.18.1, v0.19.0, v0.19.2, v0.19.8, and v0.19.10
 evidence remains labelled with the software that produced it.
 
 Verify the attestation before deployment:
@@ -257,9 +288,9 @@ Host legal-mcp-publisher
   IdentitiesOnly yes
 ```
 
-The complete schema-11 generation
-`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` is active.
-The host must remain activated-dark for this operation: authentication disabled,
+At the time of this completed historical operation, schema-11 generation
+`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` was
+active. The host had to remain activated-dark for the operation: authentication disabled,
 `legal-mcp.service` generated/inactive, Caddy disabled/inactive, exact SSH-only
 UFW with 80/443 closed, no listener on 80/443/51235, empty uploads, and no upload
 authorization or corpus/image transaction.
@@ -267,7 +298,7 @@ authorization or corpus/image transaction.
 The current host's one known unversioned v0.19.2 authentication journal was
 successfully recovered before the V2 upgrade. The following command is retained
 only as historical recovery procedure for that exact legacy state; do not run
-it on the current V2 host or its pending v0.19.8 transaction:
+it on the current V2 host. The v0.19.8 transaction is retired:
 
 ```bash
 sudo infra/hosting/configure-auth.sh --recover
@@ -280,8 +311,8 @@ or one dead-PID v0.19.2 preparation. It leaves service and ingress off and does
 not make legacy journals part of normal V2 recovery. Remove this documented
 exception after the host migration evidence is retained.
 
-After the exact v0.19.8 bridge has retired its image transaction, run the
-independently verified v0.19.10 bundle while the host remains configured-dark:
+The completed recovery next ran the independently verified v0.19.10 bundle
+while the host remained configured-dark:
 
 ```bash
 sudo infra/linode/install-host.sh --upgrade-host-tools --version 0.19.10

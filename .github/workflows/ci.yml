@@ -92,7 +92,8 @@ jobs:
             tests/test_manage_api_keys.py \
             tests/test_remote_mcp.py \
             tests/test_render_agent_audit.py \
-            tests/test_render_microsoft_integrations.py
+            tests/test_render_microsoft_integrations.py \
+            tests/test_run_harbourgrid_eval.py
           az bicep build --file infra/azure/main.bicep --stdout \
             > "$RUNNER_TEMP/azure-main.json"
           jq -e '.resources | length > 0' "$RUNNER_TEMP/azure-main.json" >/dev/null
@@ -164,19 +165,12 @@ jobs:
             --volume "$PWD/infra/hosting/legal-mcp.container.template:/legal-mcp.container.template:ro" \
             ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \
             -ceu 'export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null; apt-get install --yes --no-install-recommends acl libcap2-bin passwd python3 util-linux >/dev/null; /activation-fixture'
-          docker run --rm --privileged --user 0:0 --entrypoint /bin/bash \
-            --env LEGAL_MCP_DISPOSABLE_MOUNT_FIXTURE=1 \
-            --volume "$PWD/tests/v0198-bridge-noexec-mount-fixture.sh:/fixture:ro" \
-            ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \
-            -ceu /fixture
           docker run --rm --user 0:0 --entrypoint /bin/bash \
             --volume "$PWD/tests/flat-int8-host-cutover-fixture.sh:/fixture:ro" \
             --volume "$PWD/infra/hosting/update-image.sh:/update-image:ro" \
             --volume "$PWD/infra/linode/install-host.sh:/install-host:ro" \
             --volume "$PWD/infra/hosting/legal-mcp.container.template:/container-template:ro" \
             --volume "$PWD/infra/hosting/Caddyfile:/Caddyfile:ro" \
-            --volume "$PWD/tests/fixtures/v0.19.8/update-image.sh:/v0198-update-image:ro" \
-            --volume "$PWD/tests/fixtures/v0.19.8/configure-auth.sh:/v0198-configure-auth:ro" \
             --volume "$PWD/scripts/legal-mcp-host-deploy:/host-deploy:ro" \
             --volume "$PWD/scripts/legal-mcp-publisher-command:/publisher-command:ro" \
             ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \

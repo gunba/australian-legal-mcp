@@ -202,7 +202,7 @@ assert_jq_count "type filter: hits returned" "$typed_json" '.hits | length' 1
 assert_jq "type filter: every hit is TXR" "$typed_json" '[.hits[].type] | unique | join(",")' 'TXR'
 
 # doc_scope filter (glob).
-scoped_json="$("$BIN" search "income" --source ato --k 5 --doc-scope 'PAC/%')"
+scoped_json="$("$BIN" search "income" --source ato --k 5 --mode keyword --doc-scope 'PAC/%')"
 assert_jq_count "doc-scope filter: hits returned" "$scoped_json" '.hits | length' 1
 assert_jq "doc-scope filter: every hit under PAC/" "$scoped_json" \
 	'(.hits | length > 0) and (.hits | all(.document.native_id | startswith("PAC/")))' 'true'

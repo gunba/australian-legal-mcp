@@ -23,6 +23,25 @@ def normalized_evidence_text(value: str) -> str:
     return " ".join(value.translate(DASHES).casefold().split())
 
 
+def probe_ready_surface(endpoint: str) -> float:
+    public_endpoint = endpoint.startswith("https://")
+    ready_url = endpoint.removesuffix("/mcp") + "/readyz"
+    started = time.perf_counter()
+    try:
+        response = OPENER.open(urllib.request.Request(ready_url, method="GET"), timeout=5)
+    except urllib.error.HTTPError as error:
+        if not public_endpoint or error.code != 404:
+            raise
+        error.close()
+    else:
+        if public_endpoint:
+            raise RuntimeError("public readyz route must remain hidden")
+        if response.status != 200:
+            raise RuntimeError(f"readyz returned HTTP {response.status}")
+        response.read()
+    return (time.perf_counter() - started) * 1000
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -215,26 +234,22 @@ def main() -> int:
     if not isinstance(fetched, dict) or fetched.get("uri") != manifest["fetch_case"]["uri"]:
         failures.append("fetch case returned the wrong canonical URI")
 
-    def ready_probe() -> float:
-        ready_url = args.endpoint.removesuffix("/mcp") + "/readyz"
-        started = time.perf_counter()
-        response = OPENER.open(urllib.request.Request(ready_url, method="GET"), timeout=5)
-        if response.status != 200:
-            raise RuntimeError(f"readyz returned HTTP {response.status}")
-        response.read()
-        return (time.perf_counter() - started) * 1000
+    public_endpoint = args.endpoint.startswith("https://")
 
     load_case = next(case for case in manifest["search_cases"] if case["mode"] == "hybrid")
     load_args = {"source": load_case["source"], "mode": "hybrid", "query": load_case["query"], "doc_scope": load_case["doc_scope"], "k": 8}
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
         futures = [executor.submit(client.tool, "search", load_args) for _ in range(4)]
         time.sleep(0.02)
-        ready_ms = ready_probe()
+        ready_ms = probe_ready_surface(args.endpoint)
         for future in futures:
             future.result()
     if ready_ms > manifest["latency_slo_ms"]["ready_during_load"]:
         failures.append(f"readyz under load took {ready_ms:.1f} ms")
-    records.append({"case": "ready-during-load", "latency_ms": round(ready_ms, 3)})
+    records.append({
+        "case": "public-ready-route-hidden-during-load" if public_endpoint else "ready-during-load",
+        "latency_ms": round(ready_ms, 3),
+    })
 
     metrics = {
         "keyword_warm_p95": percentile(keyword_latencies, 0.95),
