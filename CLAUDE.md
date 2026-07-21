@@ -14,8 +14,9 @@ active on the Linode with exact v0.19.11 host tools and runtime image. Caddy exp
 only the authenticated public routes while port 51235 remains loopback-only;
 all recovery/cutover journals are retired. Private/public HarbourGrid,
 all-seven-tool/all-ten-source, capability, revocation, and reboot proofs passed.
-The sole current API-key ID is `enterprise-laptop`. The Linode hostname is
-temporary test DNS, not a permanent production identity.
+Current API-key IDs are `local-pi` and `work-laptop`; the prior
+`enterprise-laptop` key is revoked. The Linode hostname is temporary test DNS,
+not a permanent production identity.
 
 Persistent project data is
 `data/{sources,source-snapshots,models,builds,runtime,cache,runs,logs,validation,archive}`.
@@ -101,8 +102,8 @@ verified. Its exact host tools and digest-pinned image are live. The retained
 v0.19.10 bundle's one-time bridge retired the v0.19.8 transaction without
 changing the old bytes, and the corrected cutover retired its own journal. Live
 bounding, effective,
-inheritable, and permitted capability sets are empty. The prior
-`second-client` key is revoked and must not be restored.
+inheritable, and permitted capability sets are empty. The prior `second-client`
+and `enterprise-laptop` keys are revoked and must not be restored.
 
 The unpacked model is under `data/models/mdbr-leaf-ir-standard`. Maintainer
 builds use deterministic FP32 ONNX, TensorRT FP16, CUDA fallback, lossless

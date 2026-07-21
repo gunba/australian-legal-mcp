@@ -191,7 +191,7 @@ below therefore refuses to start when the vault contains `.mcp.json` or
        throw "Refusing to replace existing MCP configuration: $mcpPath"
    }
    $tempPath = Join-Path $agentDir ('.mcp.' + [guid]::NewGuid().ToString('N') + '.tmp')
-   $secureKey = Read-Host 'Paste the dedicated enterprise-laptop MCP key' -AsSecureString
+   $secureKey = Read-Host 'Paste the dedicated work-laptop MCP key' -AsSecureString
    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureKey)
    try {
        $key = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
