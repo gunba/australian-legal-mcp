@@ -194,6 +194,78 @@ fn load_chunk_rowid_range(conn: &Connection, source_id: &SourceId) -> Result<Opt
     Ok(range)
 }
 
+fn load_document_chunk_rowid_range(
+    conn: &Connection,
+    source_id: &SourceId,
+    native_id: &str,
+) -> Result<Option<RowidRange>> {
+    let (first, last, count) = conn.query_row(
+        "SELECT MIN(chunk_id), MAX(chunk_id), COUNT(*)
+         FROM chunks
+         WHERE source_id = ?1 AND native_id = ?2",
+        params![source_id.as_str(), native_id],
+        |row| {
+            Ok((
+                row.get::<_, Option<i64>>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )?;
+    let range = validate_rowid_range_metadata(source_id, "document chunk", first, last, count)?;
+    if let Some(range) = range {
+        let overlaps: i64 = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM chunks
+                 WHERE chunk_id BETWEEN ?1 AND ?2
+                   AND (source_id <> ?3 OR native_id <> ?4)
+                 LIMIT 1
+             )",
+            params![range.first, range.last, source_id.as_str(), native_id],
+            |row| row.get(0),
+        )?;
+        if overlaps != 0 {
+            bail!(
+                "document chunk rowids for source `{source_id}` do not occupy one isolated range: first={}, last={}",
+                range.first,
+                range.last
+            );
+        }
+    }
+    Ok(range)
+}
+
+fn scoped_chunk_rowid_range(
+    conn: &Connection,
+    source_id: &SourceId,
+    doc_scope: &str,
+    source_range: Option<RowidRange>,
+) -> Result<Option<RowidRange>> {
+    let like = glob_to_like(doc_scope);
+    let mut statement = conn.prepare(
+        "SELECT native_id
+         FROM documents
+         WHERE source_id = ?1 AND native_id LIKE ?2 ESCAPE '\\'
+         ORDER BY native_id
+         LIMIT 2",
+    )?;
+    let mut rows = statement.query(params![source_id.as_str(), like])?;
+    let Some(first) = rows.next()? else {
+        return Ok(None);
+    };
+    let native_id = first.get::<_, String>(0)?;
+    if rows.next()?.is_some() {
+        return Ok(source_range);
+    }
+    let document_range = load_document_chunk_rowid_range(conn, source_id, &native_id)?;
+    if let (Some(document), Some(source)) = (document_range, source_range) {
+        if document.first < source.first || document.last > source.last {
+            bail!("document chunk rowids fall outside their source FTS range");
+        }
+    }
+    Ok(document_range)
+}
+
 fn load_title_rowid_range(conn: &Connection, source_id: &SourceId) -> Result<Option<RowidRange>> {
     let (first, last, count) = conn.query_row(
         "SELECT MIN(rowid), MAX(rowid), COUNT(*) FROM title_fts WHERE source_id = ?1",
@@ -654,12 +726,15 @@ pub(crate) fn search(
         opts.mode
     };
     let chunk_rowid_range = if matches!(effective_mode, SearchMode::Hybrid | SearchMode::Keyword) {
-        Some(cached_source_fts_range(
-            &conn,
-            &generation,
-            &resolved_source,
-            FtsTableRange::Chunks,
-        )?)
+        let source_range =
+            cached_source_fts_range(&conn, &generation, &resolved_source, FtsTableRange::Chunks)?;
+        let effective_range = match opts.doc_scope {
+            Some(doc_scope) => {
+                scoped_chunk_rowid_range(&conn, &resolved_source, doc_scope, source_range)?
+            }
+            None => source_range,
+        };
+        Some(effective_range)
     } else {
         None
     };
@@ -2196,6 +2271,102 @@ mod tests {
         )?;
         let title_error = load_title_rowid_range(&conn, &source()).unwrap_err();
         assert!(title_error.to_string().contains("one isolated range"));
+        Ok(())
+    }
+
+    #[test]
+    fn document_chunk_rowid_range_is_exact_and_fails_closed_on_interleaving() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE documents(
+                 source_id TEXT NOT NULL,
+                 native_id TEXT NOT NULL,
+                 PRIMARY KEY (source_id, native_id)
+             );
+             CREATE TABLE chunks(
+                 chunk_id INTEGER PRIMARY KEY,
+                 source_id TEXT NOT NULL,
+                 native_id TEXT NOT NULL
+             );
+             INSERT INTO documents VALUES
+                 ('ato', 'Document-A'),
+                 ('ato', 'Document-B');
+             INSERT INTO chunks VALUES
+                 (10, 'ato', 'Document-A'),
+                 (12, 'ato', 'Document-A'),
+                 (20, 'ato', 'Document-B');",
+        )?;
+        assert_eq!(
+            load_document_chunk_rowid_range(&conn, &source(), "Document-A")?,
+            Some(RowidRange {
+                first: 10,
+                last: 12
+            })
+        );
+        let source_range = Some(RowidRange {
+            first: 10,
+            last: 20,
+        });
+        assert_eq!(
+            scoped_chunk_rowid_range(&conn, &source(), "document-a", source_range)?,
+            Some(RowidRange {
+                first: 10,
+                last: 12
+            })
+        );
+        assert_eq!(
+            scoped_chunk_rowid_range(&conn, &source(), "Document-*", source_range)?,
+            source_range
+        );
+        assert_eq!(
+            scoped_chunk_rowid_range(&conn, &source(), "Document-%", source_range)?,
+            source_range
+        );
+        assert_eq!(
+            scoped_chunk_rowid_range(&conn, &source(), "missing", source_range)?,
+            None
+        );
+
+        conn.execute("INSERT INTO chunks VALUES (11, 'frl', 'foreign')", [])?;
+        let error = load_document_chunk_rowid_range(&conn, &source(), "Document-A").unwrap_err();
+        assert!(error.to_string().contains("one isolated range"));
+        Ok(())
+    }
+
+    #[test]
+    fn exact_and_glob_document_scopes_preserve_lexical_results() -> Result<()> {
+        let conn = lexical_source_fixture()?;
+        let source = source();
+        let source_range = load_chunk_rowid_range(&conn, &source)?;
+
+        let cases = [
+            ("ATO-1", vec![1]),
+            ("ATO-*", vec![1, 2, 3]),
+            ("ATO-%", vec![1, 2, 3]),
+            ("missing", Vec::new()),
+        ];
+        for (scope, expected) in cases {
+            let filter = build_doc_filter(
+                "d",
+                DocumentFilterSpec {
+                    source_id: &source,
+                    types: None,
+                    date_from: None,
+                    date_to: None,
+                    doc_scope: Some(scope),
+                    include_old: true,
+                    current_only: false,
+                },
+            );
+            let range = scoped_chunk_rowid_range(&conn, &source, scope, source_range)?;
+            let hits =
+                lexical_search_in_range(&conn, &source, "alpha beta gamma", &filter, 10, range)?;
+            assert_eq!(
+                hits.into_iter().map(|hit| hit.chunk_id).collect::<Vec<_>>(),
+                expected,
+                "lexical doc_scope result changed for {scope}"
+            );
+        }
         Ok(())
     }
 

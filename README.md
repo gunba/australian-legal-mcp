@@ -166,7 +166,9 @@ legal-mcp prune-generations --keep-inactive 1
 There is no runtime `update`, corpus downloader, offline bundle, corpus package,
 or GitHub corpus-release path.
 
-Software is version 0.19.10. The active local generation is chunker-format-6
+Software is version 0.19.11. Exact document-scoped lexical searches narrow FTS
+work to that document while glob, percent-wildcard, case-insensitive, and
+missing scopes preserve their established semantics. The active local generation is chunker-format-6
 v22 `937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939`.
 It contains 409,528 documents, 6,986,040 chunks/embeddings, and 20,169
 definitions in schema 11. Its 19,758,231,552-byte `legal.db` has SHA-256
@@ -176,10 +178,10 @@ verification and the HarbourGrid retrieval/latency evaluation pass. The rebuild
 preserves typed FRL formula images through internal-link rewriting, and exact
 chunk-text hashes reuse authoritative vectors from the previous generation.
 
-The v20 Arroy generation remains the current hosted corpus until the separately
-reviewed coordinated image/generation cutover. The v19 schema-10 parent remains
-installed with its matching v0.18.1 binary/image as a disaster-recovery
-fallback; the schema-11 binary deliberately rejects schema 10.
+V22 is the current hosted corpus; v20 Arroy is its sole hosted rollback. The v19
+schema-10 parent remains installed locally with its matching v0.18.1
+binary/image as a disaster-recovery fallback; the schema-11 binary deliberately
+rejects schema 10.
 
 Maintainers may project an exact immutable schema-10 generation without a
 source or model rebuild:
@@ -244,21 +246,19 @@ scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
 
-V20 remains active on the configured-dark Linode after the v0.19.8 cutover
-rejected Podman 4.9's nullable capability field and restored the exact prior
-pair. The sealed v22 target and pending v0.19.8 journal are retained. V0.19.9
-then failed closed before mutation because production `/run` is `noexec`.
-V0.19.10 keeps that source mount closed, makes only its private adapter binds
-executable, uses live process capability sets, and includes the exact compatibility bridge
-for the unchanged v0.19.8 recovery code documented in [DEPLOYMENT.md](DEPLOYMENT.md). API-key cutover,
-all-seven-tool/all-ten-source retrieval, exact public routes, reboot recovery,
-and key overlap/revocation were proved before maintenance. The sole current
-client key ID is `second-client`; plaintext credentials are not stored in this
-repository.
+Flat-int8 v22
+`937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939`
+is active on the Linode with exact v0.19.10 host tools and the independently
+verified image digest. The v0.19.10 bridge retired the exact v0.19.8 recovery
+transaction while keeping `/run` `noexec`; the corrected paired cutover then
+retired its own journal. Arroy v20 remains as the sole hosted rollback
+generation.
 
-Immutable v0.19.8 release assets and OCI attestations were independently
-verified. The host uses its V2 tools and the v0.19.0 rollback image until the
-v0.19.10 recovery, upgrade, and coordinated retry complete.
+Private and public HarbourGrid, all-seven-tool/all-ten-source retrieval, exact
+Caddy routes, live empty capability sets, API-key revocation, and reboot
+recovery passed on v22. The sole current client key ID is
+`enterprise-laptop`; `second-client` is revoked. Plaintext credentials are not
+stored in this repository.
 
 The maintainer pipeline requires the pinned model in
 `data/models/mdbr-leaf-ir-standard`, CUDA/TensorRT ONNX Runtime, Google

@@ -66,7 +66,10 @@ MCP surface remains exactly `search`, `get_chunks`, `get_asset`,
   Arroy-image/generation to flat-int8-image/generation cutover. V0.19.10 proves
   all live process capability sets through Podman and provides an exact bridge
   that leaves v0.19.8 code immutable while that code retires its journal, retaining
-  recovery after every modelled SIGKILL phase.
+  recovery after every modelled SIGKILL phase. V0.19.11 narrows exact
+  document-scoped FTS work without changing wildcard/case semantics and makes
+  the HarbourGrid evaluator enforce private readiness versus public route
+  hiding explicitly.
 - Restricted the locked-parent activation exception to one exact networkless
   `activate` invocation with `CAP_DAC_OVERRIDE`; the hosted service and every
   other lifecycle command remain capability-free. Disposable fixtures prove
@@ -107,10 +110,11 @@ Microsoft v2.4 schema validation; bridged non-root/read-only container probes; z
 HIGH/CRITICAL image findings; Caddy validation; strict disk/mount guards;
 packaged ONNX loading; and a clean offline Linode provider plan. The live
 instance/volume boundary now also proves Ubuntu 24.04, XFS/reflink volume
-adoption and restricted SSH. V20 remains active but configured-dark while the
-exact pending v0.19.8 cutover and sealed v22 upload are recovered with v0.19.10.
-Exact routes, all seven tools, all ten sources, reboot recovery, and key
-overlap/revocation passed before maintenance.
+adoption and restricted SSH. Exact v0.19.10 host tools and the v0.19.11 runtime image serve v22;
+Arroy v20 is the sole hosted rollback and every cutover/recovery journal is
+retired. Exact routes, private/public HarbourGrid, all seven tools, all ten
+sources, live empty capability sets, API-key revocation, and reboot recovery
+passed after cutover.
 
 ## Phase 2 — disposable Linode infrastructure
 
@@ -126,13 +130,18 @@ overlap/revocation passed before maintenance.
 4. **Completed:** proved all seven tools, all ten source partitions, reboot
    recovery, API-key overlap and revocation, exact listeners/UFW, TLS, and a
    transaction-free final state.
-5. **Completed:** published and independently verified immutable v0.19.6 assets
-   and OCI attestations. The live v0.19.0 image has identical Rust/crate source;
-   label alignment is deferred to activated-dark maintenance.
-6. **Optional DR proof:** test changed/unchanged generation deltas, image
+5. **Completed:** published and independently verified immutable v0.19.10
+   assets, OCI digest, runtime, labels, and attestation; recovered and retired
+   the exact v0.19.8 transaction without changing old bytes.
+6. **Completed:** upgraded exact host tools, committed the v22/image pair,
+   retained v20 as sole rollback, removed all transaction residue, and proved
+   private/public HarbourGrid plus all tools and sources.
+7. **Completed:** issued `enterprise-laptop`, revoked `second-client`, restored
+   only exact authenticated routes, and passed a full host reboot proof.
+8. **Optional DR proof:** test changed/unchanged generation deltas, image
    rollback, volume detach/reattach, and VPS replacement without another full
    upload.
-7. Record ongoing compute/volume cost, p50/p95 latency, CPU, RSS, page cache,
+9. Record ongoing compute/volume cost, p50/p95 latency, CPU, RSS, page cache,
    queue rejection, and disk extent growth.
 
 Exit criterion: the disposable VPS can be recreated from OpenTofu + an attested
@@ -184,8 +193,8 @@ disposable caches, Cargo debug/cross/package artifacts, completed acquisition
 attempts, provider downloads, and one-off scratch work. Allocated project usage
 fell from about 300 GiB to about 203 GiB; Btrfs reflink sharing yielded about 23
 GiB of additional filesystem free space. Retain the active v22, v21 rollback
-parent, hosted Arroy v20 source, v19 DR corpus, prepared flat-v20 cutover copy,
-canonical sources/models, deployment state, logs, and validation evidence until
-the corresponding hosted cutover, replacement, and rollback gates pass. Delete
+parent, hosted Arroy v20 rollback, v19 DR corpus, prepared flat-v20 recovery
+copy, canonical sources/models, deployment state, logs, and validation evidence
+until the corresponding replacement and rollback gates pass. Delete
 no cloud bootstrap/rollback artifact or sole source of source truth or
 validation evidence before those gates pass.

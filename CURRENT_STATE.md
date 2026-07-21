@@ -1,7 +1,7 @@
 # Current state
 
-Updated 2026-07-19 after the chunker-format-6 flat-int8 rebuild, local
-verification, HarbourGrid evaluation, and hosted-cutover recovery tests.
+Updated 2026-07-21 after the immutable v0.19.10 release, hosted flat-int8 v22
+cutover, API-key revocation, public HarbourGrid evaluation, and reboot proof.
 
 ## Implemented product
 
@@ -120,7 +120,7 @@ strict Clippy, audit/deny, npm allowlisting, and workspace packaging pass.
 
 ## V20 corpus
 
-The deployed Linode generation is
+The sole hosted rollback generation is
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`:
 
 - minimum client 0.19.0, index `2026.07.14`, schema 11, and the unchanged
@@ -160,7 +160,9 @@ state, logs, and validation evidence were retained.
 
 ## V22 local corpus
 
-The software tree is 0.19.10. The active local generation is
+The software tree is 0.19.11. Exact document-scoped lexical searches now narrow
+FTS work to the uniquely matched document while preserving wildcard,
+case-insensitive, and missing-scope behavior. The active local generation is
 `937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939`:
 
 - minimum client 0.19.7, index `2026.07.19`, schema 11, and chunker format 6;
@@ -289,22 +291,28 @@ Provider-neutral Microsoft assets render for custom DNS. On 2026-07-16 the
 reviewed OpenTofu plan created one Sydney `g6-standard-4` instance, one encrypted
 128-GiB Block Storage volume, and one creation-time Cloud Firewall. The host was
 bootstrapped with verified v0.18.1 artifacts and subsequently cut over to the
-v0.19.0 empty-host software contract. The v0.19.2 publisher-tool repair and
-activation then succeeded, and v20
-`a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` remains
-the active Linode generation after the v0.19.8 cutover rejected Podman 4.9's
-`EffectiveCaps=null` observation and rolled back. The host now has exact
-v0.19.8 V2 tools and the immutable v0.19.0 runtime image. Service, Caddy, web
-UFW ingress, and `auth-ready` are off. The v22 target remains sealed with the
-pending v0.19.8 cutover journal in configured-dark state; no target decision was
-committed. API-key authentication, exact Caddy routes, all seven tools, all ten
-source partitions, reboot recovery, and API-key overlap/revocation had passed
-before maintenance. The sole current key ID is `second-client`.
+v0.19.0 empty-host software contract. The v0.19.2 publisher-tool repair and v20 activation then succeeded. The
+v0.19.8 paired cutover later rejected Podman 4.9's `EffectiveCaps=null`
+observation and rolled back exactly. Immutable v0.19.9 failed closed before
+transaction mutation because production `/run` is `noexec`. Independently
+verified v0.19.10 preserved that source mount policy, used executable private
+file binds only inside its recovery namespace, proved all four live process
+capability sets empty, and let the unchanged v0.19.8 code retire its journal.
 
-Immutable v0.19.8 release assets, OCI digest, runtime, and attestations were
-independently verified. V0.19.10 recovery must retire that exact pending journal
-before normal host-tool upgrade and cutover retry. No Azure resource or Entra
-tenant object exists. Azure
+Exact v0.19.10 host tools then committed v22
+`937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939`
+with image
+`ghcr.io/gunba/australian-legal-mcp@sha256:86fb49a110e8c814a21b184e9db5f1775c271a65c3f3c4171618dd882e5107f9`.
+Arroy v20 is the sole hosted rollback; every image/auth/host-tool/corpus journal
+and compatibility-adapter path is absent. The service is public through exact
+Caddy routes, port 51235 is host-loopback-only, and live bounding, effective,
+inheritable, and permitted capability sets are empty. Private and public
+HarbourGrid, typed formulas/assets, all seven tools, all ten source partitions,
+route denial, API-key revocation, and reboot recovery passed. The sole current
+key ID is `enterprise-laptop`; `second-client` returns 401 and must remain
+revoked.
+
+No Azure resource or Entra tenant object exists. Azure
 Bicep/Blob work remains preserved as a secondary future provider path in
 [docs/AZURE_FUTURE.md](docs/AZURE_FUTURE.md).
 

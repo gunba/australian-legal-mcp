@@ -151,7 +151,8 @@ jobs:
             tests/test_configure_azure_host.py \
             tests/test_manage_api_keys.py \
             tests/test_remote_mcp.py \
-            tests/test_render_microsoft_integrations.py
+            tests/test_render_microsoft_integrations.py \
+            tests/test_run_harbourgrid_eval.py
           az bicep build --file infra/azure/main.bicep --stdout >/dev/null
           mkdir "$RUNNER_TEMP/linode-tofu"
           cp -a infra/linode/. "$RUNNER_TEMP/linode-tofu/"

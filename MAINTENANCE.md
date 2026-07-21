@@ -16,20 +16,18 @@ non-replaceable release is created. Linux requires glibc 2.27+; Windows requires
 the Microsoft Visual C++ 2015–2022 Redistributable. Publish and independently
 verify `SHA256SUMS` for every archive.
 
-The software tree is version 0.19.10. Immutable v0.19.8 release assets and its
-OCI digest were independently verified. Its host tools repaired the verbose-UFW
-rule detection and reached the coordinated cutover, but Podman 4.9 represented
-`.EffectiveCaps` as `null`; the strict verifier rejected it and restored the
-exact Arroy generation/image pair configured-dark with the v22 upload retained.
-The immutable v0.19.9 bridge then failed closed before transaction mutation
-because production mounts `/run` `noexec`. V0.19.10 keeps `/run` closed and
-marks only the two private adapter file binds executable inside the recovery
-mount namespace. It proves the bounding, effective, inheritable, and permitted sets of every
-running container process through `podman top`. It also contains one exact
-v0.19.8 recovery bridge that leaves the old launcher, updater, and pointers
-unchanged while translating only that incompatible observation after the
-stronger live-process proof succeeds. The unchanged updater then advances and
-retires its own journal.
+The software tree is version 0.19.11. Immutable v0.19.10 release assets, OCI
+digest, labels, runtime, and attestation were independently verified. V0.19.11
+adds document-scoped FTS narrowing and a public-route-aware HarbourGrid probe;
+it does not change the corpus or host-tool transaction contract. The one-time
+compatibility bridge kept production `/run` `noexec`, made only its two private
+adapter file binds executable inside the recovery mount namespace, proved the
+bounding, effective, inheritable, and permitted sets through `podman top`, and
+let the unchanged v0.19.8 updater retire its own journal. Exact v0.19.10 host
+tools then committed the paired flat-int8 v22/image cutover and retired their
+journal. The service is public through authenticated Caddy routes, v22 is
+active, Arroy v20 is the sole hosted rollback, and all four live capability sets
+remain empty.
 
 ## Canonical local data
 
@@ -232,15 +230,13 @@ other command. See [DEPLOYMENT.md](DEPLOYMENT.md) for OpenTofu, volume identity,
 authentication, readiness, rollback, and VPS replacement; see
 [MICROSOFT_COPILOT.md](MICROSOFT_COPILOT.md) for Entra/Copilot.
 
-V20 remains active on the configured-dark Linode. The exact pending v0.19.8
-cutover and sealed v22 upload remain; service, Caddy, web UFW rules, and
-`auth-ready` are off. All seven tools, all ten source partitions, exact routes,
-reboot recovery, and key rotation/revocation passed before maintenance.
-
-The host uses exact v0.19.8 V2 tools and the immutable v0.19.0 rollback image.
-The v0.19.10 release bridge must finish and retire the old cutover before a
-normal v0.19.10 host-tool upgrade preserves the restored ordinary prepared v22
-upload for the corrected cutover retry.
+Flat-int8 v22 is active on the public Linode with exact v0.19.10 host tools and
+the v0.19.11 runtime image. Arroy v20 is the sole hosted rollback generation; all transaction
+journals and compatibility-adapter residue are absent. All seven tools, all ten
+source partitions, formula assets, exact routes, private/public HarbourGrid,
+live empty capability sets, reboot recovery, and API-key revocation passed after
+cutover. The sole current key ID is `enterprise-laptop`; `second-client` must
+remain revoked.
 
 ## Build semantics
 
