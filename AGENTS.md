@@ -30,7 +30,7 @@ and activates it. The serving container never scrapes, embeds, builds, or
 publishes corpus/model artifacts, and the image contains no corpus. GitHub
 Releases are binary-only; GHCR images are digest-pinned and attested. V20
 remains the active Linode generation, but production is configured-dark while
-the exact pending v0.19.8 cutover is recovered and retried with v0.19.9. The
+the exact pending v0.19.8 cutover is recovered and retried with v0.19.10. The
 sealed v22 upload and journal remain; Caddy, service, web UFW rules, and
 `auth-ready` are off. API-key cutover, exact routes, reboot recovery,
 all-seven-tool/all-ten-source retrieval, and key rotation/revocation passed
@@ -162,7 +162,7 @@ scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
 
-Software is 0.19.9. Chunker-format-6 flat-int8 v22
+Software is 0.19.10. Chunker-format-6 flat-int8 v22
 `937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939` is active
 and strictly verified locally. Arroy v20
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` remains
@@ -174,7 +174,7 @@ to schema 10.
 Immutable v0.19.8 release assets and OCI attestations were independently
 verified. Its host tools are installed on the configured-dark Linode. The
 cutover restored Arroy v20 after Podman 4.9 returned `EffectiveCaps=null` and
-left the exact v0.19.8 journal pending with sealed v22. V0.19.9 uses live
+left the exact v0.19.8 journal pending with sealed v22. V0.19.10 uses live
 bounding/effective/inheritable/permitted process sets and its exact release
 bridge must retire that journal before the normal host-tool upgrade and cutover
 retry. The runtime image remains immutable v0.19.0 until then.

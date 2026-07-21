@@ -160,7 +160,7 @@ state, logs, and validation evidence were retained.
 
 ## V22 local corpus
 
-The software tree is 0.19.9. The active local generation is
+The software tree is 0.19.10. The active local generation is
 `937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939`:
 
 - minimum client 0.19.7, index `2026.07.19`, schema 11, and chunker format 6;
@@ -257,8 +257,11 @@ failure never triggers abort automatically. V0.19.8 upgraded the historical
 v0.19.5 launcher transactionally, detects rules through verbose UFW status,
 closes the exact commented web rules, and accepts prepared-bootstrap,
 configured-dark, or activated-dark state as explicitly defined by the operation.
-V0.19.9 replaces Podman's nullable `EffectiveCaps` field with an exact live
-four-set process proof and adds a release-bound bridge for the one pending
+V0.19.9 first added the live proof and bridge but failed closed before
+transaction mutation because production `/run` is `noexec`. V0.19.10 makes only
+the two private adapter binds executable inside the recovery mount namespace,
+retains the exact live four-set process proof, and provides the release-bound
+bridge for the one pending
 v0.19.8 cutover. The launcher and updater bytes stay immutable; that unchanged
 updater advances and retires its own journal under the shared host lock.
 Under the shared host lock it atomically covers the publisher helper, wrapper,
@@ -299,7 +302,7 @@ source partitions, reboot recovery, and API-key overlap/revocation had passed
 before maintenance. The sole current key ID is `second-client`.
 
 Immutable v0.19.8 release assets, OCI digest, runtime, and attestations were
-independently verified. V0.19.9 recovery must retire that exact pending journal
+independently verified. V0.19.10 recovery must retire that exact pending journal
 before normal host-tool upgrade and cutover retry. No Azure resource or Entra
 tenant object exists. Azure
 Bicep/Blob work remains preserved as a secondary future provider path in

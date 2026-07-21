@@ -10,7 +10,7 @@ CoW-seeded and rsynced by changed blocks to an external XFS/reflink volume on
 the Akamai/Linode host. A corpus-free OCI image serves and validates them. The
 runtime never scrapes, embeds, builds, packages, or publishes corpus/model
 artifacts. GitHub Releases contain software binaries only. V20 remains active
-on the configured-dark Linode while v0.19.9 recovers the exact pending v0.19.8
+on the configured-dark Linode while v0.19.10 recovers the exact pending v0.19.8
 cutover and sealed v22 upload. Caddy, service, web UFW rules, and `auth-ready`
 are off. Exact routes, all-seven-tool/all-ten-source retrieval, reboot recovery,
 and key rotation/revocation passed before maintenance. The Linode hostname is
@@ -86,7 +86,7 @@ scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
 
-Software is 0.19.9. Chunker-format-6 flat-int8 v22
+Software is 0.19.10. Chunker-format-6 flat-int8 v22
 `937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939` is active
 and strictly verified locally. Arroy v20
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` remains
@@ -97,7 +97,7 @@ disaster-recovery fallback; the schema-11 binary cannot roll back to schema 10.
 Immutable v0.19.8 release assets and OCI attestations were independently
 verified. Its host tools are installed on the configured-dark Linode. The
 cutover restored Arroy v20 after Podman 4.9 returned `EffectiveCaps=null` and
-left the exact v0.19.8 journal pending with sealed v22. V0.19.9 uses live
+left the exact v0.19.8 journal pending with sealed v22. V0.19.10 uses live
 bounding/effective/inheritable/permitted process sets and its exact release
 bridge must retire that journal before the normal host-tool upgrade and cutover
 retry. The runtime image remains immutable v0.19.0 until then.

@@ -15,7 +15,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
   exit 2
 }
 
-version=0.19.9
+version=0.19.10
 revision=1111111111111111111111111111111111111111
 old_revision=2222222222222222222222222222222222222222
 old_generation=a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3
@@ -616,7 +616,17 @@ if [[ "$1" = --bind && $# -eq 3 ]]; then
   fi
   exit 0
 fi
-[[ "$1" = -o && "$2" = remount,bind,ro,nodev,nosuid && $# -eq 3 ]]
+if [[ "$1" = -o && $# -eq 3 ]]; then
+  case "$3" in
+    /usr/bin/podman|/usr/bin/flock)
+      [[ "$2" = remount,bind,ro,nodev,nosuid,exec ]]
+      touch "/tmp/${3##*/}-adapter-exec-bind"
+      ;;
+    *) [[ "$2" = remount,bind,ro,nodev,nosuid ]] ;;
+  esac
+  exit 0
+fi
+exit 1
 EOF
 chmod 755 /usr/bin/unshare /usr/bin/mount
 
@@ -678,7 +688,8 @@ reset_baseline() {
     /srv/legal-mcp/state/* "$journal" /srv/legal-mcp/lifecycle/.deployment-transaction.preparing \
     "$pointer" "$auth_ready" /tmp/kill-cutover-at /tmp/fail-target-verify \
     /tmp/target-accepts-arroy /tmp/capability-present /tmp/capability-malformed \
-    /tmp/effective-caps-queried \
+    /tmp/effective-caps-queried /tmp/podman-adapter-exec-bind \
+    /tmp/flock-adapter-exec-bind \
     /tmp/service-active /tmp/caddy-active /tmp/caddy-enabled /tmp/ufw-web-open
   restore_public_launchers
   install -o root -g root -m 0755 /tmp/legal-mcp-publisher-command \
@@ -933,7 +944,7 @@ restore_v0198_adapter_targets() {
 }
 
 # The immutable v0.19.8 updater used Podman's null EffectiveCaps field and
-# therefore cannot retire its own otherwise-valid rollback. The v0.19.9
+# therefore cannot retire its own otherwise-valid rollback. The v0.19.10
 # release bridge runs that exact updater through its stable launcher, changing
 # only the one incompatible observation after a live four-set capability proof.
 # Production uses API-key authentication. Prove that the bridge propagates its
@@ -960,7 +971,7 @@ fi
 /usr/bin/rm.fixture-real -f /tmp/capability-present
 bind_pending_transaction_to_v0198
 if "$bundle/infra/linode/install-host.sh" --recover-v0198-flat-int8 \
-  --version 0.19.9 </dev/null >/tmp/v0198-bridge-no-key.stdout \
+  --version 0.19.10 </dev/null >/tmp/v0198-bridge-no-key.stdout \
   2>/tmp/v0198-bridge-no-key.stderr; then
   echo 'v0.19.8 bridge accepted missing API-key probe input' >&2
   exit 1
@@ -970,7 +981,7 @@ restore_public_launchers
 grep -Fq 'requires a probe key on standard input' /tmp/v0198-bridge-no-key.stderr
 touch /tmp/capability-present
 if "$bundle/infra/linode/install-host.sh" --recover-v0198-flat-int8 \
-  --version 0.19.9 >/tmp/v0198-bridge-cap.stdout \
+  --version 0.19.10 >/tmp/v0198-bridge-cap.stdout \
   2>/tmp/v0198-bridge-cap.stderr <<< "$probe_key"; then
   echo 'v0.19.8 bridge accepted a live process capability' >&2
   exit 1
@@ -992,7 +1003,7 @@ fi
 /usr/bin/rm.fixture-real -f /tmp/capability-present
 bind_pending_transaction_to_v0198
 expect_v0198_bridge_rejected() {
-  local requested_version="${1:-0.19.9}"
+  local requested_version="${1:-0.19.10}"
   if "$bundle/infra/linode/install-host.sh" --recover-v0198-flat-int8 \
     --version "$requested_version" </dev/null >/tmp/v0198-negative.stdout \
     2>/tmp/v0198-negative.stderr; then
@@ -1036,7 +1047,7 @@ old_updater_before="$(sha256sum "$implementation_dir/update-image.01ab7064e6d759
 cp -a "$transaction" /tmp/v0198-transaction-copy
 printf '%s\n' transaction-retiring > /tmp/kill-cutover-at
 if "$bundle/infra/linode/install-host.sh" --recover-v0198-flat-int8 \
-  --version 0.19.9 >/tmp/v0198-bridge-kill.stdout \
+  --version 0.19.10 >/tmp/v0198-bridge-kill.stdout \
   2>/tmp/v0198-bridge-kill.stderr <<< "$probe_key"; then
   echo 'v0.19.8 bridge transaction-retiring kill point returned success' >&2
   exit 1
@@ -1046,11 +1057,13 @@ restore_public_launchers
 [[ -d "$transaction.retiring" \
   && "$(<"$transaction.retiring/retirement-outcome")" = saved ]]
 recovery_output="$("$bundle/infra/linode/install-host.sh" \
-  --recover-v0198-flat-int8 --version 0.19.9 <<< "$probe_key")"
+  --recover-v0198-flat-int8 --version 0.19.10 <<< "$probe_key")"
 restore_v0198_adapter_targets
 restore_public_launchers
 [[ "$recovery_output" == *'exact v0.19.8 flat-int8 transaction recovered'* \
   && -e /tmp/effective-caps-queried \
+  && -e /tmp/podman-adapter-exec-bind \
+  && -e /tmp/flock-adapter-exec-bind \
   && "$(sha256sum "$launcher" | awk '{print $1}')" = "$launcher_before" \
   && "$(sha256sum "$implementation_dir/update-image.01ab7064e6d759f4f71bcf7fbeef1e04262cd262bd87f0755306f5c62664eac8" | awk '{print $1}')" \
     = "$old_updater_before" ]]
@@ -1063,7 +1076,7 @@ install -o root -g root -m 0600 /tmp/v0198-transaction-copy/kind \
   "$transaction.retired/kind"
 /usr/bin/rm.fixture-real -f "$authorization"
 partial_output="$("$bundle/infra/linode/install-host.sh" \
-  --recover-v0198-flat-int8 --version 0.19.9 </dev/null)"
+  --recover-v0198-flat-int8 --version 0.19.10 </dev/null)"
 restore_v0198_adapter_targets
 restore_public_launchers
 [[ "$partial_output" == *'transaction recovered'* \
@@ -1089,7 +1102,7 @@ printf '%s\n' interrupted-adapter > /run/legal-mcp-v0198-flock-adapter
 chmod 500 /run/legal-mcp-v0198-podman-adapter \
   /run/legal-mcp-v0198-flock-adapter
 idempotent_output="$("$bundle/infra/linode/install-host.sh" \
-  --recover-v0198-flat-int8 --version 0.19.9 <<< "$probe_key")"
+  --recover-v0198-flat-int8 --version 0.19.10 <<< "$probe_key")"
 [[ "$idempotent_output" == *'was already recovered'* \
   && "$(<"$authorization")" = "$target_generation" \
   && ! -e /run/legal-mcp/authorized-upload.v0198-preparing \

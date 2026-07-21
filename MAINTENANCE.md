@@ -16,12 +16,15 @@ non-replaceable release is created. Linux requires glibc 2.27+; Windows requires
 the Microsoft Visual C++ 2015–2022 Redistributable. Publish and independently
 verify `SHA256SUMS` for every archive.
 
-The software tree is version 0.19.9. Immutable v0.19.8 release assets and its
+The software tree is version 0.19.10. Immutable v0.19.8 release assets and its
 OCI digest were independently verified. Its host tools repaired the verbose-UFW
 rule detection and reached the coordinated cutover, but Podman 4.9 represented
 `.EffectiveCaps` as `null`; the strict verifier rejected it and restored the
 exact Arroy generation/image pair configured-dark with the v22 upload retained.
-V0.19.9 proves the bounding, effective, inheritable, and permitted sets of every
+The immutable v0.19.9 bridge then failed closed before transaction mutation
+because production mounts `/run` `noexec`. V0.19.10 keeps `/run` closed and
+marks only the two private adapter file binds executable inside the recovery
+mount namespace. It proves the bounding, effective, inheritable, and permitted sets of every
 running container process through `podman top`. It also contains one exact
 v0.19.8 recovery bridge that leaves the old launcher, updater, and pointers
 unchanged while translating only that incompatible observation after the
@@ -235,8 +238,8 @@ cutover and sealed v22 upload remain; service, Caddy, web UFW rules, and
 reboot recovery, and key rotation/revocation passed before maintenance.
 
 The host uses exact v0.19.8 V2 tools and the immutable v0.19.0 rollback image.
-The v0.19.9 release bridge must finish and retire the old cutover before a
-normal v0.19.9 host-tool upgrade preserves the restored ordinary prepared v22
+The v0.19.10 release bridge must finish and retire the old cutover before a
+normal v0.19.10 host-tool upgrade preserves the restored ordinary prepared v22
 upload for the corrected cutover retry.
 
 ## Build semantics
