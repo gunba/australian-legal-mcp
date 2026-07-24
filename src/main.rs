@@ -2740,7 +2740,7 @@ fn tool_descriptors() -> JsonValue {
 mod tests {
     use super::*;
     use crate::ann::*;
-    use crate::chunker::{chunk_html, chunk_html_with_token_count, EMBED_MAX_TOKENS};
+    use crate::chunker::{chunk_html_with_token_count, EMBED_MAX_TOKENS};
     use crate::config::*;
     use crate::db::*;
     use crate::extract::*;
@@ -3366,7 +3366,10 @@ mod tests {
             Some("PAC/19970038/203-55")
         );
 
-        let chunks = chunk_html(&rewritten, Some("Example"), EMBED_MAX_TOKENS).unwrap();
+        let chunks =
+            chunk_html_with_token_count(&rewritten, Some("Example"), EMBED_MAX_TOKENS, |text| {
+                Ok(text.split_whitespace().count().max(1))
+            })?;
         assert!(chunks
             .iter()
             .any(|chunk| chunk.text.contains("[doc:ato:PAC/19970038/203-55]")));

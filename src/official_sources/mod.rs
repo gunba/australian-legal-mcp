@@ -1989,10 +1989,9 @@ fn run_command_with_timeout(
 
 #[cfg(target_os = "linux")]
 fn sandboxed_soffice_command(workspace: &Path) -> Result<ProcessCommand> {
-    let workspace = workspace
-        .canonicalize()
-        .context("canonicalizing LibreOffice sandbox workspace")?;
-    if !Path::new("/usr/bin/bwrap").is_file() || !Path::new("/usr/bin/soffice").is_file() {
+    let bwrap = Path::new("/usr/bin/bwrap");
+    let soffice = Path::new("/usr/bin/soffice");
+    if !bwrap.is_file() || !soffice.is_file() {
         bail!("sandboxed LibreOffice requires /usr/bin/bwrap and /usr/bin/soffice");
     }
     for path in ["/usr", "/etc/fonts", "/etc/ld.so.cache"] {
@@ -2000,9 +1999,21 @@ fn sandboxed_soffice_command(workspace: &Path) -> Result<ProcessCommand> {
             bail!("LibreOffice sandbox requires {path}");
         }
     }
+    build_sandboxed_soffice_command(workspace, bwrap, soffice)
+}
+
+#[cfg(target_os = "linux")]
+fn build_sandboxed_soffice_command(
+    workspace: &Path,
+    bwrap: &Path,
+    soffice: &Path,
+) -> Result<ProcessCommand> {
+    let workspace = workspace
+        .canonicalize()
+        .context("canonicalizing LibreOffice sandbox workspace")?;
     let sandbox_tmp = workspace.join("tmp");
     fs::create_dir(&sandbox_tmp).context("creating LibreOffice sandbox temp directory")?;
-    let mut command = ProcessCommand::new("/usr/bin/bwrap");
+    let mut command = ProcessCommand::new(bwrap);
     command
         .arg("--unshare-all")
         .arg("--die-with-parent")
@@ -2075,7 +2086,7 @@ fn sandboxed_soffice_command(workspace: &Path) -> Result<ProcessCommand> {
         .arg("XDG_CACHE_HOME")
         .arg(workspace.join("cache"))
         .arg("--")
-        .arg("/usr/bin/soffice");
+        .arg(soffice);
     Ok(command)
 }
 
@@ -2532,7 +2543,11 @@ mod tests {
     #[test]
     fn libreoffice_sandbox_clears_environment_and_does_not_mount_host_root() -> Result<()> {
         let temp = tempdir()?;
-        let command = sandboxed_soffice_command(temp.path())?;
+        let command = build_sandboxed_soffice_command(
+            temp.path(),
+            Path::new("/usr/bin/bwrap"),
+            Path::new("/usr/bin/soffice"),
+        )?;
         let arguments = command
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())

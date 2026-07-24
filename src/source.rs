@@ -3201,7 +3201,7 @@ pub(crate) fn scrape_diff(
 mod security_tests {
     use super::*;
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires LEGAL_MCP_BENCH_DATA_DIR with a complete schema-12 generation"]
     fn benchmark_strict_hosted_startup_under_service_timeout() -> Result<()> {
