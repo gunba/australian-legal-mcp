@@ -6,6 +6,7 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 usage: deploy-generation.sh --host legal-mcp-publisher@HOST
+       deploy-generation.sh --host legal-mcp-publisher@HOST --prepare-only
        deploy-generation.sh --host legal-mcp-publisher@HOST --abort GENERATION
 
 SSH identity selection belongs in ~/.ssh/config (use IdentitiesOnly yes).
@@ -18,6 +19,7 @@ EOF
 HOST=''
 ABORT=false
 ABORT_GENERATION=''
+PREPARE_ONLY=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --host)
@@ -31,6 +33,11 @@ while [[ $# -gt 0 ]]; do
       ABORT_GENERATION="$2"
       shift 2
       ;;
+    --prepare-only)
+      [[ "$PREPARE_ONLY" = false ]] || usage
+      PREPARE_ONLY=true
+      shift
+      ;;
     *) usage ;;
   esac
 done
@@ -39,6 +46,7 @@ done
   && "$HOST" != *@*..* \
   && "$HOST" != *@*. ]] || usage
 [[ "$ABORT" = false || "$ABORT_GENERATION" =~ ^[0-9a-f]{64}$ ]] || usage
+[[ "$ABORT" = false || "$PREPARE_ONLY" = false ]] || usage
 
 SSH_OPTIONS=(
   -o BatchMode=yes
@@ -92,7 +100,13 @@ prepare_result="$(ssh "${SSH_OPTIONS[@]}" "$HOST" "prepare $GENERATION")"
 SKIP_UPLOAD=false
 case "$prepare_result" in
   prepared) ;;
-  staged) SKIP_UPLOAD=true ;;
+  staged)
+    if [[ "$PREPARE_ONLY" = true ]]; then
+      echo 'prepare-only requires an exact prepared deployment journal' >&2
+      exit 1
+    fi
+    SKIP_UPLOAD=true
+    ;;
   already-active)
     echo "generation $GENERATION is already active on $HOST"
     exit 0
@@ -128,6 +142,11 @@ if [[ "$SKIP_UPLOAD" = false ]]; then
     --chmod=Du=rwx,Dgo=,Fu=rw,Fgo= \
     --info=progress2,stats2 \
     "$SOURCE/" "$HOST:$GENERATION/"
+fi
+
+if [[ "$PREPARE_ONLY" = true ]]; then
+  echo "prepared and uploaded generation $GENERATION on $HOST; activation remains pending"
+  exit 0
 fi
 
 # shellcheck disable=SC2029 # The validated generation is intentionally expanded locally.

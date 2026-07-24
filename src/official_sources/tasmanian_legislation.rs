@@ -195,6 +195,8 @@ impl OfficialAdapter for TasmanianLegislation {
                 drop_ids: &[],
                 drop_classes: &["view-history-note"],
                 heading_classes: &["HeadingParagraph"],
+                preserve_same_document_fragments: false,
+                repair_broken_links: false,
             },
         )?;
         Ok(Some(make_acquired_html(

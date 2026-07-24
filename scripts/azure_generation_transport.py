@@ -37,6 +37,7 @@ from typing import BinaryIO
 
 FORMAT = "australian-legal-mcp-chunk-transport"
 FORMAT_VERSION = 1
+GENERATION_SCHEMA_VERSION = 12
 CHUNK_SIZE = 64 * 1024 * 1024
 CHUNK_ENCODING = "zstd-v1"
 MIN_FREE_MARGIN = 5 * 1024 * 1024 * 1024
@@ -72,6 +73,7 @@ EXPECTED_PATHS = {
     "model.onnx",
     "tokenizer.json",
     *(f"ann/{source}.ann" for source in SOURCE_IDS),
+    *(f"lexical/{source}.db" for source in SOURCE_IDS),
 }
 FICLONE = 0x40049409
 
@@ -497,6 +499,8 @@ def expected_generation_files(generation_dir: pathlib.Path) -> dict[str, tuple[i
     except (OSError, json.JSONDecodeError) as error:
         raise TransportError(f"invalid generation.json: {error}") from error
     try:
+        if manifest["schema_version"] != GENERATION_SCHEMA_VERSION:
+            raise TransportError("generation manifest schema is not supported")
         files = {
             str(manifest["db"]["path"]): (
                 int(manifest["db"]["size"]),
@@ -516,6 +520,21 @@ def expected_generation_files(generation_dir: pathlib.Path) -> dict[str, tuple[i
             raise TransportError("generation manifest source set is not exact")
         for source in SOURCE_IDS:
             info = ann[source]
+            if info["source_id"] != source or info["path"] != f"ann/{source}.ann":
+                raise TransportError("generation manifest ANN source binding is not exact")
+            files[str(info["path"])] = (int(info["size"]), str(info["sha256"]))
+        lexical = manifest["lexical"]
+        if set(lexical) != set(SOURCE_IDS):
+            raise TransportError("generation manifest lexical source set is not exact")
+        for source in SOURCE_IDS:
+            info = lexical[source]
+            if (
+                info["source_id"] != source
+                or info["path"] != f"lexical/{source}.db"
+            ):
+                raise TransportError(
+                    "generation manifest lexical source binding is not exact"
+                )
             files[str(info["path"])] = (int(info["size"]), str(info["sha256"]))
     except (KeyError, TypeError, ValueError) as error:
         raise TransportError("generation manifest file metadata is malformed") from error
@@ -532,12 +551,38 @@ def expected_generation_files(generation_dir: pathlib.Path) -> dict[str, tuple[i
     return files
 
 
-def build_manifest(generation_dir: pathlib.Path) -> tuple[TransportManifest, dict[str, ChunkLocation]]:
-    generation_dir = generation_dir.resolve()
+def validate_source_generation_root(
+    generation_dir: pathlib.Path,
+) -> tuple[pathlib.Path, str]:
+    try:
+        metadata = generation_dir.lstat()
+    except OSError as error:
+        raise TransportError(f"cannot inspect source generation: {generation_dir}") from error
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise TransportError("source generation path must be a real non-symlink directory")
     generation_id = validate_generation_id(generation_dir.name)
-    metadata = generation_dir.lstat()
-    if not stat.S_ISDIR(metadata.st_mode) or generation_dir.is_symlink():
-        raise TransportError("generation path must be a real directory")
+
+    # Reject anything outside the immutable generation contract before reading
+    # generation.json or resolving the caller-supplied root.
+    validate_no_unexpected_entries(generation_dir)
+    try:
+        resolved = generation_dir.resolve(strict=True)
+        resolved_metadata = resolved.lstat()
+    except OSError as error:
+        raise TransportError("source generation changed while resolving its root") from error
+    if (
+        stat.S_ISLNK(resolved_metadata.st_mode)
+        or not stat.S_ISDIR(resolved_metadata.st_mode)
+        or (metadata.st_dev, metadata.st_ino)
+        != (resolved_metadata.st_dev, resolved_metadata.st_ino)
+    ):
+        raise TransportError("source generation root changed while it was validated")
+    validate_no_unexpected_entries(resolved)
+    return resolved, generation_id
+
+
+def build_manifest(generation_dir: pathlib.Path) -> tuple[TransportManifest, dict[str, ChunkLocation]]:
+    generation_dir, generation_id = validate_source_generation_root(generation_dir)
     expected = expected_generation_files(generation_dir)
     entries: list[FileEntry] = []
     unique_chunks: dict[str, ChunkLocation] = {}
@@ -570,6 +615,7 @@ def build_manifest(generation_dir: pathlib.Path) -> tuple[TransportManifest, dic
                 f"expected {expected_sha}, got {actual_sha}"
             )
         entries.append(FileEntry(relative, expected_size, expected_sha, tuple(chunks)))
+    validate_no_unexpected_entries(generation_dir)
     generation_sha = expected["generation.json"][1]
     return (
         TransportManifest(
@@ -685,25 +731,6 @@ def parse_manifest(data: bytes, expected_generation: str) -> TransportManifest:
     )
 
 
-def locations_from_manifest(
-    generation_dir: pathlib.Path, manifest: TransportManifest
-) -> dict[str, ChunkLocation]:
-    expected = expected_generation_files(generation_dir)
-    unique: dict[str, ChunkLocation] = {}
-    for entry in manifest.files:
-        if expected.get(entry.path) != (entry.size, entry.sha256):
-            raise TransportError("cached transport manifest differs from generation.json")
-        source = generation_dir.joinpath(*entry.path.split("/"))
-        regular_file(source, expected_size=entry.size)
-        for chunk in entry.chunks:
-            previous = unique.get(chunk.sha256)
-            location = ChunkLocation(source, chunk.offset, chunk.size)
-            if previous and previous.size != chunk.size:
-                raise TransportError("cached chunk digest has conflicting sizes")
-            unique.setdefault(chunk.sha256, location)
-    return unique
-
-
 def read_chunk(location: ChunkLocation) -> bytes:
     with location.source.open("rb", buffering=0) as handle:
         handle.seek(location.offset)
@@ -770,31 +797,35 @@ def upload_generation(
     workers: int,
     cache_dir: pathlib.Path | None = None,
 ) -> dict[str, object]:
-    generation_dir = generation_dir.resolve()
-    generation_id = validate_generation_id(generation_dir.name)
+    generation_dir, generation_id = validate_source_generation_root(generation_dir)
     cache_path = cache_dir / f"{generation_id}.json" if cache_dir else None
     if cache_dir:
         cache_dir.mkdir(parents=True, exist_ok=True)
         cache_metadata = cache_dir.lstat()
         if not stat.S_ISDIR(cache_metadata.st_mode) or cache_dir.is_symlink():
             raise TransportError("transport cache path must be a real directory")
+    # A generation is immutable. Rebuild the transport manifest from the live
+    # bytes on every invocation before trusting a cache or skipping a remote
+    # chunk. Size/metadata checks alone cannot detect same-size mutation.
+    manifest, chunks = build_manifest(generation_dir)
+    manifest_bytes = manifest.bytes()
     if cache_path and cache_path.exists():
         regular_file(cache_path)
-        manifest = parse_manifest(cache_path.read_bytes(), generation_id)
-        chunks = locations_from_manifest(generation_dir, manifest)
-    else:
-        manifest, chunks = build_manifest(generation_dir)
-        if cache_path:
-            temporary = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
-            try:
-                with temporary.open("xb") as handle:
-                    handle.write(manifest.bytes())
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary, cache_path)
-                fsync_directory(cache_path.parent)
-            finally:
-                temporary.unlink(missing_ok=True)
+        cached = parse_manifest(cache_path.read_bytes(), generation_id)
+        if cached.bytes() != manifest_bytes:
+            raise TransportError("cached transport manifest differs from current generation bytes")
+    elif cache_path:
+        temporary = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(manifest_bytes)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, cache_path)
+            fsync_directory(cache_path.parent)
+        finally:
+            temporary.unlink(missing_ok=True)
+    validate_no_unexpected_entries(generation_dir)
     store = blob_store(destination, token_mode)
     existing = store.list_names(f"chunks/{CHUNK_ENCODING}/sha256/")
     missing = [
@@ -854,7 +885,12 @@ def upload_generation(
         for future in concurrent.futures.as_completed(futures):
             future.result()
 
-    manifest_bytes = manifest.bytes()
+    # Re-read and re-hash the exact tree after all chunk work. This catches a
+    # local mutation even when every remote chunk already existed or the file
+    # changed after its chunk was uploaded.
+    final_manifest, _ = build_manifest(generation_dir)
+    if final_manifest.bytes() != manifest_bytes:
+        raise TransportError("generation changed while it was being uploaded")
     manifest_name = f"generations/{manifest.generation_id}/transport.json"
     manifest_created = store.put_immutable(
         manifest_name,
@@ -890,22 +926,22 @@ def ensure_restore_root(path: pathlib.Path, generation_id: str) -> pathlib.Path:
 
 
 def validate_no_unexpected_entries(root: pathlib.Path) -> None:
-    expected_directories = {"ann"}
+    expected_directories = {"ann", "lexical"}
     for path in root.rglob("*"):
         relative = path.relative_to(root).as_posix()
         metadata = path.lstat()
         if stat.S_ISLNK(metadata.st_mode):
-            raise TransportError(f"restore output contains symlink: {relative}")
+            raise TransportError(f"generation tree contains symlink: {relative}")
         if stat.S_ISDIR(metadata.st_mode):
             if relative not in expected_directories:
-                raise TransportError(f"restore output contains unexpected directory: {relative}")
+                raise TransportError(f"generation tree contains unexpected directory: {relative}")
         elif stat.S_ISREG(metadata.st_mode):
             if relative not in EXPECTED_PATHS:
-                raise TransportError(f"restore output contains unexpected file: {relative}")
+                raise TransportError(f"generation tree contains unexpected file: {relative}")
             if metadata.st_nlink != 1:
-                raise TransportError(f"restore output contains hard-linked file: {relative}")
+                raise TransportError(f"generation tree contains hard-linked file: {relative}")
         else:
-            raise TransportError(f"restore output contains special file: {relative}")
+            raise TransportError(f"generation tree contains special file: {relative}")
 
 
 def clone_or_create(

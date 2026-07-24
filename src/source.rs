@@ -3,7 +3,7 @@
 
 use crate::adaptive_http::{AdaptiveConcurrency, RequestOutcome, SOURCE_WORKER_CEILING};
 use crate::config::{
-    activate_generation, active_generation_key, data_dir, generation_dir, generations_dir,
+    activate_generation, active_generation_key, generation_dir, generations_dir,
     lifecycle_lock_file, lock_file, LEGAL_DB_FILENAME,
 };
 use crate::db::{get_corpus_meta, get_source_meta, open_read};
@@ -34,7 +34,7 @@ const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ATO_HTML_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 5;
 
-fn public_ip(ip: IpAddr) -> bool {
+pub(crate) fn public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             let octets = ip.octets();
@@ -296,6 +296,7 @@ pub(crate) fn stats() -> Result<String> {
     let descriptors = registry.descriptors();
     let mut source_stats = BTreeMap::new();
     let mut semantic_search_ready = true;
+    let mut lexical_search_ready = true;
     for descriptor in &descriptors {
         let source_id = descriptor.id.as_str();
         let source_docs = read_source_count_meta(&conn, source_id, "documents_count")?
@@ -334,18 +335,30 @@ pub(crate) fn stats() -> Result<String> {
         let source_semantic_search_ready =
             ensure_vector_search_ready(&conn, &descriptor.id).is_ok();
         semantic_search_ready &= source_semantic_search_ready;
+        let source_lexical_search_ready = active_manifest
+            .as_ref()
+            .and_then(|manifest| {
+                manifest.lexical.get(&descriptor.id).map(|info| {
+                    crate::lexical::open_runtime_sidecar(
+                        &conn,
+                        &descriptor.id,
+                        info,
+                        &manifest.db.sha256,
+                    )
+                    .is_ok()
+                })
+            })
+            .unwrap_or(false);
+        lexical_search_ready &= source_lexical_search_ready;
         let mut source_payload = json!({
             "source_id": source_id,
             "display_name": descriptor.display_name,
-            "corpus_id": get_source_meta(&conn, source_id, "corpus_id")?,
             "semantic_search_ready": source_semantic_search_ready,
+            "lexical_search_ready": source_lexical_search_ready,
             "documents": source_docs,
             "chunks": source_chunks,
             "chunk_embeddings": source_embeddings,
             "definitions": source_definitions,
-            "ann": active_manifest
-                .as_ref()
-                .and_then(|manifest| manifest.ann.get(&descriptor.id)),
             "types": types,
         });
         if let Some(prefix_breakdown) = prefix_breakdown {
@@ -360,14 +373,12 @@ pub(crate) fn stats() -> Result<String> {
         source_stats.insert(source_id.to_string(), source_payload);
     }
     let payload = json!({
-        "data_dir": data_dir()?.display().to_string(),
         "active_generation": active_generation_key()?,
         "index_version": get_corpus_meta(&conn, "index_version")?,
-        "last_update_at": get_corpus_meta(&conn, "last_update_at")?,
         "sources": descriptors,
         "source_stats": source_stats,
-        "embedding_model_id": get_corpus_meta(&conn, "embedding_model_id")?,
         "semantic_search_ready": semantic_search_ready,
+        "lexical_search_ready": lexical_search_ready,
         "search_modes": ["hybrid", "vector", "keyword"],
         "default_search_mode": "hybrid",
         "default_search_policy": {
@@ -387,6 +398,28 @@ pub(crate) fn stats() -> Result<String> {
     });
     // JSON outputs use serde_json pretty rendering before return/write.
     Ok(serde_json::to_string_pretty(&payload)?)
+}
+
+/// Compact report derived only after the caller has strictly validated every
+/// byte and binding in `manifest`. Hosted startup needs these instruction
+/// fields, not a second pass through every ANN and lexical sidecar.
+fn validated_startup_report(active: &str, manifest: &Manifest) -> Result<String> {
+    let conn = open_read()?;
+    let documents = read_corpus_count_meta(&conn, "documents_count")?
+        .unwrap_or(count_table(&conn, "documents")?);
+    let chunks =
+        read_corpus_count_meta(&conn, "chunks_count")?.unwrap_or(count_table(&conn, "chunks")?);
+    if active_generation_key()?.as_deref() != Some(active) {
+        bail!("active generation changed while rendering strict startup readiness");
+    }
+    Ok(serde_json::to_string(&json!({
+        "active_generation": active,
+        "index_version": manifest.index_version,
+        "documents": documents,
+        "chunks": chunks,
+        "semantic_search_ready": true,
+        "lexical_search_ready": true,
+    }))?)
 }
 
 pub(crate) fn verify_active_generation(prewarm: impl FnOnce() -> Result<()>) -> Result<String> {
@@ -419,6 +452,13 @@ pub(crate) fn verify_active_generation(prewarm: impl FnOnce() -> Result<()>) -> 
             }
             bail!("active generation is not ready for semantic search across every source");
         }
+        if value
+            .get("lexical_search_ready")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        {
+            bail!("active generation is not ready for lexical search across every source");
+        }
         if value.get("active_generation").and_then(JsonValue::as_str) != Some(active.as_str()) {
             bail!("active generation changed during strict verification");
         }
@@ -429,25 +469,28 @@ pub(crate) fn verify_active_generation(prewarm: impl FnOnce() -> Result<()>) -> 
     result
 }
 
-pub(crate) fn verify_active_generation_quick() -> Result<String> {
+/// Startup validation revalidates the exact installed tree, every artifact
+/// hash, the manifest-derived generation ID, and all ANN/lexical bindings.
+/// this revalidates the exact installed tree, every artifact hash, the
+/// manifest-derived generation ID, and all ANN/lexical bindings before a
+/// listener can be created.
+pub(crate) fn verify_active_generation_startup(expected_generation: &str) -> Result<String> {
     let corpus_lock = crate::config::corpus_read_lock()?;
     let result = (|| {
         let active =
             active_generation_key()?.ok_or_else(|| anyhow!("no immutable generation is active"))?;
-        ensure_generation_read_only(&generation_dir(&active)?)?;
-        let report = stats()?;
-        let value: JsonValue = serde_json::from_str(&report)?;
-        if value
-            .get("semantic_search_ready")
-            .and_then(JsonValue::as_bool)
-            != Some(true)
-        {
-            bail!("active generation is not ready for semantic search across every source");
+        if active != expected_generation {
+            bail!("active generation changed before strict startup validation");
         }
-        if value.get("active_generation").and_then(JsonValue::as_str) != Some(active.as_str()) {
-            bail!("active generation changed during startup verification");
+        let target = generation_dir(&active)?;
+        let (manifest, validated_key) = validate_installed_generation_dir(&target)
+            .context("strictly validating the active generation for hosted startup")?;
+        if validated_key.as_str() != active {
+            bail!("active generation directory name does not match its immutable content");
         }
-        Ok(report)
+        ensure_generation_read_only(&target)?;
+
+        validated_startup_report(&active, &manifest)
     })();
     fs2::FileExt::unlock(&corpus_lock)?;
     result
@@ -648,6 +691,7 @@ pub(crate) struct Manifest {
     pub(crate) model: ModelInfo,
     pub(crate) db: ManifestDb,
     pub(crate) ann: BTreeMap<SourceId, crate::ann::ManifestAnn>,
+    pub(crate) lexical: BTreeMap<SourceId, crate::lexical::ManifestLexical>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -773,6 +817,26 @@ pub(crate) fn validate_manifest_contents(manifest: &Manifest) -> Result<()> {
             || ann.embedding_model_fingerprint != manifest.model.fingerprint
         {
             bail!("ANN sidecar model for source `{source_id}` does not match manifest model");
+        }
+    }
+    let lexical_sources = manifest.lexical.keys().cloned().collect::<BTreeSet<_>>();
+    if lexical_sources != expected_sources {
+        bail!(
+            "manifest lexical source set does not match this binary: registered={expected_sources:?}, manifest={lexical_sources:?}"
+        );
+    }
+    for (source_id, lexical) in &manifest.lexical {
+        crate::lexical::validate_manifest_lexical(source_id, lexical)?;
+        let ann = manifest
+            .ann
+            .get(source_id)
+            .expect("validated ANN and lexical source sets are equal");
+        if lexical.corpus_id != ann.corpus_id
+            || lexical.chunk_count != ann.vector_count
+            || lexical.first_chunk_id != ann.first_chunk_id
+            || lexical.last_chunk_id != ann.last_chunk_id
+        {
+            bail!("lexical and ANN identities differ for source `{source_id}`");
         }
     }
     Ok(())
@@ -930,6 +994,25 @@ fn set_generation_owner_writable(root: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
+fn set_generation_root_renameable(root: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = fs::symlink_metadata(root)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("generation root must be a real directory before installation");
+    }
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(permissions.mode() | 0o200);
+    fs::set_permissions(root, permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_generation_root_renameable(_root: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
 fn ensure_generation_read_only(root: &Path) -> Result<()> {
     fn visit(path: &Path) -> Result<()> {
         let metadata = fs::symlink_metadata(path)?;
@@ -949,7 +1032,32 @@ fn ensure_generation_read_only(root: &Path) -> Result<()> {
     visit(root)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn ensure_generation_read_only(root: &Path) -> Result<()> {
+    fn visit(path: &Path) -> Result<()> {
+        use std::os::windows::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(path)?;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if metadata.file_type().is_symlink()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || !metadata.permissions().readonly()
+        {
+            bail!(
+                "installed generation path is not immutable: {}",
+                path.display()
+            );
+        }
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path)? {
+                visit(&entry?.path())?;
+            }
+        }
+        Ok(())
+    }
+    visit(root)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn ensure_generation_read_only(_root: &Path) -> Result<()> {
     Ok(())
 }
@@ -993,7 +1101,23 @@ fn reject_hard_link(metadata: &fs::Metadata, path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn reject_hard_link(metadata: &fs::Metadata, path: &Path) -> Result<()> {
+    let _ = metadata;
+    let file = File::open(path)?;
+    let identity = crate::ann::windows_file_identity(&file)?;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    if identity.number_of_links != 1 || identity.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        bail!(
+            "generation files must have one verifiable link: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn reject_hard_link(_metadata: &fs::Metadata, _path: &Path) -> Result<()> {
     Ok(())
 }
@@ -1061,6 +1185,7 @@ fn validate_generation_dir_with_mode(
     let expected_top = BTreeSet::from([
         crate::ann::ANN_DIRECTORY.to_string(),
         crate::config::GENERATION_MANIFEST_FILENAME.to_string(),
+        crate::lexical::LEXICAL_DIRECTORY.to_string(),
         LEGAL_DB_FILENAME.to_string(),
         manifest_model_path().to_string(),
         manifest_tokenizer_path().to_string(),
@@ -1128,6 +1253,9 @@ fn validate_generation_dir_with_mode(
         crate::ann::verify_sidecar(&path, source_id, info)?;
     }
 
+    let lexical_dir = root.join(crate::lexical::LEXICAL_DIRECTORY);
+    crate::lexical::verify_sidecar_file_set(&lexical_dir, &manifest.lexical)?;
+
     // FTS5's PRAGMA-integrity callback is rejected by a read-only SQLite
     // connection even though a successful check does not alter the database.
     // Full validation applies only to a writable staging generation. Installed
@@ -1143,21 +1271,30 @@ fn validate_generation_dir_with_mode(
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     conn.execute_batch("PRAGMA query_only=ON; PRAGMA cell_size_check=ON;")?;
     crate::db::enforce_db_schema_version(&conn)?;
-    crate::db::validate_chunks_fts_schema(&conn)?;
-    crate::db::verify_chunks_fts_index_digest(&conn)?;
+    crate::db::validate_canonical_schema(&conn)?;
+    crate::db::validate_no_embedded_lexical_index(&conn)?;
     verify_corpus_manifest_binding(&conn, &manifest)?;
     verify_semantic_install(&conn, &manifest)?;
+    for (source_id, info) in &manifest.lexical {
+        let path = root.join(&info.path);
+        let result = if full_sqlite_integrity {
+            crate::lexical::verify_sidecar(&path, source_id, info, &conn, &manifest.db.sha256, true)
+        } else {
+            crate::lexical::verify_installed_sidecar(
+                &path,
+                source_id,
+                info,
+                &conn,
+                &manifest.db.sha256,
+            )
+        };
+        result.with_context(|| format!("verifying lexical sidecar for source `{source_id}`"))?;
+    }
     if full_sqlite_integrity {
-        // Bundled SQLite asks FTS5 virtual tables to perform a write-shaped
-        // callback during a global integrity_check. Run SQLite's native check
-        // over every ordinary/shadow-free table, then use FTS5's documented
-        // integrity command explicitly in a rolled-back transaction.
         let tables = {
             let mut stmt = conn.prepare(
                 "SELECT name FROM sqlite_schema
                  WHERE type = 'table'
-                   AND name NOT LIKE 'chunks_fts%'
-                   AND name NOT LIKE 'title_fts%'
                  ORDER BY name",
             )?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -1180,8 +1317,6 @@ fn validate_generation_dir_with_mode(
                 );
             }
         }
-        conn.execute_batch("PRAGMA query_only=OFF")?;
-        crate::db::verify_fts_integrity(&conn)?;
     }
     let foreign_keys: i64 =
         conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
@@ -1190,7 +1325,6 @@ fn validate_generation_dir_with_mode(
     if foreign_keys != 0 {
         bail!("generation database has {foreign_keys} foreign-key violations");
     }
-    crate::db::verify_fts_relational_bindings(&conn)?;
     drop(conn);
     if full_sqlite_integrity {
         verified_regular_file(
@@ -1243,6 +1377,8 @@ fn activate_local_generation_locked(
             );
         }
     }
+    set_generation_read_only(&source).context("sealing validated generation read-only")?;
+    ensure_generation_read_only(&source).context("confirming generation seal")?;
     validate_installed_generation_dir(&source)
         .and_then(|(_, sealed_key)| {
             if sealed_key != key {
@@ -1250,7 +1386,7 @@ fn activate_local_generation_locked(
             }
             Ok(())
         })
-        .context("revalidating generation immediately before sealing")?;
+        .context("revalidating generation after sealing")?;
     commit_validated_generation(&source, key.as_str())
 }
 
@@ -1282,12 +1418,24 @@ pub(crate) fn deactivate_generation(expected_generation: &str) -> Result<Deactiv
 
 fn commit_validated_generation(source: &Path, key: &str) -> Result<ActivationReport> {
     let corpus_lock = lock_file()?;
-    let result = commit_validated_generation_locked(source, key);
+    let result = commit_validated_generation_locked(source, key, true);
     fs2::FileExt::unlock(&corpus_lock)?;
     result
 }
 
-fn commit_validated_generation_locked(source: &Path, key: &str) -> Result<ActivationReport> {
+#[cfg(test)]
+fn commit_test_generation(source: &Path, key: &str) -> Result<ActivationReport> {
+    let corpus_lock = lock_file()?;
+    let result = commit_validated_generation_locked(source, key, false);
+    fs2::FileExt::unlock(&corpus_lock)?;
+    result
+}
+
+fn commit_validated_generation_locked(
+    source: &Path,
+    key: &str,
+    revalidate_installed: bool,
+) -> Result<ActivationReport> {
     let previous = active_generation_key()?;
     let final_dir = generation_dir(key)?;
     if final_dir.exists() {
@@ -1307,15 +1455,29 @@ fn commit_validated_generation_locked(source: &Path, key: &str) -> Result<Activa
         .ok_or_else(|| anyhow!("generation has no parent directory"))?
         .to_path_buf();
     let generation_root = generations_dir()?;
-    rename_across_directories(source, &final_dir).with_context(|| {
-        format!(
-            "committing immutable generation; build and runtime must share one filesystem: {} -> {}",
-            source.display(),
-            final_dir.display()
-        )
-    })?;
+    set_generation_root_renameable(source)
+        .context("temporarily enabling the sealed generation root for atomic installation")?;
+    if let Err(error) = rename_across_directories(source, &final_dir) {
+        set_generation_read_only(source)
+            .context("resealing generation after its atomic installation failed")?;
+        return Err(error).with_context(|| {
+            format!(
+                "committing immutable generation; build and runtime must share one filesystem: {} -> {}",
+                source.display(),
+                final_dir.display()
+            )
+        });
+    }
     let durability = sync_directory(&source_parent).and_then(|()| sync_directory(&generation_root));
     set_generation_read_only(&final_dir)?;
+    ensure_generation_read_only(&final_dir)?;
+    if revalidate_installed {
+        let (_, installed_key) = validate_installed_generation_dir(&final_dir)
+            .context("revalidating the installed generation after its atomic rename")?;
+        if installed_key.as_str() != key {
+            bail!("installed generation changed during its atomic rename");
+        }
+    }
     sync_directory(&final_dir)?;
     durability.with_context(|| {
         format!(
@@ -1524,6 +1686,22 @@ pub(crate) fn verify_semantic_install(conn: &Connection, manifest: &Manifest) ->
         }
         verify_ann_db_binding(conn, source_id, ann_info)?;
         verify_ann_db_content(conn, source_id, ann_info)?;
+    }
+    for (metadata_key, table) in [
+        ("documents_count", "documents"),
+        ("chunks_count", "chunks"),
+        ("chunk_embeddings_count", "chunk_embeddings"),
+        ("definitions_count", "definitions"),
+    ] {
+        let declared = required_corpus_meta(conn, metadata_key)?
+            .parse::<i64>()
+            .with_context(|| format!("parsing corpus_meta.{metadata_key}"))?;
+        let actual = count_table(conn, table)?;
+        if declared != actual {
+            bail!(
+                "corpus_meta.{metadata_key} does not match authoritative {table} rows: declared={declared}, actual={actual}"
+            );
+        }
     }
     Ok(())
 }
@@ -3027,6 +3205,61 @@ pub(crate) fn scrape_diff(
 mod security_tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires LEGAL_MCP_BENCH_DATA_DIR with a complete schema-12 generation"]
+    fn benchmark_strict_hosted_startup_under_service_timeout() -> Result<()> {
+        use std::os::fd::AsRawFd;
+
+        let data_dir = PathBuf::from(
+            std::env::var("LEGAL_MCP_BENCH_DATA_DIR")
+                .context("LEGAL_MCP_BENCH_DATA_DIR is required")?,
+        );
+        let _environment =
+            crate::TestEnvironment::set(&[("LEGAL_MCP_DATA_DIR", data_dir.as_os_str())]);
+        let active = active_generation_key()?
+            .ok_or_else(|| anyhow!("benchmark data directory has no active generation"))?;
+        let root = generation_dir(&active)?;
+        let mut files = Vec::new();
+        for entry in fs::read_dir(&root)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                for child in fs::read_dir(path)? {
+                    let child = child?.path();
+                    if child.is_file() {
+                        files.push(child);
+                    }
+                }
+            } else if path.is_file() {
+                files.push(path);
+            }
+        }
+        for path in files {
+            let file = File::open(path)?;
+            // SAFETY: `file` owns a valid descriptor for this call; offset and
+            // length are non-negative, and zero length means through EOF.
+            let status =
+                unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+            if status != 0 {
+                bail!("POSIX_FADV_DONTNEED failed with status {status}");
+            }
+        }
+
+        let started = Instant::now();
+        let report = verify_active_generation_startup(&active)?;
+        let elapsed = started.elapsed();
+        let value: JsonValue = serde_json::from_str(&report)?;
+        assert_eq!(value["active_generation"], active);
+        assert_eq!(value["semantic_search_ready"], true);
+        assert_eq!(value["lexical_search_ready"], true);
+        assert!(
+            elapsed < Duration::from_secs(600),
+            "strict hosted startup took {elapsed:?}, exceeding the service timeout"
+        );
+        eprintln!("STRICT_STARTUP_BENCH duration_ms={}", elapsed.as_millis());
+        Ok(())
+    }
+
     #[test]
     fn private_and_special_networks_are_rejected() {
         for address in [
@@ -3049,35 +3282,63 @@ mod security_tests {
     }
 
     fn sample_manifest() -> Manifest {
-        let ann = crate::legal_source::source_registry()
-            .source_ids()
-            .into_iter()
-            .enumerate()
-            .map(|(index, source)| {
-                let source_id: SourceId = source.parse().expect("valid registered source id");
-                let digit = char::from_digit((index % 10) as u32, 10)
-                    .expect("single decimal digit")
-                    .to_string();
-                let metadata = crate::ann::ManifestAnn {
-                    source_id: source_id.clone(),
-                    format: crate::ann::ANN_FORMAT.to_string(),
-                    format_version: crate::ann::ANN_FORMAT_VERSION,
-                    path: crate::ann::sidecar_manifest_path(&source_id),
-                    sha256: digit.repeat(64),
-                    size: crate::ann::expected_sidecar_size(1)
-                        .expect("single-vector sidecar layout"),
-                    corpus_id: format!("sha256:{}", digit.repeat(64)),
-                    embedding_model_id: EMBEDDING_MODEL_ID.to_string(),
-                    embedding_model_fingerprint: crate::EMBEDDING_MODEL_FINGERPRINT.to_string(),
-                    embedding_dimension: crate::EMBEDDING_DIM as u32,
-                    embedding_set_sha256: digit.repeat(64),
-                    vector_count: 1,
-                    first_chunk_id: 1,
-                    last_chunk_id: 1,
-                    id_encoding: crate::ann::ANN_ID_ENCODING.to_string(),
-                    metric: crate::ann::ANN_METRIC.to_string(),
-                };
-                (source_id, metadata)
+        let ann: BTreeMap<SourceId, crate::ann::ManifestAnn> =
+            crate::legal_source::source_registry()
+                .source_ids()
+                .into_iter()
+                .enumerate()
+                .map(|(index, source)| {
+                    let source_id: SourceId = source.parse().expect("valid registered source id");
+                    let digit = char::from_digit((index % 10) as u32, 10)
+                        .expect("single decimal digit")
+                        .to_string();
+                    let metadata = crate::ann::ManifestAnn {
+                        source_id: source_id.clone(),
+                        format: crate::ann::ANN_FORMAT.to_string(),
+                        format_version: crate::ann::ANN_FORMAT_VERSION,
+                        path: crate::ann::sidecar_manifest_path(&source_id),
+                        sha256: digit.repeat(64),
+                        size: crate::ann::expected_sidecar_size(1)
+                            .expect("single-vector sidecar layout"),
+                        corpus_id: format!("sha256:{}", digit.repeat(64)),
+                        embedding_model_id: EMBEDDING_MODEL_ID.to_string(),
+                        embedding_model_fingerprint: crate::EMBEDDING_MODEL_FINGERPRINT.to_string(),
+                        embedding_dimension: crate::EMBEDDING_DIM as u32,
+                        embedding_set_sha256: digit.repeat(64),
+                        vector_count: 1,
+                        first_chunk_id: 1,
+                        last_chunk_id: 1,
+                        id_encoding: crate::ann::ANN_ID_ENCODING.to_string(),
+                        metric: crate::ann::ANN_METRIC.to_string(),
+                    };
+                    (source_id, metadata)
+                })
+                .collect();
+        let lexical = ann
+            .iter()
+            .map(|(source_id, ann)| {
+                (
+                    source_id.clone(),
+                    crate::lexical::ManifestLexical {
+                        source_id: source_id.clone(),
+                        format: crate::lexical::LEXICAL_FORMAT.to_string(),
+                        format_version: crate::lexical::LEXICAL_FORMAT_VERSION,
+                        path: crate::lexical::sidecar_manifest_path(source_id),
+                        sha256: ann.embedding_set_sha256.clone(),
+                        size: 4096,
+                        corpus_id: ann.corpus_id.clone(),
+                        source_index_sha256: ann.embedding_set_sha256.clone(),
+                        tokenizer: crate::lexical::LEXICAL_TOKENIZER.to_string(),
+                        document_count: 1,
+                        chunk_count: 1,
+                        first_chunk_id: 1,
+                        last_chunk_id: 1,
+                        chunk_text_sha256: ann.embedding_set_sha256.clone(),
+                        title_text_sha256: ann.embedding_set_sha256.clone(),
+                        chunk_fts_index_sha256: ann.embedding_set_sha256.clone(),
+                        title_fts_index_sha256: ann.embedding_set_sha256.clone(),
+                    },
+                )
             })
             .collect();
         Manifest {
@@ -3105,6 +3366,7 @@ mod security_tests {
                 size: 1,
             },
             ann,
+            lexical,
         }
     }
 
@@ -3117,6 +3379,10 @@ mod security_tests {
         missing.ann.clear();
         assert!(validate_manifest(&missing).is_err());
 
+        let mut missing_lexical = manifest.clone();
+        missing_lexical.lexical.clear();
+        assert!(validate_manifest(&missing_lexical).is_err());
+
         let mut mismatched = manifest.clone();
         mismatched
             .ann
@@ -3124,6 +3390,23 @@ mod security_tests {
             .expect("ATO manifest entry")
             .source_id = "frl".parse().expect("valid source id");
         assert!(validate_manifest(&mismatched).is_err());
+
+        let mut mismatched_lexical = manifest.clone();
+        mismatched_lexical
+            .lexical
+            .get_mut(&"ato".parse::<SourceId>().expect("valid source id"))
+            .expect("ATO lexical manifest entry")
+            .source_id = "frl".parse().expect("valid source id");
+        assert!(validate_manifest(&mismatched_lexical).is_err());
+
+        let original_key = generation_key(&manifest)?;
+        let mut changed_lexical = manifest.clone();
+        changed_lexical
+            .lexical
+            .get_mut(&"ato".parse::<SourceId>().expect("valid source id"))
+            .expect("ATO lexical manifest entry")
+            .sha256 = "f".repeat(64);
+        assert_ne!(generation_key(&changed_lexical)?, original_key);
 
         let mut encoded = serde_json::to_value(&manifest)?;
         encoded
@@ -3174,6 +3457,30 @@ mod security_tests {
             crate::TestEnvironment::set(&[("LEGAL_MCP_DATA_DIR", runtime.as_os_str())]);
         let error = activate_local_generation(&linked, None).unwrap_err();
         assert!(error.to_string().contains("real non-symlink directory"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sealed_generation_root_can_move_between_directories() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let source_parent = root.path().join("source");
+        let destination_parent = root.path().join("destination");
+        let source = source_parent.join("generation");
+        let destination = destination_parent.join("generation");
+        fs::create_dir_all(source.join("ann"))?;
+        fs::create_dir_all(&destination_parent)?;
+        fs::write(source.join("ann/source.ann"), b"immutable")?;
+
+        set_generation_read_only(&source)?;
+        ensure_generation_read_only(&source)?;
+        set_generation_root_renameable(&source)?;
+        rename_across_directories(&source, &destination)?;
+        set_generation_read_only(&destination)?;
+        ensure_generation_read_only(&destination)?;
+
+        assert!(!source.exists());
+        assert_eq!(fs::read(destination.join("ann/source.ann"))?, b"immutable");
         Ok(())
     }
 
@@ -3282,7 +3589,7 @@ mod security_tests {
         let first = root.path().join("first-staging");
         fs::create_dir(&first)?;
         fs::write(first.join("marker"), b"first")?;
-        let first_report = commit_validated_generation(&first, &first_key)?;
+        let first_report = commit_test_generation(&first, &first_key)?;
         assert_eq!(first_report.active_generation, first_key);
         assert_eq!(first_report.previous_generation, None);
         assert!(!first.exists());
@@ -3295,7 +3602,7 @@ mod security_tests {
         let second = root.path().join("second-staging");
         fs::create_dir(&second)?;
         fs::write(second.join("marker"), b"second")?;
-        let second_report = commit_validated_generation(&second, &second_key)?;
+        let second_report = commit_test_generation(&second, &second_key)?;
         assert_eq!(
             second_report.previous_generation.as_deref(),
             Some(first_key.as_str())
@@ -3307,7 +3614,7 @@ mod security_tests {
 
         let collision = root.path().join("collision-staging");
         fs::create_dir(&collision)?;
-        let repeated = commit_validated_generation(&collision, &second_key)?;
+        let repeated = commit_test_generation(&collision, &second_key)?;
         assert_eq!(repeated.active_generation, second_key);
         assert!(
             collision.exists(),

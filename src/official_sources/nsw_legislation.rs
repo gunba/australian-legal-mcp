@@ -114,6 +114,8 @@ impl OfficialAdapter for NswLegislation {
                 drop_ids: &["fragToolbar"],
                 drop_classes: &["nav-result", "view-history-note"],
                 heading_classes: &[],
+                preserve_same_document_fragments: false,
+                repair_broken_links: false,
             },
         )?;
         Ok(Some(make_acquired_html(

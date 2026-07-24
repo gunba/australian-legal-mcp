@@ -4,6 +4,7 @@
 use crate::config::{active_generation_key, ann_path};
 use crate::db::{decompress_text, get_corpus_meta, get_source_meta, open_read, table_exists};
 use crate::legal_source::source_registry;
+use crate::search_timing::{SearchPhase, SearchRequestTiming, SearchTimings};
 use crate::semantic::{dot_i8, encode_query_embedding};
 use crate::source::load_active_generation_manifest;
 use crate::{
@@ -16,7 +17,6 @@ use legal_model::{ChunkRef, DocumentId, SourceId};
 use regex::Regex;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
-use rust_stemmers::{Algorithm, Stemmer};
 use serde::Serialize;
 use serde_json::{json, Value as JsonValue};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(test)]
 pub(crate) fn fts_query(query: &str) -> String {
-    fts_terms(query).join(" OR ")
+    fts_strict_query(query)
 }
 
 const MAX_FTS_INPUT_CHARS: usize = 4_096;
@@ -37,7 +37,6 @@ const FTS_STOPWORDS: &[&str] = &[
 
 fn fts_terms(query: &str) -> Vec<String> {
     let re = Regex::new(r"[A-Za-z0-9']+(?:-[A-Za-z0-9']+)*").expect("valid regex");
-    let stemmer = Stemmer::create(Algorithm::English);
     let bounded = query.chars().take(MAX_FTS_INPUT_CHARS).collect::<String>();
     let mut seen = HashSet::new();
     re.find_iter(&bounded)
@@ -46,59 +45,14 @@ fn fts_terms(query: &str) -> Vec<String> {
             let normalized = term.to_ascii_lowercase();
             term.len() >= 2
                 && !FTS_STOPWORDS.contains(&normalized.as_str())
-                // chunks_fts/title_fts use SQLite's Porter tokenizer. Collapse
-                // equivalent English forms before constructing boolean
-                // clauses so one indexed stem cannot masquerade as multiple
-                // corroborating query terms.
-                && seen.insert(stemmer.stem(&normalized).into_owned())
+                // SQLite owns Porter stemming. Deduplicate only identical
+                // normalized source terms so every SQLite-effective term
+                // remains in the strict conjunction, independent of order.
+                && seen.insert(normalized)
         })
         .take(MAX_FTS_TERMS)
         .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
         .collect()
-}
-
-fn fts_broad_query(query: &str) -> Option<String> {
-    let terms = fts_terms(query);
-    (terms.len() > 1).then(|| terms.join(" OR "))
-}
-
-fn fts_corroborated_query(query: &str) -> Option<String> {
-    let terms = fts_terms(query);
-    match terms.len() {
-        // There is no safe intermediate relaxation for two effective terms:
-        // OR would permit a single common posting list to dominate the query.
-        0..=2 => None,
-        // For longer prose, a one-term match is usually the pathological
-        // case: a common token can expand to most of a source. Require two
-        // independently matching terms while still accepting every pair.
-        _ => Some(fts_at_least_two_query(&terms)),
-    }
-}
-
-/// Build an FTS5 expression that matches iff at least two distinct terms
-/// match. The divide-and-conquer form is logically complete (unlike selecting
-/// only adjacent pairs) and grows O(n log n), bounded by [`MAX_FTS_TERMS`].
-fn fts_at_least_two_query(terms: &[String]) -> String {
-    debug_assert!(terms.len() >= 2);
-    if terms.len() == 2 {
-        return format!("({} AND {})", terms[0], terms[1]);
-    }
-
-    let middle = terms.len() / 2;
-    let (left, right) = terms.split_at(middle);
-    let mut alternatives = Vec::with_capacity(3);
-    if left.len() >= 2 {
-        alternatives.push(format!("({})", fts_at_least_two_query(left)));
-    }
-    if right.len() >= 2 {
-        alternatives.push(format!("({})", fts_at_least_two_query(right)));
-    }
-    alternatives.push(format!(
-        "(({}) AND ({}))",
-        left.join(" OR "),
-        right.join(" OR ")
-    ));
-    alternatives.join(" OR ")
 }
 
 fn fts_strict_query(query: &str) -> String {
@@ -124,6 +78,21 @@ pub(crate) fn glob_to_like(pattern: &str) -> String {
     out
 }
 
+fn type_glob_to_like(pattern: &str) -> String {
+    let mut out = String::new();
+    for ch in pattern.chars() {
+        match ch {
+            '*' => out.push('%'),
+            '%' | '_' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 pub(crate) struct SqlFilter {
     pub(crate) source: SourceId,
     pub(crate) sql: String,
@@ -136,217 +105,43 @@ struct RowidRange {
     last: i64,
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-enum FtsTableRange {
-    Chunks,
-    Titles,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LexicalBounds {
+    Empty,
+    Unbounded,
+    Range(RowidRange),
 }
 
-fn validate_rowid_range_metadata(
-    source_id: &SourceId,
-    label: &str,
-    first: Option<i64>,
-    last: Option<i64>,
-    count: i64,
-) -> Result<Option<RowidRange>> {
-    match (first, last, count) {
-        (None, None, 0) => Ok(None),
-        (Some(first), Some(last), count) if count > 0 && first <= last => {
-            Ok(Some(RowidRange { first, last }))
-        }
-        _ => bail!(
-            "source `{source_id}` {label} rowid range metadata is inconsistent: first={first:?}, last={last:?}, rows={count}"
-        ),
-    }
-}
-
-fn load_chunk_rowid_range(conn: &Connection, source_id: &SourceId) -> Result<Option<RowidRange>> {
-    let (first, last, count) = conn.query_row(
-        "SELECT MIN(chunk_id), MAX(chunk_id), COUNT(*) FROM chunks WHERE source_id = ?1",
-        [source_id.as_str()],
-        |row| {
-            Ok((
-                row.get::<_, Option<i64>>(0)?,
-                row.get::<_, Option<i64>>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        },
-    )?;
-    let range = validate_rowid_range_metadata(source_id, "chunk", first, last, count)?;
-    if let Some(range) = range {
-        let overlaps: i64 = conn.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM chunks
-                 WHERE chunk_id BETWEEN ?1 AND ?2 AND source_id <> ?3
-                 LIMIT 1
-             )",
-            params![range.first, range.last, source_id.as_str()],
-            |row| row.get(0),
-        )?;
-        if overlaps != 0 {
-            bail!(
-                "source `{source_id}` chunk rowids do not occupy one isolated range: first={}, last={}",
-                range.first,
-                range.last
-            );
-        }
-    }
-    Ok(range)
-}
-
-fn load_document_chunk_rowid_range(
-    conn: &Connection,
-    source_id: &SourceId,
-    native_id: &str,
-) -> Result<Option<RowidRange>> {
-    let (first, last, count) = conn.query_row(
-        "SELECT MIN(chunk_id), MAX(chunk_id), COUNT(*)
-         FROM chunks
-         WHERE source_id = ?1 AND native_id = ?2",
-        params![source_id.as_str(), native_id],
-        |row| {
-            Ok((
-                row.get::<_, Option<i64>>(0)?,
-                row.get::<_, Option<i64>>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        },
-    )?;
-    let range = validate_rowid_range_metadata(source_id, "document chunk", first, last, count)?;
-    if let Some(range) = range {
-        let overlaps: i64 = conn.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM chunks
-                 WHERE chunk_id BETWEEN ?1 AND ?2
-                   AND (source_id <> ?3 OR native_id <> ?4)
-                 LIMIT 1
-             )",
-            params![range.first, range.last, source_id.as_str(), native_id],
-            |row| row.get(0),
-        )?;
-        if overlaps != 0 {
-            bail!(
-                "document chunk rowids for source `{source_id}` do not occupy one isolated range: first={}, last={}",
-                range.first,
-                range.last
-            );
-        }
-    }
-    Ok(range)
-}
-
-fn scoped_chunk_rowid_range(
-    conn: &Connection,
-    source_id: &SourceId,
-    doc_scope: &str,
-    source_range: Option<RowidRange>,
-) -> Result<Option<RowidRange>> {
-    let like = glob_to_like(doc_scope);
+fn scoped_lexical_bounds(conn: &Connection, doc_scope: Option<&str>) -> Result<LexicalBounds> {
+    let Some(doc_scope) = doc_scope else {
+        return Ok(LexicalBounds::Unbounded);
+    };
     let mut statement = conn.prepare(
-        "SELECT native_id
-         FROM documents
-         WHERE source_id = ?1 AND native_id LIKE ?2 ESCAPE '\\'
-         ORDER BY native_id
+        "SELECT first_chunk_id, last_chunk_id
+         FROM document_filter
+         WHERE native_id LIKE ?1 ESCAPE '\\'
+         ORDER BY native_id COLLATE BINARY
          LIMIT 2",
     )?;
-    let mut rows = statement.query(params![source_id.as_str(), like])?;
+    let mut rows = statement.query([glob_to_like(doc_scope)])?;
     let Some(first) = rows.next()? else {
-        return Ok(None);
+        return Ok(LexicalBounds::Empty);
     };
-    let native_id = first.get::<_, String>(0)?;
+    let range = match (
+        first.get::<_, Option<i64>>(0)?,
+        first.get::<_, Option<i64>>(1)?,
+    ) {
+        (None, None) => LexicalBounds::Empty,
+        (Some(first), Some(last)) if first > 0 && first <= last => {
+            LexicalBounds::Range(RowidRange { first, last })
+        }
+        _ => bail!("lexical document chunk range metadata is inconsistent"),
+    };
     if rows.next()?.is_some() {
-        return Ok(source_range);
+        Ok(LexicalBounds::Unbounded)
+    } else {
+        Ok(range)
     }
-    let document_range = load_document_chunk_rowid_range(conn, source_id, &native_id)?;
-    if let (Some(document), Some(source)) = (document_range, source_range) {
-        if document.first < source.first || document.last > source.last {
-            bail!("document chunk rowids fall outside their source FTS range");
-        }
-    }
-    Ok(document_range)
-}
-
-fn load_title_rowid_range(conn: &Connection, source_id: &SourceId) -> Result<Option<RowidRange>> {
-    let (first, last, count) = conn.query_row(
-        "SELECT MIN(rowid), MAX(rowid), COUNT(*) FROM title_fts WHERE source_id = ?1",
-        [source_id.as_str()],
-        |row| {
-            Ok((
-                row.get::<_, Option<i64>>(0)?,
-                row.get::<_, Option<i64>>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        },
-    )?;
-    let range = validate_rowid_range_metadata(source_id, "title", first, last, count)?;
-    if let Some(range) = range {
-        let overlaps: i64 = conn.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM title_fts
-                 WHERE rowid BETWEEN ?1 AND ?2 AND source_id <> ?3
-                 LIMIT 1
-             )",
-            params![range.first, range.last, source_id.as_str()],
-            |row| row.get(0),
-        )?;
-        if overlaps != 0 {
-            bail!(
-                "source `{source_id}` title rowids do not occupy one isolated range: first={}, last={}",
-                range.first,
-                range.last
-            );
-        }
-    }
-    Ok(range)
-}
-
-fn cached_source_fts_range(
-    conn: &Connection,
-    generation: &str,
-    source_id: &SourceId,
-    table: FtsTableRange,
-) -> Result<Option<RowidRange>> {
-    type CacheValue = std::result::Result<Option<RowidRange>, String>;
-    type CacheKey = (String, String, String, FtsTableRange);
-    static CACHE: OnceLock<Mutex<HashMap<CacheKey, CacheValue>>> = OnceLock::new();
-
-    // Production connections always have a generation-specific path. Avoid
-    // caching anonymous in-memory databases, which are mutable test fixtures.
-    let Some(path) = conn.path().filter(|path| !path.is_empty()) else {
-        return match table {
-            FtsTableRange::Chunks => load_chunk_rowid_range(conn, source_id),
-            FtsTableRange::Titles => load_title_rowid_range(conn, source_id),
-        };
-    };
-    let key = (
-        path.to_string(),
-        generation.to_string(),
-        source_id.as_str().to_string(),
-        table,
-    );
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    {
-        let cache = cache
-            .lock()
-            .map_err(|_| anyhow!("source FTS range cache lock poisoned"))?;
-        if let Some(result) = cache.get(&key) {
-            return result.clone().map_err(|message| anyhow!(message));
-        }
-    }
-
-    let loaded = match table {
-        FtsTableRange::Chunks => load_chunk_rowid_range(conn, source_id),
-        FtsTableRange::Titles => load_title_rowid_range(conn, source_id),
-    }
-    .map_err(|error| error.to_string());
-    let mut cache = cache
-        .lock()
-        .map_err(|_| anyhow!("source FTS range cache lock poisoned"))?;
-    cache
-        .entry(key)
-        .or_insert(loaded)
-        .clone()
-        .map_err(|message| anyhow!(message))
 }
 
 pub(crate) struct DocumentFilterSpec<'a> {
@@ -359,7 +154,25 @@ pub(crate) struct DocumentFilterSpec<'a> {
     pub(crate) current_only: bool,
 }
 
+#[derive(Clone, Copy)]
+enum FilterStore {
+    Corpus,
+    Lexical,
+}
+
 pub(crate) fn build_doc_filter(alias: &str, spec: DocumentFilterSpec<'_>) -> SqlFilter {
+    build_doc_filter_for(alias, spec, FilterStore::Corpus)
+}
+
+pub(crate) fn build_lexical_doc_filter(alias: &str, spec: DocumentFilterSpec<'_>) -> SqlFilter {
+    build_doc_filter_for(alias, spec, FilterStore::Lexical)
+}
+
+fn build_doc_filter_for(
+    alias: &str,
+    spec: DocumentFilterSpec<'_>,
+    store: FilterStore,
+) -> SqlFilter {
     let DocumentFilterSpec {
         source_id,
         types,
@@ -371,23 +184,27 @@ pub(crate) fn build_doc_filter(alias: &str, spec: DocumentFilterSpec<'_>) -> Sql
     } = spec;
     // ATO owns its edited-private-advice and old-content defaults. Other
     // sources must not inherit ATO document codes or date policy.
-    let mut clauses = vec![format!("{alias}.source_id = ?")];
-    let mut params_out = vec![Value::Text(source_id.as_str().to_string())];
+    let (mut clauses, mut params_out) = if matches!(store, FilterStore::Corpus) {
+        (
+            vec![format!("{alias}.source_id = ?")],
+            vec![Value::Text(source_id.as_str().to_string())],
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
-    if let Some(types) = types {
-        if !types.is_empty() {
-            let mut ors = Vec::new();
-            for t in types {
-                if t.contains('*') {
-                    ors.push(format!("{alias}.type LIKE ? ESCAPE '\\'"));
-                    params_out.push(Value::Text(glob_to_like(t)));
-                } else {
-                    ors.push(format!("{alias}.type = ?"));
-                    params_out.push(Value::Text(t.clone()));
-                }
+    if let Some(types) = types.filter(|types| !types.is_empty()) {
+        let mut ors = Vec::new();
+        for t in types {
+            if t.contains('*') {
+                ors.push(format!("{alias}.type LIKE ? ESCAPE '\\'"));
+                params_out.push(Value::Text(type_glob_to_like(t)));
+            } else {
+                ors.push(format!("{alias}.type = ?"));
+                params_out.push(Value::Text(t.clone()));
             }
-            clauses.push(format!("({})", ors.join(" OR ")));
         }
+        clauses.push(format!("({})", ors.join(" OR ")));
     } else if source_id.as_str() == "ato" && !DEFAULT_EXCLUDED_TYPES.is_empty() {
         let placeholders = vec!["?"; DEFAULT_EXCLUDED_TYPES.len()].join(",");
         clauses.push(format!("{alias}.type NOT IN ({placeholders})"));
@@ -408,7 +225,7 @@ pub(crate) fn build_doc_filter(alias: &str, spec: DocumentFilterSpec<'_>) -> Sql
         clauses.push(format!("{alias}.native_id LIKE ? ESCAPE '\\'"));
         params_out.push(Value::Text(glob_to_like(doc_scope)));
     }
-    if source_id.as_str() == "ato" && !include_old && date_from.is_none() {
+    if source_id.as_str() == "ato" && !include_old {
         let placeholders = vec!["?"; LEGISLATION_TYPE_PREFIXES.len()].join(",");
         clauses.push(format!(
             "({alias}.date IS NULL OR {alias}.date >= ? OR {alias}.type IN ({placeholders}))"
@@ -419,10 +236,12 @@ pub(crate) fn build_doc_filter(alias: &str, spec: DocumentFilterSpec<'_>) -> Sql
         }
     }
     if current_only {
-        // W2.4: drop rulings with a known withdrawal/supersession date by
-        // default. Callers that explicitly want the historical/withdrawn
-        // material pass current_only=false.
-        clauses.push(format!("{alias}.withdrawn_date IS NULL"));
+        let superseded = if matches!(store, FilterStore::Corpus) {
+            format!("{alias}.superseded_by IS NULL")
+        } else {
+            format!("{alias}.is_superseded = 0")
+        };
+        clauses.push(format!("{alias}.withdrawn_date IS NULL AND {superseded}"));
     }
 
     SqlFilter {
@@ -560,6 +379,7 @@ pub(crate) struct SearchOptions<'a> {
 #[derive(Debug, Clone)]
 pub(crate) struct CandidateMeta {
     pub(crate) document: DocumentId,
+    pub(crate) date: Option<String>,
     /// True when this chunk's plaintext is short (< 100 chars) and the
     /// chunk sits at the start of the document — typically a stub
     /// preamble that crowds out more useful chunks. We approximate "intro"
@@ -655,6 +475,65 @@ pub(crate) fn search(
     opts: SearchOptions<'_>,
     server_state: Option<&ServerState>,
 ) -> Result<String> {
+    search_with_request_timing(query, opts, server_state, None)
+}
+
+pub(crate) fn search_with_request_timing(
+    query: &str,
+    opts: SearchOptions<'_>,
+    server_state: Option<&ServerState>,
+    request_timing: Option<SearchRequestTiming>,
+) -> Result<String> {
+    let (result, timing_record) = execute_timed_search(query, opts, server_state, request_timing);
+    if let Some(record) = timing_record {
+        eprintln!("{record}");
+    }
+    result
+}
+
+fn execute_timed_search(
+    query: &str,
+    opts: SearchOptions<'_>,
+    server_state: Option<&ServerState>,
+    request_timing: Option<SearchRequestTiming>,
+) -> (Result<String>, Option<JsonValue>) {
+    let effective_mode = if opts.similar_to_chunk.is_some()
+        || opts
+            .seed_text
+            .map(str::trim)
+            .is_some_and(|seed| !seed.is_empty())
+    {
+        SearchMode::Vector
+    } else {
+        opts.mode
+    };
+    let mut timings = SearchTimings::new(request_timing, effective_mode);
+    let result = search_inner(query, opts, server_state, effective_mode, &mut timings);
+    let timing_record = timings.finish(result.is_ok());
+    (result, timing_record)
+}
+
+#[cfg(test)]
+pub(crate) fn search_with_timing_record(
+    query: &str,
+    opts: SearchOptions<'_>,
+    server_state: Option<&ServerState>,
+    request_timing: SearchRequestTiming,
+) -> (Result<String>, JsonValue) {
+    let (result, record) = execute_timed_search(query, opts, server_state, Some(request_timing));
+    (
+        result,
+        record.expect("a supplied request timing context produces one timing record"),
+    )
+}
+
+fn search_inner(
+    query: &str,
+    opts: SearchOptions<'_>,
+    server_state: Option<&ServerState>,
+    effective_mode: SearchMode,
+    timings: &mut SearchTimings,
+) -> Result<String> {
     let _corpus_lock = crate::config::corpus_read_lock()?;
     let resolved_source = opts.source.clone();
     source_registry().source(&resolved_source)?;
@@ -668,7 +547,7 @@ pub(crate) fn search(
     validate_doc_types(&conn, &resolved_source, opts.types)?;
     let k = opts.k.clamp(1, MAX_K);
     let max_per_doc = opts.max_per_doc.clamp(1, HARD_MAX_PER_DOC);
-    let filter = build_doc_filter(
+    let corpus_filter = build_doc_filter(
         "d",
         DocumentFilterSpec {
             source_id: &resolved_source,
@@ -703,7 +582,9 @@ pub(crate) fn search(
                 .map_err(|_| anyhow!("similar_to_chunk id exceeds SQLite integer range"))?;
             Some((
                 seed_id,
-                load_chunk_embedding(&conn, &resolved_source, seed_id)?,
+                timings.measure(SearchPhase::Embedding, || {
+                    load_chunk_embedding(&conn, &resolved_source, seed_id)
+                })?,
             ))
         }
         None => None,
@@ -720,49 +601,58 @@ pub(crate) fn search(
     // A "seed search" is driven by a seed vector rather than the `query`
     // string: forces vector-only mode and returns no title hits.
     let is_seed_search = similar_seed.is_some() || seed_text.is_some();
-    let effective_mode = if is_seed_search {
-        SearchMode::Vector
-    } else {
-        opts.mode
-    };
-    let chunk_rowid_range = if matches!(effective_mode, SearchMode::Hybrid | SearchMode::Keyword) {
-        let source_range =
-            cached_source_fts_range(&conn, &generation, &resolved_source, FtsTableRange::Chunks)?;
-        let effective_range = match opts.doc_scope {
-            Some(doc_scope) => {
-                scoped_chunk_rowid_range(&conn, &resolved_source, doc_scope, source_range)?
-            }
-            None => source_range,
-        };
-        Some(effective_range)
-    } else {
-        None
-    };
-    let title_rowid_range = if is_seed_search {
-        None
-    } else {
-        Some(cached_source_fts_range(
+    let lexical_filter = (!is_seed_search).then(|| {
+        build_lexical_doc_filter(
+            "d",
+            DocumentFilterSpec {
+                source_id: &resolved_source,
+                types: opts.types,
+                date_from: opts.date_from,
+                date_to: opts.date_to,
+                doc_scope: opts.doc_scope,
+                include_old: opts.include_old,
+                current_only: opts.current_only,
+            },
+        )
+    });
+    let (lexical_conn, lexical_bounds) = timings.measure(SearchPhase::LexicalIndex, || {
+        let installed_manifest = load_active_generation_manifest()?
+            .ok_or_else(|| anyhow!("active generation manifest is missing"))?;
+        let info = installed_manifest
+            .lexical
+            .get(&resolved_source)
+            .ok_or_else(|| {
+                anyhow!("active manifest has no lexical sidecar for source `{resolved_source}`")
+            })?;
+        let lexical_conn = crate::lexical::open_runtime_sidecar(
             &conn,
-            &generation,
             &resolved_source,
-            FtsTableRange::Titles,
-        )?)
-    };
+            info,
+            &installed_manifest.db.sha256,
+        )?;
+        let lexical_bounds = scoped_lexical_bounds(&lexical_conn, opts.doc_scope)?;
+        Ok((lexical_conn, lexical_bounds))
+    })?;
     let source_ann = if matches!(effective_mode, SearchMode::Hybrid | SearchMode::Vector) {
-        Some(ensure_vector_search_ready(&conn, &resolved_source)?)
+        Some(timings.measure(SearchPhase::VectorScan, || {
+            ensure_vector_search_ready(&conn, &resolved_source)
+        })?)
     } else {
         None
     };
     let lexical_hits = if matches!(effective_mode, SearchMode::Hybrid | SearchMode::Keyword) {
-        lexical_search_in_range(
-            &conn,
-            &resolved_source,
-            query,
-            &filter,
-            internal_limit,
-            chunk_rowid_range
-                .ok_or_else(|| anyhow!("lexical search did not prepare source FTS bounds"))?,
-        )?
+        timings.measure(SearchPhase::LexicalIndex, || {
+            lexical_search_in_range(
+                &lexical_conn,
+                &resolved_source,
+                query,
+                lexical_filter
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("lexical search did not prepare its source filter"))?,
+                internal_limit,
+                lexical_bounds,
+            )
+        })?
     } else {
         Vec::new()
     };
@@ -777,19 +667,21 @@ pub(crate) fn search(
                 // `seed_text`, when set, replaces the `query` string as the
                 // text to embed for the semantic stage.
                 let embed_input = seed_text.unwrap_or(query);
-                match server_state {
-                    Some(state) => state.encode_query_embedding(embed_input)?,
-                    None => encode_query_embedding(embed_input)?,
-                }
+                timings.measure(SearchPhase::Embedding, || match server_state {
+                    Some(state) => state.encode_query_embedding(embed_input),
+                    None => encode_query_embedding(embed_input),
+                })?
             };
-            let vector_hits = vector_search(
-                &conn,
-                &resolved_source,
-                source_ann,
-                &query_embedding,
-                &filter,
-                internal_limit,
-            )?;
+            let vector_hits = timings.measure(SearchPhase::VectorScan, || {
+                vector_search(
+                    &conn,
+                    &resolved_source,
+                    source_ann,
+                    &query_embedding,
+                    &corpus_filter,
+                    internal_limit,
+                )
+            })?;
             // Filter the seed chunk out of its own similar-chunks results.
             let vector_hits = if let Some((seed_id, _)) = similar_seed {
                 vector_hits
@@ -800,7 +692,9 @@ pub(crate) fn search(
                 vector_hits
             };
             if matches!(effective_mode, SearchMode::Hybrid) {
-                rrf_fuse(&vector_hits, &lexical_hits)
+                timings.measure_value(SearchPhase::Fusion, || {
+                    rrf_fuse(&vector_hits, &lexical_hits)
+                })
             } else {
                 vector_hits
             }
@@ -816,32 +710,49 @@ pub(crate) fn search(
 
     // Batch-load (chunk_id -> document, is_intro) for all candidates so the
     // dedup pass doesn't have to round-trip per chunk.
-    let candidate_meta = load_candidate_meta(&conn, &resolved_source, &ranked_hits)?;
-    let deduped = dedup_per_doc(ranked_hits, &candidate_meta, frontier, max_per_doc);
+    let candidate_meta = timings.measure(SearchPhase::LexicalIndex, || {
+        load_candidate_meta(&lexical_conn, &resolved_source, &ranked_hits)
+    })?;
+    let mut deduped = dedup_per_doc(ranked_hits, &candidate_meta, frontier, max_per_doc);
+    if matches!(opts.sort_by, SortBy::Recency) {
+        deduped.sort_by(|a, b| {
+            let a_meta = candidate_meta
+                .get(&a.chunk_id)
+                .expect("deduped candidate has lexical metadata");
+            let b_meta = candidate_meta
+                .get(&b.chunk_id)
+                .expect("deduped candidate has lexical metadata");
+            b_meta
+                .date
+                .cmp(&a_meta.date)
+                .then_with(|| a_meta.document.cmp(&b_meta.document))
+                .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+        });
+        deduped.truncate(k);
+    }
 
     let ranked_ids = deduped.iter().map(|hit| hit.chunk_id).collect::<Vec<_>>();
-    let mut hydrated = load_hits(
-        &conn,
-        &resolved_source,
-        &generation,
-        &ranked_ids,
-        query,
-        opts.include_snippet,
-    )?;
-    let mut records = ranked_ids
-        .into_iter()
-        .filter_map(|chunk_id| hydrated.remove(&chunk_id))
-        .collect::<Vec<_>>();
-    if matches!(opts.sort_by, SortBy::Recency) {
-        // Recency sort materializes a widened frontier, then sorts by date descending.
-        records.sort_by(|a, b| {
-            b.date
-                .cmp(&a.date)
-                .then_with(|| a.document.cmp(&b.document))
-                .then_with(|| a.chunk.cmp(&b.chunk))
-        });
-        records.truncate(k);
-    }
+    let records = timings.measure(SearchPhase::PayloadHydration, || {
+        let mut hydrated = load_hits(
+            &conn,
+            &resolved_source,
+            &generation,
+            &ranked_ids,
+            query,
+            opts.include_snippet,
+        )?;
+        if hydrated.len() != ranked_ids.len() {
+            bail!("search sidecar returned an unknown legal.db chunk");
+        }
+        ranked_ids
+            .into_iter()
+            .map(|chunk_id| {
+                hydrated
+                    .remove(&chunk_id)
+                    .ok_or_else(|| anyhow!("search winner disappeared during hydration"))
+            })
+            .collect::<Result<Vec<_>>>()
+    })?;
     // JSON metadata preserves query/filter state in next_call when k can grow.
     let next_call = if candidate_count > records.len() && k < MAX_K {
         Some(search_next_call(query, std::cmp::min(k * 2, MAX_K), &opts)?)
@@ -868,12 +779,17 @@ pub(crate) fn search(
     } else {
         collect_title_hits_in_range(
             &conn,
+            &lexical_conn,
             &resolved_source,
             query,
             TITLE_HITS_K,
-            &filter,
-            title_rowid_range
-                .ok_or_else(|| anyhow!("title search did not prepare source FTS bounds"))?,
+            (
+                &corpus_filter,
+                lexical_filter
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("title search did not prepare its source filter"))?,
+            ),
+            Some(timings),
         )?
     };
 
@@ -893,7 +809,7 @@ pub(crate) fn search_cli(query: &str, opts: SearchOptions<'_>) -> Result<(String
 }
 
 pub(crate) fn load_candidate_meta(
-    conn: &Connection,
+    lexical: &Connection,
     source_id: &SourceId,
     ranked: &[VectorHit],
 ) -> Result<HashMap<i64, CandidateMeta>> {
@@ -907,62 +823,27 @@ pub(crate) fn load_candidate_meta(
     ids.dedup();
 
     let placeholders = vec!["?"; ids.len()].join(",");
-    // Two-step query: first read (chunk_id, native_id, ord) for every
-    // candidate cheaply; then decompress the text BLOB only for the
-    // small minority sitting at ord == 0 so we can measure the *plain*
-    // text length precisely. Heading-path is gone; "intro" now means
-    // "leading stub chunk" (ord 0 with short text) which still
-    // correctly demotes the typical preamble pattern.
     let sql = format!(
-        "SELECT chunk_id, native_id, ord FROM chunks \
-         WHERE source_id = ? AND chunk_id IN ({placeholders})"
+        "SELECT c.chunk_id, d.native_id, d.date, c.is_intro \
+         FROM chunk_filter AS c \
+         JOIN document_filter AS d ON d.doc_key = c.doc_key \
+         WHERE c.chunk_id IN ({placeholders})"
     );
-    let mut params_vec = vec![Value::Text(source_id.as_str().to_string())];
-    params_vec.extend(ids.into_iter().map(Value::Integer));
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(params_vec), |row| {
-        let chunk_id: i64 = row.get("chunk_id")?;
-        let native_id: String = row.get("native_id")?;
-        let ord: i64 = row.get("ord")?;
-        Ok((chunk_id, native_id, ord))
-    })?;
-    let mut leading_chunk_ids: Vec<i64> = Vec::new();
-    let mut staged: Vec<(i64, String, i64)> = Vec::new();
-    for row in rows {
-        let (chunk_id, native_id, ord) = row?;
-        if ord == 0 {
-            leading_chunk_ids.push(chunk_id);
-        }
-        staged.push((chunk_id, native_id, ord));
-    }
-
-    let mut intro_set: HashSet<i64> = HashSet::new();
-    if !leading_chunk_ids.is_empty() {
-        let placeholders2 = vec!["?"; leading_chunk_ids.len()].join(",");
-        let sql2 = format!(
-            "SELECT chunk_id, text FROM chunks \
-             WHERE source_id = ? AND chunk_id IN ({placeholders2})"
-        );
-        let mut params_vec2 = vec![Value::Text(source_id.as_str().to_string())];
-        params_vec2.extend(leading_chunk_ids.into_iter().map(Value::Integer));
-        let mut stmt2 = conn.prepare(&sql2)?;
-        let rows2 = stmt2.query_map(params_from_iter(params_vec2), |row| {
+    let expected = ids.len();
+    let mut stmt = lexical.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params_from_iter(ids.into_iter().map(Value::Integer)),
+        |row| {
             let chunk_id: i64 = row.get("chunk_id")?;
-            let text_blob: Vec<u8> = row.get("text")?;
-            Ok((chunk_id, text_blob))
-        })?;
-        for row in rows2 {
-            let (chunk_id, text_blob) = row?;
-            let plain = decompress_text(text_blob)?;
-            if plain.len() < 100 {
-                intro_set.insert(chunk_id);
-            }
-        }
-    }
-
+            let native_id: String = row.get("native_id")?;
+            let date: Option<String> = row.get("date")?;
+            let is_intro = row.get::<_, i64>("is_intro")? != 0;
+            Ok((chunk_id, native_id, date, is_intro))
+        },
+    )?;
     let mut out = HashMap::new();
-    for (chunk_id, native_id, _ord) in staged {
-        let is_intro = intro_set.contains(&chunk_id);
+    for row in rows {
+        let (chunk_id, native_id, date, is_intro) = row?;
         out.insert(
             chunk_id,
             CandidateMeta {
@@ -970,9 +851,13 @@ pub(crate) fn load_candidate_meta(
                     source: source_id.clone(),
                     native_id,
                 },
+                date,
                 is_intro,
             },
         );
+    }
+    if out.len() != expected {
+        bail!("search candidate is absent from its source lexical sidecar");
     }
     Ok(out)
 }
@@ -1499,68 +1384,64 @@ fn exact_rerank_candidates(
 
 #[cfg(test)]
 pub(crate) fn lexical_search(
-    conn: &Connection,
+    lexical: &Connection,
     source_id: &SourceId,
     query: &str,
     filter: &SqlFilter,
     limit: usize,
 ) -> Result<Vec<VectorHit>> {
-    let rowid_range = load_chunk_rowid_range(conn, source_id)?;
-    lexical_search_in_range(conn, source_id, query, filter, limit, rowid_range)
+    lexical_search_in_range(
+        lexical,
+        source_id,
+        query,
+        filter,
+        limit,
+        LexicalBounds::Unbounded,
+    )
 }
 
 fn lexical_search_in_range(
-    conn: &Connection,
+    lexical: &Connection,
     source_id: &SourceId,
     query: &str,
     filter: &SqlFilter,
     limit: usize,
-    rowid_range: Option<RowidRange>,
+    bounds: LexicalBounds,
 ) -> Result<Vec<VectorHit>> {
     let strict_query = fts_strict_query(query);
-    let Some(rowid_range) = rowid_range else {
+    if matches!(bounds, LexicalBounds::Empty) {
         return Ok(Vec::new());
-    };
+    }
     if strict_query.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
-    let mut hits =
-        lexical_search_stage(conn, source_id, &strict_query, filter, limit, rowid_range)?;
-    if hits.len() < limit {
-        if let Some(broad_query) = fts_corroborated_query(query) {
-            let broad =
-                lexical_search_stage(conn, source_id, &broad_query, filter, limit, rowid_range)?;
-            let mut seen = hits.iter().map(|hit| hit.chunk_id).collect::<HashSet<_>>();
-            hits.extend(broad.into_iter().filter(|hit| seen.insert(hit.chunk_id)));
-            hits.truncate(limit);
-        }
-    }
-    Ok(hits)
+    lexical_search_stage(lexical, source_id, &strict_query, filter, limit, bounds)
 }
 
 fn lexical_search_stage(
-    conn: &Connection,
+    lexical: &Connection,
     source_id: &SourceId,
     fts_query: &str,
     filter: &SqlFilter,
     limit: usize,
-    rowid_range: RowidRange,
+    bounds: LexicalBounds,
 ) -> Result<Vec<VectorHit>> {
     let where_filter = if filter.sql.is_empty() {
         String::new()
     } else {
         format!(" AND {}", filter.sql)
     };
-    let sql = lexical_search_stage_sql(&where_filter);
-    let mut params_vec = vec![
-        Value::Text(fts_query.to_string()),
-        Value::Integer(rowid_range.first),
-        Value::Integer(rowid_range.last),
-    ];
+    let range = matches!(bounds, LexicalBounds::Range(_));
+    let sql = lexical_search_stage_sql(&where_filter, range);
+    let mut params_vec = vec![Value::Text(fts_query.to_string())];
+    if let LexicalBounds::Range(rowid_range) = bounds {
+        params_vec.push(Value::Integer(rowid_range.first));
+        params_vec.push(Value::Integer(rowid_range.last));
+    }
     params_vec.extend(filter.params.clone());
-    params_vec.push(Value::Integer(limit as i64));
+    params_vec.push(Value::Integer(i64::try_from(limit)?));
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = lexical.prepare(&sql)?;
     debug_assert_eq!(&filter.source, source_id);
     let rows = stmt
         .query_map(params_from_iter(params_vec), |row| {
@@ -1573,16 +1454,19 @@ fn lexical_search_stage(
     Ok(rows)
 }
 
-fn lexical_search_stage_sql(where_filter: &str) -> String {
+fn lexical_search_stage_sql(where_filter: &str, bounded: bool) -> String {
+    let rowid_filter = if bounded {
+        " AND f.rowid BETWEEN ? AND ?"
+    } else {
+        ""
+    };
     format!(
         r#"
-        SELECT f.rowid AS chunk_id, -bm25(chunks_fts) AS score
-        FROM chunks_fts f
-        CROSS JOIN chunks c ON c.chunk_id = f.rowid
-        CROSS JOIN documents d
-          ON d.source_id = c.source_id AND d.native_id = c.native_id
-        WHERE chunks_fts MATCH ?
-          AND f.rowid BETWEEN ? AND ? {where_filter}
+        SELECT f.rowid AS chunk_id, -bm25(chunk_fts) AS score
+        FROM chunk_fts AS f
+        CROSS JOIN chunk_filter AS c ON c.chunk_id = f.rowid
+        CROSS JOIN document_filter AS d ON d.doc_key = c.doc_key
+        WHERE chunk_fts MATCH ? {rowid_filter} {where_filter}
         ORDER BY score DESC, chunk_id ASC
         LIMIT ?
         "#
@@ -1896,29 +1780,42 @@ pub(crate) fn trim_chars(s: &str, max_chars: usize) -> String {
 /// document filter so chunk and title queries stay consistently scoped.
 #[cfg(test)]
 pub(crate) fn collect_title_hits(
-    conn: &Connection,
+    legal: &Connection,
+    lexical: &Connection,
     source_id: &SourceId,
     query: &str,
     k: usize,
-    filter: &SqlFilter,
+    corpus_filter: &SqlFilter,
+    lexical_filter: &SqlFilter,
 ) -> Result<Vec<Hit>> {
-    let rowid_range = load_title_rowid_range(conn, source_id)?;
-    collect_title_hits_in_range(conn, source_id, query, k, filter, rowid_range)
+    collect_title_hits_in_range(
+        legal,
+        lexical,
+        source_id,
+        query,
+        k,
+        (corpus_filter, lexical_filter),
+        None,
+    )
 }
 
 fn collect_title_hits_in_range(
-    conn: &Connection,
+    legal: &Connection,
+    lexical: &Connection,
     source_id: &SourceId,
     query: &str,
     k: usize,
-    filter: &SqlFilter,
-    rowid_range: Option<RowidRange>,
+    filters: (&SqlFilter, &SqlFilter),
+    mut timings: Option<&mut SearchTimings>,
 ) -> Result<Vec<Hit>> {
-    // Title hits rank title_fts independently and reuse the chunk
-    // query's document filter.
+    let (corpus_filter, lexical_filter) = filters;
     let k = k.clamp(1, 100);
     let mut hits = Vec::new();
-    if let Some(direct) = query_direct_document_hit(conn, source_id, query.trim(), filter)? {
+    if let Some(direct) =
+        measure_optional_phase(&mut timings, SearchPhase::PayloadHydration, || {
+            query_direct_document_hit(legal, source_id, query.trim(), corpus_filter)
+        })?
+    {
         hits.push(direct);
     }
     let strict_query = fts_strict_query(query);
@@ -1929,24 +1826,50 @@ fn collect_title_hits_in_range(
         .iter()
         .map(|hit| hit.document.clone())
         .collect::<HashSet<_>>();
-    if let Some(rowid_range) = rowid_range {
-        hits.extend(
-            query_title_fts(conn, source_id, &strict_query, filter, k, rowid_range)?
-                .into_iter()
-                .filter(|hit| seen.insert(hit.document.clone())),
-        );
+    let remaining = k.saturating_sub(hits.len());
+    if remaining == 0 {
+        return Ok(hits);
     }
-    if hits.len() < k {
-        if let (Some(broad_query), Some(rowid_range)) = (fts_broad_query(query), rowid_range) {
-            hits.extend(
-                query_title_fts(conn, source_id, &broad_query, filter, k, rowid_range)?
-                    .into_iter()
-                    .filter(|hit| seen.insert(hit.document.clone())),
-            );
+    let title_ids = measure_optional_phase(&mut timings, SearchPhase::LexicalIndex, || {
+        query_title_fts(lexical, source_id, &strict_query, lexical_filter, k)
+    })?;
+    let title_ids = title_ids
+        .into_iter()
+        .filter(|native_id| {
+            seen.insert(DocumentId {
+                source: source_id.clone(),
+                native_id: native_id.clone(),
+            })
+        })
+        .take(remaining)
+        .collect::<Vec<_>>();
+    let title_hits = measure_optional_phase(&mut timings, SearchPhase::PayloadHydration, || {
+        let mut hydrated = load_title_hits(legal, source_id, &title_ids)?;
+        if hydrated.len() != title_ids.len() {
+            bail!("lexical title sidecar returned an unknown legal.db document");
         }
-    }
-    hits.truncate(k);
+        title_ids
+            .into_iter()
+            .map(|native_id| {
+                hydrated
+                    .remove(&native_id)
+                    .ok_or_else(|| anyhow!("lexical title winner disappeared during hydration"))
+            })
+            .collect::<Result<Vec<_>>>()
+    })?;
+    hits.extend(title_hits);
     Ok(hits)
+}
+
+fn measure_optional_phase<T>(
+    timings: &mut Option<&mut SearchTimings>,
+    phase: SearchPhase,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    match timings.as_deref_mut() {
+        Some(timings) => timings.measure(phase, operation),
+        None => operation(),
+    }
 }
 
 fn query_direct_document_hit(
@@ -2015,93 +1938,97 @@ fn query_direct_document_hit(
 }
 
 fn query_title_fts(
-    conn: &Connection,
+    lexical: &Connection,
     source_id: &SourceId,
     title_query: &str,
     filter: &SqlFilter,
     limit: usize,
-    rowid_range: RowidRange,
-) -> Result<Vec<Hit>> {
+) -> Result<Vec<String>> {
     let where_filter = if filter.sql.is_empty() {
         String::new()
     } else {
         format!(" AND {}", filter.sql)
     };
     let sql = title_search_stage_sql(&where_filter);
-    let mut params_vec = vec![
-        Value::Text(title_query.to_string()),
-        Value::Integer(rowid_range.first),
-        Value::Integer(rowid_range.last),
-    ];
+    let mut params_vec = vec![Value::Text(title_query.to_string())];
     params_vec.extend(filter.params.clone());
-    params_vec.push(Value::Integer(limit as i64));
+    params_vec.push(Value::Integer(i64::try_from(limit)?));
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = lexical.prepare(&sql)?;
     debug_assert_eq!(&filter.source, source_id);
     let rows = stmt
-        .query_map(params_from_iter(params_vec), |row| {
-            let native_id: String = row.get("native_id")?;
-            let title: String = row.get("title")?;
-            Ok(Hit {
-                canonical_url: row.get("canonical_url")?,
-                document: DocumentId {
-                    source: source_id.clone(),
-                    native_id,
-                },
-                title: title.clone(),
-                doc_type: row.get("type")?,
-                date: row.get("date")?,
-                anchor: None,
-                snippet: Some(title),
-                chunk: None,
-                next_call: None,
-                withdrawn_date: row.get("withdrawn_date")?,
-                superseded_by: row
-                    .get::<_, Option<String>>("superseded_by")?
-                    .map(|native_id| DocumentId {
-                        source: source_id.clone(),
-                        native_id,
-                    }),
-                replaces: row
-                    .get::<_, Option<String>>("replaces")?
-                    .map(|native_id| DocumentId {
-                        source: source_id.clone(),
-                        native_id,
-                    }),
-                has_in_doc_links: row
-                    .get::<_, i64>("has_in_doc_links")
-                    .ok()
-                    .filter(|v| *v != 0)
-                    .map(|_| true),
-                has_related_docs: row
-                    .get::<_, i64>("has_related_docs")
-                    .ok()
-                    .filter(|v| *v != 0)
-                    .map(|_| true),
-                has_history: row
-                    .get::<_, i64>("has_history")
-                    .ok()
-                    .filter(|v| *v != 0)
-                    .map(|_| true),
-            })
-        })?
+        .query_map(params_from_iter(params_vec), |row| row.get("native_id"))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+fn load_title_hits(
+    legal: &Connection,
+    source_id: &SourceId,
+    native_ids: &[String],
+) -> Result<HashMap<String, Hit>> {
+    if native_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = vec!["?"; native_ids.len()].join(",");
+    let sql = format!(
+        r#"
+        SELECT d.native_id, d.type, d.title, d.date, d.canonical_url,
+               d.withdrawn_date, d.superseded_by, d.replaces,
+               d.has_in_doc_links, d.has_related_docs, d.has_history
+        FROM documents AS d
+        WHERE d.source_id = ? AND d.native_id IN ({placeholders})
+        "#
+    );
+    let mut parameters = vec![Value::Text(source_id.as_str().to_string())];
+    parameters.extend(native_ids.iter().cloned().map(Value::Text));
+    let mut statement = legal.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(parameters), |row| {
+        let native_id = row.get::<_, String>("native_id")?;
+        let title = row.get::<_, String>("title")?;
+        let hit = Hit {
+            canonical_url: row.get("canonical_url")?,
+            document: DocumentId {
+                source: source_id.clone(),
+                native_id: native_id.clone(),
+            },
+            title: title.clone(),
+            doc_type: row.get("type")?,
+            date: row.get("date")?,
+            anchor: None,
+            snippet: Some(title),
+            chunk: None,
+            next_call: None,
+            withdrawn_date: row.get("withdrawn_date")?,
+            superseded_by: row
+                .get::<_, Option<String>>("superseded_by")?
+                .map(|native_id| DocumentId {
+                    source: source_id.clone(),
+                    native_id,
+                }),
+            replaces: row
+                .get::<_, Option<String>>("replaces")?
+                .map(|native_id| DocumentId {
+                    source: source_id.clone(),
+                    native_id,
+                }),
+            has_in_doc_links: (row.get::<_, i64>("has_in_doc_links")? != 0).then_some(true),
+            has_related_docs: (row.get::<_, i64>("has_related_docs")? != 0).then_some(true),
+            has_history: (row.get::<_, i64>("has_history")? != 0).then_some(true),
+        };
+        Ok((native_id, hit))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
 }
 
 fn title_search_stage_sql(where_filter: &str) -> String {
     format!(
         r#"
-        SELECT t.native_id AS native_id, bm25(title_fts) AS score,
-               d.type, d.title, d.date, d.canonical_url,
-               d.withdrawn_date, d.superseded_by, d.replaces,
-               d.has_in_doc_links, d.has_related_docs, d.has_history
-        FROM title_fts t
-        CROSS JOIN documents d
-          ON d.source_id = t.source_id AND d.native_id = t.native_id
-        WHERE title_fts MATCH ?
-          AND t.rowid BETWEEN ? AND ? {where_filter}
-        ORDER BY score ASC, t.source_id ASC, t.native_id ASC
+        SELECT d.native_id AS native_id, -bm25(title_fts) AS score
+        FROM title_fts AS t
+        CROSS JOIN document_filter AS d ON d.doc_key = t.rowid
+        WHERE title_fts MATCH ? {where_filter}
+        ORDER BY score DESC, d.native_id COLLATE BINARY ASC
         LIMIT ?
         "#
     )
@@ -2111,6 +2038,129 @@ fn title_search_stage_sql(where_filter: &str) -> String {
 mod tests {
     use super::*;
     use crate::db::{compress_text, init_db};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires LEGAL_MCP_BENCH_DATA_DIR and LEGAL_MCP_BENCH_EXPECTED_IDS"]
+    fn benchmark_installed_production_lexical_phase() -> Result<()> {
+        use std::os::fd::AsRawFd;
+        use std::time::Instant;
+
+        let data_dir = PathBuf::from(
+            std::env::var("LEGAL_MCP_BENCH_DATA_DIR")
+                .context("LEGAL_MCP_BENCH_DATA_DIR is required")?,
+        );
+        let _environment =
+            crate::TestEnvironment::set(&[("LEGAL_MCP_DATA_DIR", data_dir.as_os_str())]);
+        let source_id: SourceId = std::env::var("LEGAL_MCP_BENCH_SOURCE")
+            .unwrap_or_else(|_| "federal-court".to_string())
+            .parse()?;
+        let query = std::env::var("LEGAL_MCP_BENCH_QUERY").unwrap_or_else(|_| {
+            "moreton resources innovation science australia activities".to_string()
+        });
+        let expected_ids = std::env::var("LEGAL_MCP_BENCH_EXPECTED_IDS")?
+            .split(',')
+            .map(|item| item.trim().parse::<u64>().map_err(Into::into))
+            .collect::<Result<Vec<_>>>()?;
+        if expected_ids.is_empty() {
+            bail!("LEGAL_MCP_BENCH_EXPECTED_IDS must not be empty");
+        }
+        let runs = std::env::var("LEGAL_MCP_BENCH_COLD_RUNS")
+            .unwrap_or_else(|_| "30".to_string())
+            .parse::<usize>()?;
+        if runs == 0 {
+            bail!("LEGAL_MCP_BENCH_COLD_RUNS must be positive");
+        }
+        let limit_ms = std::env::var("LEGAL_MCP_BENCH_COLD_P95_LIMIT_MS")
+            .unwrap_or_else(|_| "100".to_string())
+            .parse::<f64>()?;
+        if !limit_ms.is_finite() || limit_ms <= 0.0 {
+            bail!("LEGAL_MCP_BENCH_COLD_P95_LIMIT_MS must be finite and positive");
+        }
+
+        let active = crate::config::active_generation_key()?
+            .ok_or_else(|| anyhow!("benchmark data directory has no active generation"))?;
+        crate::source::verify_active_generation_startup(&active)?;
+        let manifest = load_active_generation_manifest()?
+            .ok_or_else(|| anyhow!("benchmark data directory has no generation manifest"))?;
+        let info = manifest
+            .lexical
+            .get(&source_id)
+            .ok_or_else(|| anyhow!("benchmark source has no lexical sidecar"))?;
+        let sidecar_path = crate::config::generation_dir(&active)?.join(&info.path);
+        let mut times_ms = Vec::with_capacity(runs);
+        for run in 0..runs {
+            let file = std::fs::File::open(&sidecar_path)?;
+            // SAFETY: `file` owns a valid descriptor; offset and length are
+            // non-negative, and a zero length extends through EOF.
+            let status =
+                unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+            if status != 0 {
+                bail!("POSIX_FADV_DONTNEED failed with status {status}");
+            }
+            drop(file);
+
+            let admitted = Instant::now();
+            let options = SearchOptions {
+                source: source_id.clone(),
+                k: expected_ids.len(),
+                types: None,
+                date_from: None,
+                date_to: None,
+                doc_scope: None,
+                mode: SearchMode::Keyword,
+                sort_by: SortBy::Relevance,
+                include_old: false,
+                current_only: true,
+                max_per_doc: HARD_MAX_PER_DOC,
+                include_snippet: false,
+                similar_to_chunk: None,
+                seed_text: None,
+            };
+            let (result, timing) = search_with_timing_record(
+                &query,
+                options,
+                None,
+                SearchRequestTiming::new(run as u64 + 1, admitted, admitted),
+            );
+            let result: JsonValue = serde_json::from_str(&result?)?;
+            let ids = result["hits"]
+                .as_array()
+                .ok_or_else(|| anyhow!("benchmark search has no hits array"))?
+                .iter()
+                .map(|hit| {
+                    hit["chunk"]["chunk_id"]
+                        .as_u64()
+                        .ok_or_else(|| anyhow!("benchmark hit has no typed chunk ID"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if ids != expected_ids {
+                bail!("production lexical benchmark returned unexpected chunk IDs: {ids:?}");
+            }
+            let duration_us = timing["duration_us"]["lexical_index"]
+                .as_u64()
+                .ok_or_else(|| anyhow!("benchmark timing has no lexical_index duration"))?;
+            times_ms.push(duration_us as f64 / 1_000.0);
+        }
+        times_ms.sort_by(f64::total_cmp);
+        let p95_index = ((0.95 * times_ms.len() as f64).ceil() as usize)
+            .saturating_sub(1)
+            .min(times_ms.len() - 1);
+        let p95_ms = times_ms[p95_index];
+        assert!(
+            p95_ms < limit_ms,
+            "production lexical phase cold p95 {p95_ms:.3} ms does not satisfy the {limit_ms:.3} ms limit"
+        );
+        eprintln!(
+            "PRODUCTION_LEXICAL_BENCH source={} runs={} median_ms={:.3} p95_ms={:.3} max_ms={:.3}",
+            source_id,
+            runs,
+            times_ms[times_ms.len() / 2],
+            p95_ms,
+            times_ms[times_ms.len() - 1]
+        );
+        Ok(())
+    }
 
     fn source() -> SourceId {
         "ato".parse().expect("valid source")
@@ -2139,32 +2189,36 @@ mod tests {
              VALUES (?1, ?2, ?3, 0, ?4)",
             params![chunk_id, source_id, native_id, compress_text(text)?],
         )?;
-        conn.execute(
-            "INSERT INTO chunks_fts(rowid, text) VALUES (?1, ?2)",
-            params![chunk_id, text],
-        )?;
         Ok(())
     }
 
     fn lexical_source_fixture() -> Result<Connection> {
-        let conn = Connection::open_in_memory()?;
-        init_db(&conn)?;
-        conn.execute_batch(
+        let legal = Connection::open_in_memory()?;
+        init_db(&legal)?;
+        legal.execute_batch(
             "INSERT INTO sources(source_id, display_name) VALUES
                  ('ato', 'ATO'),
                  ('frl', 'Federal Register of Legislation');",
         )?;
         for chunk_id in 1..=3 {
-            insert_lexical_fixture_row(&conn, "ato", chunk_id, "alpha beta gamma global decoy")?;
+            insert_lexical_fixture_row(&legal, "ato", chunk_id, "alpha beta gamma global decoy")?;
         }
-        insert_lexical_fixture_row(&conn, "frl", 100, "alpha gamma corroborated")?;
-        insert_lexical_fixture_row(&conn, "frl", 101, "alpha singleton")?;
-        insert_lexical_fixture_row(&conn, "frl", 102, "gamma singleton")?;
-        Ok(conn)
+        insert_lexical_fixture_row(&legal, "frl", 100, "alpha gamma corroborated")?;
+        insert_lexical_fixture_row(&legal, "frl", 101, "alpha singleton")?;
+        insert_lexical_fixture_row(&legal, "frl", 102, "gamma singleton")?;
+        insert_lexical_fixture_row(&legal, "frl", 103, "alpha beta gamma strict")?;
+        insert_lexical_fixture_row(&legal, "frl", 104, "sky skies strict")?;
+        insert_lexical_fixture_row(&legal, "frl", 105, "sky singleton")?;
+        insert_lexical_fixture_row(&legal, "frl", 106, "skies singleton")?;
+        Ok(legal)
+    }
+
+    fn build_lexical_fixture(legal: &Connection, source_id: &SourceId) -> Result<Connection> {
+        crate::lexical::test_sidecar_connection(legal, source_id)
     }
 
     fn unrestricted_filter(source_id: &SourceId) -> SqlFilter {
-        build_doc_filter(
+        build_lexical_doc_filter(
             "d",
             DocumentFilterSpec {
                 source_id,
@@ -2186,8 +2240,20 @@ mod tests {
         assert_eq!(fts_terms(&repeated), vec!["\"Tax\"".to_string()]);
         assert_eq!(
             fts_terms("develop development alpha"),
-            vec!["\"develop\"".to_string(), "\"alpha\"".to_string()],
-            "Porter-equivalent forms must not count as independent terms"
+            vec![
+                "\"develop\"".to_string(),
+                "\"development\"".to_string(),
+                "\"alpha\"".to_string(),
+            ],
+            "distinct source terms must be left for SQLite to tokenize"
+        );
+        assert_eq!(
+            fts_terms("sky skies"),
+            vec!["\"sky\"".to_string(), "\"skies\"".to_string()]
+        );
+        assert_eq!(
+            fts_terms("skies sky"),
+            vec!["\"skies\"".to_string(), "\"sky\"".to_string()]
         );
         let many = (0..100)
             .map(|n| format!("term{n}"))
@@ -2197,156 +2263,93 @@ mod tests {
     }
 
     #[test]
-    fn fts_broadening_is_a_distinct_second_stage() {
+    fn fts_query_is_strict_only() {
         assert_eq!(
             fts_strict_query("capital gains tax"),
             "\"capital\" \"gains\" \"tax\""
         );
-        assert_eq!(
-            fts_broad_query("capital gains tax").as_deref(),
-            Some("\"capital\" OR \"gains\" OR \"tax\"")
-        );
-        let corroborated = fts_corroborated_query("capital gains tax").expect("relaxed query");
-        assert!(corroborated.contains(" AND "));
-        assert_ne!(corroborated, "\"capital\" OR \"gains\" OR \"tax\"");
-        assert!(fts_corroborated_query("develop development alpha").is_none());
+        assert!(!fts_strict_query("capital gains tax").contains(" OR "));
     }
 
     #[test]
-    fn broad_fallback_requires_corroboration_but_keeps_every_term_pair() -> Result<()> {
-        let conn = lexical_source_fixture()?;
+    fn strict_search_never_falls_back_to_any_two_terms() -> Result<()> {
+        let legal = lexical_source_fixture()?;
         let source: SourceId = "frl".parse()?;
+        let lexical = build_lexical_fixture(&legal, &source)?;
         let filter = unrestricted_filter(&source);
 
-        let hits = lexical_search(&conn, &source, "alpha beta gamma", &filter, 10)?;
+        let hits = lexical_search(&lexical, &source, "alpha beta gamma", &filter, 10)?;
         assert_eq!(
             hits.iter().map(|hit| hit.chunk_id).collect::<Vec<_>>(),
-            vec![100],
-            "the non-adjacent alpha/gamma pair should survive, while singleton and other-source postings must not"
+            vec![103],
+            "only the strict all-term match may survive"
         );
 
-        let short_query_hits = lexical_search(&conn, &source, "alpha beta", &filter, 10)?;
+        let short_query_hits = lexical_search(&lexical, &source, "alpha delta", &filter, 10)?;
         assert!(
             short_query_hits.is_empty(),
-            "two-term chunk search must not degrade to a one-term posting scan"
+            "strict search must not broaden when it has too few results"
         );
         Ok(())
     }
 
     #[test]
-    fn source_rowid_ranges_allow_gaps_but_fail_closed_on_interleaving() -> Result<()> {
-        let conn = Connection::open_in_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE chunks(chunk_id INTEGER PRIMARY KEY, source_id TEXT NOT NULL);
-             CREATE VIRTUAL TABLE title_fts USING fts5(
-                 source_id UNINDEXED, native_id UNINDEXED, title, headings
-             );
-             INSERT INTO chunks VALUES (1, 'ato'), (2, 'ato');
-             INSERT INTO title_fts(rowid, source_id, native_id, title, headings) VALUES
-                 (1, 'ato', 'a', 'alpha', ''),
-                 (2, 'ato', 'b', 'beta', '');",
-        )?;
-        assert_eq!(
-            load_chunk_rowid_range(&conn, &source())?,
-            Some(RowidRange { first: 1, last: 2 })
-        );
-        assert_eq!(
-            load_title_rowid_range(&conn, &source())?,
-            Some(RowidRange { first: 1, last: 2 })
-        );
+    fn sqlite_porter_strict_terms_are_order_independent() -> Result<()> {
+        let legal = lexical_source_fixture()?;
+        let source: SourceId = "frl".parse()?;
+        let lexical = build_lexical_fixture(&legal, &source)?;
+        let filter = unrestricted_filter(&source);
 
-        conn.execute("UPDATE chunks SET chunk_id = 3 WHERE chunk_id = 2", [])?;
-        assert_eq!(
-            load_chunk_rowid_range(&conn, &source())?,
-            Some(RowidRange { first: 1, last: 3 })
-        );
-        conn.execute("INSERT INTO chunks VALUES (2, 'frl')", [])?;
-        let chunk_error = load_chunk_rowid_range(&conn, &source()).unwrap_err();
-        assert!(chunk_error.to_string().contains("one isolated range"));
-
-        conn.execute_batch(
-            "INSERT INTO title_fts(rowid, source_id, native_id, title, headings) VALUES
-                 (3, 'frl', 'c', 'gamma', ''),
-                 (4, 'ato', 'd', 'delta', '');",
-        )?;
-        let title_error = load_title_rowid_range(&conn, &source()).unwrap_err();
-        assert!(title_error.to_string().contains("one isolated range"));
+        for query in ["sky skies", "skies sky"] {
+            let hits = lexical_search(&lexical, &source, query, &filter, 10)?;
+            assert_eq!(
+                hits.iter().map(|hit| hit.chunk_id).collect::<Vec<_>>(),
+                vec![104],
+                "strict SQLite Porter matching changed with query order for `{query}`"
+            );
+        }
         Ok(())
     }
 
     #[test]
-    fn document_chunk_rowid_range_is_exact_and_fails_closed_on_interleaving() -> Result<()> {
-        let conn = Connection::open_in_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE documents(
-                 source_id TEXT NOT NULL,
-                 native_id TEXT NOT NULL,
-                 PRIMARY KEY (source_id, native_id)
-             );
-             CREATE TABLE chunks(
-                 chunk_id INTEGER PRIMARY KEY,
-                 source_id TEXT NOT NULL,
-                 native_id TEXT NOT NULL
-             );
-             INSERT INTO documents VALUES
-                 ('ato', 'Document-A'),
-                 ('ato', 'Document-B');
-             INSERT INTO chunks VALUES
-                 (10, 'ato', 'Document-A'),
-                 (12, 'ato', 'Document-A'),
-                 (20, 'ato', 'Document-B');",
-        )?;
-        assert_eq!(
-            load_document_chunk_rowid_range(&conn, &source(), "Document-A")?,
-            Some(RowidRange {
-                first: 10,
-                last: 12
-            })
-        );
-        let source_range = Some(RowidRange {
-            first: 10,
-            last: 20,
-        });
-        assert_eq!(
-            scoped_chunk_rowid_range(&conn, &source(), "document-a", source_range)?,
-            Some(RowidRange {
-                first: 10,
-                last: 12
-            })
-        );
-        assert_eq!(
-            scoped_chunk_rowid_range(&conn, &source(), "Document-*", source_range)?,
-            source_range
-        );
-        assert_eq!(
-            scoped_chunk_rowid_range(&conn, &source(), "Document-%", source_range)?,
-            source_range
-        );
-        assert_eq!(
-            scoped_chunk_rowid_range(&conn, &source(), "missing", source_range)?,
-            None
-        );
-
-        conn.execute("INSERT INTO chunks VALUES (11, 'frl', 'foreign')", [])?;
-        let error = load_document_chunk_rowid_range(&conn, &source(), "Document-A").unwrap_err();
-        assert!(error.to_string().contains("one isolated range"));
+    fn candidate_ranking_metadata_is_sidecar_only_and_unknown_ids_fail() -> Result<()> {
+        let legal = lexical_source_fixture()?;
+        let source: SourceId = "frl".parse()?;
+        let lexical = build_lexical_fixture(&legal, &source)?;
+        drop(legal);
+        let ranked = vec![VectorHit {
+            chunk_id: 103,
+            score: 1.0,
+        }];
+        let metadata = load_candidate_meta(&lexical, &source, &ranked)?;
+        assert_eq!(metadata[&103].document.native_id, "frl-103");
+        assert!(metadata[&103].is_intro);
+        assert!(load_candidate_meta(
+            &lexical,
+            &source,
+            &[VectorHit {
+                chunk_id: 999,
+                score: 1.0,
+            }],
+        )
+        .is_err());
         Ok(())
     }
 
     #[test]
-    fn exact_and_glob_document_scopes_preserve_lexical_results() -> Result<()> {
-        let conn = lexical_source_fixture()?;
+    fn exact_casefolded_and_wildcard_scopes_preserve_lexical_results() -> Result<()> {
+        let legal = lexical_source_fixture()?;
         let source = source();
-        let source_range = load_chunk_rowid_range(&conn, &source)?;
+        let lexical = build_lexical_fixture(&legal, &source)?;
 
         let cases = [
-            ("ATO-1", vec![1]),
+            ("ato-1", vec![1]),
             ("ATO-*", vec![1, 2, 3]),
             ("ATO-%", vec![1, 2, 3]),
             ("missing", Vec::new()),
         ];
         for (scope, expected) in cases {
-            let filter = build_doc_filter(
+            let filter = build_lexical_doc_filter(
                 "d",
                 DocumentFilterSpec {
                     source_id: &source,
@@ -2358,9 +2361,15 @@ mod tests {
                     current_only: false,
                 },
             );
-            let range = scoped_chunk_rowid_range(&conn, &source, scope, source_range)?;
-            let hits =
-                lexical_search_in_range(&conn, &source, "alpha beta gamma", &filter, 10, range)?;
+            let bounds = scoped_lexical_bounds(&lexical, Some(scope))?;
+            let hits = lexical_search_in_range(
+                &lexical,
+                &source,
+                "alpha beta gamma",
+                &filter,
+                10,
+                bounds,
+            )?;
             assert_eq!(
                 hits.into_iter().map(|hit| hit.chunk_id).collect::<Vec<_>>(),
                 expected,
@@ -2370,39 +2379,316 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn fts_query_plans_apply_rowid_bounds_inside_both_virtual_tables() -> Result<()> {
-        let conn = Connection::open_in_memory()?;
-        init_db(&conn)?;
-        let source: SourceId = "frl".parse()?;
-        let filter = unrestricted_filter(&source);
-        let where_filter = format!(" AND {}", filter.sql);
-
-        for (alias, query) in [
-            ("f", lexical_search_stage_sql(&where_filter)),
-            ("t", title_search_stage_sql(&where_filter)),
+    fn filtered_fixture() -> Result<(Connection, Connection, SourceId)> {
+        let legal = Connection::open_in_memory()?;
+        init_db(&legal)?;
+        legal.execute(
+            "INSERT INTO sources(source_id, display_name) VALUES ('ato', 'ATO')",
+            [],
+        )?;
+        for (chunk_id, native_id, document_type, date, withdrawn, superseded_by) in [
+            (1_i64, "PAC/OLD", "PAC", "1990-01-01", None, None),
+            (2, "EV/NEW", "EV", "2025-01-01", None, None),
+            (3, "TXR/OLD", "TXR", "1990-01-01", None, None),
+            (4, "TXR/CURRENT", "TXR", "2025-02-01", None, None),
+            (
+                5,
+                "TXR/WITHDRAWN",
+                "TXR",
+                "2025-03-01",
+                Some("2026-01-01"),
+                None,
+            ),
+            (
+                6,
+                "TXR/SUPERSEDED",
+                "TXR",
+                "2025-04-01",
+                None,
+                Some("TXR/CURRENT"),
+            ),
         ] {
-            let explain = format!("EXPLAIN QUERY PLAN {query}");
-            let mut values = vec![
-                Value::Text("alpha".to_string()),
-                Value::Integer(100),
-                Value::Integer(200),
-            ];
-            values.extend(filter.params.clone());
-            values.push(Value::Integer(10));
-            let mut statement = conn.prepare(&explain)?;
-            let plan = statement
-                .query_map(params_from_iter(values), |row| row.get::<_, String>(3))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let fts_step = plan
-                .iter()
-                .find(|step| step.contains("VIRTUAL TABLE"))
-                .unwrap_or_else(|| panic!("missing FTS step in plan: {plan:?}"));
-            assert!(
-                fts_step.starts_with(&format!("SCAN {alias} ")) && fts_step.contains("><"),
-                "FTS rowid bounds were not consumed by the virtual table: {plan:?}"
-            );
+            legal.execute(
+                "INSERT INTO documents(
+                     source_id, native_id, type, title, date, canonical_url,
+                     downloaded_at, content_hash, html, withdrawn_date, superseded_by
+                 ) VALUES ('ato', ?1, ?2, ?1, ?3, ?4,
+                           '2026-01-01T00:00:00Z', ?1, X'00', ?5, ?6)",
+                params![
+                    native_id,
+                    document_type,
+                    date,
+                    format!("https://example.invalid/{native_id}"),
+                    withdrawn,
+                    superseded_by,
+                ],
+            )?;
+            legal.execute(
+                "INSERT INTO chunks(chunk_id, source_id, native_id, ord, text)
+                 VALUES (?1, 'ato', ?2, 0, ?3)",
+                params![chunk_id, native_id, compress_text("needle")?],
+            )?;
         }
+        let source = source();
+        let lexical = crate::lexical::test_sidecar_connection(&legal, &source)?;
+        Ok((legal, lexical, source))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assert_filter_exact(
+        legal: &Connection,
+        lexical: &Connection,
+        source_id: &SourceId,
+        types: Option<&[String]>,
+        date_from: Option<&str>,
+        date_to: Option<&str>,
+        doc_scope: Option<&str>,
+        include_old: bool,
+        current_only: bool,
+    ) -> Result<()> {
+        let corpus_filter = build_doc_filter(
+            "d",
+            DocumentFilterSpec {
+                source_id,
+                types,
+                date_from,
+                date_to,
+                doc_scope,
+                include_old,
+                current_only,
+            },
+        );
+        let lexical_filter = build_lexical_doc_filter(
+            "d",
+            DocumentFilterSpec {
+                source_id,
+                types,
+                date_from,
+                date_to,
+                doc_scope,
+                include_old,
+                current_only,
+            },
+        );
+        let sql = format!(
+            "SELECT c.chunk_id
+             FROM chunks AS c
+             JOIN documents AS d
+               ON d.source_id=c.source_id AND d.native_id=c.native_id
+             WHERE {}
+             ORDER BY c.chunk_id",
+            corpus_filter.sql
+        );
+        let mut statement = legal.prepare(&sql)?;
+        let expected = statement
+            .query_map(params_from_iter(corpus_filter.params), |row| {
+                row.get::<_, i64>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let bounds = scoped_lexical_bounds(lexical, doc_scope)?;
+        let actual =
+            lexical_search_in_range(lexical, source_id, "needle", &lexical_filter, 100, bounds)?
+                .into_iter()
+                .map(|hit| hit.chunk_id)
+                .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn lexical_filters_exactly_match_authoritative_document_semantics() -> Result<()> {
+        let (legal, lexical, source) = filtered_fixture()?;
+        assert_filter_exact(
+            &legal, &lexical, &source, None, None, None, None, false, true,
+        )?;
+        let empty: Vec<String> = Vec::new();
+        assert_filter_exact(
+            &legal,
+            &lexical,
+            &source,
+            Some(&empty),
+            None,
+            None,
+            None,
+            false,
+            true,
+        )?;
+        let ev = vec!["EV".to_string()];
+        assert_filter_exact(
+            &legal,
+            &lexical,
+            &source,
+            Some(&ev),
+            None,
+            None,
+            None,
+            false,
+            true,
+        )?;
+        assert_filter_exact(
+            &legal, &lexical, &source, None, None, None, None, true, true,
+        )?;
+        assert_filter_exact(
+            &legal, &lexical, &source, None, None, None, None, true, false,
+        )?;
+        let exact = vec!["TXR".to_string()];
+        assert_filter_exact(
+            &legal,
+            &lexical,
+            &source,
+            Some(&exact),
+            None,
+            None,
+            None,
+            true,
+            false,
+        )?;
+        let glob = vec!["T*".to_string()];
+        assert_filter_exact(
+            &legal,
+            &lexical,
+            &source,
+            Some(&glob),
+            None,
+            None,
+            None,
+            true,
+            false,
+        )?;
+        let literal_percent = vec!["T%*".to_string()];
+        assert_filter_exact(
+            &legal,
+            &lexical,
+            &source,
+            Some(&literal_percent),
+            None,
+            None,
+            None,
+            true,
+            false,
+        )?;
+        assert_filter_exact(
+            &legal,
+            &lexical,
+            &source,
+            None,
+            Some("2025-01-15"),
+            Some("2025-12-31"),
+            None,
+            false,
+            false,
+        )?;
+        for scope in ["txr/current", "txr/*", "txr/%"] {
+            assert_filter_exact(
+                &legal,
+                &lexical,
+                &source,
+                None,
+                None,
+                None,
+                Some(scope),
+                false,
+                true,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn filtered_chunk_ids(
+        lexical: &Connection,
+        source: &SourceId,
+        types: Option<&[String]>,
+        date_from: Option<&str>,
+        include_old: bool,
+        current_only: bool,
+    ) -> Result<Vec<i64>> {
+        let filter = build_lexical_doc_filter(
+            "d",
+            DocumentFilterSpec {
+                source_id: source,
+                types,
+                date_from,
+                date_to: None,
+                doc_scope: None,
+                include_old,
+                current_only,
+            },
+        );
+        Ok(lexical_search_in_range(
+            lexical,
+            source,
+            "needle",
+            &filter,
+            100,
+            LexicalBounds::Unbounded,
+        )?
+        .into_iter()
+        .map(|hit| hit.chunk_id)
+        .collect())
+    }
+
+    #[test]
+    fn ato_default_old_private_advice_and_current_policies_are_exact() -> Result<()> {
+        let (_legal, lexical, source) = filtered_fixture()?;
+        assert_eq!(
+            filtered_chunk_ids(&lexical, &source, None, None, false, true)?,
+            vec![1, 4]
+        );
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(
+            filtered_chunk_ids(&lexical, &source, Some(&empty), None, false, true)?,
+            vec![1, 4]
+        );
+        assert_eq!(
+            filtered_chunk_ids(&lexical, &source, None, Some("1990-01-01"), false, false,)?,
+            vec![1, 4, 5, 6]
+        );
+        assert_eq!(
+            filtered_chunk_ids(&lexical, &source, None, None, true, false)?,
+            vec![1, 3, 4, 5, 6]
+        );
+        let edited_private_advice = vec!["EV".to_string()];
+        assert_eq!(
+            filtered_chunk_ids(
+                &lexical,
+                &source,
+                Some(&edited_private_advice),
+                None,
+                false,
+                true,
+            )?,
+            vec![2]
+        );
+        let literal_percent = vec!["T%*".to_string()];
+        assert!(
+            filtered_chunk_ids(&lexical, &source, Some(&literal_percent), None, true, false,)?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn chunk_fts_query_plan_consumes_exact_document_bounds() -> Result<()> {
+        let legal = lexical_source_fixture()?;
+        let source: SourceId = "frl".parse()?;
+        let conn = build_lexical_fixture(&legal, &source)?;
+        let filter = unrestricted_filter(&source);
+        let query = lexical_search_stage_sql("", true);
+        let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {query}"))?;
+        let plan = statement
+            .query_map(params!["alpha", 100_i64, 103_i64, 10_i64], |row| {
+                row.get::<_, String>(3)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let fts_step = plan
+            .iter()
+            .find(|step| step.contains("VIRTUAL TABLE"))
+            .unwrap_or_else(|| panic!("missing FTS step in plan: {plan:?}"));
+        assert!(
+            fts_step.starts_with("SCAN f ") && fts_step.contains("><"),
+            "FTS rowid bounds were not consumed by the virtual table: {plan:?}"
+        );
+        assert!(filter.sql.is_empty());
         Ok(())
     }
 

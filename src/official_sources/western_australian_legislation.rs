@@ -22,6 +22,10 @@ impl OfficialAdapter for WesternAustralianLegislation {
         }
     }
 
+    fn normalization_revision(&self) -> Option<&'static str> {
+        Some("1")
+    }
+
     fn discover(
         &self,
         client: &OfficialHttpClient,

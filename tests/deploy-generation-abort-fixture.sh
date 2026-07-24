@@ -107,6 +107,22 @@ if grep -Fq "activate $generation" "$ssh_log"; then
   exit 1
 fi
 
+# Pair transitions use the ordinary restricted prepare and rsync path, then
+# deliberately leave activation to the privileged pair coordinator.
+: > "$ssh_log"
+export FIXTURE_RSYNC_STATUS=0
+unset FIXTURE_ACTIVATE_STATUS
+output="$(LEGAL_MCP_DATA_DIR="$runtime" LEGAL_MCP_BINARY="$fixture_root/legal-mcp" \
+  "$DEPLOY" --host legal-mcp-publisher@fixture.example --prepare-only)"
+[[ "$output" = "prepared and uploaded generation $generation on legal-mcp-publisher@fixture.example; activation remains pending" ]]
+grep -Fq "legal-mcp-publisher@fixture.example prepare $generation" "$ssh_log"
+grep -Fq 'rsync:' "$ssh_log"
+if grep -Fq "activate $generation" "$ssh_log" \
+  || grep -Fq "abort $generation" "$ssh_log"; then
+  echo 'prepare-only transport invoked activation or abort' >&2
+  exit 1
+fi
+
 # A lost or failed activation response also remains an explicit recovery
 # decision and never triggers abort automatically.
 : > "$ssh_log"

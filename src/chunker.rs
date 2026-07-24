@@ -1,10 +1,11 @@
-//! Block-aware chunker. Walks cleaned ATO HTML into atomic blocks, renders
-//! each to plaintext with markdown markers, then greedily packs blocks into
-//! chunks bounded by `max_tokens` while preserving document order.
+//! Block-aware chunker. Walks cleaned structural HTML into atomic blocks,
+//! renders each to plaintext with markdown markers, then greedily packs blocks
+//! into chunks bounded by `max_tokens` while preserving document order.
 
 use crate::config::tokenizer_path;
-use crate::html::{collect_referenced_anchors, render_node};
+use crate::html::{collect_referenced_anchors, push_anchor_marker, render_node};
 use crate::{DOCUMENT_EMBEDDING_PREFIX, EMBEDDING_INPUT_MAX_TOKENS};
+use legal_model::{is_canonical_public_component, AssetRef, DocumentId};
 use regex::Regex;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -14,14 +15,14 @@ use tokenizers::Tokenizer;
 
 // ----- Block-aware chunking -----
 //
-// Cleaned ATO HTML becomes a flat list of atomic blocks, each rendered as
-// plaintext with markdown markers and greedily packed within `max_tokens`.
+// Cleaned structural HTML becomes a flat list of atomic blocks, each rendered
+// as plaintext with markdown markers and greedily packed within `max_tokens`.
 // The public helpers expose HTML rendering, token estimation, and the stable
 // intermediate block and chunk shapes used by the build pipeline.
 
 // Checkpoints pin CHUNKER_FORMAT_VERSION; changing output shape
 // forces an explicit fresh build instead of resuming stale chunk records.
-pub(crate) const CHUNKER_FORMAT_VERSION: u32 = 6;
+pub(crate) const CHUNKER_FORMAT_VERSION: u32 = 9;
 pub(crate) const EMBED_MAX_TOKENS: usize = EMBEDDING_INPUT_MAX_TOKENS;
 
 #[derive(Debug, Clone, Serialize)]
@@ -34,6 +35,9 @@ pub(crate) struct Chunk {
     pub(crate) token_count: usize,
     #[serde(skip)]
     pub(crate) embedding_token_ids: Option<Vec<i64>>,
+    /// Context repeated if exact tokenizer enforcement splits this chunk.
+    #[serde(skip)]
+    heading_context: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,9 +46,10 @@ pub(crate) struct ChunkBlock {
     pub(crate) definition_text: String,
     pub(crate) anchor: Option<String>,
     pub(crate) is_oversize_table: bool,
-    /// Set when the block is an oversize table — needed by chunker_split
-    /// to walk rows in table-row-split mode.
-    pub(crate) table_html: Option<String>,
+    /// Present only until pending headings are attached to substantive content.
+    heading_level: Option<usize>,
+    /// Heading text repeated when this block must be split.
+    heading_context: Option<String>,
 }
 
 pub(crate) fn chunker_approx_tokens(text: &str) -> usize {
@@ -100,6 +105,14 @@ pub(crate) fn chunker_first_referenced_anchor(
     node: scraper::ElementRef,
     referenced: &std::collections::HashSet<String>,
 ) -> Option<String> {
+    if let Some(anchor) = node
+        .value()
+        .attr("name")
+        .or_else(|| node.value().attr("id"))
+        .filter(|anchor| referenced.contains(*anchor))
+    {
+        return Some(anchor.to_string());
+    }
     for el in node.descendants() {
         if let Some(eref) = scraper::ElementRef::wrap(el) {
             let val = eref.value();
@@ -245,7 +258,21 @@ pub(crate) fn chunker_render_table_text(
     for row in table.select(&row_sel) {
         let cells: Vec<String> = row
             .select(&cell_sel)
-            .map(|cell| chunker_normalise_text(&chunker_render_inline(cell, referenced)))
+            .map(|cell| {
+                let mut text = chunker_render_inline(cell, referenced);
+                if let Some(anchor) = cell
+                    .value()
+                    .attr("name")
+                    .or_else(|| cell.value().attr("id"))
+                    .filter(|anchor| referenced.contains(*anchor))
+                {
+                    if !text.is_empty() {
+                        text.push(' ');
+                    }
+                    push_anchor_marker(&mut text, anchor);
+                }
+                chunker_normalise_text(&text)
+            })
             .filter(|c| !c.is_empty())
             .collect();
         if !cells.is_empty() {
@@ -320,17 +347,13 @@ pub(crate) fn chunker_render_block(
     }
     let anchor = chunker_first_referenced_anchor(node, referenced);
     let is_oversize_table = tag == "table" && chunker_approx_tokens(&text) > EMBED_MAX_TOKENS;
-    let table_html = if is_oversize_table {
-        Some(node.html())
-    } else {
-        None
-    };
     Some(ChunkBlock {
         text: text.clone(),
         definition_text: text,
         anchor,
         is_oversize_table,
-        table_html,
+        heading_level: None,
+        heading_context: None,
     })
 }
 
@@ -369,7 +392,8 @@ pub(crate) fn chunker_render_dt_dd_pair(
         definition_text: rendered,
         anchor,
         is_oversize_table: false,
-        table_html: None,
+        heading_level: None,
+        heading_context: None,
     })
 }
 
@@ -413,9 +437,19 @@ pub(crate) fn chunker_walk(
             idx += if dd.is_some() { 2 } else { 1 };
             continue;
         }
-        // Headings render as their own block with markdown level marker.
+        // Preserve a text-only heading's level and order until the first
+        // substantive block is available. Some official pages contain
+        // invalid heading elements wrapped around structural content such as
+        // a table of contents list. Walk that content as ordinary blocks;
+        // flattening the entire subtree into repeated heading context can
+        // consume the complete embedding budget before any body text.
         if HEADING_TAGS.contains(&tag) {
             chunker_flush_inline(&mut inline_parts, &mut inline_anchors, blocks);
+            if chunker_has_structural_child(eref) {
+                chunker_walk(eref, blocks, referenced, root_title);
+                idx += 1;
+                continue;
+            }
             let inner = chunker_render_inline(eref, referenced);
             let heading_text = chunker_normalise_text(&inner);
             if !heading_text.is_empty() && !chunker_is_root_title_echo(&heading_text, root_title) {
@@ -427,7 +461,8 @@ pub(crate) fn chunker_walk(
                     definition_text: rendered,
                     anchor,
                     is_oversize_table: false,
-                    table_html: None,
+                    heading_level: Some(level),
+                    heading_context: None,
                 });
             }
             idx += 1;
@@ -448,8 +483,10 @@ pub(crate) fn chunker_walk(
             idx += 1;
             continue;
         }
-        // Pure inline element — accumulate.
-        let rendered = chunker_render_inline(eref, referenced);
+        // Pure inline element — render the element itself so wrapper-owned
+        // document, asset, anchor, and emphasis markers are retained.
+        let mut rendered = String::new();
+        render_node(child, &mut rendered, referenced);
         if !rendered.is_empty() {
             inline_parts.push(rendered);
         }
@@ -475,11 +512,54 @@ pub(crate) fn chunker_flush_inline(
             definition_text: text,
             anchor,
             is_oversize_table: false,
-            table_html: None,
+            heading_level: None,
+            heading_context: None,
         });
     }
     inline_parts.clear();
     inline_anchors.clear();
+}
+
+fn chunker_attach_pending_headings(blocks: Vec<ChunkBlock>) -> Vec<ChunkBlock> {
+    let mut output = Vec::with_capacity(blocks.len());
+    let mut pending = Vec::new();
+
+    for mut block in blocks {
+        if block.heading_level.is_some() {
+            pending.push(block);
+            continue;
+        }
+        if pending.is_empty() {
+            output.push(block);
+            continue;
+        }
+
+        let context = pending
+            .iter()
+            .map(|heading| heading.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let definition_context = pending
+            .iter()
+            .map(|heading| heading.definition_text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let heading_anchor = pending.iter().find_map(|heading| heading.anchor.clone());
+        block.text = format!("{context}\n\n{}", block.text);
+        block.definition_text = format!("{definition_context}\n\n{}", block.definition_text);
+        block.anchor = heading_anchor.or(block.anchor);
+        block.heading_context = Some(context);
+        output.push(block);
+        pending.clear();
+    }
+
+    // A document ending in headings has no body to carry them. Preserve those
+    // headings as ordinary blocks rather than dropping source text.
+    for mut heading in pending {
+        heading.heading_level = None;
+        output.push(heading);
+    }
+    output
 }
 
 /// Split an oversize block into pieces that each fit within max_tokens.
@@ -491,19 +571,66 @@ pub(crate) fn chunker_split_oversize_block(
     block: &ChunkBlock,
     max_tokens: usize,
 ) -> Vec<(String, String)> {
+    let (body_text, body_definition, body_max_tokens) =
+        if let Some(context) = block.heading_context.as_deref() {
+            let prefix = format!("{context}\n\n");
+            let body_text = block
+                .text
+                .strip_prefix(&prefix)
+                .expect("heading context must prefix chunk block text");
+            let body_definition = block
+                .definition_text
+                .strip_prefix(&prefix)
+                .expect("heading context must prefix definition text");
+            let context_words = context.split_whitespace().count();
+            let max_total_words = (0..=max_tokens)
+                .rev()
+                .find(|words| ((*words as f64) * 1.3) as usize <= max_tokens)
+                .unwrap_or(0);
+            let body_words = max_total_words.saturating_sub(context_words).max(1);
+            let body_max_tokens = std::cmp::max(1, ((body_words as f64) * 1.3) as usize);
+            (body_text, body_definition, body_max_tokens)
+        } else {
+            (
+                block.text.as_str(),
+                block.definition_text.as_str(),
+                max_tokens,
+            )
+        };
+
+    let pieces = chunker_split_oversize_body(block, body_text, body_definition, body_max_tokens);
+    if let Some(context) = block.heading_context.as_deref() {
+        pieces
+            .into_iter()
+            .map(|(text, definition)| {
+                (
+                    format!("{context}\n\n{text}"),
+                    format!("{context}\n\n{definition}"),
+                )
+            })
+            .collect()
+    } else {
+        pieces
+    }
+}
+
+fn chunker_split_oversize_body(
+    block: &ChunkBlock,
+    body_text: &str,
+    body_definition: &str,
+    max_tokens: usize,
+) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     if block.is_oversize_table {
-        if let Some(html) = block.table_html.as_deref() {
-            for (piece, defn) in chunker_table_row_split(html, max_tokens) {
-                for p in chunker_enforce_max_tokens(&piece, &defn, max_tokens) {
-                    out.push(p);
-                }
+        for (piece, defn) in chunker_table_text_split(body_text, max_tokens) {
+            for p in chunker_enforce_max_tokens(&piece, &defn, max_tokens) {
+                out.push(p);
             }
-            return out;
         }
+        return out;
     }
     // Prose: sentence-split, greedy-pack.
-    let sentences = chunker_sentence_split(&block.text);
+    let sentences = chunker_sentence_split(body_text);
     let mut buf: Vec<String> = Vec::new();
     let mut buf_tokens: usize = 0;
     for s in sentences {
@@ -522,7 +649,12 @@ pub(crate) fn chunker_split_oversize_block(
     }
     if !buf.is_empty() {
         let piece = buf.join(" ");
-        for p in chunker_enforce_max_tokens(&piece, &piece, max_tokens) {
+        let definition = if piece == body_text {
+            body_definition
+        } else {
+            &piece
+        };
+        for p in chunker_enforce_max_tokens(&piece, definition, max_tokens) {
             out.push(p);
         }
     }
@@ -537,42 +669,55 @@ pub(crate) fn chunker_enforce_max_tokens(
     if chunker_approx_tokens(text) <= max_tokens {
         return vec![(text.to_string(), definition_text.to_string())];
     }
-    let words: Vec<&str> = text.split_whitespace().collect();
     let target_words = std::cmp::max(1, ((max_tokens as f64) / 1.4) as usize);
     let mut out: Vec<(String, String)> = Vec::new();
-    let mut i = 0;
-    while i < words.len() {
-        let end = std::cmp::min(i + target_words, words.len());
-        let piece = words[i..end].join(" ");
+    let mut remaining = text.trim();
+    while !remaining.is_empty() {
+        let words = chunker_word_spans(remaining);
+        if words.len() <= target_words {
+            out.push((remaining.to_string(), remaining.to_string()));
+            break;
+        }
+        let candidate = words[target_words - 1].end;
+        let split = chunker_typed_marker_spans(remaining)
+            .into_iter()
+            .find(|marker| marker.start < candidate && candidate < marker.end)
+            .map_or(candidate, |marker| {
+                if marker.start > 0 {
+                    marker.start
+                } else {
+                    marker.end
+                }
+            });
+        let piece = remaining[..split].trim_end().to_string();
+        if piece.is_empty() {
+            break;
+        }
         out.push((piece.clone(), piece));
-        i = end;
+        remaining = remaining[split..].trim_start();
     }
     out
 }
 
-pub(crate) fn chunker_table_row_split(
-    table_html: &str,
-    max_tokens: usize,
-) -> Vec<(String, String)> {
-    let frag = scraper::Html::parse_fragment(table_html);
-    let row_sel = scraper::Selector::parse("tr").unwrap();
-    let cell_sel = scraper::Selector::parse("th, td").unwrap();
-    let referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut rows: Vec<String> = Vec::new();
-    for row in frag.select(&row_sel) {
-        let cells: Vec<String> = row
-            .select(&cell_sel)
-            .map(|c| chunker_normalise_text(&chunker_render_inline(c, &referenced)))
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !cells.is_empty() {
-            rows.push(cells.join(" | "));
-        }
-    }
+fn chunker_word_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+    static WORD_RE: OnceLock<Regex> = OnceLock::new();
+    WORD_RE
+        .get_or_init(|| Regex::new(r"\S+").expect("valid word regex"))
+        .find_iter(text)
+        .map(|word| word.start()..word.end())
+        .collect()
+}
+
+fn chunker_table_text_split(table_text: &str, max_tokens: usize) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut buf: Vec<String> = Vec::new();
     let mut buf_tokens: usize = 0;
-    for row in rows {
+    for row in table_text
+        .lines()
+        .map(str::trim)
+        .filter(|row| !row.is_empty())
+    {
+        let row = row.to_string();
         let row_tokens = chunker_approx_tokens(&row);
         if !buf.is_empty() && buf_tokens + row_tokens > max_tokens {
             let piece = buf.join("\n");
@@ -630,17 +775,20 @@ pub(crate) fn chunker_sentence_split(text: &str) -> Vec<String> {
 /// sentences, or word-window
 /// fallback) so every emitted chunk fits the budget.
 pub(crate) fn chunker_pack(blocks: Vec<ChunkBlock>, max_tokens: usize) -> Vec<Chunk> {
+    let blocks = chunker_attach_pending_headings(blocks);
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut ord_counter: i64 = 0;
     let mut current_text: Vec<String> = Vec::new();
     let mut current_def: Vec<String> = Vec::new();
     let mut current_words: usize = 0;
     let mut current_anchor: Option<String> = None;
+    let mut current_heading_context: Option<String> = None;
 
     let flush = |current_text: &mut Vec<String>,
                  current_def: &mut Vec<String>,
                  current_words: &mut usize,
                  current_anchor: &mut Option<String>,
+                 current_heading_context: &mut Option<String>,
                  ord_counter: &mut i64,
                  chunks: &mut Vec<Chunk>| {
         if current_text.is_empty() {
@@ -659,6 +807,7 @@ pub(crate) fn chunker_pack(blocks: Vec<ChunkBlock>, max_tokens: usize) -> Vec<Ch
             },
             token_count: 0,
             embedding_token_ids: None,
+            heading_context: current_heading_context.take(),
         });
         *ord_counter += 1;
         current_text.clear();
@@ -667,6 +816,17 @@ pub(crate) fn chunker_pack(blocks: Vec<ChunkBlock>, max_tokens: usize) -> Vec<Ch
     };
 
     for block in blocks {
+        if block.heading_context.is_some() && !current_text.is_empty() {
+            flush(
+                &mut current_text,
+                &mut current_def,
+                &mut current_words,
+                &mut current_anchor,
+                &mut current_heading_context,
+                &mut ord_counter,
+                &mut chunks,
+            );
+        }
         let block_words = block.text.split_whitespace().count();
         let block_tokens = std::cmp::max(1, ((block_words as f64) * 1.3) as usize);
         if block_tokens > max_tokens {
@@ -675,6 +835,7 @@ pub(crate) fn chunker_pack(blocks: Vec<ChunkBlock>, max_tokens: usize) -> Vec<Ch
                 &mut current_def,
                 &mut current_words,
                 &mut current_anchor,
+                &mut current_heading_context,
                 &mut ord_counter,
                 &mut chunks,
             );
@@ -687,6 +848,7 @@ pub(crate) fn chunker_pack(blocks: Vec<ChunkBlock>, max_tokens: usize) -> Vec<Ch
                     definition_text: if defn != text { Some(defn) } else { None },
                     token_count: 0,
                     embedding_token_ids: None,
+                    heading_context: block.heading_context.clone(),
                 });
                 ord_counter += 1;
             }
@@ -702,6 +864,7 @@ pub(crate) fn chunker_pack(blocks: Vec<ChunkBlock>, max_tokens: usize) -> Vec<Ch
                 &mut current_def,
                 &mut current_words,
                 &mut current_anchor,
+                &mut current_heading_context,
                 &mut ord_counter,
                 &mut chunks,
             );
@@ -712,18 +875,23 @@ pub(crate) fn chunker_pack(blocks: Vec<ChunkBlock>, max_tokens: usize) -> Vec<Ch
         if current_anchor.is_none() && block.anchor.is_some() {
             current_anchor = block.anchor;
         }
+        if current_heading_context.is_none() {
+            current_heading_context = block.heading_context;
+        }
     }
     flush(
         &mut current_text,
         &mut current_def,
         &mut current_words,
         &mut current_anchor,
+        &mut current_heading_context,
         &mut ord_counter,
         &mut chunks,
     );
     chunks
 }
 
+#[cfg(test)]
 fn chunker_enforce_final_token_limit<F>(
     chunks: Vec<Chunk>,
     max_tokens: usize,
@@ -769,35 +937,84 @@ where
             continue;
         }
 
+        let heading_context = chunk.heading_context.clone();
+        let candidate_heading_prefix = heading_context
+            .as_deref()
+            .map(|context| format!("{context}\n\n"));
+        let attached_body = candidate_heading_prefix.as_deref().map(|prefix| {
+            chunk
+                .text
+                .strip_prefix(prefix)
+                .expect("heading context must prefix chunk text")
+        });
+        // Repeating heading context is useful only when at least one body
+        // character fits beside it. If that is mathematically impossible,
+        // split the complete heading-plus-body stream instead. This keeps the
+        // chunker total and preserves all source text for arbitrarily long
+        // valid headings.
+        let repeat_heading = match (candidate_heading_prefix.as_deref(), attached_body) {
+            (Some(prefix), Some(body)) => match body.chars().next() {
+                Some(first) => {
+                    let first_end = first.len_utf8();
+                    let first_fits = prefixed_tokens(&format!("{prefix}{}", &body[..first_end]))?.0
+                        <= max_tokens;
+                    let mut markers_fit = true;
+                    for marker in chunker_typed_marker_spans(body) {
+                        if prefixed_tokens(&format!("{prefix}{}", &body[marker]))?.0 > max_tokens {
+                            markers_fit = false;
+                            break;
+                        }
+                    }
+                    first_fits && markers_fit
+                }
+                None => false,
+            },
+            _ => false,
+        };
+        let heading_prefix = repeat_heading
+            .then(|| candidate_heading_prefix.clone())
+            .flatten();
+        let output_heading_context = repeat_heading.then(|| heading_context.clone()).flatten();
         let mut pieces = Vec::new();
-        let mut remaining = chunk.text.as_str();
+        let mut remaining = if repeat_heading {
+            attached_body.expect("repeated heading has an attached body")
+        } else {
+            chunk.text.as_str()
+        };
+        let with_heading = |text: &str| {
+            heading_prefix
+                .as_deref()
+                .map_or_else(|| text.to_string(), |prefix| format!("{prefix}{text}"))
+        };
         while !remaining.is_empty() {
-            let (remaining_count, remaining_ids) = prefixed_tokens(remaining)?;
+            let remaining_text = with_heading(remaining);
+            let (remaining_count, remaining_ids) = prefixed_tokens(&remaining_text)?;
             if remaining_count <= max_tokens {
-                pieces.push((remaining.to_string(), remaining_count, remaining_ids));
+                pieces.push((remaining_text, remaining_count, remaining_ids));
                 break;
             }
-            let boundaries = remaining
-                .char_indices()
-                .map(|(index, _)| index)
-                .skip(1)
-                .chain(std::iter::once(remaining.len()))
-                .collect::<Vec<_>>();
+            let boundaries = chunker_safe_split_boundaries(remaining);
             let mut low = 0usize;
             let mut high = boundaries.len();
             while low < high {
                 let mid = low + (high - low) / 2;
-                if prefixed_tokens(&remaining[..boundaries[mid]])?.0 <= max_tokens {
+                if prefixed_tokens(&with_heading(&remaining[..boundaries[mid]]))?.0 <= max_tokens {
                     low = mid + 1;
                 } else {
                     high = mid;
                 }
             }
             if low == 0 {
+                if chunker_typed_marker_spans(remaining)
+                    .first()
+                    .is_some_and(|marker| marker.start == 0)
+                {
+                    anyhow::bail!("a typed marker exceeds the tokenizer limit");
+                }
                 anyhow::bail!("a single character exceeds the tokenizer limit");
             }
             let split = boundaries[low - 1];
-            let piece = remaining[..split].to_string();
+            let piece = with_heading(&remaining[..split]);
             let (piece_count, piece_ids) = prefixed_tokens(&piece)?;
             pieces.push((piece, piece_count, piece_ids));
             remaining = &remaining[split..];
@@ -813,6 +1030,7 @@ where
                     .flatten(),
                 token_count,
                 embedding_token_ids: token_ids,
+                heading_context: output_heading_context.clone(),
             });
         }
     }
@@ -822,41 +1040,117 @@ where
     Ok(output)
 }
 
-fn chunker_apply_live_tokenizer_limit(chunks: Vec<Chunk>, max_tokens: usize) -> Vec<Chunk> {
+fn chunker_typed_marker_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+    const PREFIXES: &[&str] = &["[anchor:", "[asset:", "[doc:", "[fetch:"];
+    let mut spans = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < text.len() {
+        let Some(relative_start) = text[cursor..].find('[') else {
+            break;
+        };
+        let start = cursor + relative_start;
+        let Some(prefix) = PREFIXES
+            .iter()
+            .find(|prefix| text[start..].starts_with(**prefix))
+        else {
+            cursor = start + 1;
+            continue;
+        };
+        let value_start = start + prefix.len();
+        let Some(relative_end) = text[value_start..].find(']') else {
+            cursor = start + 1;
+            continue;
+        };
+        let end = value_start + relative_end + 1;
+        let value = &text[value_start..end - 1];
+        let valid = match *prefix {
+            "[anchor:" => is_canonical_public_component(value),
+            "[asset:" => value.parse::<AssetRef>().is_ok(),
+            "[doc:" if value.len() <= 512 => {
+                let identity_end = value
+                    .char_indices()
+                    .find(|(_, character)| character.is_whitespace() || *character == '@')
+                    .map_or(value.len(), |(index, _)| index);
+                value[..identity_end].parse::<DocumentId>().is_ok()
+            }
+            "[fetch:" => crate::uri::parse_doc_uri(value).is_ok(),
+            _ => false,
+        };
+        if valid && end - start <= 600 {
+            spans.push(start..end);
+        }
+        cursor = end;
+    }
+    spans
+}
+
+fn chunker_safe_split_boundaries(text: &str) -> Vec<usize> {
+    let protected = chunker_typed_marker_spans(text);
+    let mut protected_index = 0usize;
+    let mut output = Vec::new();
+    for boundary in text
+        .char_indices()
+        .map(|(index, _)| index)
+        .skip(1)
+        .chain(std::iter::once(text.len()))
+    {
+        while protected
+            .get(protected_index)
+            .is_some_and(|span| span.end <= boundary)
+        {
+            protected_index += 1;
+        }
+        if protected
+            .get(protected_index)
+            .is_none_or(|span| !(span.start < boundary && boundary < span.end))
+        {
+            output.push(boundary);
+        }
+    }
+    output
+}
+
+fn chunker_apply_live_tokenizer_limit(
+    chunks: Vec<Chunk>,
+    max_tokens: usize,
+) -> anyhow::Result<Vec<Chunk>> {
     let Ok(path) = tokenizer_path() else {
-        return chunks;
+        return Ok(chunks);
     };
     static TOKENIZERS: OnceLock<Mutex<HashMap<PathBuf, Arc<Tokenizer>>>> = OnceLock::new();
     let cache = TOKENIZERS.get_or_init(|| Mutex::new(HashMap::new()));
     let tokenizer = {
-        let Ok(mut cache) = cache.lock() else {
-            return chunks;
-        };
+        let mut cache = cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("tokenizer cache lock is poisoned"))?;
         if let Some(tokenizer) = cache.get(&path) {
             Arc::clone(tokenizer)
         } else {
-            let Ok(mut tokenizer) = Tokenizer::from_file(&path) else {
-                return chunks;
-            };
-            if tokenizer.with_truncation(None).is_err() {
-                return chunks;
-            }
+            let mut tokenizer = Tokenizer::from_file(&path)
+                .map_err(|error| anyhow::anyhow!("loading installed tokenizer: {error}"))?;
+            tokenizer
+                .with_truncation(None)
+                .map_err(|error| anyhow::anyhow!("disabling tokenizer truncation: {error}"))?;
             tokenizer.with_padding(None);
             let tokenizer = Arc::new(tokenizer);
             cache.insert(path, Arc::clone(&tokenizer));
             tokenizer
         }
     };
-    chunker_enforce_final_token_limit(chunks, max_tokens, |text| {
-        tokenizer
+    chunker_enforce_final_token_limit_result(chunks, max_tokens, |text| {
+        Ok(tokenizer
             .encode(text, true)
-            .expect("installed tokenizer failed to encode chunk text")
+            .map_err(|error| anyhow::anyhow!("installed tokenizer failed: {error}"))?
             .get_ids()
-            .len()
+            .len())
     })
 }
 
-pub(crate) fn chunk_html(html: &str, root_title: Option<&str>, max_tokens: usize) -> Vec<Chunk> {
+pub(crate) fn chunk_html(
+    html: &str,
+    root_title: Option<&str>,
+    max_tokens: usize,
+) -> anyhow::Result<Vec<Chunk>> {
     let chunks = chunk_html_packed(html, root_title, max_tokens);
     chunker_apply_live_tokenizer_limit(chunks, max_tokens)
 }
@@ -932,7 +1226,347 @@ fn chunk_fragment_packed(
 
 #[cfg(test)]
 mod tests {
-    use super::{chunker_enforce_final_token_limit, Chunk};
+    use super::{
+        chunk_fragment_with_prepared_tokens, chunk_html_packed, chunk_html_with_token_count,
+        chunker_enforce_final_token_limit, chunker_normalise_text, Chunk, CHUNKER_FORMAT_VERSION,
+    };
+
+    #[test]
+    fn heading_and_first_substantive_body_are_one_chunk() {
+        let chunks = chunk_html_packed(
+            "<h2 id='rule'>Application rule</h2><p>The rule applies to every applicant.</p>",
+            None,
+            64,
+        );
+
+        assert_eq!(CHUNKER_FORMAT_VERSION, 9);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].text,
+            "## Application rule\n\nThe rule applies to every applicant."
+        );
+        assert_eq!(chunks[0].anchor.as_deref(), Some("rule"));
+        assert_ne!(chunks[0].text, "## Application rule");
+    }
+
+    #[test]
+    fn consecutive_headings_keep_levels_and_source_order() {
+        let chunks = chunk_html_packed(
+            "<section><h2>Part 2</h2><div><h3>Division 4</h3>\
+             <article><h4>18 Eligibility</h4><p>A person is eligible when the criteria are met.</p>\
+             </article></div></section>",
+            None,
+            64,
+        );
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].text,
+            "## Part 2\n\n### Division 4\n\n#### 18 Eligibility\n\n\
+             A person is eligible when the criteria are met."
+        );
+    }
+
+    #[test]
+    fn same_level_headings_are_not_dropped_or_reordered() {
+        let chunks = chunk_html_packed(
+            "<h2>Schedule 1</h2><h2>Amendment 3</h2><p>Insert the following text.</p>",
+            None,
+            64,
+        );
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].text,
+            "## Schedule 1\n\n## Amendment 3\n\nInsert the following text."
+        );
+    }
+
+    #[test]
+    fn empty_blocks_do_not_consume_pending_headings() {
+        let chunks = chunk_html_packed(
+            "<h3>Operative provision</h3><p>  </p><div>\n</div><p>Substantive text.</p>",
+            None,
+            64,
+        );
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].text,
+            "### Operative provision\n\nSubstantive text."
+        );
+    }
+
+    #[test]
+    fn approximate_oversize_continuations_repeat_heading_context() {
+        let context = "## Section 18";
+        let body = "one two three four five six seven eight nine ten eleven twelve";
+        let chunks = chunk_html_packed(&format!("<h2>Section 18</h2><p>{body}</p>"), None, 8);
+
+        assert!(chunks.len() > 1);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.text.starts_with(&format!("{context}\n\n"))));
+        assert!(chunks.iter().all(|chunk| chunk.text != context));
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.text.strip_prefix(&format!("{context}\n\n")).unwrap())
+                .collect::<Vec<_>>()
+                .join(" "),
+            body
+        );
+    }
+
+    #[test]
+    fn exact_tokenizer_continuations_repeat_context_in_text_and_embedding_input() {
+        let html = scraper::Html::parse_fragment("<h2>Scope</h2><p>café naïve résumé wording</p>");
+        let chunks = chunk_fragment_with_prepared_tokens(&html, None, 20, |text| {
+            Ok((
+                text.chars().count(),
+                Some(text.bytes().map(i64::from).collect()),
+            ))
+        })
+        .unwrap();
+        let prefix = "## Scope\n\n";
+
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|chunk| {
+            chunk.text.starts_with(prefix)
+                && chunk.token_count <= 20
+                && chunk.embedding_token_ids.as_ref().unwrap()
+                    == &chunk.text.bytes().map(i64::from).collect::<Vec<_>>()
+        }));
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.text.strip_prefix(prefix).unwrap())
+                .collect::<String>(),
+            "café naïve résumé wording"
+        );
+    }
+
+    #[test]
+    fn oversize_table_rows_repeat_heading_context() {
+        let rows = (0..100)
+            .map(|index| format!("<tr><td>row {index} alpha beta gamma</td></tr>"))
+            .collect::<String>();
+        let chunks = chunk_html_packed(
+            &format!("<h3>Rates table</h3><table>{rows}</table>"),
+            None,
+            30,
+        );
+        let prefix = "### Rates table\n\n";
+
+        assert!(chunks.len() > 1);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.text.starts_with(prefix) && chunk.text.contains("row ")));
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.text.strip_prefix(prefix).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            (0..100)
+                .map(|index| format!("row {index} alpha beta gamma"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    #[test]
+    fn documents_without_headings_keep_existing_packing() {
+        let chunks = chunk_html_packed(
+            "<p>alpha beta</p><p>gamma delta</p><p>epsilon zeta</p>",
+            None,
+            5,
+        );
+
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha beta\n\ngamma delta", "epsilon zeta"]
+        );
+        assert!(chunks.iter().all(|chunk| chunk.heading_context.is_none()));
+    }
+
+    #[test]
+    fn trailing_heading_is_preserved_when_no_body_follows() {
+        let chunks = chunk_html_packed("<p>Body.</p><h2>Appendix</h2>", None, 64);
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "Body.\n\n## Appendix");
+    }
+
+    #[test]
+    fn root_title_echo_does_not_create_heading_context() {
+        let chunks = chunk_html_packed(
+            "<h1>Example title</h1><p>Body.</p>",
+            Some(" example TITLE "),
+            64,
+        );
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "Body.");
+        assert!(chunks[0].heading_context.is_none());
+    }
+
+    #[test]
+    fn structural_content_nested_in_a_heading_is_not_repeated_as_context() {
+        let items = (0..80)
+            .map(|index| format!("<li><a href='#part-{index}'>Part {index}</a></li>"))
+            .collect::<String>();
+        let chunks = chunk_html_packed(
+            &format!("<h3><ul>{items}</ul></h3><p>Operative body.</p>"),
+            None,
+            24,
+        );
+        let text = chunks
+            .iter()
+            .map(|chunk| chunk.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(chunks.len() > 1);
+        assert!(!text.contains("### Part"));
+        assert_eq!(text.matches("Part 0").count(), 1);
+        assert_eq!(text.matches("Part 79").count(), 1);
+        assert_eq!(text.matches("Operative body.").count(), 1);
+        assert!(chunks.iter().all(|chunk| chunk.heading_context.is_none()));
+    }
+
+    #[test]
+    fn overlong_heading_context_falls_back_to_a_lossless_stream() {
+        let expected = "## ABCDEFGHIJKL\n\nbody";
+        let chunks =
+            chunk_html_with_token_count("<h2>ABCDEFGHIJKL</h2><p>body</p>", None, 8, |text| {
+                Ok(text.chars().count())
+            })
+            .unwrap();
+
+        assert!(chunks.len() > 1);
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.text.as_str())
+                .collect::<String>(),
+            expected
+        );
+        assert!(chunks.iter().all(|chunk| chunk.token_count <= 8));
+        assert!(chunks.iter().all(|chunk| chunk.heading_context.is_none()));
+    }
+
+    #[test]
+    fn exact_tokenizer_split_keeps_typed_asset_markers_atomic() {
+        let asset = "frl:C2004A05138/sha256-481f9ff2a748417d3d70eabbe16af8e25190263f069f56b4596904cbdd809c29";
+        let marker = format!("[asset:{asset}]");
+        let html = format!(
+            "<p>{} <img data-asset-ref='{asset}' alt='formula'> {}</p>",
+            "before ".repeat(12),
+            "after ".repeat(12)
+        );
+        let expected = chunker_normalise_text(&format!(
+            "{} [image: formula] {marker} {}",
+            "before ".repeat(12),
+            "after ".repeat(12)
+        ));
+        let chunks =
+            chunk_html_with_token_count(&html, None, 160, |text| Ok(text.chars().count())).unwrap();
+        let joined = chunks
+            .iter()
+            .map(|chunk| chunk.text.as_str())
+            .collect::<String>();
+
+        assert!(chunks.len() > 1);
+        assert_eq!(joined, expected);
+        assert_eq!(joined.matches(&marker).count(), 1);
+        assert!(chunks.iter().any(|chunk| chunk.text.contains(&marker)));
+        assert!(chunks
+            .iter()
+            .all(|chunk| { !chunk.text.contains("[asset:") || chunk.text.contains(&marker) }));
+        assert!(chunks.iter().all(|chunk| chunk.token_count <= 160));
+    }
+
+    #[test]
+    fn approximate_split_keeps_qualified_document_markers_atomic() {
+        let html = format!(
+            "<p>{}<a data-doc-id='ato:PAC/X' data-view='HISTFT'>ref</a>{}</p>",
+            "a ".repeat(363),
+            " b".repeat(32)
+        );
+        let chunks = chunk_html_packed(&html, None, 512);
+        let marker = "[doc:ato:PAC/X view=HISTFT]";
+        let rendered = chunks
+            .iter()
+            .map(|chunk| chunk.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(chunks.len() > 1);
+        assert_eq!(rendered.matches(marker).count(), 1);
+        assert!(!rendered.contains("[doc:ato:PAC/X view= HISTFT]"));
+        assert!(chunks.iter().any(|chunk| chunk.text.contains(marker)));
+    }
+
+    #[test]
+    fn direct_inline_wrappers_retain_typed_markers() {
+        let chunks = chunk_html_packed(
+            "<a data-doc-id='ato:PAC/X'>document</a>\
+             <img data-asset-ref='frl:C1/image.png' alt='formula'>",
+            None,
+            64,
+        );
+        let rendered = chunks
+            .iter()
+            .map(|chunk| chunk.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("document [doc:ato:PAC/X]"));
+        assert!(rendered.contains("[image: formula] [asset:frl:C1/image.png]"));
+    }
+
+    #[test]
+    fn oversize_table_split_retains_referenced_anchor_markers() {
+        let rows = (0..30)
+            .map(|index| {
+                if index == 17 {
+                    "<tr><td id='target'>target row alpha beta gamma</td></tr>".to_string()
+                } else {
+                    format!("<tr><td>row {index} alpha beta gamma</td></tr>")
+                }
+            })
+            .collect::<String>();
+        let chunks = chunk_html_packed(
+            &format!("<p><a href='#target'>jump</a></p><table>{rows}</table>"),
+            None,
+            24,
+        );
+        let rendered = chunks
+            .iter()
+            .map(|chunk| chunk.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(rendered.matches("[anchor:target]").count(), 1);
+    }
+
+    #[test]
+    fn tokenizer_boundary_keeps_heading_attached_to_body() {
+        let chunks =
+            chunk_html_with_token_count("<h2>Rule</h2><p>1234567890</p>", None, 14, |text| {
+                Ok(text.chars().count())
+            })
+            .unwrap();
+
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.text.starts_with("## Rule\n\n")));
+        assert!(chunks.iter().all(|chunk| chunk.text != "## Rule"));
+    }
 
     #[test]
     fn final_limit_uses_tokenizer_counts_including_the_embedding_prefix() {
@@ -943,6 +1577,7 @@ mod tests {
             definition_text: Some("different".to_string()),
             token_count: 0,
             embedding_token_ids: None,
+            heading_context: None,
         }];
         let chunks = chunker_enforce_final_token_limit(chunks, 5, |text| text.len());
 
@@ -976,6 +1611,7 @@ mod tests {
             definition_text: None,
             token_count: 0,
             embedding_token_ids: None,
+            heading_context: None,
         }];
         let chunks = chunker_enforce_final_token_limit(chunks, 3, |text| text.len());
         assert_eq!(chunks.len(), 1);

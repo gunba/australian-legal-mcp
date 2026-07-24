@@ -23,7 +23,7 @@ NoNewPrivileges=true
 HealthCmd=/usr/local/bin/legal-mcp healthcheck --port 51235
 HealthInterval=30s
 HealthTimeout=10s
-HealthStartPeriod=120s
+HealthStartPeriod=300s
 HealthRetries=3
 HealthOnFailure=kill
 PodmanArgs=--cpus=3.5 --pids-limit=256 --memory=6g --memory-swap=6g --ulimit=nofile=65536:65536
@@ -32,7 +32,7 @@ PodmanArgs=--cpus=3.5 --pids-limit=256 --memory=6g --memory-swap=6g --ulimit=nof
 ExecCondition=/usr/local/libexec/legal-mcp/host-tool-launcher --check-auth-ready
 Restart=on-failure
 RestartSec=5s
-TimeoutStartSec=180s
+TimeoutStartSec=600s
 TimeoutStopSec=45s
 LimitNOFILE=65536
 LimitCORE=0

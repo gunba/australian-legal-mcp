@@ -14,6 +14,10 @@ Arroy v20
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3`
 is the sole hosted rollback generation.
 
+Unreleased version 0.20.0 accepts schema 12 only and must not replace the
+live binary until a fresh generation with all ten `lexical/<source>.db`
+sidecars has passed strict local and one-shot image validation.
+
 Private/public HarbourGrid, exact public routes,
 all-seven-tool/all-ten-source retrieval, live empty capability sets, reboot
 recovery, and key revocation passed after cutover. Current client key IDs are
@@ -46,8 +50,90 @@ sudo /usr/local/sbin/legal-mcp-update-image \
   < /path/to/current-probe-key
 ```
 
-The completed v0.19.8 compatibility bridge is absent from v0.19.11. Its only
-valid implementation remains the retained immutable v0.19.10 bundle.
+## Schema-12 pair cutover and rollback
+
+Version 0.20/schema 12 is an incompatible image/generation transition. Never
+activate its prepared generation with the v0.19.11 image and never update the
+image while schema 11 is active. The installed v0.20 updater provides one
+generic, crash-safe pair transaction for that boundary.
+
+Build and strictly verify the complete schema-12 generation locally. Stage it
+without ordinary activation:
+
+```bash
+scripts/deploy-generation.sh \
+  --host legal-mcp-publisher@HOST \
+  --prepare-only
+```
+
+Then install the v0.20 host tools from the exact immutable release bundle. Use
+`--from-public` when the host is public; host-tool upgrade closes ingress and
+does not reopen it:
+
+```bash
+sudo /var/lib/legal-mcp-release/v0.20.0/infra/linode/install-host.sh \
+  --upgrade-host-tools --version 0.20.0 --from-public
+```
+
+While the ordinary prepared-upload journal remains intact, bind that exact
+generation to the target image digest and release template:
+
+```bash
+sudo /usr/local/sbin/legal-mcp-update-image --pair-cutover \
+  --generation SCHEMA12_GENERATION \
+  --expected-current-generation 937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939 \
+  --image ghcr.io/gunba/australian-legal-mcp@sha256:V020_DIGEST \
+  --version 0.20.0 \
+  --template /var/lib/legal-mcp-release/v0.20.0/infra/hosting/legal-mcp.container.template \
+  < /path/to/current-probe-key
+```
+
+If current v0.20 host tools are already public, this command also needs
+`--from-public`. The flag grants authority to darken only. The coordinator
+locks the whole host, preserves the configured authentication files, seals the
+upload, verifies each generation in an isolated lifecycle with its matching
+digest-pinned image, and proves the target on loopback before making the pair
+decision durable. Its temporary container retains the production UID/GID,
+read-only root, `no-new-privileges`, dropped capabilities, loopback publishing,
+and read-only `nodev,nosuid,noexec` data/model mounts. It never publishes Caddy
+or UFW and always finishes configured-dark.
+
+Explicitly republish only after reviewing the completed pair:
+
+```bash
+sudo /usr/local/sbin/legal-mcp-configure-auth --recover \
+  < /path/to/current-probe-key
+```
+
+Hosted activation never prunes generations automatically. Do not manually prune
+the installed v0.19.11 schema-11 generation. Retain its exact digest-pinned
+image and release template. They form the rollback pair. To move
+back from schema 12, use the reverse operation, adding `--from-public` when
+needed:
+
+```bash
+sudo /usr/local/sbin/legal-mcp-update-image --pair-rollback --from-public \
+  --generation 937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939 \
+  --expected-current-generation SCHEMA12_GENERATION \
+  --image ghcr.io/gunba/australian-legal-mcp@sha256:43be03afbdd78c509053200d0f61b35a1519e9d95f303b917f8023f4ae2a7470 \
+  --version 0.19.11 \
+  --template /var/lib/legal-mcp-release/v0.19.11/infra/hosting/legal-mcp.container.template \
+  < /path/to/current-probe-key
+```
+
+Explicitly recover authentication after rollback. A killed transition is
+resumed only through:
+
+```bash
+sudo /usr/local/sbin/legal-mcp-update-image --recover --pair-cutover \
+  < /path/to/current-probe-key
+```
+
+Recovery restores both prior members before the durable decision or completes
+both target members after it, then remains dark. Missing, altered, replayed, or
+unrecognised pair state is rejected rather than guessed. Outside the pair
+transaction, the ordinary same-schema prepare/activate/abort, image,
+authentication, and bootstrap routes keep their existing contracts.
 
 The same image and mounted-generation contract can later run on an Azure VM.
 Azure-specific work is retained in [docs/AZURE_FUTURE.md](docs/AZURE_FUTURE.md),
@@ -79,10 +165,11 @@ The image contains:
 - ONNX Runtime 1.25.0, `libgomp`, C/C++ runtime libraries, and CA certificates;
 - a fixed unprivileged `971:971` runtime identity.
 
-`model.onnx`, `tokenizer.json`, `legal.db`, and the ten ANN sidecars remain part
-of each complete immutable generation on the corpus volume. They are data/model
-artifacts, not image dependencies. `data/`, `release/`, `target/`, and `Temp/`
-are excluded from both Docker and OCI build contexts.
+`model.onnx`, `tokenizer.json`, `legal.db`, the ten ANN sidecars, and the ten
+lexical sidecars remain part of each complete immutable schema-12 generation on
+the corpus volume. They are data/model artifacts, not image dependencies.
+`data/`, `release/`, `target/`, and `Temp/` are excluded from both Docker and
+OCI build contexts.
 
 The long-running service container uses a read-only root filesystem, drops
 every capability, sets `no-new-privileges`, bounds memory/PIDs/files, has no
@@ -152,7 +239,7 @@ sha256sum --check SHA256SUMS
 Immutable v0.19.11 exists at commit
 `893b06c20e5fc2f33ca7633e636023ccb5762745`; its checksums, attestation, labels,
 and hardened runtime were independently verified before deployment. Historical
-v0.18.1, v0.19.0, v0.19.2, v0.19.8, and v0.19.10 evidence remains labelled with
+v0.18.1, v0.19.0, v0.19.2, and v0.19.10 evidence remains labelled with
 the software that produced it.
 
 Verify the attestation before deployment:
@@ -300,7 +387,7 @@ authorization or corpus/image transaction.
 The current host's one known unversioned v0.19.2 authentication journal was
 successfully recovered before the V2 upgrade. The following command is retained
 only as historical recovery procedure for that exact legacy state; do not run
-it on the current V2 host. The v0.19.8 transaction is retired:
+it on the current V2 host:
 
 ```bash
 sudo infra/hosting/configure-auth.sh --recover
@@ -509,76 +596,6 @@ sudo /path/to/the-same-release-bundle/infra/hosting/update-image.sh --recover \
 Retain that version-matched release bundle until the transaction has completed;
 its recovery code owns the transaction format. Never deploy by tag, mutate a running container, or install native libraries
 into it.
-
-### One-time Arroy-v20 to flat-int8 cutover
-
-The hard sidecar-format transition is not an ordinary image update or publisher
-activation. First leave the fully uploaded flat-int8 generation in the exact
-`prepared` corpus deployment transaction. Then, from the same release whose V2
-host tools are installed, invoke the one root/admin operation (stream a valid
-probe key on standard input when the configured mode contains `api-key`):
-
-```bash
-sudo /usr/local/sbin/legal-mcp-update-image --flat-int8-cutover \
-  --generation TARGET_FLAT_GENERATION \
-  --expected-current-generation a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3 \
-  --image ghcr.io/gunba/australian-legal-mcp@sha256:TARGET_DIGEST \
-  --version X.Y.Z \
-  --template /path/to/exact-release/infra/hosting/legal-mcp.container.template
-```
-
-The launcher holds `/run/lock/legal-mcp-host-transaction.lock`, rejects foreign
-auth/image/host-tool work, verifies the exact release, labels, digest, template,
-Arroy prior and flat target, then makes auth-ready, service, and ingress dark
-before changing either member of the pair. The publisher has no cutover or
-image operation. Do not run its ordinary `activate` command for this prepared
-generation.
-
-After interruption or reboot, do not delete or edit either journal. Re-enter
-the same installed launcher; it deterministically finishes a fully proved
-commit or restores and proves the prior generation plus image/template pair
-before reopening ingress:
-
-```bash
-sudo /usr/local/sbin/legal-mcp-update-image \
-  --recover --flat-int8-cutover
-```
-
-Before the durable target decision, rollback also restores the flat generation's
-ordinary prepared upload, journal, ownership, and upload authorization. After
-that decision, recovery can only finish the target pair.
-
-One immutable v0.19.8 transaction can remain pending after Podman 4.9 reports
-`EffectiveCaps=null`. The v0.19.9 bridge failed closed before transaction
-mutation because production `/run` is `noexec`. V0.19.10 retains that source
-mount policy and marks only the two adapter file binds executable inside its
-private mount namespace. Recover only the exact transaction from the complete,
-independently verified v0.19.10 Linux bundle, streaming the existing API probe
-key on standard input:
-
-```bash
-sudo /path/to/v0.19.10/infra/linode/install-host.sh \
-  --recover-v0198-flat-int8 --version 0.19.10 \
-  < /root/one-time-probe-key
-```
-
-The bridge validates the exact v0.19.8 host tools, generations, image pins,
-rollback journal, and configured-dark boundary. In a private mount namespace it
-runs the unchanged v0.19.8 stable launcher and updater. Every Podman operation
-is delegated unchanged except the incompatible `EffectiveCaps` query, which is
-answered only after `podman top` proves empty bounding, effective, inheritable,
-and permitted sets for every process. It never edits the cutover journal or
-installed tool bytes. It resumes partial retirement deletion, recreates only
-the exact volatile upload authorization from the durable prepared journal after
-a reboot, and re-enters the old launcher even after transaction deletion so
-stale dispatch/permit state is retired. After it restores and retires the
-saved-pair transaction, upgrade host tools normally to v0.19.10; that upgrade
-preserves the active-prior plus ordinary-prepared-v22 state. Then restart the
-cutover with the v0.19.10 digest. Rerun the same bridge after interruption; never
-remove its state by hand.
-
-The hosted v0.19.8 attempt exercised automatic rollback and left the exact
-saved pair configured-dark for this recovery path.
 
 ## 8. Verification and operations
 

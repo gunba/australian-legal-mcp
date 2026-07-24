@@ -16,21 +16,20 @@ non-replaceable release is created. Linux requires glibc 2.27+; Windows requires
 the Microsoft Visual C++ 2015–2022 Redistributable. Publish and independently
 verify `SHA256SUMS` for every archive.
 
-The software tree is version 0.19.11. Immutable v0.19.11 release assets, OCI
-digest, labels, runtime, and attestation were independently verified and are
-live. V0.19.11 adds document-scoped FTS narrowing and a public-route-aware
-HarbourGrid probe; it does not change the corpus. Its host-tool contract
-advanced normally to v0.19.11 and removes the completed one-time bridge surface;
-only the retained immutable v0.19.10 bundle owns that historical recovery. The
-one-time
-compatibility bridge kept production `/run` `noexec`, made only its two private
-adapter file binds executable inside the recovery mount namespace, proved the
-bounding, effective, inheritable, and permitted sets through `podman top`, and
-let the unchanged v0.19.8 updater retire its own journal. Exact v0.19.10 host
-tools then committed the paired flat-int8 v22/image cutover and retired their
-journal. The service is public through authenticated Caddy routes, v22 is
-active, Arroy v20 is the sole hosted rollback, and all four live capability sets
-remain empty.
+The deployed software release is version 0.19.11. Immutable v0.19.11 release
+assets, OCI digest, labels, runtime, and attestation were independently verified
+and are live. V0.19.11 adds document-scoped FTS narrowing and a
+public-route-aware HarbourGrid probe; it does not change the corpus. Its
+host-tool contract
+advanced normally to v0.19.11. The service is public through authenticated
+Caddy routes, v22 is active, Arroy v20 is the sole hosted rollback, and all four
+live capability sets remain empty.
+
+Unreleased version 0.20.0 accepts schema 12 only. It requires ten
+manifest-bound lexical SQLite sidecars and a payload-only `legal.db`. Do not
+deploy it through an ordinary image-only or generation-only operation against
+the live schema-11 pair. Build and validate a fresh complete generation, then
+use the explicit pair transition below.
 
 ## Canonical local data
 
@@ -177,24 +176,8 @@ rebuild. `LEGAL_MCP_EMBEDDING_CACHE_DB` may point to a completed matching-schema
 DB; only exact `(model_id, chunk_text_sha256)` vectors are reused. This is
 disposable acceleration, never authoritative state.
 
-For the one schema-10 to schema-11 cutover, derive rather than rebuild:
-
-```bash
-target/release/legal-mcp derive-schema11-from-schema10 \
-  --source-generation-dir "$PWD/data/runtime/generations/1a6beead567b55babebbe253b5ae13efcd9ce2e8ab55b60c2de4106e39f180f4" \
-  --expected-source-generation 1a6beead567b55babebbe253b5ae13efcd9ce2e8ab55b60c2de4106e39f180f4 \
-  --out-dir "$PWD/data/builds/<fresh-schema-11-candidate>"
-```
-
-The projection strictly revalidates the immutable parent, reflinks or copies
-its artifacts, rebuilds only the chunk FTS5 storage as contentless-delete,
-removes the disposable embedding cache, writes `generation.json` last, and
-strictly validates the result. SQLite necessarily performs FTS tokenization of
-the already stored chunk text. The path performs no acquisition, OCR,
-rechunking, model tokenization, model execution, re-embedding, or sidecar rebuild;
-model, tokenizer, and all ten flat sidecars remain byte-identical. The command
-accepts only the current flat format and is not a conversion path for historical
-Arroy generations.
+Schema 12 is a hard cut. There is no schema projection command. Build a fresh
+complete generation from the committed source workspaces before activation.
 
 The script durably journals pending acquisition/build/activation work in
 `data/runs/pending-generation.json`, resumes the same build output, performs
@@ -233,9 +216,95 @@ other command. See [DEPLOYMENT.md](DEPLOYMENT.md) for OpenTofu, volume identity,
 authentication, readiness, rollback, and VPS replacement; see
 [MICROSOFT_COPILOT.md](MICROSOFT_COPILOT.md) for Entra/Copilot.
 
+## Schema-12 image and generation pair transition
+
+An incompatible runtime and generation cannot move independently. The generic
+pair coordinator binds two exact image/generation pairs and validates each
+generation only with its matching digest-pinned image. It does not inspect or
+translate a schema or index format.
+
+First make schema 12 the locally active, strictly verified generation. Upload
+it through the ordinary restricted publisher path without asking the old image
+to activate it:
+
+```bash
+scripts/deploy-generation.sh \
+  --host legal-mcp-publisher@HOST \
+  --prepare-only
+```
+
+Record the 64-character generation ID. Upgrade the host tools from the exact
+v0.20 release bundle. A public host requires explicit authority to close
+ingress; the upgrade remains configured-dark:
+
+```bash
+sudo /var/lib/legal-mcp-release/v0.20.0/infra/linode/install-host.sh \
+  --upgrade-host-tools --version 0.20.0 --from-public
+```
+
+Run the installed privileged coordinator while the prepared upload and its
+ordinary deployment journal are intact:
+
+```bash
+sudo /usr/local/sbin/legal-mcp-update-image --pair-cutover \
+  --generation SCHEMA12_GENERATION \
+  --expected-current-generation 937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939 \
+  --image ghcr.io/gunba/australian-legal-mcp@sha256:V020_DIGEST \
+  --version 0.20.0 \
+  --template /var/lib/legal-mcp-release/v0.20.0/infra/hosting/legal-mcp.container.template \
+  < /path/to/current-probe-key
+```
+
+Omit the input redirection for Entra-only mode. If v0.20 host tools are already
+installed while the service is public, add `--from-public`; without it the
+coordinator refuses to darken a public host. The flag authorises closure only.
+The command never republishes Caddy, UFW, or `auth-ready`.
+
+The coordinator seals the upload, validates it through a read-only temporary
+lifecycle with the target image, switches the pinned image and active pointer,
+proves exact loopback readiness, authentication, mounts, UID/GID, and empty
+capability sets, and commits only after the target pair passes. It leaves the
+v0.19.11 image and schema-11 generation in place as the paired rollback. Hosted
+activation does not prune generations automatically. Keep the immutable
+v0.19.11 release bundle and do not manually prune that generation.
+
+After success, explicitly restore the unchanged configured authentication:
+
+```bash
+sudo /usr/local/sbin/legal-mcp-configure-auth --recover \
+  < /path/to/current-probe-key
+```
+
+Recover a killed or power-interrupted pair operation through the installed
+launcher. Recovery rolls back both members before the durable target decision,
+or finishes both members after it. It always returns configured-dark:
+
+```bash
+sudo /usr/local/sbin/legal-mcp-update-image --recover --pair-cutover \
+  < /path/to/current-probe-key
+```
+
+To return from schema 12 to the retained v0.19.11/schema-11 pair, use the same
+generic machinery with the immutable v0.19.11 bundle and digest. Add
+`--from-public` when starting from the public state:
+
+```bash
+sudo /usr/local/sbin/legal-mcp-update-image --pair-rollback --from-public \
+  --generation 937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939 \
+  --expected-current-generation SCHEMA12_GENERATION \
+  --image ghcr.io/gunba/australian-legal-mcp@sha256:43be03afbdd78c509053200d0f61b35a1519e9d95f303b917f8023f4ae2a7470 \
+  --version 0.19.11 \
+  --template /var/lib/legal-mcp-release/v0.19.11/infra/hosting/legal-mcp.container.template \
+  < /path/to/current-probe-key
+```
+
+Republish authentication explicitly after the rollback. Ordinary same-schema
+prepare, activate, abort, rollback, image, authentication, and bootstrap routes
+remain unchanged outside an active pair transaction.
+
 Flat-int8 v22 is active on the public Linode with exact v0.19.11 host tools and
 runtime image. Arroy v20 is the sole hosted rollback generation; all transaction
-journals and compatibility-adapter residue are absent. All seven tools, all ten
+journals are absent. All seven tools, all ten
 source partitions, formula assets, exact routes, private/public HarbourGrid,
 live empty capability sets, reboot recovery, and API-key revocation passed after
 cutover. Current key IDs are `local-pi` and `work-laptop`; `enterprise-laptop`
@@ -249,18 +318,25 @@ Every generation starts from one complete committed source set. The build:
 2. streams normalization/chunk preparation without loading whole sources;
 3. splits text losslessly and reuses exact model/text vectors;
 4. encodes missing vectors in bounded batches;
-5. derives metadata, links, definitions, citations, and FTS rows;
+5. derives metadata, links, definitions, and citations in `legal.db`;
 6. builds deterministic source-keyed flat int8 sidecars;
-7. clears the disposable embedding cache and finalizes SQLite;
-8. copies and re-verifies pinned model files atomically;
-9. writes `generation.json` last while retaining resumable state until durable;
-10. validates exact registry, DB, model, ANN, FTS, and hash bindings before
+7. clears the disposable embedding cache and finalizes payload-only SQLite;
+8. builds one deterministic source-only lexical SQLite sidecar per source;
+9. copies and re-verifies pinned model files atomically;
+10. writes `generation.json` last while retaining resumable state until durable;
+11. validates exact registry, DB, model, ANN, lexical, filter, FTS, source-text,
+    and hash bindings before
     immutable activation.
 
 Each sidecar has a fixed 4 KiB little-endian header, a sorted u32 chunk-ID
 plane, and an aligned contiguous 256-byte int8 vector plane. One bounded global
 four-thread pool scans eligible rows exactly; SQLite rereads and reranks the
 selected candidates with raw integer dots and chunk-ID tie order.
+
+Each `lexical/<source>.db` contains only document filters, chunk mappings, and
+contentless chunk/title FTS5 tables. Search is strict-only, runs entirely in
+that source sidecar, orders by score descending then chunk ID ascending, and
+hydrates selected winners from `legal.db`.
 
 ## Verification gate
 

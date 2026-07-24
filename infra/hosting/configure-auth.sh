@@ -79,7 +79,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-EXPECTED_HOST_TOOL_VERSION=0.19.11
+EXPECTED_HOST_TOOL_VERSION=0.20.0
 HOST_TOOLS_MARKER=/etc/legal-mcp/host-tools
 IMAGE_FILE=/etc/legal-mcp/image
 RUNTIME_ENV=/etc/legal-mcp/runtime.env
@@ -466,7 +466,7 @@ validate_host_tools_v2() {
     && "${marker[1]}" = "VERSION=$EXPECTED_HOST_TOOL_VERSION" \
     && "${marker[2]}" =~ ^SOURCE_COMMIT=[0-9a-f]{40}$ \
     && "${marker[3]}" =~ ^HOST_DEPLOY_SHA256=([0-9a-f]{64})$ ]] || {
-    echo 'installed V2 host-tool marker is not the exact v0.19.11 contract' >&2
+    echo 'installed V2 host-tool marker is not the exact v0.20.0 contract' >&2
     return 1
   }
   deploy_sha="${BASH_REMATCH[1]}"
@@ -781,7 +781,7 @@ validate_static_v2_host() {
 }
 
 wait_for_generation() {
-  local expected="$1" deadline=$((SECONDS + 180))
+  local expected="$1" deadline=$((SECONDS + 600))
   while (( SECONDS < deadline )); do
     if curl --fail --silent --max-time 5 http://127.0.0.1:51235/readyz 2>/dev/null |
       python3 -c 'import json,sys; value=json.load(sys.stdin); raise SystemExit(0 if value == {"status":"ok","generation":sys.argv[1]} else 1)' \

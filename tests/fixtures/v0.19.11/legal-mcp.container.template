@@ -1,0 +1,41 @@
+[Unit]
+Description=Australian Legal MCP container
+Documentation=https://github.com/gunba/australian-legal-mcp/blob/main/DEPLOYMENT.md
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/srv/legal-mcp
+
+[Container]
+Image=__IMAGE_DIGEST__
+ContainerName=australian-legal-mcp
+User=971:971
+Network=bridge
+PublishPort=127.0.0.1:51235:51235
+EnvironmentFile=/etc/legal-mcp/runtime.env
+Volume=/srv/legal-mcp/generations:/var/lib/legal-mcp/generations:ro,nodev,nosuid,noexec
+Volume=/srv/legal-mcp/lifecycle:/var/lib/legal-mcp/lifecycle:ro,nodev,nosuid,noexec
+Volume=/srv/legal-mcp/state:/var/lib/legal-mcp/state:rw,nodev,nosuid,noexec
+Volume=/etc/legal-mcp/api-keys.json:/run/secrets/legal-mcp-api-keys.json:ro,nodev,nosuid,noexec
+ReadOnly=true
+Tmpfs=/tmp:rw,nodev,nosuid,noexec,size=64m,mode=1777
+DropCapability=all
+NoNewPrivileges=true
+HealthCmd=/usr/local/bin/legal-mcp healthcheck --port 51235
+HealthInterval=30s
+HealthTimeout=10s
+HealthStartPeriod=120s
+HealthRetries=3
+HealthOnFailure=kill
+PodmanArgs=--cpus=3.5 --pids-limit=256 --memory=6g --memory-swap=6g --ulimit=nofile=65536:65536
+
+[Service]
+ExecCondition=/usr/local/libexec/legal-mcp/host-tool-launcher --check-auth-ready
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=180s
+TimeoutStopSec=45s
+LimitNOFILE=65536
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

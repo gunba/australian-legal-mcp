@@ -16,7 +16,7 @@ Entra-governed path into Microsoft 365 Copilot.
   activated under `data/runtime`.
 - The current hosted target is a corpus-free, digest-pinned OCI image on an
   Akamai/Linode VPS. A detachable encrypted XFS/reflink volume is the live
-  SQLite/ANN filesystem.
+  SQLite/ANN/lexical filesystem.
 - A restricted publisher CoW-seeds and rsyncs changed blocks; a one-shot copy of
   the same image validates and activates each generation.
 - Podman publishes the application bridge only on host loopback. Native Caddy
@@ -32,11 +32,15 @@ MCP surface remains exactly `search`, `get_chunks`, `get_asset`,
 
 ## Completed foundation
 
+- Unreleased v0.20.0 uses schema 12: payload-only `legal.db`, one deterministic
+  source-only lexical SQLite sidecar per source, strict-only chunk/title FTS,
+  winner-only payload hydration, exact filter mappings, and manifest-bound
+  corruption checks. Flat-int8 semantic retrieval and exact reranking remain
+  unchanged.
 - Ten official adapters, adaptive acquisition, bounded Federal Chrome CDP,
-  transactional workspaces, strict source quality, schema 11, cleaned HTML,
-  links/assets/definitions, deterministic FTS/vector ranking, and exact flat
-  int8 top-50 equality against SQLite. Schema 11 uses digest-bound
-  contentless-delete chunk FTS.
+  transactional workspaces, strict source quality, cleaned HTML,
+  links/assets/definitions, deterministic lexical/vector ranking, and exact
+  flat-int8 top-50 equality against SQLite.
 - Pinned mdbr-leaf-ir FP32 graph, exact tokenizer, TensorRT FP16/CUDA local build,
   and CPU serving path.
 - Validated/active local chunker-format-6 v22
@@ -48,9 +52,6 @@ MCP surface remains exactly `search`, `get_chunks`, `get_asset`,
   authority, formula, `get_asset`, latency, and loaded-readiness gates. The
   schema-10 v19 parent and matching v0.18.1 binary/image remain the local
   disaster-recovery fallback; the schema-11 binary deliberately rejects it.
-- Added deterministic schema-10 projection. SQLite tokenizes existing text only
-  to rebuild FTS; acquisition, OCR, rechunking, model tokenization/execution,
-  re-embedding, and ANN reconstruction do not run.
 - Removed runtime corpus download/publication/offline-bundle paths.
 - Added immutable activation, strict verification, lifecycle locks, durable
   maintainer resumption, exact-generation readiness, and hardened systemd.
@@ -59,14 +60,7 @@ MCP surface remains exactly `search`, `get_chunks`, `get_asset`,
   transactions, Caddy, API-key plus Entra auth, signed image provenance/SBOM
   policy, RFC 9728 metadata/challenges, and Copilot templates.
 - Added version-matched host-tool upgrade, explicit publisher abort, and
-  fail-closed empty-host image cutover operations for the v20 transition.
-  V0.19.8 transactionally upgrades the historical launcher, detects the live
-  rules through verbose UFW status, removes the exact commented web rules, and
-  adds the configured-dark state required for a coordinated
-  Arroy-image/generation to flat-int8-image/generation cutover. V0.19.10 proves
-  all live process capability sets through Podman and provides an exact bridge
-  that leaves v0.19.8 code immutable while that code retires its journal, retaining
-  recovery after every modelled SIGKILL phase. V0.19.11 narrows exact
+  fail-closed empty-host image cutover operations. V0.19.11 narrows exact
   document-scoped FTS work without changing wildcard/case semantics and makes
   the HarbourGrid evaluator enforce private readiness versus public route
   hiding explicitly.
@@ -111,8 +105,8 @@ HIGH/CRITICAL image findings; Caddy validation; strict disk/mount guards;
 packaged ONNX loading; and a clean offline Linode provider plan. The live
 instance/volume boundary now also proves Ubuntu 24.04, XFS/reflink volume
 adoption and restricted SSH. Exact v0.19.11 host tools and runtime image serve v22;
-Arroy v20 is the sole hosted rollback and every cutover/recovery journal is
-retired. Exact routes, private/public HarbourGrid, all seven tools, all ten
+Arroy v20 is the sole hosted rollback and every deployment journal is retired.
+Exact routes, private/public HarbourGrid, all seven tools, all ten
 sources, live empty capability sets, API-key revocation, and reboot recovery
 passed after cutover.
 
@@ -131,8 +125,7 @@ passed after cutover.
    recovery, API-key overlap and revocation, exact listeners/UFW, TLS, and a
    transaction-free final state.
 5. **Completed:** published and independently verified immutable v0.19.10
-   assets, OCI digest, runtime, labels, and attestation; recovered and retired
-   the exact v0.19.8 transaction without changing old bytes.
+   assets, OCI digest, runtime, labels, and attestation.
 6. **Completed:** upgraded exact host tools, committed the v22/image pair,
    retained v20 as sole rollback, removed all transaction residue, and proved
    private/public HarbourGrid plus all tools and sources.
@@ -196,8 +189,8 @@ disposable caches, Cargo debug/cross/package artifacts, completed acquisition
 attempts, provider downloads, and one-off scratch work. Allocated project usage
 fell from about 300 GiB to about 203 GiB; Btrfs reflink sharing yielded about 23
 GiB of additional filesystem free space. Retain the active v22, v21 rollback
-parent, hosted Arroy v20 rollback, v19 DR corpus, prepared flat-v20 recovery
-copy, canonical sources/models, deployment state, logs, and validation evidence
+parent, hosted Arroy v20 rollback, v19 DR corpus, canonical sources/models,
+deployment state, logs, and validation evidence
 until the corresponding replacement and rollback gates pass. Delete
 no cloud bootstrap/rollback artifact or sole source of source truth or
 validation evidence before those gates pass.

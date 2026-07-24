@@ -39,7 +39,7 @@ BIN="${LEGAL_MCP_BIN:-$REPO_DIR/target/release/legal-mcp}"
 FORCE_REBUILD="${LEGAL_MCP_FORCE_REBUILD:-}"
 
 cd "$REPO_DIR"
-for command_name in flock python3 unrtf antiword soffice pdftotext pdftoppm tesseract; do
+for command_name in flock python3 unrtf antiword soffice bwrap pdftotext pdftoppm tesseract; do
   command -v "$command_name" >/dev/null 2>&1 || { echo "missing command: $command_name" >&2; exit 2; }
 done
 [[ -x "$BIN" ]] || { echo "legal-mcp binary not found at $BIN" >&2; exit 2; }

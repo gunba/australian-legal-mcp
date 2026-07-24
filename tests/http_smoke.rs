@@ -5,7 +5,8 @@
 //! shape. Readiness is deterministic — we read the `legal-mcp listening
 //! on ...` line from stderr before issuing requests.
 
-use std::io::{BufRead, BufReader, Write};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -41,7 +42,50 @@ fn pick_free_port() -> Result<u16> {
 struct Server {
     child: Child,
     url: String,
+    stderr_lines: mpsc::Receiver<String>,
     stderr_thread: Option<JoinHandle<()>>,
+}
+
+impl Server {
+    fn wait_for_json_events(&self, names: &[&str]) -> Result<BTreeMap<String, Value>> {
+        let wanted = names.iter().copied().collect::<BTreeSet<_>>();
+        let mut found = BTreeMap::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while found.len() < wanted.len() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!(
+                    "timed out waiting for structured events: wanted {wanted:?}, found {:?}",
+                    found.keys().collect::<Vec<_>>()
+                ));
+            }
+            let line = match self.stderr_lines.recv_timeout(remaining) {
+                Ok(line) => line,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(anyhow!(
+                        "timed out waiting for structured events: wanted {wanted:?}, found {:?}",
+                        found.keys().collect::<Vec<_>>()
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(anyhow!(
+                        "server log closed while waiting for structured events: wanted {wanted:?}, found {:?}",
+                        found.keys().collect::<Vec<_>>()
+                    ));
+                }
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let Some(event) = value.get("event").and_then(Value::as_str) else {
+                continue;
+            };
+            if wanted.contains(event) {
+                found.insert(event.to_string(), value);
+            }
+        }
+        Ok(found)
+    }
 }
 
 impl Drop for Server {
@@ -191,6 +235,7 @@ fn start_server_once(
     Ok(Server {
         child,
         url,
+        stderr_lines: line_receiver,
         stderr_thread: Some(stderr_thread),
     })
 }
@@ -496,6 +541,200 @@ fn streamable_http_notifications_batches_and_errors_conform() -> Result<()> {
     let parse_error = post_raw(&server.url, "{", Some("application/json"))?;
     let parse_error: Value = serde_json::from_str(&parse_error.body)?;
     assert_eq!(parse_error["error"]["code"], -32700);
+    assert_eq!(parse_error["error"]["message"], "parse error");
+    Ok(())
+}
+
+#[test]
+fn failed_search_timing_is_correlated_private_and_response_clean() -> Result<()> {
+    const QUERY: &str = "PRIVATE_QUERY_DOCUMENT_SENTINEL";
+    const FILTER: &str = "PRIVATE_FILTER_SENTINEL";
+    const NATIVE_ID: &str = "PRIVATE_NATIVE_ID_SENTINEL";
+    const CREDENTIAL: &str = "private-client.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    let dir = tempdir()?;
+    let server = start_server(dir.path())?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let payload = serde_json::to_string(&json!({
+        "jsonrpc": "2.0",
+        "id": "failed-search-contract",
+        "method": "tools/call",
+        "params": {
+            "name": "search",
+            "arguments": {
+                "query": QUERY,
+                "source": "ato",
+                "types": [FILTER],
+                "doc_scope": NATIVE_ID,
+                "mode": "keyword"
+            }
+        }
+    }))?;
+    let response = client
+        .post(&server.url)
+        .header("accept", "application/json, text/event-stream")
+        .header("content-type", "application/json")
+        .header("mcp-protocol-version", "2025-06-18")
+        .header("x-api-key", CREDENTIAL)
+        .body(payload)
+        .send()?;
+    assert_eq!(response.status().as_u16(), 200);
+    assert!(
+        response.headers().get("server-timing").is_none(),
+        "internal timing must not be exposed as an HTTP response header"
+    );
+    let body = response.text()?;
+    let value: Value = serde_json::from_str(&body)?;
+    assert_eq!(value["id"], "failed-search-contract");
+    assert_eq!(value["result"]["isError"], true);
+    assert_eq!(value["result"]["content"][0]["text"], "tool request failed");
+    assert_eq!(
+        value["result"]
+            .as_object()
+            .expect("tool result object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["content", "isError"])
+    );
+    for private in [QUERY, FILTER, NATIVE_ID, CREDENTIAL] {
+        assert!(!body.contains(private), "response leaked `{private}`");
+    }
+    for timing_field in ["search-timing", "phase_status", "duration_us"] {
+        assert!(
+            !body.contains(timing_field),
+            "response leaked internal timing field `{timing_field}`"
+        );
+    }
+
+    let events = server.wait_for_json_events(&["search-timing", "tool-error", "http-request"])?;
+    let search_timing = &events["search-timing"];
+    let tool_error = &events["tool-error"];
+    let http_request = &events["http-request"];
+    assert_eq!(search_timing["request_id"], http_request["request_id"]);
+    assert_eq!(tool_error["request_id"], http_request["request_id"]);
+    assert_eq!(tool_error["tool"], "search");
+    assert_eq!(tool_error["category"], "execution_failed");
+    assert_eq!(search_timing["mode"], "keyword");
+    assert_eq!(search_timing["status"], "error");
+    assert_eq!(search_timing["phase_status"]["queue"], "completed");
+    for phase in [
+        "queue",
+        "lexical_index",
+        "embedding",
+        "vector_scan",
+        "fusion",
+        "payload_hydration",
+        "total",
+    ] {
+        assert!(
+            search_timing["duration_us"][phase].is_u64(),
+            "missing numeric duration for {phase}: {search_timing}"
+        );
+    }
+    let structured_logs = serde_json::to_string(&events)?;
+    for private in [QUERY, FILTER, NATIVE_ID, CREDENTIAL] {
+        assert!(
+            !structured_logs.contains(private),
+            "structured logs leaked `{private}`"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn rejected_search_arguments_emit_private_correlated_timing() -> Result<()> {
+    const QUERY: &str = "PRIVATE_REJECTED_QUERY_SENTINEL";
+    let dir = tempdir()?;
+    let server = start_server(dir.path())?;
+    let response = post(
+        &server.url,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "rejected-search",
+            "method": "tools/call",
+            "params": {
+                "name": "search",
+                "arguments": {"query": QUERY, "mode": "keyword"}
+            }
+        }),
+    )?;
+    assert_eq!(response["error"]["code"], -32602);
+    assert!(!response.to_string().contains(QUERY));
+
+    let events = server.wait_for_json_events(&["search-timing", "http-request"])?;
+    let timing = &events["search-timing"];
+    assert_eq!(timing["request_id"], events["http-request"]["request_id"]);
+    assert_eq!(timing["mode"], "unvalidated");
+    assert_eq!(timing["status"], "error");
+    assert_eq!(timing["phase_status"]["lexical_index"], "not_run");
+    assert!(!serde_json::to_string(&events)?.contains(QUERY));
+    Ok(())
+}
+
+#[test]
+fn queue_full_has_a_safe_request_id_without_parsing_the_body() -> Result<()> {
+    const PRIVATE_BODY: &str = "PRIVATE_QUEUE_BODY_CREDENTIAL_FILTER_SENTINEL";
+    let dir = tempdir()?;
+    let server = start_server_with_auth_and_workers(dir.path(), TestAuth::Disabled, Some(1))?;
+    let address = server
+        .url
+        .strip_prefix("http://")
+        .and_then(|value| value.strip_suffix("/mcp"))
+        .ok_or_else(|| anyhow!("test server URL is not canonical"))?;
+    let mut streams = Vec::new();
+    for index in 0..24 {
+        let mut stream = TcpStream::connect(address)
+            .with_context(|| format!("opening slow queue fixture connection {index}"))?;
+        stream.set_nonblocking(true)?;
+        write!(
+            stream,
+            "POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nMcp-Protocol-Version: 2025-06-18\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{PRIVATE_BODY}"
+        )?;
+        stream.flush()?;
+        streams.push(stream);
+        if index == 0 {
+            // Let the sole worker enter its bounded body read before filling
+            // the four queue slots. Later TCP accept ordering cannot then make
+            // the selected final connection the worker-owned request.
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut responses = vec![Vec::new(); streams.len()];
+    let rejected = 'rejected: loop {
+        for (index, stream) in streams.iter_mut().enumerate() {
+            let mut buffer = [0_u8; 4096];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => responses[index].extend_from_slice(&buffer[..read]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if String::from_utf8_lossy(&responses[index]).contains("HTTP/1.1 503") {
+                break 'rejected index;
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!("timed out waiting for a queue-full response"));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let rejected_response = String::from_utf8_lossy(&responses[rejected]);
+    assert!(rejected_response.contains("Service Unavailable"));
+
+    let events = server.wait_for_json_events(&["http-request"])?;
+    let event = &events["http-request"];
+    assert_eq!(event["outcome"], "queue-full");
+    assert!(event["request_id"].is_u64());
+    assert_eq!(event["path"], "/mcp");
+    assert!(!event.to_string().contains(PRIVATE_BODY));
+    drop(streams);
     Ok(())
 }
 

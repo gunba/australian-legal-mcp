@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
 import json
 import pathlib
@@ -12,10 +13,11 @@ import statistics
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
-ASSET_RE = re.compile(r"\[asset:([a-z0-9-]+):([^\]]+)]")
+ASSET_RE = re.compile(r"\[asset:([a-z0-9-]+):([^\]\s]+)]")
 DASHES = str.maketrans({"‐": "-", "‑": "-", "‒": "-", "–": "-", "—": "-", "−": "-"})
 
 
@@ -127,12 +129,37 @@ class McpClient:
 
 def document_ids(payload: dict[str, Any]) -> set[str]:
     ids: set[str] = set()
-    for key in ("hits", "title_hits"):
-        for hit in payload.get(key, []):
-            document = hit.get("document", {}) if isinstance(hit, dict) else {}
-            if isinstance(document.get("native_id"), str):
-                ids.add(document["native_id"])
+    for hit in payload.get("hits", []):
+        document = hit.get("document", {}) if isinstance(hit, dict) else {}
+        if isinstance(document.get("native_id"), str):
+            ids.add(document["native_id"])
     return ids
+
+
+def decode_public_asset_id(value: str) -> str:
+    decoded = urllib.parse.unquote_to_bytes(value).decode("utf-8", errors="strict")
+    safe = "!\"$&'()*+,-./;<=>@\\^_`{|}~"
+    if urllib.parse.quote(decoded, safe=safe) != value:
+        raise ValueError("asset ID is not canonically percent-encoded")
+    return decoded
+
+
+def valid_image_content(result: dict[str, Any]) -> bool:
+    for item in result.get("content", []):
+        if not isinstance(item, dict) or item.get("type") != "image":
+            continue
+        media_type = item.get("mimeType")
+        data = item.get("data")
+        if not isinstance(media_type, str) or not media_type.startswith("image/"):
+            continue
+        if not isinstance(data, str) or not data:
+            continue
+        try:
+            if base64.b64decode(data, validate=True):
+                return True
+        except (ValueError, base64.binascii.Error):
+            continue
+    return False
 
 
 def chunk_for_document(payload: dict[str, Any], native_ids: set[str]) -> dict[str, Any]:
@@ -203,20 +230,41 @@ def main() -> int:
         chunk = chunk_for_document(payload, expected)
         chunks, chunk_ms, _, _ = client.tool("get_chunks", {"chunks": [chunk], "before": 2, "after": 8, "max_chars": 100000})
         retrieval_latencies.append(chunk_ms)
-        rendered = json.dumps(chunks, ensure_ascii=False)
-        normalized_rendered = normalized_evidence_text(rendered)
+        chunk_records = chunks.get("chunks", []) if isinstance(chunks, dict) else []
+        text_records = [
+            item.get("text", "")
+            for item in chunk_records
+            if isinstance(item, dict) and isinstance(item.get("text"), str)
+        ]
+        rendered_text = "\n".join(text_records)
+        normalized_rendered = normalized_evidence_text(rendered_text)
         for expected_text in case.get("expected_text", []):
             if normalized_evidence_text(expected_text) not in normalized_rendered:
                 failures.append(f"{case['id']}: retrieved context omitted {expected_text!r}")
         if case.get("requires_asset"):
-            match = ASSET_RE.search(rendered)
+            requested_text = "\n".join(
+                item.get("text", "")
+                for item in chunk_records
+                if isinstance(item, dict)
+                and item.get("requested") is True
+                and isinstance(item.get("text"), str)
+            )
+            match = ASSET_RE.search(requested_text)
             if not match:
                 failures.append(f"{case['id']}: formula context exposed no typed asset")
             else:
-                _, asset_ms, _, raw_result = client.tool("get_asset", {"asset": {"source": match.group(1), "asset_id": match.group(2)}})
-                retrieval_latencies.append(asset_ms)
-                if not any(isinstance(item, dict) and item.get("type") == "image" for item in raw_result.get("content", [])):
-                    failures.append(f"{case['id']}: get_asset returned no image")
+                try:
+                    asset_id = decode_public_asset_id(match.group(2))
+                except (UnicodeDecodeError, ValueError) as error:
+                    failures.append(f"{case['id']}: formula asset marker is not canonical: {error}")
+                else:
+                    if match.group(1) != case["source"]:
+                        failures.append(f"{case['id']}: formula asset marker has the wrong source")
+                    else:
+                        _, asset_ms, _, raw_result = client.tool("get_asset", {"asset": {"source": match.group(1), "asset_id": asset_id}})
+                        retrieval_latencies.append(asset_ms)
+                        if not valid_image_content(raw_result):
+                            failures.append(f"{case['id']}: get_asset returned no valid nonempty image")
         document = {"source": case["source"], "native_id": case["expected_documents"][0]}
         anchors, anchor_ms, _, _ = client.tool("get_doc_anchors", {"document": document})
         retrieval_latencies.append(anchor_ms)

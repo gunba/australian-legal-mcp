@@ -31,7 +31,7 @@
       "id": "rd-clawback-feedstock",
       "source": "frl",
       "mode": "keyword",
-      "query": "355-450 feedstock adjustment recoupment clawback amount formula",
+      "query": "clawback amount formula",
       "doc_scope": "C2004A05138",
       "expected_documents": ["C2004A05138"],
       "expected_text": ["355-450", "formula"],
@@ -68,7 +68,7 @@
       "id": "singapore-treaty",
       "source": "ato",
       "mode": "keyword",
-      "query": "Singapore agreement royalties resident principal purpose MLI",
+      "query": "principal purpose MLI",
       "doc_scope": "MLI/MLI-SINGAPORE-AGREEMENT",
       "expected_documents": ["MLI/MLI-SINGAPORE-AGREEMENT"],
       "expected_text": ["Singapore"]

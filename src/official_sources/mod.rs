@@ -30,7 +30,7 @@ use rayon::prelude::*;
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, LOCATION, RETRY_AFTER};
 use reqwest::{StatusCode, Url};
-use scraper::node::Node;
+use scraper::node::{Element, Node};
 use scraper::{CaseSensitivity, Html, Selector};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -170,8 +170,20 @@ pub(super) trait OfficialAdapter: Send + Sync {
     fn minimum_request_interval_ms(&self, _url: &Url) -> u64 {
         self.rate_policy().minimum_request_interval_ms
     }
+    fn has_browser_transport(&self) -> bool {
+        false
+    }
     fn use_browser_transport(&self, _url: &Url) -> bool {
         false
+    }
+    fn normalization_revision(&self) -> Option<&'static str> {
+        None
+    }
+    fn minimum_snapshot_retention_percent(&self) -> usize {
+        50
+    }
+    fn validate_normalized_html(&self, _html: &str) -> Result<()> {
+        Ok(())
     }
     fn discover(
         &self,
@@ -227,6 +239,7 @@ impl SourceAcquisition for OfficialAcquisition {
                     self.adapter.source_id(),
                     plan.documents.len(),
                     previous.inventory.len(),
+                    self.adapter.minimum_snapshot_retention_percent(),
                 )?;
             }
             return Ok(SourceDiscoveryBatch {
@@ -242,6 +255,7 @@ impl SourceAcquisition for OfficialAcquisition {
                 self.adapter.source_id(),
                 documents.len(),
                 previous.inventory.len(),
+                self.adapter.minimum_snapshot_retention_percent(),
             )?;
         }
         let plan = DiscoveryPlan {
@@ -403,8 +417,16 @@ fn validate_discovery(
     Ok(())
 }
 
-fn validate_snapshot_size(source_id: &str, current: usize, previous: usize) -> Result<()> {
-    if current.saturating_mul(2) < previous {
+fn validate_snapshot_size(
+    source_id: &str,
+    current: usize,
+    previous: usize,
+    minimum_percent: usize,
+) -> Result<()> {
+    if !(1..=100).contains(&minimum_percent) {
+        bail!("{source_id} has an invalid snapshot-retention policy");
+    }
+    if current.saturating_mul(100) < previous.saturating_mul(minimum_percent) {
         bail!(
             "{source_id} discovery shrank from {previous} to {current} documents; refusing a destructive partial snapshot"
         );
@@ -476,8 +498,11 @@ fn fetch_documents(
         schema_version: STATE_SCHEMA_VERSION,
         inventory,
     };
-    commit_state(adapter, workspace, &next)?;
+    // Staging cleanup is fallible, so complete it before the atomic state write.
+    // Once state.json advances, the source update is committed and must not
+    // subsequently report failure.
     clear_staging(adapter, workspace)?;
+    commit_state(adapter, workspace, &next)?;
     Ok(SourceFetchReport {
         completed,
         failed: 0,
@@ -493,7 +518,7 @@ fn acquire_one(
     entry: &DiscoveredDocument,
     committed: Option<&InventoryEntry>,
 ) -> Result<(String, Option<InventoryEntry>, bool)> {
-    let source_revision = discovered_source_revision(entry)?;
+    let source_revision = discovered_source_revision(adapter, entry)?;
     if let Some(committed) = committed {
         if reusable_entry(
             adapter,
@@ -529,6 +554,15 @@ fn acquire_one(
         cleaned_html: ensure_document_html(&entry.title, acquired.html)?,
         assets: acquired.assets,
     };
+    adapter
+        .validate_normalized_html(&normalized.cleaned_html)
+        .with_context(|| {
+            format!(
+                "validating normalized {} {}",
+                adapter.source_id(),
+                entry.native_id
+            )
+        })?;
     let content_hash = normalized_content_hash(&normalized);
     persist_document(adapter, workspace, &normalized, &content_hash)?;
     let inventory = InventoryEntry {
@@ -551,16 +585,24 @@ fn reusable_entry(
 ) -> bool {
     candidate.upstream_version == source_revision
         && candidate.canonical_url == discovered.canonical_url
-        && load_inventory_document(adapter, workspace, source, candidate).is_ok()
+        && load_inventory_document(adapter, workspace, source, candidate)
+            .and_then(|document| adapter.validate_normalized_html(&document.html))
+            .is_ok()
 }
 
-fn discovered_source_revision(entry: &DiscoveredDocument) -> Result<String> {
+fn discovered_source_revision(
+    adapter: &dyn OfficialAdapter,
+    entry: &DiscoveredDocument,
+) -> Result<String> {
     let bytes = serde_json::to_vec(entry).context("serializing discovered document contract")?;
-    Ok(format!(
-        "{}|{}",
-        entry.upstream_version,
-        sha256_bytes(&bytes)
-    ))
+    let upstream = format!("{}|{}", entry.upstream_version, sha256_bytes(&bytes));
+    match adapter.normalization_revision() {
+        Some(revision) => {
+            validate_text("normalization revision", revision, 128)?;
+            Ok(format!("normalizer:{revision}|{upstream}"))
+        }
+        None => Ok(upstream),
+    }
 }
 
 struct PreparedDocument {
@@ -961,13 +1003,15 @@ impl OfficialHttpClient {
         let policy = adapter.rate_policy();
         let timeout = Duration::from_secs(policy.request_timeout_seconds);
         let client = Client::builder()
+            .no_proxy()
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
             .cookie_store(true)
             .user_agent("australian-legal-mcp/official-source-adapter")
             .build()
             .context("building official-source HTTP client")?;
-        let browser = (adapter.source_id() == FEDERAL_COURT_SOURCE_ID)
+        let browser = adapter
+            .has_browser_transport()
             .then(|| BrowserHttpTransport::new(MAX_DOCUMENT_BYTES))
             .transpose()?;
         Ok(Self {
@@ -1483,6 +1527,8 @@ pub(super) struct HtmlRules<'a> {
     pub(super) drop_ids: &'a [&'a str],
     pub(super) drop_classes: &'a [&'a str],
     pub(super) heading_classes: &'a [&'a str],
+    pub(super) preserve_same_document_fragments: bool,
+    pub(super) repair_broken_links: bool,
 }
 
 pub(super) fn normalize_html(html: &str, base_url: &str, rules: HtmlRules<'_>) -> Result<String> {
@@ -1498,9 +1544,10 @@ pub(super) fn normalize_html(html: &str, base_url: &str, rules: HtmlRules<'_>) -
         .next()
         .ok_or_else(|| anyhow!("official document lacks {}", rules.content_selector))?;
     let base = Url::parse(base_url).context("parsing document base URL")?;
+    let fragment_targets = collect_fragment_targets(root)?;
     let mut output = String::from("<article>");
     for child in root.children() {
-        serialize_html_node(child, &base, &rules, None, &mut output)?;
+        serialize_html_node(child, &base, &rules, None, &fragment_targets, &mut output)?;
     }
     output.push_str("</article>");
     ensure_nonempty_html(&output)?;
@@ -1520,19 +1567,96 @@ pub(crate) fn rewrite_internal_document_links(
         .next()
         .ok_or_else(|| anyhow!("normalized document lacks article root"))?;
     let base = Url::parse(base_url)?;
+    let fragment_targets = collect_fragment_targets(root)?;
     let mut output = String::from("<article>");
     let rules = HtmlRules {
         content_selector: "article",
         drop_ids: &[],
         drop_classes: &[],
         heading_classes: &[],
+        preserve_same_document_fragments: true,
+        repair_broken_links: false,
     };
     for child in root.children() {
-        serialize_html_node(child, &base, &rules, Some(links), &mut output)?;
+        serialize_html_node(
+            child,
+            &base,
+            &rules,
+            Some(links),
+            &fragment_targets,
+            &mut output,
+        )?;
     }
     output.push_str("</article>");
     ensure_nonempty_html(&output)?;
     Ok(output)
+}
+
+fn collect_fragment_targets(root: scraper::ElementRef<'_>) -> Result<BTreeSet<String>> {
+    let selector = Selector::parse("[id], a[name]")
+        .map_err(|_| anyhow!("invalid official fragment-target selector"))?;
+    Ok(root
+        .select(&selector)
+        .flat_map(|element| {
+            [element.value().attr("id"), element.value().attr("name")]
+                .into_iter()
+                .flatten()
+                .map(str::to_owned)
+        })
+        .collect())
+}
+
+enum NormalizedLinkTarget {
+    Href(String),
+    Document(String),
+}
+
+fn normalized_link_target(
+    element: &Element,
+    base: &Url,
+    rules: &HtmlRules<'_>,
+    links: Option<&BTreeMap<String, DocumentId>>,
+    fragment_targets: &BTreeSet<String>,
+) -> Result<Option<NormalizedLinkTarget>> {
+    let Some(href) = element.attr("href") else {
+        return Ok(None);
+    };
+    let Ok(mut url) = base.join(href) else {
+        return Ok(None);
+    };
+    if rules.repair_broken_links
+        && url.scheme() == "http"
+        && base.scheme() == "https"
+        && url.host_str() == base.host_str()
+        && url.port().is_none()
+    {
+        url.set_scheme("https")
+            .map_err(|_| anyhow!("upgrading official hyperlink to HTTPS"))?;
+    }
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+    {
+        return Ok(None);
+    }
+
+    let fragment = url.fragment().map(str::to_owned);
+    url.set_fragment(None);
+    let mut document_url = base.clone();
+    document_url.set_fragment(None);
+    if rules.preserve_same_document_fragments && url == document_url {
+        if let Some(fragment) = fragment {
+            return Ok(
+                (fragment_targets.contains(&fragment) || !rules.repair_broken_links)
+                    .then(|| NormalizedLinkTarget::Href(format!("#{fragment}"))),
+            );
+        }
+    }
+    if let Some(document) = links.and_then(|links| links.get(url.as_str())) {
+        return Ok(Some(NormalizedLinkTarget::Document(document.to_string())));
+    }
+    Ok(Some(NormalizedLinkTarget::Href(url.to_string())))
 }
 
 fn serialize_html_node(
@@ -1540,6 +1664,7 @@ fn serialize_html_node(
     base: &Url,
     rules: &HtmlRules<'_>,
     links: Option<&BTreeMap<String, DocumentId>>,
+    fragment_targets: &BTreeSet<String>,
     output: &mut String,
 ) -> Result<()> {
     match node.value() {
@@ -1616,7 +1741,17 @@ fn serialize_html_node(
                     | "u"
                     | "ul"
             );
-            if allowed {
+            let link_target = (tag == "a")
+                .then(|| normalized_link_target(element, base, rules, links, fragment_targets))
+                .transpose()?
+                .flatten();
+            let emit_element = allowed
+                && (tag != "a"
+                    || link_target.is_some()
+                    || element.attr("id").is_some()
+                    || element.attr("name").is_some()
+                    || !rules.repair_broken_links);
+            if emit_element {
                 output.push('<');
                 output.push_str(tag);
                 for name in ["id", "name", "colspan", "rowspan"] {
@@ -1639,35 +1774,25 @@ fn serialize_html_node(
                         }
                     }
                 }
-                if tag == "a" {
-                    if let Some(href) = element.attr("href") {
-                        if let Ok(mut url) = base.join(href) {
-                            if url.scheme() == "https"
-                                && url.username().is_empty()
-                                && url.password().is_none()
-                            {
-                                url.set_fragment(None);
-                                if let Some(document) =
-                                    links.and_then(|links| links.get(url.as_str()))
-                                {
-                                    output.push_str(" data-doc-id=\"");
-                                    escape_attribute(&document.to_string(), output);
-                                    output.push('"');
-                                } else {
-                                    output.push_str(" href=\"");
-                                    escape_attribute(url.as_str(), output);
-                                    output.push('"');
-                                }
-                            }
-                        }
+                match link_target {
+                    Some(NormalizedLinkTarget::Href(ref href)) => {
+                        output.push_str(" href=\"");
+                        escape_attribute(href, output);
+                        output.push('"');
                     }
+                    Some(NormalizedLinkTarget::Document(ref document)) => {
+                        output.push_str(" data-doc-id=\"");
+                        escape_attribute(document, output);
+                        output.push('"');
+                    }
+                    None => {}
                 }
                 output.push('>');
             }
             for child in node.children() {
-                serialize_html_node(child, base, rules, links, output)?;
+                serialize_html_node(child, base, rules, links, fragment_targets, output)?;
             }
-            if allowed && !matches!(tag, "br" | "hr" | "img") {
+            if emit_element && !matches!(tag, "br" | "hr" | "img") {
                 output.push_str("</");
                 output.push_str(tag);
                 output.push('>');
@@ -1675,7 +1800,7 @@ fn serialize_html_node(
         }
         _ => {
             for child in node.children() {
-                serialize_html_node(child, base, rules, links, output)?;
+                serialize_html_node(child, base, rules, links, fragment_targets, output)?;
             }
         }
     }
@@ -1838,6 +1963,11 @@ fn run_command_with_timeout(
     timeout: Duration,
     label: &str,
 ) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command
         .spawn()
         .with_context(|| format!("starting required document conversion command `{label}`"))?;
@@ -1850,12 +1980,139 @@ fn run_command_with_timeout(
             bail!("document conversion command `{label}` exited with {status}");
         }
         if started.elapsed() >= timeout {
-            child.kill().ok();
-            child.wait().ok();
+            terminate_command_process_tree(&mut child);
             bail!("document conversion command `{label}` exceeded its timeout");
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[cfg(target_os = "linux")]
+fn sandboxed_soffice_command(workspace: &Path) -> Result<ProcessCommand> {
+    let bwrap = Path::new("/usr/bin/bwrap");
+    let soffice = Path::new("/usr/bin/soffice");
+    if !bwrap.is_file() || !soffice.is_file() {
+        bail!("sandboxed LibreOffice requires /usr/bin/bwrap and /usr/bin/soffice");
+    }
+    for path in ["/usr", "/etc/fonts", "/etc/ld.so.cache"] {
+        if !Path::new(path).exists() {
+            bail!("LibreOffice sandbox requires {path}");
+        }
+    }
+    build_sandboxed_soffice_command(workspace, bwrap, soffice)
+}
+
+#[cfg(target_os = "linux")]
+fn build_sandboxed_soffice_command(
+    workspace: &Path,
+    bwrap: &Path,
+    soffice: &Path,
+) -> Result<ProcessCommand> {
+    let workspace = workspace
+        .canonicalize()
+        .context("canonicalizing LibreOffice sandbox workspace")?;
+    let sandbox_tmp = workspace.join("tmp");
+    fs::create_dir(&sandbox_tmp).context("creating LibreOffice sandbox temp directory")?;
+    let mut command = ProcessCommand::new(bwrap);
+    command
+        .arg("--unshare-all")
+        .arg("--die-with-parent")
+        .arg("--new-session")
+        .arg("--tmpfs")
+        .arg("/")
+        .arg("--dir")
+        .arg("/usr")
+        .arg("--ro-bind")
+        .arg("/usr")
+        .arg("/usr")
+        .arg("--symlink")
+        .arg("usr/bin")
+        .arg("/bin")
+        .arg("--symlink")
+        .arg("usr/lib")
+        .arg("/lib")
+        .arg("--symlink")
+        .arg("usr/lib64")
+        .arg("/lib64")
+        .arg("--dir")
+        .arg("/etc")
+        .arg("--dir")
+        .arg("/etc/fonts")
+        .arg("--ro-bind")
+        .arg("/etc/fonts")
+        .arg("/etc/fonts")
+        .arg("--ro-bind")
+        .arg("/etc/ld.so.cache")
+        .arg("/etc/ld.so.cache")
+        .arg("--dir")
+        .arg("/tmp")
+        .arg("--dir")
+        .arg("/var")
+        .arg("--dir")
+        .arg("/var/cache")
+        .arg("--dir")
+        .arg("/var/cache/fontconfig")
+        .arg("--dir")
+        .arg(&workspace)
+        .arg("--bind")
+        .arg(&workspace)
+        .arg(&workspace)
+        .arg("--proc")
+        .arg("/proc")
+        .arg("--dev")
+        .arg("/dev")
+        .arg("--chdir")
+        .arg(&workspace)
+        .arg("--clearenv")
+        .arg("--setenv")
+        .arg("PATH")
+        .arg("/usr/bin")
+        .arg("--setenv")
+        .arg("LANG")
+        .arg("C.UTF-8")
+        .arg("--setenv")
+        .arg("SAL_USE_VCLPLUGIN")
+        .arg("svp")
+        .arg("--setenv")
+        .arg("HOME")
+        .arg(&workspace)
+        .arg("--setenv")
+        .arg("TMPDIR")
+        .arg(&sandbox_tmp)
+        .arg("--setenv")
+        .arg("XDG_CONFIG_HOME")
+        .arg(workspace.join("config"))
+        .arg("--setenv")
+        .arg("XDG_CACHE_HOME")
+        .arg(workspace.join("cache"))
+        .arg("--")
+        .arg(soffice);
+    Ok(command)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sandboxed_soffice_command(_workspace: &Path) -> Result<ProcessCommand> {
+    bail!("sandboxed LibreOffice conversion is supported only on Linux")
+}
+
+#[cfg(unix)]
+fn terminate_command_process_tree(child: &mut std::process::Child) {
+    if let Ok(process_group) = i32::try_from(child.id()) {
+        // SAFETY: run_command_with_timeout starts the child as the leader of a
+        // new process group, so the negative PID targets only that command and
+        // descendants such as LibreOffice's soffice.bin worker.
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+    }
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[cfg(not(unix))]
+fn terminate_command_process_tree(child: &mut std::process::Child) {
+    child.kill().ok();
+    child.wait().ok();
 }
 
 pub(super) fn normalize_rtf(bytes: &[u8], base_url: &str) -> Result<String> {
@@ -1907,6 +2164,8 @@ fn normalize_rtf_with_unrtf(bytes: &[u8], base_url: &str) -> Result<String> {
             drop_ids: &[],
             drop_classes: &[],
             heading_classes: &[],
+            preserve_same_document_fragments: false,
+            repair_broken_links: false,
         },
     )?;
     ensure_nonempty_html(&normalized)?;
@@ -1941,11 +2200,18 @@ pub(super) fn normalize_legacy_word(bytes: &[u8]) -> Result<String> {
 }
 
 fn render_office_document_to_pdf(bytes: &[u8], extension: &str) -> Result<String> {
+    normalize_pdf(&render_office_document_to_pdf_bytes(bytes, extension)?)
+}
+
+pub(super) fn render_office_document_to_pdf_bytes(
+    bytes: &[u8],
+    extension: &str,
+) -> Result<Vec<u8>> {
     let temp = tempfile::tempdir().context("creating office rendering workspace")?;
     let input = temp.path().join(format!("input.{extension}"));
     fs::write(&input, bytes).context("writing office rendering input")?;
     let profile = temp.path().join("libreoffice-profile");
-    let mut command = ProcessCommand::new("soffice");
+    let mut command = sandboxed_soffice_command(temp.path())?;
     command
         .arg("--headless")
         .arg(format!(
@@ -1966,7 +2232,42 @@ fn render_office_document_to_pdf(bytes: &[u8], extension: &str) -> Result<String
     )?;
     let rendered = read_bounded_file(&temp.path().join("input.pdf"), MAX_DOCUMENT_BYTES)
         .context("reading LibreOffice-rendered office PDF")?;
-    normalize_pdf(&rendered)
+    if !rendered.starts_with(b"%PDF") {
+        bail!("LibreOffice office document rendering produced an invalid PDF");
+    }
+    Ok(rendered)
+}
+
+pub(super) fn convert_office_document_to_docx(bytes: &[u8], extension: &str) -> Result<Vec<u8>> {
+    let temp = tempfile::tempdir().context("creating structured Word conversion workspace")?;
+    let input = temp.path().join(format!("input.{extension}"));
+    fs::write(&input, bytes).context("writing structured Word conversion input")?;
+    let profile = temp.path().join("libreoffice-profile");
+    let mut command = sandboxed_soffice_command(temp.path())?;
+    command
+        .arg("--headless")
+        .arg(format!(
+            "-env:UserInstallation=file://{}",
+            profile.display()
+        ))
+        .arg("--convert-to")
+        .arg("docx")
+        .arg("--outdir")
+        .arg(temp.path())
+        .arg(&input)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    run_command_with_timeout(
+        command,
+        Duration::from_secs(15 * 60),
+        "LibreOffice structured Word conversion",
+    )?;
+    let converted = read_bounded_file(&temp.path().join("input.docx"), MAX_DOCUMENT_BYTES)
+        .context("reading LibreOffice-converted DOCX")?;
+    if !converted.starts_with(b"PK\x03\x04") {
+        bail!("LibreOffice structured Word conversion produced an invalid DOCX")
+    }
+    Ok(converted)
 }
 
 #[cfg(test)]
@@ -2217,6 +2518,51 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    #[test]
+    fn command_timeout_terminates_descendant_processes() -> Result<()> {
+        let temp = tempdir()?;
+        let sentinel = temp.path().join("descendant-survived");
+        let mut command = ProcessCommand::new("sh");
+        command
+            .arg("-c")
+            .arg("(sleep 1; printf leaked > \"$SENTINEL\") & wait")
+            .env("SENTINEL", &sentinel)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let error =
+            run_command_with_timeout(command, Duration::from_millis(50), "process-tree fixture")
+                .expect_err("the process-tree fixture must time out");
+        assert!(error.to_string().contains("exceeded its timeout"));
+        thread::sleep(Duration::from_millis(1_200));
+        assert!(!sentinel.exists());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn libreoffice_sandbox_clears_environment_and_does_not_mount_host_root() -> Result<()> {
+        let temp = tempdir()?;
+        let command = build_sandboxed_soffice_command(
+            temp.path(),
+            Path::new("/usr/bin/bwrap"),
+            Path::new("/usr/bin/soffice"),
+        )?;
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(arguments.iter().any(|argument| argument == "--clearenv"));
+        assert!(arguments.windows(3).any(|window| {
+            window == ["--tmpfs".to_string(), "/".to_string(), "--dir".to_string()]
+        }));
+        assert!(!arguments.windows(3).any(|window| {
+            window == ["--ro-bind".to_string(), "/".to_string(), "/".to_string()]
+        }));
+        assert!(!arguments.iter().any(|argument| argument == "/run/user"));
+        Ok(())
+    }
+
     struct TestAdapter;
 
     impl OfficialAdapter for TestAdapter {
@@ -2262,6 +2608,55 @@ mod tests {
         }
     }
 
+    struct QualityAdapter;
+
+    impl OfficialAdapter for QualityAdapter {
+        fn source_id(&self) -> &'static str {
+            "test"
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Quality test"
+        }
+
+        fn approved_hosts(&self) -> &'static [&'static str] {
+            &["example.gov.au"]
+        }
+
+        fn rate_policy(&self) -> SourceRatePolicy {
+            SourceRatePolicy {
+                minimum_request_interval_ms: 0,
+                request_timeout_seconds: 1,
+            }
+        }
+
+        fn validate_normalized_html(&self, html: &str) -> Result<()> {
+            if html.contains("Document quality") {
+                bail!("stale normalized quality fixture")
+            }
+            Ok(())
+        }
+
+        fn discover(
+            &self,
+            _: &OfficialHttpClient,
+            _: SourceUpdateMode,
+        ) -> Result<Vec<DiscoveredDocument>> {
+            unreachable!()
+        }
+
+        fn acquire(
+            &self,
+            _: &OfficialHttpClient,
+            entry: &DiscoveredDocument,
+        ) -> Result<Option<AcquiredDocument>> {
+            Ok(Some(make_acquired_html(
+                "<article><p>Repaired quality fixture</p></article>".to_owned(),
+                entry.canonical_url.clone(),
+            )))
+        }
+    }
+
     fn entry(native_id: &str, version: &str) -> DiscoveredDocument {
         let url = format!("https://example.gov.au/{native_id}");
         DiscoveredDocument {
@@ -2281,7 +2676,7 @@ mod tests {
 
     #[test]
     fn html_normalization_is_structural_and_drops_hidden_source_chrome() -> Result<()> {
-        let html = r#"<html><body><div id="content"><h1>A &amp; B</h1><script>bad()</script><p>Law <a href="/x">text</a></p><div class="hidden">omit</div></div></body></html>"#;
+        let html = r#"<html><body><div id="content"><h1>A &amp; B</h1><script>bad()</script><p>Law <a href="/x">text</a> and <a href="http://example.gov.au/legacy">legacy</a></p><div class="hidden">omit</div></div></body></html>"#;
         let normalized = normalize_html(
             html,
             "https://example.gov.au/doc",
@@ -2290,11 +2685,13 @@ mod tests {
                 drop_ids: &[],
                 drop_classes: &["hidden"],
                 heading_classes: &[],
+                preserve_same_document_fragments: false,
+                repair_broken_links: true,
             },
         )?;
         assert_eq!(
             normalized,
-            "<article><h1>A &amp; B</h1><p>Law <a href=\"https://example.gov.au/x\">text</a></p></article>"
+            "<article><h1>A &amp; B</h1><p>Law <a href=\"https://example.gov.au/x\">text</a> and <a href=\"https://example.gov.au/legacy\">legacy</a></p></article>"
         );
         Ok(())
     }
@@ -2390,8 +2787,8 @@ mod tests {
 
     #[test]
     fn authoritative_snapshot_rejects_catastrophic_shrinkage() {
-        assert!(validate_snapshot_size("test", 49, 100).is_err());
-        assert!(validate_snapshot_size("test", 50, 100).is_ok());
+        assert!(validate_snapshot_size("test", 49, 100, 50).is_err());
+        assert!(validate_snapshot_size("test", 50, 100, 50).is_ok());
     }
 
     #[test]
@@ -2429,6 +2826,50 @@ mod tests {
             .collect::<Result<Vec<_>>>()?;
         assert_eq!(documents.len(), 1);
         assert_eq!(documents[0].inventory.document.native_id, "two");
+        Ok(())
+    }
+
+    #[test]
+    fn current_adapter_quality_gate_reacquires_a_stale_committed_document() -> Result<()> {
+        let workspace = tempdir()?;
+        let document = entry("quality", "v1");
+        let first = fetch_documents(&TestAdapter, workspace.path(), vec![document.clone()])?;
+        assert_eq!((first.completed, first.skipped), (1, 0));
+
+        let repaired = fetch_documents(&QualityAdapter, workspace.path(), vec![document])?;
+        assert_eq!((repaired.completed, repaired.skipped), (1, 0));
+        let state = load_state(&QualityAdapter, workspace.path())?;
+        let candidate = state
+            .inventory
+            .get("quality")
+            .ok_or_else(|| anyhow!("repaired quality fixture is missing"))?;
+        let source: SourceId = "test".parse()?;
+        let stored =
+            load_inventory_document(&QualityAdapter, workspace.path(), &source, candidate)?;
+        assert!(stored.html.contains("Repaired quality fixture"));
+        assert!(!stored.html.contains("Document quality"));
+        Ok(())
+    }
+
+    #[test]
+    fn adapter_normalization_revision_invalidates_only_opted_in_sources() -> Result<()> {
+        let document = entry("revision", "v1");
+        let unchanged = discovered_source_revision(&TestAdapter, &document)?;
+        let federal = discovered_source_revision(&federal_court::ADAPTER, &document)?;
+        let south_australian =
+            discovered_source_revision(&south_australian_legislation::ADAPTER, &document)?;
+        let high_court = discovered_source_revision(&high_court::ADAPTER, &document)?;
+        let western_australian =
+            discovered_source_revision(&western_australian_legislation::ADAPTER, &document)?;
+        assert!(!unchanged.starts_with("normalizer:"));
+        assert!(federal.starts_with("normalizer:2|"));
+        assert_ne!(unchanged, federal);
+        assert!(south_australian.starts_with("normalizer:3|"));
+        assert_ne!(unchanged, south_australian);
+        assert!(high_court.starts_with("normalizer:1|"));
+        assert!(western_australian.starts_with("normalizer:1|"));
+        assert_ne!(unchanged, high_court);
+        assert_ne!(unchanged, western_australian);
         Ok(())
     }
 

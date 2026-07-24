@@ -7,5 +7,6 @@ This directory contains durable, sanitised evidence for the source-scoped search
 - [HarbourGrid v22 evaluation JSON](harbourgrid-v22-evaluation.json) — deterministic evaluator output.
 - [HarbourGrid v21 regression baseline JSON](harbourgrid-v21-regression-baseline.json) — the three formula failures that required chunker format 6.
 - [Flat-int8 prototype benchmark](flat-int8-v20-benchmark.md) — exact source-scoped scan size, latency, equality, and design evidence.
+- [Schema-12 lexical sidecar benchmark](schema12-lexical-sidecar-benchmark.md) — deterministic Federal Court warm and advised-cold p95 gate with exact result IDs.
 
 The full rendered agent audit remains local validation evidence because it is a multi-megabyte generated artifact. The Obsidian validation pack includes that HTML/JSON audit, the historical memorandum, the substantive technical review, and the historical agent feedback for offline review.

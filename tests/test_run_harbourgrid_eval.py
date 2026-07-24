@@ -65,6 +65,23 @@ class HarbourGridReadySurfaceTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "must remain hidden"):
             MODULE.probe_ready_surface("https://legal.example/mcp")
 
+    def test_asset_marker_match_cannot_cross_truncated_chunk_text(self):
+        rendered = "[asset:frl:C1/sha256-abc\n[asset:frl:C1/sha256-def]"
+        markers = MODULE.ASSET_RE.findall(rendered)
+        self.assertEqual(markers, [("frl", "C1/sha256-def")])
+
+    def test_public_asset_id_is_decoded_for_the_typed_tool_argument(self):
+        self.assertEqual(MODULE.decode_public_asset_id("folder/name%3Apart"), "folder/name:part")
+        for invalid in ["folder%2fname", "folder%41", "folder%", "folder%FF"]:
+            with self.assertRaises((UnicodeDecodeError, ValueError)):
+                MODULE.decode_public_asset_id(invalid)
+
+    def test_image_content_requires_nonempty_valid_base64_and_image_mime(self):
+        self.assertTrue(MODULE.valid_image_content({"content": [{"type": "image", "mimeType": "image/png", "data": "eA=="}]}))
+        self.assertFalse(MODULE.valid_image_content({"content": [{"type": "image", "mimeType": "text/plain", "data": "eA=="}]}))
+        self.assertFalse(MODULE.valid_image_content({"content": [{"type": "image", "mimeType": "image/png", "data": ""}]}))
+        self.assertFalse(MODULE.valid_image_content({"content": [{"type": "image", "mimeType": "image/png", "data": "***"}]}))
+
 
 if __name__ == "__main__":
     unittest.main()

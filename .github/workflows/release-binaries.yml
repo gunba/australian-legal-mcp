@@ -110,10 +110,11 @@ jobs:
             ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \
             -ceu 'export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null; apt-get install --yes --no-install-recommends acl libcap2-bin passwd python3 util-linux >/dev/null; /activation-fixture'
           docker run --rm --user 0:0 --entrypoint /bin/bash \
-            --volume "$PWD/tests/flat-int8-host-cutover-fixture.sh:/fixture:ro" \
+            --volume "$PWD/tests/image-generation-pair-cutover-fixture.sh:/fixture:ro" \
             --volume "$PWD/infra/hosting/update-image.sh:/update-image:ro" \
             --volume "$PWD/infra/linode/install-host.sh:/install-host:ro" \
             --volume "$PWD/infra/hosting/legal-mcp.container.template:/container-template:ro" \
+            --volume "$PWD/tests/fixtures/v0.19.11/legal-mcp.container.template:/v01911-container-template:ro" \
             --volume "$PWD/infra/hosting/Caddyfile:/Caddyfile:ro" \
             --volume "$PWD/scripts/legal-mcp-host-deploy:/host-deploy:ro" \
             --volume "$PWD/scripts/legal-mcp-publisher-command:/publisher-command:ro" \

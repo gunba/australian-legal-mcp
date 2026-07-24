@@ -44,11 +44,12 @@ const MAX_ARCHIVE_MEMBER_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_ARCHIVE_EXPANDED_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_XML_DEPTH: usize = 256;
 const MAX_XML_NODES: usize = 4_000_000;
+const MAX_DOCX_STYLE_REFERENCE_DEPTH: usize = 128;
 const MIN_FULL_TEXT_ALPHANUMERIC_CHARS: usize = 128;
 const OVERLAP_DAYS: i64 = 7;
 const MAX_HTTP_ATTEMPTS: usize = 4;
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
-const STATE_SCHEMA_VERSION: u32 = 1;
+const STATE_SCHEMA_VERSION: u32 = 2;
 const DISCOVERY_SCHEMA_VERSION: u32 = 1;
 const STATE_RELATIVE_PATH: &str = "state.json";
 const STAGING_DIR: &str = "staging";
@@ -434,13 +435,6 @@ trait FrlApi: Send + Sync {
         upper_bound: &str,
     ) -> Result<Option<FrlVersion>>;
 
-    fn version_candidates(&self, title_id: &str, upper_bound: &str) -> Result<Vec<FrlVersion>> {
-        Ok(self
-            .authoritative_version(title_id, upper_bound)?
-            .into_iter()
-            .collect())
-    }
-
     fn documents_page(
         &self,
         version: &FrlVersionKey,
@@ -457,6 +451,21 @@ struct HttpFrlApi {
     concurrency: AdaptiveConcurrency,
     minimum_interval: Duration,
     last_request: Mutex<Option<Instant>>,
+}
+
+#[derive(Clone, Copy)]
+enum FrlHttpSurface {
+    Api,
+    PublicRendition,
+}
+
+impl FrlHttpSurface {
+    fn validate(self, url: &Url) -> Result<()> {
+        match self {
+            Self::Api => validate_api_url(url),
+            Self::PublicRendition => validate_public_rendition_url(url),
+        }
+    }
 }
 
 impl HttpFrlApi {
@@ -504,7 +513,21 @@ impl HttpFrlApi {
     }
 
     fn get_bounded(&self, url: Url, accept: &str, limit: u64) -> Result<Vec<u8>> {
-        validate_api_url(&url)?;
+        self.get_bounded_from(url, accept, limit, FrlHttpSurface::Api)
+    }
+
+    fn get_public_bounded(&self, url: Url, accept: &str, limit: u64) -> Result<Vec<u8>> {
+        self.get_bounded_from(url, accept, limit, FrlHttpSurface::PublicRendition)
+    }
+
+    fn get_bounded_from(
+        &self,
+        url: Url,
+        accept: &str,
+        limit: u64,
+        surface: FrlHttpSurface,
+    ) -> Result<Vec<u8>> {
+        surface.validate(&url)?;
         let mut last_error = None;
         for attempt in 0..MAX_HTTP_ATTEMPTS {
             let request = self.concurrency.acquire()?;
@@ -649,6 +672,44 @@ impl HttpFrlApi {
         );
         self.entity_url(&segment)
     }
+
+    fn public_rendition_url(&self, rendition: &FrlRendition, kind: RenditionKind) -> Result<Url> {
+        let title_id = validate_native_id(&rendition.title_id)?;
+        let start = public_rendition_datetime(&rendition.start)?;
+        let retrospective_start = public_rendition_datetime(&rendition.retrospective_start)?;
+        let format = match kind {
+            RenditionKind::Epub => "epub",
+            RenditionKind::Docx => "word",
+            RenditionKind::Pdf => bail!("FRL public PDF does not expose official extracted text"),
+        };
+        let url = Url::parse(&format!(
+            "{FRL_PUBLIC_BASE}{title_id}/{start}/{retrospective_start}/text/original/{format}"
+        ))
+        .context("constructing exact FRL public rendition URL")?;
+        validate_public_rendition_url(&url)?;
+        Ok(url)
+    }
+
+    fn fetch_binary_rendition(
+        &self,
+        rendition: &FrlRendition,
+        kind: RenditionKind,
+        accept: &str,
+    ) -> Result<Vec<u8>> {
+        let api_url = self.rendition_url(rendition)?;
+        match self.get_bounded(api_url, accept, MAX_RENDITION_BYTES) {
+            Ok(bytes) => Ok(bytes),
+            Err(api_error) => {
+                let public_url = self.public_rendition_url(rendition, kind)?;
+                self.get_public_bounded(public_url, accept, MAX_RENDITION_BYTES)
+                    .with_context(|| {
+                        format!(
+                            "fetching the exact public FRL rendition after its API entity failed: {api_error:#}"
+                        )
+                    })
+            }
+        }
+    }
 }
 
 impl FrlApi for HttpFrlApi {
@@ -756,37 +817,6 @@ impl FrlApi for HttpFrlApi {
         Ok(selected.into_iter().next())
     }
 
-    fn version_candidates(&self, title_id: &str, upper_bound: &str) -> Result<Vec<FrlVersion>> {
-        validate_native_id(title_id)?;
-        canonical_datetime(upper_bound)?;
-        let mut url = self.entity_url("Versions")?;
-        {
-            let mut query = url.query_pairs_mut();
-            query.append_pair("$top", &PAGE_SIZE.to_string());
-            query.append_pair(
-                "$orderby",
-                "isCurrent desc,isLatest desc,start desc,retrospectiveStart desc,registeredAt desc",
-            );
-            query.append_pair(
-                "$filter",
-                &format!(
-                    "titleId eq '{}' and registeredAt ne null and registeredAt le {}",
-                    odata_string(title_id),
-                    upper_bound
-                ),
-            );
-            query.append_pair(
-                "$select",
-                "titleId,start,retrospectiveStart,end,retrospectiveEnd,isCurrent,isLatest,name,status,registerId,registeredAt,compilationNumber",
-            );
-        }
-        let page = self.get_json::<ODataPage<FrlVersion>>(url, MAX_JSON_BODY_BYTES)?;
-        page.value
-            .into_iter()
-            .map(|version| canonicalize_version(&version))
-            .collect()
-    }
-
     fn documents_page(
         &self,
         version: &FrlVersionKey,
@@ -829,20 +859,19 @@ impl FrlApi for HttpFrlApi {
                 rendition.extension.as_deref().unwrap_or("")
             )
         })?;
-        let url = self.rendition_url(rendition)?;
         match kind {
-            RenditionKind::Epub => Ok(FrlPayload::Epub(self.get_bounded(
-                url,
+            RenditionKind::Epub => Ok(FrlPayload::Epub(self.fetch_binary_rendition(
+                rendition,
+                kind,
                 "application/epub+zip",
-                MAX_RENDITION_BYTES,
             )?)),
-            RenditionKind::Docx => Ok(FrlPayload::Docx(self.get_bounded(
-                url,
+            RenditionKind::Docx => Ok(FrlPayload::Docx(self.fetch_binary_rendition(
+                rendition,
+                kind,
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                MAX_RENDITION_BYTES,
             )?)),
             RenditionKind::Pdf => {
-                let mut url = url;
+                let mut url = self.rendition_url(rendition)?;
                 url.query_pairs_mut().append_pair("$select", "contents");
                 let entity: OfficialTextResponse = self.get_json(url, MAX_RENDITION_BYTES)?;
                 Ok(
@@ -864,6 +893,37 @@ fn validate_api_url(url: &Url) -> Result<()> {
         || url.password().is_some()
     {
         bail!("refusing non-FRL API URL {url}");
+    }
+    Ok(())
+}
+
+fn validate_public_rendition_url(url: &Url) -> Result<()> {
+    if url.scheme() != "https"
+        || url.host_str() != Some("www.legislation.gov.au")
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("refusing non-FRL public rendition URL {url}");
+    }
+    let segments = url
+        .path_segments()
+        .ok_or_else(|| anyhow!("FRL public rendition URL has no path"))?
+        .collect::<Vec<_>>();
+    if segments.len() != 6
+        || segments[3] != "text"
+        || segments[4] != "original"
+        || !matches!(segments[5], "epub" | "word")
+    {
+        bail!("refusing malformed FRL public rendition URL {url}");
+    }
+    validate_native_id(segments[0])?;
+    for datetime in &segments[1..=2] {
+        if public_rendition_datetime(datetime)? != *datetime {
+            bail!("refusing non-canonical FRL public rendition URL {url}");
+        }
     }
     Ok(())
 }
@@ -1005,6 +1065,18 @@ fn canonical_datetime(value: &str) -> Result<String> {
     ))
 }
 
+fn public_rendition_datetime(value: &str) -> Result<String> {
+    let parsed = parse_datetime(value)?;
+    if parsed.nanosecond() % 1_000_000 != 0 {
+        bail!("FRL public rendition datetime `{value}` exceeds millisecond precision");
+    }
+    Ok(format!(
+        "{}.{:03}",
+        parsed.format("%Y-%m-%dT%H:%M:%S"),
+        parsed.nanosecond() / 1_000_000
+    ))
+}
+
 fn format_datetime(value: NaiveDateTime) -> String {
     format!(
         "{}.{:07}",
@@ -1089,12 +1161,22 @@ fn discover_to_run_dir(
         });
     }
     let state = load_state(workspace)?;
+    let state_is_current = state.schema_version == STATE_SCHEMA_VERSION;
     let titles = scan_titles(api, page_size)?;
     let VersionScan {
         versions,
         proposed_cursor,
         upper_bound,
-    } = scan_versions(api, state.cursor.as_ref(), scan_started_at, page_size)?;
+    } = scan_versions(
+        api,
+        if state_is_current {
+            state.cursor.as_ref()
+        } else {
+            None
+        },
+        scan_started_at,
+        page_size,
+    )?;
     let title_ids = titles
         .iter()
         .map(|title| title.id.as_str())
@@ -1104,7 +1186,7 @@ fn discover_to_run_dir(
         versions
             .into_iter()
             .filter(|version| title_ids.contains(version.title_id.as_str())),
-        state.cursor.is_none(),
+        !state_is_current || state.cursor.is_none(),
         &upper_bound,
     )?;
     let mut selected_title_ids = selected_versions
@@ -1112,7 +1194,9 @@ fn discover_to_run_dir(
         .map(|version| version.title_id.clone())
         .collect::<BTreeSet<_>>();
     for title in &titles {
-        if state.inventory.contains_key(&title.id) || selected_title_ids.contains(&title.id) {
+        if (state_is_current && state.inventory.contains_key(&title.id))
+            || selected_title_ids.contains(&title.id)
+        {
             continue;
         }
         let authoritative = api
@@ -1681,6 +1765,7 @@ fn fetch_plan(
         workspace,
         source: &source,
         previous_inventory: &previous_state.inventory,
+        allow_reuse: previous_state.schema_version == STATE_SCHEMA_VERSION,
         page_size,
     };
     let pool = rayon::ThreadPoolBuilder::new()
@@ -1748,6 +1833,7 @@ struct FrlAcquisitionContext<'a> {
     workspace: &'a Path,
     source: &'a SourceId,
     previous_inventory: &'a BTreeMap<String, FrlInventoryEntry>,
+    allow_reuse: bool,
     page_size: usize,
 }
 
@@ -1765,15 +1851,20 @@ fn acquire_planned_version(
             None
         }
     };
-    let reusable = staged
-        .filter(|entry| entry.upstream_version == key)
-        .or_else(|| {
-            context
-                .previous_inventory
-                .get(title_id)
+    let reusable = context
+        .allow_reuse
+        .then(|| {
+            staged
                 .filter(|entry| entry.upstream_version == key)
-                .cloned()
-        });
+                .or_else(|| {
+                    context
+                        .previous_inventory
+                        .get(title_id)
+                        .filter(|entry| entry.upstream_version == key)
+                        .cloned()
+                })
+        })
+        .flatten();
     if let Some(entry) = reusable {
         match load_inventory_document(context.workspace, context.source, title_id, &entry) {
             Ok(_) => return Ok((title_id.to_owned(), entry, true)),
@@ -1784,47 +1875,15 @@ fn acquire_planned_version(
             }
         }
     }
-    let upper_bound = format_datetime(Utc::now().naive_utc());
-    let mut candidates = vec![version.clone()];
-    candidates.extend(context.api.version_candidates(title_id, &upper_bound)?);
-    let mut seen = BTreeSet::new();
-    let mut deduplicated = Vec::new();
-    for candidate in candidates {
-        if seen.insert(FrlVersionKey::from_version(&candidate)?) {
-            deduplicated.push(candidate);
-        }
-    }
-    let mut failures = Vec::new();
-    let mut selected = None;
-    for candidate in deduplicated {
-        let candidate_key = FrlVersionKey::from_version(&candidate)?;
-        let attempt = scan_documents(context.api, &candidate_key, context.page_size)
-            .with_context(|| format!("listing FRL renditions for {title_id}"))
-            .and_then(|documents| {
-                fetch_preferred_normalized_document(context.api, title, &candidate, &documents)
-            });
-        match attempt {
-            Ok((_rendition, document)) => {
-                selected = Some((candidate, candidate_key, document));
-                break;
-            }
-            Err(error) => failures.push(format!("{}: {error:#}", candidate_key.start)),
-        }
-    }
-    let (selected_version, selected_key, document) = selected.ok_or_else(|| {
-        anyhow!(
-            "all official FRL versions failed for {title_id}: {}",
-            failures.join("; ")
-        )
-    })?;
-    if selected_key != key {
-        eprintln!(
-            "FRL title {title_id}: using verified version {} after the current rendition failed",
-            selected_key.start
-        );
-    }
+    let documents = scan_documents(context.api, &key, context.page_size)
+        .with_context(|| format!("listing FRL renditions for {title_id}"))?;
+    let (_rendition, document) =
+        fetch_preferred_normalized_document(context.api, title, version, &documents)
+            .with_context(|| format!("normalizing the authoritative FRL version for {title_id}"))?;
+    let selected_version = version;
+    let selected_key = key;
     let stored = persist_document(context.workspace, &document)?;
-    let cursor = FrlCursor::from_version(&selected_version)?.ok_or_else(|| {
+    let cursor = FrlCursor::from_version(selected_version)?.ok_or_else(|| {
         anyhow!(
             "FRL version {} has no registration time",
             selected_version.title_id
@@ -1910,7 +1969,7 @@ fn load_state(workspace: &Path) -> Result<FrlState> {
 }
 
 fn validate_state(state: &FrlState) -> Result<()> {
-    if state.schema_version != STATE_SCHEMA_VERSION {
+    if !matches!(state.schema_version, 1 | STATE_SCHEMA_VERSION) {
         bail!(
             "unsupported FRL state schema version {}",
             state.schema_version
@@ -2273,6 +2332,9 @@ pub(crate) fn normalized_document_results(
         );
     }
     let state = load_state(workspace)?;
+    if state.schema_version != STATE_SCHEMA_VERSION {
+        bail!("FRL workspace uses a superseded normalizer; run a full FRL source update");
+    }
     if state.inventory.is_empty() {
         bail!("FRL committed authoritative inventory is empty");
     }
@@ -2747,6 +2809,792 @@ pub(crate) fn normalize_docx_for_source(
     Ok((html, assets))
 }
 
+#[derive(Clone, Copy, Debug)]
+enum DocxNumberingSuffix {
+    Tab,
+    Space,
+    Nothing,
+}
+
+#[derive(Clone, Debug)]
+struct DocxNumberingLevel {
+    start: i64,
+    format: String,
+    text: String,
+    suffix: DocxNumberingSuffix,
+    legal: bool,
+    restart_after: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DocxNumbering {
+    instances: BTreeMap<i64, BTreeMap<usize, DocxNumberingLevel>>,
+}
+
+#[derive(Clone, Debug)]
+struct DocxRawNumberingInstance {
+    abstract_id: i64,
+    node: XmlNode,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DocxNumberingSetting {
+    instance: Option<i64>,
+    level: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct DocxRawParagraphStyle {
+    based_on: Option<String>,
+    numbering: Option<DocxNumberingSetting>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DocxParagraphStyles {
+    default_style: Option<String>,
+    numbering: BTreeMap<String, Option<(i64, usize)>>,
+}
+
+#[derive(Debug, Default)]
+struct DocxNumberingState {
+    counters: BTreeMap<i64, Vec<Option<i64>>>,
+}
+
+#[derive(Default)]
+struct DocxNumberingLevelPatch {
+    start: Option<i64>,
+    format: Option<String>,
+    text: Option<String>,
+    suffix: Option<DocxNumberingSuffix>,
+    legal: Option<bool>,
+    restart_after: Option<Option<usize>>,
+}
+
+impl DocxNumberingLevelPatch {
+    fn resolve(
+        self,
+        base: Option<&DocxNumberingLevel>,
+        level: usize,
+    ) -> Result<DocxNumberingLevel> {
+        let format = self
+            .format
+            .or_else(|| base.map(|base| base.format.clone()))
+            .unwrap_or_else(|| "decimal".to_owned());
+        let text = self
+            .text
+            .or_else(|| base.map(|base| base.text.clone()))
+            .or_else(|| format.eq_ignore_ascii_case("none").then(String::new))
+            .ok_or_else(|| anyhow!("DOCX numbering level {level} has no level text"))?;
+        Ok(DocxNumberingLevel {
+            start: self
+                .start
+                .or_else(|| base.map(|base| base.start))
+                .unwrap_or(1),
+            format,
+            text,
+            suffix: self
+                .suffix
+                .or_else(|| base.map(|base| base.suffix))
+                .unwrap_or(DocxNumberingSuffix::Tab),
+            legal: self
+                .legal
+                .or_else(|| base.map(|base| base.legal))
+                .unwrap_or(false),
+            restart_after: self
+                .restart_after
+                .or_else(|| base.map(|base| base.restart_after))
+                .unwrap_or_else(|| level.checked_sub(1)),
+        })
+    }
+}
+
+fn parse_docx_numbering(archive: &BTreeMap<PathBuf, Vec<u8>>) -> Result<DocxNumbering> {
+    let path = Path::new("word/numbering.xml");
+    let Some(bytes) = archive.get(path) else {
+        return Ok(DocxNumbering::default());
+    };
+    let source = std::str::from_utf8(bytes).context("DOCX numbering is not UTF-8")?;
+    let xml = parse_xml(source).context("parsing DOCX word/numbering.xml")?;
+    let mut abstracts = BTreeMap::<i64, BTreeMap<usize, DocxNumberingLevel>>::new();
+    let mut linked_abstracts = BTreeMap::<i64, String>::new();
+    let mut abstract_ids = BTreeSet::new();
+    for abstract_numbering in
+        child_nodes(&xml).filter(|node| local_name(&node.name) == "abstractnum")
+    {
+        let id = parse_docx_nonnegative_integer(
+            attr_local(abstract_numbering, "abstractnumid")
+                .ok_or_else(|| anyhow!("DOCX abstract numbering has no id"))?,
+            "abstract numbering id",
+        )?;
+        if !abstract_ids.insert(id) {
+            bail!("DOCX numbering contains duplicate abstract id {id}");
+        }
+        let mut levels = BTreeMap::new();
+        for level_node in
+            child_nodes(abstract_numbering).filter(|node| local_name(&node.name) == "lvl")
+        {
+            let (level, patch) = parse_docx_numbering_level(level_node)?;
+            let resolved = patch.resolve(None, level)?;
+            if levels.insert(level, resolved).is_some() {
+                bail!("DOCX abstract numbering {id} contains duplicate level {level}");
+            }
+        }
+        if levels.is_empty() {
+            let style = docx_numbering_style_link(abstract_numbering, "numstylelink")?
+                .ok_or_else(|| anyhow!("DOCX abstract numbering {id} has no levels"))?;
+            linked_abstracts.insert(id, style);
+            continue;
+        }
+        abstracts.insert(id, levels);
+    }
+
+    let mut raw_instances = BTreeMap::new();
+    for numbering in child_nodes(&xml).filter(|node| local_name(&node.name) == "num") {
+        let id = parse_docx_nonnegative_integer(
+            attr_local(numbering, "numid")
+                .ok_or_else(|| anyhow!("DOCX numbering instance has no id"))?,
+            "numbering instance id",
+        )?;
+        let abstract_id = child_nodes(numbering)
+            .find(|node| local_name(&node.name) == "abstractnumid")
+            .and_then(|node| attr_local(node, "val"))
+            .ok_or_else(|| anyhow!("DOCX numbering instance {id} has no abstract id"))?;
+        let abstract_id =
+            parse_docx_nonnegative_integer(abstract_id, "numbering abstract reference")?;
+        if raw_instances
+            .insert(
+                id,
+                DocxRawNumberingInstance {
+                    abstract_id,
+                    node: numbering.clone(),
+                },
+            )
+            .is_some()
+        {
+            bail!("DOCX numbering contains duplicate instance id {id}");
+        }
+    }
+
+    let numbering_styles = parse_docx_numbering_style_ids(archive)?;
+    let mut instances = BTreeMap::new();
+    let mut resolving = BTreeSet::new();
+    for id in raw_instances.keys().copied().collect::<Vec<_>>() {
+        resolve_docx_numbering_instance(
+            id,
+            &raw_instances,
+            &abstracts,
+            &linked_abstracts,
+            &numbering_styles,
+            &mut resolving,
+            &mut instances,
+        )?;
+    }
+    Ok(DocxNumbering { instances })
+}
+
+fn resolve_docx_numbering_instance(
+    id: i64,
+    raw_instances: &BTreeMap<i64, DocxRawNumberingInstance>,
+    abstracts: &BTreeMap<i64, BTreeMap<usize, DocxNumberingLevel>>,
+    linked_abstracts: &BTreeMap<i64, String>,
+    numbering_styles: &BTreeMap<String, i64>,
+    resolving: &mut BTreeSet<i64>,
+    instances: &mut BTreeMap<i64, BTreeMap<usize, DocxNumberingLevel>>,
+) -> Result<BTreeMap<usize, DocxNumberingLevel>> {
+    if let Some(levels) = instances.get(&id) {
+        return Ok(levels.clone());
+    }
+    if resolving.len() >= MAX_DOCX_STYLE_REFERENCE_DEPTH {
+        bail!("DOCX numbering style link exceeds its reference-depth bound");
+    }
+    if !resolving.insert(id) {
+        bail!("DOCX numbering style link contains an instance cycle at {id}");
+    }
+    let raw = raw_instances
+        .get(&id)
+        .ok_or_else(|| anyhow!("DOCX numbering style refers to missing instance {id}"))?;
+    let mut levels = if let Some(levels) = abstracts.get(&raw.abstract_id) {
+        levels.clone()
+    } else if let Some(style) = linked_abstracts.get(&raw.abstract_id) {
+        let style_instance = numbering_styles.get(style).ok_or_else(|| {
+            anyhow!(
+                "DOCX abstract numbering {} links to missing numbering style {style}",
+                raw.abstract_id
+            )
+        })?;
+        resolve_docx_numbering_instance(
+            *style_instance,
+            raw_instances,
+            abstracts,
+            linked_abstracts,
+            numbering_styles,
+            resolving,
+            instances,
+        )?
+    } else {
+        bail!(
+            "DOCX numbering instance {id} refers to missing abstract {}",
+            raw.abstract_id
+        );
+    };
+    apply_docx_numbering_overrides(id, &raw.node, &mut levels)?;
+    resolving.remove(&id);
+    instances.insert(id, levels.clone());
+    Ok(levels)
+}
+
+fn apply_docx_numbering_overrides(
+    id: i64,
+    numbering: &XmlNode,
+    levels: &mut BTreeMap<usize, DocxNumberingLevel>,
+) -> Result<()> {
+    let mut overridden = BTreeSet::new();
+    for level_override in
+        child_nodes(numbering).filter(|node| local_name(&node.name) == "lvloverride")
+    {
+        let level = parse_docx_level_index(
+            attr_local(level_override, "ilvl")
+                .ok_or_else(|| anyhow!("DOCX numbering override has no level"))?,
+        )?;
+        if !overridden.insert(level) {
+            bail!("DOCX numbering instance {id} contains duplicate override {level}");
+        }
+        let mut resolved = levels
+            .get(&level)
+            .cloned()
+            .ok_or_else(|| anyhow!("DOCX numbering override {level} has no abstract level"))?;
+        if let Some(level_node) =
+            child_nodes(level_override).find(|node| local_name(&node.name) == "lvl")
+        {
+            let (override_level, patch) = parse_docx_numbering_level(level_node)?;
+            if override_level != level {
+                bail!("DOCX numbering override level does not match its level definition");
+            }
+            resolved = patch.resolve(Some(&resolved), level)?;
+        }
+        if let Some(start) = child_nodes(level_override)
+            .find(|node| local_name(&node.name) == "startoverride")
+            .and_then(|node| attr_local(node, "val"))
+        {
+            resolved.start = parse_docx_start(start)?;
+        }
+        levels.insert(level, resolved);
+    }
+    Ok(())
+}
+
+fn docx_numbering_style_link(node: &XmlNode, name: &str) -> Result<Option<String>> {
+    let Some(value) = child_nodes(node)
+        .find(|child| local_name(&child.name) == name)
+        .and_then(|child| attr_local(child, "val"))
+    else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+        bail!("DOCX numbering style link is invalid");
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn parse_docx_numbering_style_ids(
+    archive: &BTreeMap<PathBuf, Vec<u8>>,
+) -> Result<BTreeMap<String, i64>> {
+    let Some(bytes) = archive.get(Path::new("word/styles.xml")) else {
+        return Ok(BTreeMap::new());
+    };
+    let source = std::str::from_utf8(bytes).context("DOCX styles are not UTF-8")?;
+    let xml = parse_xml(source).context("parsing DOCX word/styles.xml")?;
+    let mut raw = BTreeMap::new();
+    for style in child_nodes(&xml).filter(|node| {
+        local_name(&node.name) == "style"
+            && attr_local(node, "type").is_some_and(|value| value.eq_ignore_ascii_case("numbering"))
+    }) {
+        let id = parse_docx_style_id(
+            attr_local(style, "styleid")
+                .ok_or_else(|| anyhow!("DOCX numbering style has no id"))?,
+        )?;
+        let based_on = child_nodes(style)
+            .find(|node| local_name(&node.name) == "basedon")
+            .and_then(|node| attr_local(node, "val"))
+            .map(parse_docx_style_id)
+            .transpose()?;
+        let numbering = child_nodes(style)
+            .find(|node| local_name(&node.name) == "ppr")
+            .and_then(|properties| {
+                child_nodes(properties).find(|node| local_name(&node.name) == "numpr")
+            })
+            .map(parse_docx_numbering_setting)
+            .transpose()?;
+        if raw
+            .insert(
+                id.clone(),
+                DocxRawParagraphStyle {
+                    based_on,
+                    numbering,
+                },
+            )
+            .is_some()
+        {
+            bail!("DOCX styles contain duplicate numbering style {id}");
+        }
+    }
+    let mut styles = BTreeMap::new();
+    let mut resolving = BTreeSet::new();
+    let mut resolved = BTreeMap::new();
+    for id in raw.keys() {
+        if let Some((instance, _)) =
+            resolve_docx_paragraph_style(id, &raw, &mut resolving, &mut resolved)?
+        {
+            styles.insert(id.clone(), instance);
+        }
+    }
+    Ok(styles)
+}
+
+fn parse_docx_style_id(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+        bail!("DOCX style id is invalid");
+    }
+    Ok(value.to_owned())
+}
+
+fn parse_docx_numbering_setting(numbering: &XmlNode) -> Result<DocxNumberingSetting> {
+    let instance = child_nodes(numbering)
+        .find(|node| local_name(&node.name) == "numid")
+        .and_then(|node| attr_local(node, "val"))
+        .map(|value| parse_docx_nonnegative_integer(value, "numbering id"))
+        .transpose()?;
+    let level = child_nodes(numbering)
+        .find(|node| local_name(&node.name) == "ilvl")
+        .and_then(|node| attr_local(node, "val"))
+        .map(parse_docx_level_index)
+        .transpose()?;
+    Ok(DocxNumberingSetting { instance, level })
+}
+
+fn resolve_docx_numbering_setting(
+    setting: DocxNumberingSetting,
+    inherited: Option<(i64, usize)>,
+) -> Option<(i64, usize)> {
+    if setting.instance == Some(0) {
+        return None;
+    }
+    let instance = setting
+        .instance
+        .or_else(|| inherited.map(|(instance, _)| instance))?;
+    let level = setting
+        .level
+        .or_else(|| inherited.map(|(_, level)| level))
+        .unwrap_or(0);
+    Some((instance, level))
+}
+
+fn parse_docx_paragraph_styles(
+    archive: &BTreeMap<PathBuf, Vec<u8>>,
+) -> Result<DocxParagraphStyles> {
+    let Some(bytes) = archive.get(Path::new("word/styles.xml")) else {
+        return Ok(DocxParagraphStyles::default());
+    };
+    let source = std::str::from_utf8(bytes).context("DOCX styles are not UTF-8")?;
+    let xml = parse_xml(source).context("parsing DOCX word/styles.xml")?;
+    let mut raw = BTreeMap::new();
+    let mut default_style = None;
+    for style in child_nodes(&xml).filter(|node| {
+        local_name(&node.name) == "style"
+            && attr_local(node, "type").is_some_and(|value| value.eq_ignore_ascii_case("paragraph"))
+    }) {
+        let id = parse_docx_style_id(
+            attr_local(style, "styleid")
+                .ok_or_else(|| anyhow!("DOCX paragraph style has no id"))?,
+        )?;
+        let based_on = child_nodes(style)
+            .find(|node| local_name(&node.name) == "basedon")
+            .and_then(|node| attr_local(node, "val"))
+            .map(parse_docx_style_id)
+            .transpose()?;
+        let numbering = child_nodes(style)
+            .find(|node| local_name(&node.name) == "ppr")
+            .and_then(|properties| {
+                child_nodes(properties).find(|node| local_name(&node.name) == "numpr")
+            })
+            .map(parse_docx_numbering_setting)
+            .transpose()?;
+        if attr_local(style, "default")
+            .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "on"))
+            && default_style.replace(id.clone()).is_some()
+        {
+            bail!("DOCX styles contain multiple default paragraph styles");
+        }
+        if raw
+            .insert(
+                id.clone(),
+                DocxRawParagraphStyle {
+                    based_on,
+                    numbering,
+                },
+            )
+            .is_some()
+        {
+            bail!("DOCX styles contain duplicate paragraph style {id}");
+        }
+    }
+
+    let mut numbering = BTreeMap::new();
+    let mut resolving = BTreeSet::new();
+    for id in raw.keys().cloned().collect::<Vec<_>>() {
+        resolve_docx_paragraph_style(&id, &raw, &mut resolving, &mut numbering)?;
+    }
+    Ok(DocxParagraphStyles {
+        default_style,
+        numbering,
+    })
+}
+
+fn resolve_docx_paragraph_style(
+    id: &str,
+    raw: &BTreeMap<String, DocxRawParagraphStyle>,
+    resolving: &mut BTreeSet<String>,
+    resolved: &mut BTreeMap<String, Option<(i64, usize)>>,
+) -> Result<Option<(i64, usize)>> {
+    if let Some(numbering) = resolved.get(id) {
+        return Ok(*numbering);
+    }
+    if resolving.len() >= MAX_DOCX_STYLE_REFERENCE_DEPTH {
+        bail!("DOCX paragraph style inheritance exceeds its reference-depth bound");
+    }
+    if !resolving.insert(id.to_owned()) {
+        bail!("DOCX paragraph style inheritance contains a cycle at {id}");
+    }
+    let style = raw
+        .get(id)
+        .ok_or_else(|| anyhow!("DOCX paragraph style inherits missing style {id}"))?;
+    let inherited = match style.based_on.as_deref() {
+        Some(base) => resolve_docx_paragraph_style(base, raw, resolving, resolved)?,
+        None => None,
+    };
+    let numbering = match style.numbering {
+        Some(setting) => resolve_docx_numbering_setting(setting, inherited),
+        None => inherited,
+    };
+    resolving.remove(id);
+    resolved.insert(id.to_owned(), numbering);
+    Ok(numbering)
+}
+
+fn parse_docx_numbering_level(level: &XmlNode) -> Result<(usize, DocxNumberingLevelPatch)> {
+    let index = parse_docx_level_index(
+        attr_local(level, "ilvl").ok_or_else(|| anyhow!("DOCX numbering level has no index"))?,
+    )?;
+    let mut patch = DocxNumberingLevelPatch::default();
+    for property in child_nodes(level) {
+        match local_name(&property.name).as_str() {
+            "start" => {
+                patch.start = Some(parse_docx_start(
+                    attr_local(property, "val")
+                        .ok_or_else(|| anyhow!("DOCX numbering start has no value"))?,
+                )?);
+            }
+            "numfmt" => {
+                let format = attr_local(property, "val")
+                    .ok_or_else(|| anyhow!("DOCX numbering format has no value"))?
+                    .trim();
+                if format.is_empty() || format.len() > 64 {
+                    bail!("DOCX numbering format is invalid");
+                }
+                patch.format = Some(format.to_owned());
+            }
+            "lvltext" => {
+                let text = attr_local(property, "val")
+                    .ok_or_else(|| anyhow!("DOCX numbering level text has no value"))?;
+                if text.len() > 256 || text.chars().any(char::is_control) {
+                    bail!("DOCX numbering level text is invalid");
+                }
+                patch.text = Some(text.to_owned());
+            }
+            "suff" => {
+                patch.suffix = Some(
+                    match attr_local(property, "val")
+                        .ok_or_else(|| anyhow!("DOCX numbering suffix has no value"))?
+                        .to_ascii_lowercase()
+                        .as_str()
+                    {
+                        "tab" => DocxNumberingSuffix::Tab,
+                        "space" => DocxNumberingSuffix::Space,
+                        "nothing" => DocxNumberingSuffix::Nothing,
+                        value => bail!("unsupported DOCX numbering suffix {value}"),
+                    },
+                );
+            }
+            "islgl" => patch.legal = Some(parse_docx_on_off(attr_local(property, "val"))?),
+            "lvlrestart" => {
+                let value = parse_docx_nonnegative_integer(
+                    attr_local(property, "val")
+                        .ok_or_else(|| anyhow!("DOCX numbering restart has no value"))?,
+                    "numbering restart",
+                )?;
+                patch.restart_after = Some(if value == 0 {
+                    None
+                } else {
+                    let ancestor = usize::try_from(value - 1)?;
+                    if ancestor >= index {
+                        bail!("DOCX numbering restart must refer to a higher level");
+                    }
+                    Some(ancestor)
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok((index, patch))
+}
+
+fn parse_docx_nonnegative_integer(value: &str, label: &str) -> Result<i64> {
+    let value = value
+        .parse::<i64>()
+        .with_context(|| format!("DOCX {label} is not numeric"))?;
+    if value < 0 {
+        bail!("DOCX {label} is negative");
+    }
+    Ok(value)
+}
+
+fn parse_docx_level_index(value: &str) -> Result<usize> {
+    let level = value
+        .parse::<usize>()
+        .context("DOCX numbering level is not numeric")?;
+    if level > 8 {
+        bail!("DOCX numbering level exceeds the OOXML level bound");
+    }
+    Ok(level)
+}
+
+fn parse_docx_start(value: &str) -> Result<i64> {
+    let value = parse_docx_nonnegative_integer(value, "numbering start")?;
+    if value > 1_000_000_000 {
+        bail!("DOCX numbering start exceeds its bound");
+    }
+    Ok(value)
+}
+
+fn parse_docx_on_off(value: Option<&str>) -> Result<bool> {
+    match value.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("1" | "true" | "on") => Ok(true),
+        Some("0" | "false" | "off") => Ok(false),
+        Some(value) => bail!("invalid DOCX on/off value {value}"),
+    }
+}
+
+impl DocxNumbering {
+    fn paragraph_marker(
+        &self,
+        paragraph: &XmlNode,
+        styles: &DocxParagraphStyles,
+        state: &mut DocxNumberingState,
+    ) -> Result<Option<(String, DocxNumberingSuffix)>> {
+        let Some((numbering_id, level_index)) = docx_paragraph_numbering(paragraph, styles)? else {
+            return Ok(None);
+        };
+        let levels = self.instances.get(&numbering_id).ok_or_else(|| {
+            anyhow!("DOCX paragraph refers to missing numbering instance {numbering_id}")
+        })?;
+        let level = levels.get(&level_index).ok_or_else(|| {
+            anyhow!("DOCX numbering instance {numbering_id} has no level {level_index}")
+        })?;
+        let counters = state
+            .counters
+            .entry(numbering_id)
+            .or_insert_with(|| vec![None; 9]);
+        for (ancestor, counter) in counters.iter_mut().enumerate().take(level_index) {
+            if counter.is_none() {
+                if let Some(ancestor_level) = levels.get(&ancestor) {
+                    *counter = Some(ancestor_level.start);
+                }
+            }
+        }
+        counters[level_index] = Some(match counters[level_index] {
+            Some(value) => value
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("DOCX numbering counter overflow"))?,
+            None => level.start,
+        });
+        for (child_index, counter) in counters.iter_mut().enumerate().skip(level_index + 1) {
+            if levels
+                .get(&child_index)
+                .is_some_and(|child| child.restart_after == Some(level_index))
+            {
+                *counter = None;
+            }
+        }
+        let marker = render_docx_numbering_text(level, levels, counters)?;
+        Ok(Some((marker, level.suffix)))
+    }
+}
+
+fn docx_paragraph_numbering(
+    paragraph: &XmlNode,
+    styles: &DocxParagraphStyles,
+) -> Result<Option<(i64, usize)>> {
+    let properties = child_nodes(paragraph).find(|node| local_name(&node.name) == "ppr");
+    if let Some(numbering) = properties.and_then(|properties| {
+        child_nodes(properties).find(|node| local_name(&node.name) == "numpr")
+    }) {
+        let inherited = paragraph_or_default_style_numbering(properties, styles);
+        return Ok(resolve_docx_numbering_setting(
+            parse_docx_numbering_setting(numbering)?,
+            inherited,
+        ));
+    }
+    Ok(paragraph_or_default_style_numbering(properties, styles))
+}
+
+fn paragraph_style_numbering(
+    properties: &XmlNode,
+    styles: &DocxParagraphStyles,
+) -> Option<Option<(i64, usize)>> {
+    child_nodes(properties)
+        .find(|node| local_name(&node.name) == "pstyle")
+        .and_then(|node| attr_local(node, "val"))
+        .map(|style| styles.numbering.get(style).copied().flatten())
+}
+
+fn paragraph_or_default_style_numbering(
+    properties: Option<&XmlNode>,
+    styles: &DocxParagraphStyles,
+) -> Option<(i64, usize)> {
+    match properties.and_then(|properties| paragraph_style_numbering(properties, styles)) {
+        Some(numbering) => numbering,
+        None => styles
+            .default_style
+            .as_deref()
+            .and_then(|style| styles.numbering.get(style).copied().flatten()),
+    }
+}
+
+fn render_docx_numbering_text(
+    level: &DocxNumberingLevel,
+    levels: &BTreeMap<usize, DocxNumberingLevel>,
+    counters: &[Option<i64>],
+) -> Result<String> {
+    let mut output = String::new();
+    let mut characters = level.text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            output.push(character);
+            continue;
+        }
+        match characters.peek().copied() {
+            Some('%') => {
+                characters.next();
+                output.push('%');
+            }
+            Some(reference @ '1'..='9') => {
+                characters.next();
+                let index = reference as usize - '1' as usize;
+                let value =
+                    counters.get(index).copied().flatten().ok_or_else(|| {
+                        anyhow!("DOCX numbering text refers to unset level {index}")
+                    })?;
+                let referenced_level = levels.get(&index).ok_or_else(|| {
+                    anyhow!("DOCX numbering text refers to missing level {index}")
+                })?;
+                let format = if level.legal {
+                    "decimal"
+                } else {
+                    &referenced_level.format
+                };
+                output.push_str(&format_docx_number(value, format));
+            }
+            _ => output.push('%'),
+        }
+    }
+    Ok(output)
+}
+
+fn format_docx_number(value: i64, format: &str) -> String {
+    match format.to_ascii_lowercase().as_str() {
+        "none" => String::new(),
+        "decimalzero" => format!("{value:02}"),
+        "upperletter" => format_docx_letters(value, true),
+        "lowerletter" => format_docx_letters(value, false),
+        "upperroman" => format_docx_roman(value, true),
+        "lowerroman" => format_docx_roman(value, false),
+        "ordinal" | "ordinaltext" => format_docx_ordinal(value),
+        "hex" => format!("{value:X}"),
+        // Static bullet level text has no placeholder. For uncommon locale-
+        // specific formats, a decimal counter is a stable source-derived
+        // fallback that preserves the paragraph marker instead of dropping it.
+        _ => value.to_string(),
+    }
+}
+
+fn format_docx_letters(value: i64, uppercase: bool) -> String {
+    if value <= 0 {
+        return value.to_string();
+    }
+    let mut value = value as u64;
+    let mut characters = Vec::new();
+    while value > 0 {
+        value -= 1;
+        let character = (b'a' + (value % 26) as u8) as char;
+        characters.push(if uppercase {
+            character.to_ascii_uppercase()
+        } else {
+            character
+        });
+        value /= 26;
+    }
+    characters.into_iter().rev().collect()
+}
+
+fn format_docx_roman(value: i64, uppercase: bool) -> String {
+    if !(1..=3_999).contains(&value) {
+        return value.to_string();
+    }
+    let mut value = value;
+    let mut output = String::new();
+    for (number, marker) in [
+        (1_000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ] {
+        while value >= number {
+            output.push_str(marker);
+            value -= number;
+        }
+    }
+    if uppercase {
+        output
+    } else {
+        output.to_ascii_lowercase()
+    }
+}
+
+fn format_docx_ordinal(value: i64) -> String {
+    let suffix = if (11..=13).contains(&(value % 100)) {
+        "th"
+    } else {
+        match value % 10 {
+            1 => "st",
+            2 => "nd",
+            3 => "rd",
+            _ => "th",
+        }
+    };
+    format!("{value}{suffix}")
+}
+
 fn normalize_docx_with_source(
     bytes: &[u8],
     source_id: &str,
@@ -2758,27 +3606,158 @@ fn normalize_docx_with_source(
     let xml = parse_xml(&document).context("parsing DOCX word/document.xml")?;
     let relationships = parse_docx_relationships(&archive)?;
     let content_types = parse_docx_content_types(&archive)?;
+    let numbering = parse_docx_numbering(&archive)?;
+    let styles = parse_docx_paragraph_styles(&archive)?;
+    let mut referenced_footnote_ids = BTreeSet::new();
+    let mut referenced_footnotes = Vec::new();
+    collect_visible_docx_footnote_references(
+        &xml,
+        &mut referenced_footnote_ids,
+        &mut referenced_footnotes,
+    )?;
+    let footnote_markers = referenced_footnotes
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (*id, (index + 1).to_string()))
+        .collect::<BTreeMap<_, _>>();
     let body = descendants(&xml)
         .find(|node| local_name(&node.name) == "body")
         .ok_or_else(|| anyhow!("DOCX document has no body"))?;
     let mut assets = AssetCollector::new(source_id, native_id)?;
     let mut html = String::from("<article>");
     let mut sink = HtmlSink::new(&mut html);
+    let mut numbering_state = DocxNumberingState::default();
+    let render_context = DocxRenderContext {
+        relationships: &relationships,
+        content_types: &content_types,
+        archive: &archive,
+        numbering: &numbering,
+        styles: &styles,
+        footnote_markers: &footnote_markers,
+    };
     for child in &body.children {
         if let XmlChild::Node(node) = child {
             render_docx_block(
                 node,
-                &relationships,
-                &content_types,
-                &archive,
+                &render_context,
+                &mut numbering_state,
                 &mut assets,
                 &mut sink,
             )?;
         }
     }
+    if !referenced_footnotes.is_empty() {
+        render_docx_footnotes(
+            &archive,
+            &referenced_footnotes,
+            &numbering,
+            &styles,
+            &footnote_markers,
+            &mut assets,
+            &mut sink,
+        )?;
+    }
     sink.block_boundary();
     html.push_str("</article>");
     Ok((html, assets.into_vec()))
+}
+
+fn collect_visible_docx_footnote_references(
+    node: &XmlNode,
+    seen: &mut BTreeSet<i64>,
+    ordered: &mut Vec<i64>,
+) -> Result<()> {
+    if local_name(&node.name) == "del" {
+        return Ok(());
+    }
+    if local_name(&node.name) == "footnotereference" {
+        let id = attr_local(node, "id")
+            .ok_or_else(|| anyhow!("DOCX footnote reference has no id"))?
+            .parse::<i64>()
+            .context("DOCX footnote reference id is not numeric")?;
+        if id < 0 {
+            bail!("DOCX document refers to reserved footnote id {id}");
+        }
+        if !seen.insert(id) {
+            bail!("DOCX document contains duplicate footnote reference id {id}");
+        }
+        ordered.push(id);
+    }
+    for child in child_nodes(node) {
+        collect_visible_docx_footnote_references(child, seen, ordered)?;
+    }
+    Ok(())
+}
+
+fn render_docx_footnotes(
+    archive: &BTreeMap<PathBuf, Vec<u8>>,
+    referenced: &[i64],
+    numbering: &DocxNumbering,
+    styles: &DocxParagraphStyles,
+    footnote_markers: &BTreeMap<i64, String>,
+    assets: &mut AssetCollector,
+    sink: &mut HtmlSink<'_>,
+) -> Result<()> {
+    let content_types = parse_docx_content_types(archive)?;
+    let footnotes = archive_text(archive, Path::new("word/footnotes.xml"), "DOCX footnotes")?;
+    let xml = parse_xml(&footnotes).context("parsing DOCX word/footnotes.xml")?;
+    let relationships = parse_docx_relationships_at(
+        archive,
+        Path::new("word/_rels/footnotes.xml.rels"),
+        "DOCX footnote relationships",
+    )?;
+    let referenced_ids = referenced.iter().copied().collect::<BTreeSet<_>>();
+    let mut by_id = BTreeMap::new();
+    for footnote in descendants(&xml).filter(|node| local_name(&node.name) == "footnote") {
+        let Some(id) = attr_local(footnote, "id") else {
+            continue;
+        };
+        let id = id
+            .parse::<i64>()
+            .context("DOCX footnote id is not numeric")?;
+        if referenced_ids.contains(&id) && by_id.insert(id, footnote).is_some() {
+            bail!("DOCX footnotes contain duplicate id {id}");
+        }
+    }
+    let missing = referenced
+        .iter()
+        .filter(|id| !by_id.contains_key(id))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!("DOCX footnotes are missing referenced ids {missing:?}");
+    }
+
+    sink.open("section", &[("id", "footnotes".to_owned())], true);
+    sink.open("h2", &[], true);
+    sink.text("Footnotes");
+    sink.close("h2", true);
+    sink.open("ol", &[], true);
+    let mut numbering_state = DocxNumberingState::default();
+    let render_context = DocxRenderContext {
+        relationships: &relationships,
+        content_types: &content_types,
+        archive,
+        numbering,
+        styles,
+        footnote_markers,
+    };
+    for id in referenced {
+        let footnote = by_id
+            .get(id)
+            .copied()
+            .ok_or_else(|| anyhow!("DOCX footnote {id} disappeared during rendering"))?;
+        sink.open("li", &[("id", format!("footnote-{id}"))], true);
+        sink.open("a", &[("href", format!("#footnote-reference-{id}"))], false);
+        sink.close("a", false);
+        for block in child_nodes(footnote) {
+            render_docx_block(block, &render_context, &mut numbering_state, assets, sink)?;
+        }
+        sink.close("li", true);
+    }
+    sink.close("ol", true);
+    sink.close("section", true);
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -2790,12 +3769,23 @@ struct DocxRelationship {
 fn parse_docx_relationships(
     archive: &BTreeMap<PathBuf, Vec<u8>>,
 ) -> Result<BTreeMap<String, DocxRelationship>> {
-    let path = Path::new("word/_rels/document.xml.rels");
+    parse_docx_relationships_at(
+        archive,
+        Path::new("word/_rels/document.xml.rels"),
+        "DOCX relationships",
+    )
+}
+
+fn parse_docx_relationships_at(
+    archive: &BTreeMap<PathBuf, Vec<u8>>,
+    path: &Path,
+    label: &str,
+) -> Result<BTreeMap<String, DocxRelationship>> {
     let Some(bytes) = archive.get(path) else {
         return Ok(BTreeMap::new());
     };
-    let source = std::str::from_utf8(bytes).context("DOCX relationships are not UTF-8")?;
-    let xml = parse_xml(source).context("parsing DOCX relationships")?;
+    let source = std::str::from_utf8(bytes).with_context(|| format!("{label} are not UTF-8"))?;
+    let xml = parse_xml(source).with_context(|| format!("parsing {label}"))?;
     let mut relationships = BTreeMap::new();
     for node in descendants(&xml).filter(|node| local_name(&node.name) == "relationship") {
         let (Some(id), Some(target)) = (attr_local(node, "id"), attr_local(node, "target")) else {
@@ -2840,16 +3830,24 @@ fn parse_docx_content_types(
     Ok(defaults)
 }
 
+struct DocxRenderContext<'a> {
+    relationships: &'a BTreeMap<String, DocxRelationship>,
+    content_types: &'a BTreeMap<String, String>,
+    archive: &'a BTreeMap<PathBuf, Vec<u8>>,
+    numbering: &'a DocxNumbering,
+    styles: &'a DocxParagraphStyles,
+    footnote_markers: &'a BTreeMap<i64, String>,
+}
+
 fn render_docx_block(
     node: &XmlNode,
-    relationships: &BTreeMap<String, DocxRelationship>,
-    content_types: &BTreeMap<String, String>,
-    archive: &BTreeMap<PathBuf, Vec<u8>>,
+    context: &DocxRenderContext<'_>,
+    numbering_state: &mut DocxNumberingState,
     assets: &mut AssetCollector,
     sink: &mut HtmlSink<'_>,
 ) -> Result<()> {
     match local_name(&node.name).as_str() {
-        "p" => render_docx_paragraph(node, relationships, content_types, archive, assets, sink),
+        "p" => render_docx_paragraph(node, context, numbering_state, assets, sink),
         "tbl" => {
             sink.open("table", &[], true);
             for row in child_nodes(node).filter(|child| local_name(&child.name) == "tr") {
@@ -2857,14 +3855,7 @@ fn render_docx_block(
                 for cell in child_nodes(row).filter(|child| local_name(&child.name) == "tc") {
                     sink.open("td", &[], true);
                     for block in child_nodes(cell) {
-                        render_docx_block(
-                            block,
-                            relationships,
-                            content_types,
-                            archive,
-                            assets,
-                            sink,
-                        )?;
+                        render_docx_block(block, context, numbering_state, assets, sink)?;
                     }
                     sink.close("td", true);
                 }
@@ -2875,7 +3866,7 @@ fn render_docx_block(
         }
         _ => {
             for child in child_nodes(node) {
-                render_docx_block(child, relationships, content_types, archive, assets, sink)?;
+                render_docx_block(child, context, numbering_state, assets, sink)?;
             }
             Ok(())
         }
@@ -2884,9 +3875,8 @@ fn render_docx_block(
 
 fn render_docx_paragraph(
     paragraph: &XmlNode,
-    relationships: &BTreeMap<String, DocxRelationship>,
-    content_types: &BTreeMap<String, String>,
-    archive: &BTreeMap<PathBuf, Vec<u8>>,
+    context: &DocxRenderContext<'_>,
+    numbering_state: &mut DocxNumberingState,
     assets: &mut AssetCollector,
     sink: &mut HtmlSink<'_>,
 ) -> Result<()> {
@@ -2895,8 +3885,23 @@ fn render_docx_paragraph(
         .and_then(|node| attr_local(node, "val"));
     let tag = heading_tag(style).unwrap_or("p");
     sink.open(tag, &[], true);
+    if let Some((marker, suffix)) =
+        context
+            .numbering
+            .paragraph_marker(paragraph, context.styles, numbering_state)?
+    {
+        if !marker.is_empty() {
+            sink.text(&marker);
+            if matches!(
+                suffix,
+                DocxNumberingSuffix::Tab | DocxNumberingSuffix::Space
+            ) {
+                sink.text(" ");
+            }
+        }
+    }
     for child in &paragraph.children {
-        render_docx_inline(child, relationships, content_types, archive, assets, sink)?;
+        render_docx_inline(child, context, assets, sink)?;
     }
     sink.close(tag, true);
     Ok(())
@@ -2904,9 +3909,7 @@ fn render_docx_paragraph(
 
 fn render_docx_inline(
     child: &XmlChild,
-    relationships: &BTreeMap<String, DocxRelationship>,
-    content_types: &BTreeMap<String, String>,
-    archive: &BTreeMap<PathBuf, Vec<u8>>,
+    context: &DocxRenderContext<'_>,
     assets: &mut AssetCollector,
     sink: &mut HtmlSink<'_>,
 ) -> Result<()> {
@@ -2922,6 +3925,31 @@ fn render_docx_inline(
             }
         }
         "instrtext" | "fldchar" => return Ok(()),
+        "footnotereference" => {
+            let id = attr_local(node, "id")
+                .ok_or_else(|| anyhow!("DOCX footnote reference has no id"))?
+                .parse::<i64>()
+                .context("DOCX footnote reference id is not numeric")?;
+            if id < 0 {
+                bail!("DOCX document refers to reserved footnote id {id}");
+            }
+            sink.open("sup", &[], false);
+            sink.open(
+                "a",
+                &[
+                    ("id", format!("footnote-reference-{id}")),
+                    ("href", format!("#footnote-{id}")),
+                ],
+                false,
+            );
+            let marker = context
+                .footnote_markers
+                .get(&id)
+                .ok_or_else(|| anyhow!("DOCX footnote reference {id} has no display marker"))?;
+            sink.text(marker);
+            sink.close("a", false);
+            sink.close("sup", false);
+        }
         "tab" => sink.text("\t"),
         "br" | "cr" => sink.empty("br", &[]),
         "del" => return Ok(()),
@@ -2955,14 +3983,7 @@ fn render_docx_inline(
                         continue;
                     }
                 }
-                render_docx_inline(
-                    run_child,
-                    relationships,
-                    content_types,
-                    archive,
-                    assets,
-                    sink,
-                )?;
+                render_docx_inline(run_child, context, assets, sink)?;
             }
             if vertical == Some("superscript") {
                 sink.close("sup", false);
@@ -2981,7 +4002,7 @@ fn render_docx_inline(
         }
         "hyperlink" => {
             let href = attr_local(node, "id")
-                .and_then(|id| relationships.get(id))
+                .and_then(|id| context.relationships.get(id))
                 .filter(|relationship| relationship.external)
                 .and_then(|relationship| Url::parse(&relationship.target).ok())
                 .filter(|url| matches!(url.scheme(), "http" | "https"))
@@ -2990,17 +4011,10 @@ fn render_docx_inline(
                 sink.open("a", &[("href", href)], false);
             }
             for hyperlink_child in &node.children {
-                render_docx_inline(
-                    hyperlink_child,
-                    relationships,
-                    content_types,
-                    archive,
-                    assets,
-                    sink,
-                )?;
+                render_docx_inline(hyperlink_child, context, assets, sink)?;
             }
             if attr_local(node, "id")
-                .and_then(|id| relationships.get(id))
+                .and_then(|id| context.relationships.get(id))
                 .is_some_and(|relationship| {
                     relationship.external
                         && Url::parse(&relationship.target)
@@ -3012,14 +4026,15 @@ fn render_docx_inline(
         }
         "blip" => {
             let Some(relationship) = attr_local(node, "embed")
-                .and_then(|id| relationships.get(id))
+                .and_then(|id| context.relationships.get(id))
                 .filter(|relationship| !relationship.external)
             else {
                 return Ok(());
             };
             let path =
                 resolve_archive_reference(Path::new("word/document.xml"), &relationship.target)?;
-            let bytes = archive
+            let bytes = context
+                .archive
                 .get(&path)
                 .ok_or_else(|| anyhow!("DOCX image {} is absent", path.display()))?;
             let extension = path
@@ -3027,7 +4042,8 @@ fn render_docx_inline(
                 .and_then(|value| value.to_str())
                 .unwrap_or_default()
                 .to_ascii_lowercase();
-            let media_type = content_types
+            let media_type = context
+                .content_types
                 .get(&extension)
                 .cloned()
                 .unwrap_or_else(|| media_type_for_path(&path));
@@ -3036,7 +4052,7 @@ fn render_docx_inline(
         }
         _ => {
             for nested in &node.children {
-                render_docx_inline(nested, relationships, content_types, archive, assets, sink)?;
+                render_docx_inline(nested, context, assets, sink)?;
             }
         }
     }
@@ -3064,7 +4080,7 @@ fn heading_tag(style: Option<&str>) -> Option<&'static str> {
 }
 
 struct AssetCollector {
-    source_id: String,
+    source_id: SourceId,
     native_id: String,
     assets: BTreeMap<String, FrlNormalizedAsset>,
 }
@@ -3072,9 +4088,9 @@ struct AssetCollector {
 impl AssetCollector {
     fn new(source_id: &str, native_id: &str) -> Result<Self> {
         let source = SourceId::new(source_id)?;
-        DocumentId::new(source, native_id.to_owned())?;
+        DocumentId::new(source.clone(), native_id.to_owned())?;
         Ok(Self {
-            source_id: source_id.to_owned(),
+            source_id: source,
             native_id: native_id.to_owned(),
             assets: BTreeMap::new(),
         })
@@ -3101,7 +4117,7 @@ impl AssetCollector {
                 media_type,
                 bytes,
             });
-        Ok(format!("{}:{asset_id}", self.source_id))
+        Ok(AssetRef::new(self.source_id.clone(), asset_id)?.public_ref())
     }
 
     fn into_vec(self) -> Vec<FrlNormalizedAsset> {
@@ -4231,6 +5247,54 @@ mod tests {
     }
 
     #[test]
+    fn public_rendition_url_is_bound_to_the_exact_authoritative_version() -> Result<()> {
+        let api = HttpFrlApi::new(FRL_ACQUISITION.rate_policy())?;
+        let mut candidate = rendition("F2019L00134", "Epub", ".epub")?;
+        candidate.start = canonical_datetime("2026-03-25T13:50:00")?;
+        candidate.retrospective_start = candidate.start.clone();
+        let url = api.public_rendition_url(&candidate, RenditionKind::Epub)?;
+        assert_eq!(
+            url.as_str(),
+            "https://www.legislation.gov.au/F2019L00134/2026-03-25T13:50:00.000/2026-03-25T13:50:00.000/text/original/epub"
+        );
+        validate_public_rendition_url(&url)?;
+
+        candidate.start = canonical_datetime("2026-03-25T13:50:00.0000001")?;
+        assert!(api
+            .public_rendition_url(&candidate, RenditionKind::Epub)
+            .is_err());
+        assert!(validate_public_rendition_url(&Url::parse(
+            "https://www.legislation.gov.au/F2019L00134/latest/text"
+        )?)
+        .is_err());
+        assert!(validate_public_rendition_url(&Url::parse(
+            "https://www.legislation.gov.au/F2019L00134/2026-03-25T13:50:00.000/2026-03-25T13:50:00.000/text/original/epub?version=older"
+        )?)
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires the live official FRL API and public rendition host"]
+    fn exact_public_epub_recovers_an_unavailable_api_entity() -> Result<()> {
+        let api = HttpFrlApi::new(FRL_ACQUISITION.rate_policy())?;
+        let mut candidate = rendition("F2019L00134", "Epub", ".epub")?;
+        candidate.start = canonical_datetime("2026-03-25T13:50:00")?;
+        candidate.retrospective_start = candidate.start.clone();
+        candidate.compilation_number = Some("5".to_owned());
+        candidate.register_id = Some("F2026C00250".to_owned());
+        candidate.version_type = Some("Rectification".to_owned());
+        candidate.is_authorised = false;
+        let FrlPayload::Epub(bytes) = api.fetch_rendition(&candidate)? else {
+            bail!("exact FRL public EPUB fallback returned the wrong payload kind");
+        };
+        assert!(bytes.starts_with(b"PK"));
+        let (html, _) = normalize_epub(&bytes, "F2019L00134")?;
+        assert!(html.contains("CASA 09/19"));
+        Ok(())
+    }
+
+    #[test]
     fn saved_discovery_plan_is_validated_before_reuse() -> Result<()> {
         let workspace = tempdir()?;
         let run_dir = tempdir()?;
@@ -4721,6 +5785,229 @@ mod tests {
         assert!(docx_chunks.contains(asset_marker));
         assert_eq!(epub_chunks.matches(asset_marker).count(), 1);
         assert_eq!(docx_chunks.matches(asset_marker).count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn genuine_docx_numbering_resolves_levels_formats_starts_and_overrides() -> Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/federal-court/numbered-paragraph-footnote.docx");
+        let bytes = fs::read(fixture)?;
+        let archive = read_zip_archive(&bytes, "DOCX numbering fixture")?;
+        let document = archive_text(
+            &archive,
+            Path::new("word/document.xml"),
+            "DOCX numbering fixture",
+        )?;
+        assert!(document.contains("<w:numPr>"));
+        assert!(archive.contains_key(Path::new("word/numbering.xml")));
+        assert!(!document.contains("<w:t>1</w:t>"));
+        assert!(!document.contains("<w:t>2</w:t>"));
+
+        let numbering = parse_docx_numbering(&archive)?;
+        let levels = numbering
+            .instances
+            .get(&42)
+            .ok_or_else(|| anyhow!("fixture numbering instance was not parsed"))?;
+        assert_eq!(levels.get(&0).map(|level| level.start), Some(1));
+        assert_eq!(
+            levels.get(&1).map(|level| level.format.as_str()),
+            Some("lowerLetter")
+        );
+        assert_eq!(levels.get(&1).map(|level| level.start), Some(3));
+        assert_eq!(format_docx_number(27, "upperLetter"), "AA");
+        assert_eq!(format_docx_number(14, "lowerRoman"), "xiv");
+        assert_eq!(format_docx_number(22, "ordinal"), "22nd");
+
+        let (html, assets) = normalize_docx_with_source(
+            &bytes,
+            crate::official_sources::FEDERAL_COURT_SOURCE_ID,
+            "fca/single/2026/2026fca0001",
+        )?;
+        assert!(assets.is_empty());
+        assert!(html.contains("<p>1 The numbered paragraph"));
+        assert!(html.contains("<p>(c) The nested point"));
+        assert!(html.contains("<p>2 The next numbered paragraph"));
+        assert!(html.contains("id=\"footnote-reference-9\" href=\"#footnote-9\">1</a>"));
+        assert!(html.contains("id=\"footnote-reference-2\" href=\"#footnote-2\">2</a>"));
+        assert!(html.find("id=\"footnote-9\"").unwrap() < html.find("id=\"footnote-2\"").unwrap());
+        Ok(())
+    }
+
+    #[test]
+    fn docx_numbering_resolves_a_numbering_style_link() -> Result<()> {
+        let numbering = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:abstractNum w:abstractNumId="19">
+    <w:styleLink w:val="FCListNo"/>
+    <w:lvl w:ilvl="0">
+      <w:start w:val="1"/>
+      <w:numFmt w:val="decimal"/>
+      <w:lvlText w:val="(%1)"/>
+    </w:lvl>
+  </w:abstractNum>
+  <w:abstractNum w:abstractNumId="45">
+    <w:numStyleLink w:val="FCListNo"/>
+  </w:abstractNum>
+  <w:num w:numId="20"><w:abstractNumId w:val="19"/></w:num>
+  <w:num w:numId="21"><w:abstractNumId w:val="45"/></w:num>
+</w:numbering>"#;
+        let styles = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="numbering" w:styleId="FCListNo">
+    <w:pPr><w:numPr><w:numId w:val="20"/></w:numPr></w:pPr>
+  </w:style>
+</w:styles>"#;
+        let archive = BTreeMap::from([
+            (PathBuf::from("word/numbering.xml"), numbering.to_vec()),
+            (PathBuf::from("word/styles.xml"), styles.to_vec()),
+        ]);
+        let parsed = parse_docx_numbering(&archive)?;
+        let level = parsed
+            .instances
+            .get(&21)
+            .and_then(|levels| levels.get(&0))
+            .ok_or_else(|| anyhow!("linked numbering level was not resolved"))?;
+        assert_eq!(level.start, 1);
+        assert_eq!(level.format, "decimal");
+        assert_eq!(level.text, "(%1)");
+        Ok(())
+    }
+
+    #[test]
+    fn docx_numbering_rejects_an_unresolved_numbering_style_link() {
+        let numbering = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:abstractNum w:abstractNumId="45">
+    <w:numStyleLink w:val="MissingStyle"/>
+  </w:abstractNum>
+  <w:num w:numId="21"><w:abstractNumId w:val="45"/></w:num>
+</w:numbering>"#;
+        let archive = BTreeMap::from([(PathBuf::from("word/numbering.xml"), numbering.to_vec())]);
+        assert!(parse_docx_numbering(&archive)
+            .unwrap_err()
+            .to_string()
+            .contains("links to missing numbering style MissingStyle"));
+    }
+
+    #[test]
+    fn explicit_nonnumbered_paragraph_style_suppresses_numbered_default() -> Result<()> {
+        let properties = parse_xml(
+            r#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:pStyle w:val="Plain"/></w:pPr>"#,
+        )?;
+        let styles = DocxParagraphStyles {
+            default_style: Some("Default".to_string()),
+            numbering: BTreeMap::from([
+                ("Default".to_string(), Some((7, 0))),
+                ("Plain".to_string(), None),
+            ]),
+        };
+
+        assert_eq!(
+            paragraph_or_default_style_numbering(Some(&properties), &styles),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn paragraph_style_inheritance_has_a_hard_depth_bound() {
+        let mut raw = BTreeMap::new();
+        for index in 0..=MAX_DOCX_STYLE_REFERENCE_DEPTH {
+            raw.insert(
+                format!("Style{index}"),
+                DocxRawParagraphStyle {
+                    based_on: (index > 0).then(|| format!("Style{}", index - 1)),
+                    numbering: None,
+                },
+            );
+        }
+        let mut resolving = BTreeSet::new();
+        let mut resolved = BTreeMap::new();
+        assert!(resolve_docx_paragraph_style(
+            &format!("Style{MAX_DOCX_STYLE_REFERENCE_DEPTH}"),
+            &raw,
+            &mut resolving,
+            &mut resolved,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn deleted_footnote_references_do_not_consume_visible_ordinals() -> Result<()> {
+        let document = parse_xml(
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:del><w:r><w:footnoteReference w:id="7"/></w:r></w:del><w:r><w:footnoteReference w:id="9"/></w:r></w:p></w:body></w:document>"#,
+        )?;
+        let mut seen = BTreeSet::new();
+        let mut ordered = Vec::new();
+        collect_visible_docx_footnote_references(&document, &mut seen, &mut ordered)?;
+        assert_eq!(ordered, vec![9]);
+        Ok(())
+    }
+
+    #[test]
+    fn numbering_restart_zero_preserves_a_child_counter() -> Result<()> {
+        let parent = DocxNumberingLevel {
+            start: 1,
+            format: "decimal".to_string(),
+            text: "%1".to_string(),
+            suffix: DocxNumberingSuffix::Space,
+            legal: false,
+            restart_after: None,
+        };
+        let child = DocxNumberingLevel {
+            start: 1,
+            format: "decimal".to_string(),
+            text: "%1.%2".to_string(),
+            suffix: DocxNumberingSuffix::Space,
+            legal: false,
+            restart_after: None,
+        };
+        let numbering = DocxNumbering {
+            instances: BTreeMap::from([(20, BTreeMap::from([(0, parent), (1, child)]))]),
+        };
+        let styles = DocxParagraphStyles::default();
+        let paragraph = |level| {
+            parse_xml(&format!(
+                r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:pPr><w:numPr><w:ilvl w:val="{level}"/><w:numId w:val="20"/></w:numPr></w:pPr></w:p>"#
+            ))
+        };
+        let mut state = DocxNumberingState::default();
+        assert_eq!(
+            numbering
+                .paragraph_marker(&paragraph(1)?, &styles, &mut state)?
+                .map(|marker| marker.0),
+            Some("1.1".to_string())
+        );
+        numbering.paragraph_marker(&paragraph(0)?, &styles, &mut state)?;
+        assert_eq!(
+            numbering
+                .paragraph_marker(&paragraph(1)?, &styles, &mut state)?
+                .map(|marker| marker.0),
+            Some("2.2".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn numbering_style_inherits_its_numbering_instance() -> Result<()> {
+        let styles = br#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <w:style w:type="numbering" w:styleId="Base"><w:pPr><w:numPr><w:numId w:val="20"/></w:numPr></w:pPr></w:style>
+          <w:style w:type="numbering" w:styleId="Child"><w:basedOn w:val="Base"/></w:style>
+        </w:styles>"#;
+        let archive = BTreeMap::from([(PathBuf::from("word/styles.xml"), styles.to_vec())]);
+        let resolved = parse_docx_numbering_style_ids(&archive)?;
+        assert_eq!(resolved.get("Child"), Some(&20));
+        Ok(())
+    }
+
+    #[test]
+    fn asset_markers_encode_citation_characters_canonically() -> Result<()> {
+        let mut assets = AssetCollector::new("high-court", "[2025] HCA 50")?;
+        let marker = assets.insert(vec![1, 2, 3], "image/png".to_string())?;
+        assert!(marker.starts_with("high-court:%5B2025%5D%20HCA%2050/sha256-"));
+        let parsed: AssetRef = marker.parse()?;
+        assert!(parsed.asset_id.starts_with("[2025] HCA 50/sha256-"));
         Ok(())
     }
 

@@ -112,6 +112,8 @@ impl OfficialAdapter for QueenslandLegislation {
                 drop_ids: &[],
                 drop_classes: &["view-history-note", "view-repealed", "source"],
                 heading_classes: &[],
+                preserve_same_document_fragments: false,
+                repair_broken_links: false,
             },
         )?;
         Ok(Some(make_acquired_html(

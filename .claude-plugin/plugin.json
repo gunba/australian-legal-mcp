@@ -1,6 +1,6 @@
 {
   "name": "australian-legal-mcp",
-  "version": "0.19.11",
+  "version": "0.20.0",
   "description": "Source-grounded search and retrieval across Australian legal sources.",
   "author": {
     "name": "gunba",

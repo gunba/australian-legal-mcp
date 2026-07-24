@@ -2,7 +2,7 @@
 
 - **Validated:** 19–21 July 2026
 - **Build validation software:** `legal-mcp 0.19.7`
-- **Hosted serving software:** `legal-mcp 0.19.11` (v0.19.10 performed the paired cutover)
+- **Hosted serving software:** `legal-mcp 0.19.11`
 - **Generation:** `937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939`
 - **Status:** active locally and on the authenticated Linode service; Arroy v20 is the sole hosted rollback.
 
@@ -49,8 +49,8 @@ V22 passed all three checks. Retrieval contained the provision text, exposed a t
 
 These are end-to-end evaluator measurements and should not be compared directly with the isolated flat-sidecar microbenchmark.
 
-After the v0.19.10 cutover, the same evaluator passed with zero failures against
-the live service. A three-repetition host-loopback run measured keyword p95
+After the v0.19.10 deployment, the same evaluator passed with zero failures
+against the live service. A three-repetition host-loopback run measured keyword p95
 720.831 ms, hybrid p95 1,133.475 ms, retrieval p95 12.203 ms, and private
 readiness under load. The final v0.19.11 public-TLS run again had zero failures:
 keyword p95 was 584.989 ms, hybrid p95 910.471 ms, and retrieval p95 757.606 ms.
@@ -83,7 +83,6 @@ Before merge:
 - rustfmt, strict Clippy, `cargo audit`, and `cargo deny` passed;
 - 18 Python tests passed;
 - Bash syntax, ShellCheck, actionlint, Caddy validation, packaging, npm allowlisting, and diff checks passed;
-- the coordinated flat-int8 host-cutover fixture passed all 24 crash phases;
 - launcher upgrade, authentication, deployment, activation, abort, publisher, bootstrap, and SIGKILL recovery fixtures passed; and
 - GitHub `main` CI completed successfully after merge.
 

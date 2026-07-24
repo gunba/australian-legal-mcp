@@ -33,7 +33,7 @@ pub(crate) struct BuildCorpusArgs<'a> {
     pub(crate) profile_enabled: bool,
 }
 
-const BUILD_STATE_SCHEMA_VERSION: u32 = 2;
+const BUILD_STATE_SCHEMA_VERSION: u32 = 3;
 const WORKSPACE_LOCK_FILENAME: &str = ".source-update.lock";
 const WORKSPACE_STAGING_DIRECTORY: &str = "staging";
 
@@ -333,6 +333,22 @@ fn validate_or_create_build_state(
 }
 
 fn seed_embedding_cache(
+    target: &Connection,
+    target_path: &Path,
+    seed_path: &Path,
+) -> Result<usize> {
+    let root = seed_path
+        .parent()
+        .ok_or_else(|| anyhow!("embedding cache seed has no generation directory"))?;
+    let (manifest, _) = crate::source::validate_generation_dir(root)
+        .context("validating the complete embedding-cache seed generation")?;
+    if root.join(&manifest.db.path).canonicalize()? != seed_path.canonicalize()? {
+        bail!("embedding cache seed is not the validated generation database");
+    }
+    seed_embedding_cache_from_verified_db(target, target_path, seed_path)
+}
+
+fn seed_embedding_cache_from_verified_db(
     target: &Connection,
     target_path: &Path,
     seed_path: &Path,
@@ -678,19 +694,14 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
             size: 0,
         },
         ann: BTreeMap::new(),
+        lexical: BTreeMap::new(),
     };
 
     // Bind corpus-wide immutable metadata only after every source transaction commits.
-    let chunks_fts_index_sha256 = crate::db::chunks_fts_index_sha256(&conn, "chunks_fts")?;
     let binding_tx = conn.unchecked_transaction()?;
     set_corpus_meta(&binding_tx, "index_version", &manifest.index_version)?;
     set_corpus_meta(&binding_tx, "embedding_model_id", &manifest.model.id)?;
     set_corpus_meta(&binding_tx, "last_update_at", &manifest.created_at)?;
-    set_corpus_meta(
-        &binding_tx,
-        "chunks_fts_index_sha256",
-        &chunks_fts_index_sha256,
-    )?;
     let documents_count: i64 =
         binding_tx.query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))?;
     let chunks_count: i64 =
@@ -721,7 +732,7 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
     conn.execute_batch("VACUUM")?;
     crate::source::verify_corpus_manifest_binding(&conn, &manifest)?;
     verify_semantic_install(&conn, &manifest)?;
-    verify_final_build_fts(&conn)?;
+    verify_final_payload_database(&conn)?;
     let final_workspace_bindings = fingerprint_source_workspaces(&canonical_workspaces)?;
     if final_workspace_bindings != source_workspace_bindings {
         bail!(
@@ -746,6 +757,15 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
     }
     manifest.db.size = fs::metadata(db_path)?.len();
     manifest.db.sha256 = sha256_file(db_path)?;
+    let lexical_connection = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    lexical_connection.pragma_update(None, "temp_store", "MEMORY")?;
+    lexical_connection.execute_batch("PRAGMA query_only=ON; PRAGMA cell_size_check=ON;")?;
+    manifest.lexical =
+        crate::lexical::build_sidecars(&lexical_connection, out_dir, &manifest.db.sha256)?;
+    drop(lexical_connection);
     crate::source::validate_manifest(&manifest)?;
     atomic_write(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)?;
     fs::remove_file(&build_state_path)
@@ -766,12 +786,8 @@ pub(crate) fn build_corpus(args: BuildCorpusArgs<'_>) -> Result<()> {
     Ok(())
 }
 
-fn verify_final_build_fts(conn: &Connection) -> Result<()> {
-    crate::db::validate_chunks_fts_schema(conn)?;
-    crate::db::verify_chunks_fts_index_digest(conn)?;
-    // This includes exact FTS/source row identity and non-overlapping source
-    // rowid partitions for both chunk and title indexes.
-    crate::db::verify_fts_relational_bindings(conn)?;
+fn verify_final_payload_database(conn: &Connection) -> Result<()> {
+    crate::db::validate_no_embedded_lexical_index(conn)?;
     let foreign_keys: i64 =
         conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
             row.get(0)
@@ -779,7 +795,6 @@ fn verify_final_build_fts(conn: &Connection) -> Result<()> {
     if foreign_keys != 0 {
         bail!("completed build has {foreign_keys} foreign-key violations");
     }
-    crate::db::verify_fts_integrity(conn)?;
     Ok(())
 }
 
@@ -946,8 +961,14 @@ mod security_tests {
 
         let target = open_write_at(&target_path)?;
         init_db(&target)?;
-        assert_eq!(seed_embedding_cache(&target, &target_path, &seed_path)?, 1);
-        assert_eq!(seed_embedding_cache(&target, &target_path, &seed_path)?, 0);
+        assert_eq!(
+            seed_embedding_cache_from_verified_db(&target, &target_path, &seed_path)?,
+            1
+        );
+        assert_eq!(
+            seed_embedding_cache_from_verified_db(&target, &target_path, &seed_path)?,
+            0
+        );
         assert_eq!(
             target.query_row("SELECT COUNT(*) FROM embedding_cache", [], |row| {
                 row.get::<_, i64>(0)
@@ -991,7 +1012,10 @@ mod security_tests {
 
         let target = open_write_at(&target_path)?;
         init_db(&target)?;
-        assert_eq!(seed_embedding_cache(&target, &target_path, &seed_path)?, 1);
+        assert_eq!(
+            seed_embedding_cache_from_verified_db(&target, &target_path, &seed_path)?,
+            1
+        );
         let expected_hash = format!("{:x}", Sha256::digest(text.as_bytes()));
         let stored: (String, Vec<u8>) = target.query_row(
             "SELECT text_sha256, embedding FROM embedding_cache
@@ -1069,32 +1093,26 @@ mod security_tests {
     }
 
     #[test]
-    fn final_build_gate_rejects_overlapping_source_partitions() -> Result<()> {
+    fn final_build_gate_rejects_an_embedded_lexical_index() -> Result<()> {
         let conn = Connection::open_in_memory()?;
         init_db(&conn)?;
-        conn.execute_batch(
-            "INSERT INTO sources(source_id, display_name) VALUES ('ato', 'ATO'), ('frl', 'FRL');
-             INSERT INTO documents(
-                 source_id, native_id, type, title, canonical_url, downloaded_at,
-                 content_hash, html
-             ) VALUES
-                 ('ato', 'a', 'fixture', 'A', 'https://example.invalid/a', '2026-01-01T00:00:00Z', 'a', X'00'),
-                 ('frl', 'b', 'fixture', 'B', 'https://example.invalid/b', '2026-01-01T00:00:00Z', 'b', X'00'),
-                 ('ato', 'c', 'fixture', 'C', 'https://example.invalid/c', '2026-01-01T00:00:00Z', 'c', X'00');
-             INSERT INTO chunks(chunk_id, source_id, native_id, ord, text) VALUES
-                 (1, 'ato', 'a', 0, X'00'),
-                 (2, 'frl', 'b', 0, X'00'),
-                 (3, 'ato', 'c', 0, X'00');
-             INSERT INTO chunks_fts(rowid, text) VALUES (1, 'a'), (2, 'b'), (3, 'c');
-             INSERT INTO title_fts(rowid, source_id, native_id, title, headings) VALUES
-                 (1, 'ato', 'a', 'A', ''),
-                 (2, 'frl', 'b', 'B', ''),
-                 (3, 'ato', 'c', 'C', '');",
-        )?;
-        let digest = crate::db::chunks_fts_index_sha256(&conn, "chunks_fts")?;
-        set_corpus_meta(&conn, "chunks_fts_index_sha256", &digest)?;
-        let error = verify_final_build_fts(&conn).unwrap_err();
-        assert!(error.to_string().contains("overlap rowid ranges"));
+        conn.execute_batch("CREATE VIRTUAL TABLE chunks_fts USING fts5(text);")?;
+        let error = verify_final_payload_database(&conn).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("must not contain runtime lexical indexes"));
+        Ok(())
+    }
+
+    #[test]
+    fn final_build_gate_rejects_disguised_fts5_virtual_tables() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        init_db(&conn)?;
+        conn.execute_batch("CREATE VIRTUAL TABLE unrelated USING\nfts5(text);")?;
+        let error = verify_final_payload_database(&conn).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("must not contain runtime lexical indexes"));
         Ok(())
     }
 }

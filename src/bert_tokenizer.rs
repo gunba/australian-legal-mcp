@@ -57,8 +57,12 @@ impl BertWordPieceTokenizer {
                 continuation_vocab.insert(suffix.to_string(), id);
             }
         }
-        let reference = Tokenizer::from_bytes(bytes)
+        let mut reference = Tokenizer::from_bytes(bytes)
             .map_err(|error| anyhow!("loading reference tokenizer: {error}"))?;
+        reference
+            .with_truncation(None)
+            .map_err(|error| anyhow!("disabling reference tokenizer truncation: {error}"))?;
+        reference.with_padding(None);
         Ok(Self {
             initial_vocab,
             continuation_vocab,
@@ -284,4 +288,28 @@ fn is_chinese_character(character: char) -> bool {
             | 0xF900..=0xFAFF
             | 0x2F800..=0x2FA1F
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BertWordPieceTokenizer;
+    use anyhow::{Context, Result};
+    use std::path::PathBuf;
+
+    #[test]
+    #[ignore = "requires LEGAL_MCP_TEST_MODEL_DIR"]
+    fn special_token_inputs_are_neither_truncated_nor_padded() -> Result<()> {
+        let model = PathBuf::from(
+            std::env::var("LEGAL_MCP_TEST_MODEL_DIR")
+                .context("LEGAL_MCP_TEST_MODEL_DIR is required")?,
+        );
+        let tokenizer = BertWordPieceTokenizer::from_file(&model.join("tokenizer.json"))?;
+
+        let long = tokenizer.encode(&format!("{} [MASK]", "!".repeat(600)))?;
+        assert!(long.len() > 512, "special-token input was truncated");
+        let short = tokenizer.encode("short [MASK]")?;
+        assert!(short.len() < 128, "special-token input was padded");
+        assert!(!short.contains(&0), "special-token input contains PAD IDs");
+        Ok(())
+    }
 }
