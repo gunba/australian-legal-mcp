@@ -1106,8 +1106,17 @@ mod tests {
         let path = temp.path().join("legal.db");
         fs::write(&path, b"authoritative")?;
         let seal = LiveDbSeal::capture_path(path.clone())?;
-        fs::write(&path, b"counterfeited!")?;
-        assert!(seal.verify().is_err());
+        let mutation = fs::write(&path, b"counterfeited!");
+        #[cfg(windows)]
+        {
+            assert!(mutation.is_err());
+            seal.verify()?;
+        }
+        #[cfg(not(windows))]
+        {
+            mutation?;
+            assert!(seal.verify().is_err());
+        }
         Ok(())
     }
 

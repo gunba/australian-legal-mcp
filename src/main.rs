@@ -152,6 +152,7 @@ impl TestEnvironment {
 #[cfg(test)]
 impl Drop for TestEnvironment {
     fn drop(&mut self) {
+        crate::lexical::clear_runtime_verification_cache_for_tests();
         for (name, previous) in self.previous.iter().rev() {
             match previous {
                 Some(value) => std::env::set_var(name, value),

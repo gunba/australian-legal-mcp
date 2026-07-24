@@ -462,6 +462,36 @@ pub(crate) fn verify_sidecar(
     main_db_sha256: &str,
     full_sqlite_integrity: bool,
 ) -> Result<()> {
+    verify_sidecar_with_seal_retention(
+        path,
+        source_id,
+        info,
+        legal,
+        main_db_sha256,
+        full_sqlite_integrity,
+        false,
+    )
+}
+
+pub(crate) fn verify_installed_sidecar(
+    path: &Path,
+    source_id: &SourceId,
+    info: &ManifestLexical,
+    legal: &Connection,
+    main_db_sha256: &str,
+) -> Result<()> {
+    verify_sidecar_with_seal_retention(path, source_id, info, legal, main_db_sha256, false, true)
+}
+
+fn verify_sidecar_with_seal_retention(
+    path: &Path,
+    source_id: &SourceId,
+    info: &ManifestLexical,
+    legal: &Connection,
+    main_db_sha256: &str,
+    full_sqlite_integrity: bool,
+    retain_runtime_seal: bool,
+) -> Result<()> {
     validate_manifest_lexical(source_id, info)?;
     let before = regular_file_metadata(path)?;
     if before.len() != info.size || sha256_path(path)? != info.sha256 {
@@ -516,21 +546,33 @@ pub(crate) fn verify_sidecar(
     if full_sqlite_integrity && sha256_path(path)? != info.sha256 {
         bail!("lexical sidecar changed during strict verification");
     }
-    let key = RuntimeVerificationKey {
-        path: path.to_path_buf(),
-        source_id: source_id.clone(),
-        sidecar_sha256: info.sha256.clone(),
-        main_db_sha256: main_db_sha256.to_string(),
-    };
-    let cache = VERIFIED_SIDECARS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache
-        .lock()
-        .map_err(|_| anyhow!("lexical verification cache lock poisoned"))?;
-    if cache.len() >= MAX_VERIFIED_SIDECARS {
-        cache.clear();
+    if retain_runtime_seal {
+        let key = RuntimeVerificationKey {
+            path: path.to_path_buf(),
+            source_id: source_id.clone(),
+            sidecar_sha256: info.sha256.clone(),
+            main_db_sha256: main_db_sha256.to_string(),
+        };
+        let cache = VERIFIED_SIDECARS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut cache = cache
+            .lock()
+            .map_err(|_| anyhow!("lexical verification cache lock poisoned"))?;
+        if cache.len() >= MAX_VERIFIED_SIDECARS {
+            cache.clear();
+        }
+        cache.insert(key, seal);
     }
-    cache.insert(key, seal);
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn clear_runtime_verification_cache_for_tests() {
+    if let Some(cache) = VERIFIED_SIDECARS.get() {
+        cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
 }
 
 pub(crate) fn verify_sidecar_file_set(

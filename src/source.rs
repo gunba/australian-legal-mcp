@@ -1276,15 +1276,19 @@ fn validate_generation_dir_with_mode(
     verify_corpus_manifest_binding(&conn, &manifest)?;
     verify_semantic_install(&conn, &manifest)?;
     for (source_id, info) in &manifest.lexical {
-        crate::lexical::verify_sidecar(
-            &root.join(&info.path),
-            source_id,
-            info,
-            &conn,
-            &manifest.db.sha256,
-            full_sqlite_integrity,
-        )
-        .with_context(|| format!("verifying lexical sidecar for source `{source_id}`"))?;
+        let path = root.join(&info.path);
+        let result = if full_sqlite_integrity {
+            crate::lexical::verify_sidecar(&path, source_id, info, &conn, &manifest.db.sha256, true)
+        } else {
+            crate::lexical::verify_installed_sidecar(
+                &path,
+                source_id,
+                info,
+                &conn,
+                &manifest.db.sha256,
+            )
+        };
+        result.with_context(|| format!("verifying lexical sidecar for source `{source_id}`"))?;
     }
     if full_sqlite_integrity {
         let tables = {

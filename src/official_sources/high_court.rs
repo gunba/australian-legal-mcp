@@ -987,15 +987,14 @@ mod tests {
             .to_string()
             .contains("does not cover its complete result range"));
 
-        let first_page = CURRENT_JUDGMENTS_FIXTURE
-            .replace(
-                "Displaying 1 - 1 of 1 results",
-                "Displaying 1 - 1 of 2 results",
-            )
-            .replace(
-                "      </div>\n    </main>",
-                "        <a href=\"?page=1\">Last page</a>\n      </div>\n    </main>",
-            );
+        let mut first_page = CURRENT_JUDGMENTS_FIXTURE.replace(
+            "Displaying 1 - 1 of 1 results",
+            "Displaying 1 - 1 of 2 results",
+        );
+        let closing_view = first_page
+            .rfind("</div>")
+            .ok_or_else(|| anyhow!("test judgment view has no closing element"))?;
+        first_page.insert_str(closing_view, "<a href=\"?page=1\">Last page</a>");
         let second_page = first_page
             .replace(
                 "chaplin-v-secretary-department-social-services",
@@ -1017,9 +1016,12 @@ mod tests {
             }
         })
         .expect_err("overlapping category ranges must fail closed");
-        assert!(error
-            .to_string()
-            .contains("overlapping or incomplete result-range partition"));
+        assert!(
+            error
+                .to_string()
+                .contains("overlapping or incomplete result-range partition"),
+            "unexpected discovery error: {error:#}"
+        );
         Ok(())
     }
 
