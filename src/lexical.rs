@@ -11,9 +11,7 @@ use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-#[cfg(windows)]
-use std::fs::OpenOptions;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -297,21 +295,23 @@ pub(crate) fn build_sidecar(
     if !is_sha256(main_db_sha256) {
         bail!("main database SHA-256 is malformed");
     }
-    let identity = source_identity(legal, source_id)?;
+    let identity = source_identity(legal, source_id).context("reading lexical source identity")?;
     let output = output_root.join(sidecar_relative_path(source_id));
     let parent = output
         .parent()
         .ok_or_else(|| anyhow!("lexical sidecar output has no parent"))?;
-    fs::create_dir_all(parent)?;
+    fs::create_dir_all(parent).context("creating lexical output directory")?;
     let temporary = tempfile::Builder::new()
         .prefix(&format!("lexical-{source_id}-build-"))
-        .tempdir_in(parent)?;
+        .tempdir_in(parent)
+        .context("creating lexical build directory")?;
     let build_path = temporary.path().join(format!("{source_id}.db.part"));
 
-    let mut sidecar = Connection::open(&build_path)?;
-    configure_build_connection(&sidecar)?;
-    create_schema(&sidecar)?;
-    let digests = populate_sidecar(&mut sidecar, legal, source_id, &identity)?;
+    let mut sidecar = Connection::open(&build_path).context("opening lexical build database")?;
+    configure_build_connection(&sidecar).context("configuring lexical build database")?;
+    create_schema(&sidecar).context("creating lexical sidecar schema")?;
+    let digests = populate_sidecar(&mut sidecar, legal, source_id, &identity)
+        .context("populating lexical sidecar")?;
 
     sidecar.execute("INSERT INTO chunk_fts(chunk_fts) VALUES('optimize')", [])?;
     sidecar.execute("INSERT INTO title_fts(title_fts) VALUES('optimize')", [])?;
@@ -355,7 +355,11 @@ pub(crate) fn build_sidecar(
         .close()
         .map_err(|(_, error)| error)
         .context("closing completed lexical sidecar")?;
-    File::open(&build_path)?.sync_all()?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&build_path)?
+        .sync_all()?;
 
     let info = ManifestLexical {
         source_id: source_id.clone(),
@@ -377,8 +381,9 @@ pub(crate) fn build_sidecar(
         title_fts_index_sha256,
     };
     validate_manifest_lexical(source_id, &info)?;
-    verify_sidecar(&build_path, source_id, &info, legal, main_db_sha256, true)?;
-    replace_file(&build_path, &output)?;
+    verify_sidecar(&build_path, source_id, &info, legal, main_db_sha256, true)
+        .context("verifying completed lexical build")?;
+    replace_file(&build_path, &output).context("publishing completed lexical build")?;
     Ok(info)
 }
 
@@ -561,6 +566,8 @@ fn verify_sidecar_with_seal_retention(
             cache.clear();
         }
         cache.insert(key, seal);
+    } else {
+        drop(seal);
     }
     Ok(())
 }
@@ -1385,7 +1392,11 @@ fn replace_file(source: &Path, destination: &Path) -> Result<()> {
         }
     }
     replace_file_platform(source, destination)?;
-    File::open(destination)?.sync_all()?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(destination)?
+        .sync_all()?;
     #[cfg(not(windows))]
     if let Some(parent) = destination.parent() {
         File::open(parent)?.sync_all()?;
@@ -1726,8 +1737,10 @@ mod tests {
     fn independent_bm25_reference_and_chunk_id_tie_order_are_exact() -> Result<()> {
         let legal = fixture_legal()?;
         let root = tempfile::tempdir()?;
-        let info = build_sidecar(&legal, &source(), root.path(), &"2".repeat(64))?;
-        let sidecar = Connection::open(root.path().join(info.path))?;
+        let info = build_sidecar(&legal, &source(), root.path(), &"2".repeat(64))
+            .context("building BM25 reference sidecar")?;
+        let sidecar = Connection::open(root.path().join(info.path))
+            .context("opening BM25 reference sidecar")?;
         let mut statement = sidecar.prepare(
             "SELECT rowid, -bm25(chunk_fts) AS score
              FROM chunk_fts WHERE chunk_fts MATCH 'rare'
