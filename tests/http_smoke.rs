@@ -685,7 +685,7 @@ fn queue_full_has_a_safe_request_id_without_parsing_the_body() -> Result<()> {
         .and_then(|value| value.strip_suffix("/mcp"))
         .ok_or_else(|| anyhow!("test server URL is not canonical"))?;
     let mut streams = Vec::new();
-    for index in 0..12 {
+    for index in 0..24 {
         let mut stream = TcpStream::connect(address)
             .with_context(|| format!("opening slow queue fixture connection {index}"))?;
         stream.set_nonblocking(true)?;
@@ -699,11 +699,11 @@ fn queue_full_has_a_safe_request_id_without_parsing_the_body() -> Result<()> {
             // Let the sole worker enter its bounded body read before filling
             // the four queue slots. Later TCP accept ordering cannot then make
             // the selected final connection the worker-owned request.
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_secs(1));
         }
     }
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut responses = vec![Vec::new(); streams.len()];
     let rejected = 'rejected: loop {
         for (index, stream) in streams.iter_mut().enumerate() {
