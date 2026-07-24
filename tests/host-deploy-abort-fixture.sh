@@ -48,6 +48,9 @@ install -o root -g root -m 0640 /dev/null /srv/legal-mcp/lifecycle/LIFECYCLE_LOC
 printf 'LEGAL_MCP_VOLUME_V1\nUUID=%s\n' "$volume_uuid" > /srv/legal-mcp/.legal-mcp-volume
 chown root:root /srv/legal-mcp/.legal-mcp-volume
 chmod 444 /srv/legal-mcp/.legal-mcp-volume
+printf 'LEGAL_MCP_HOST_V1\nVOLUME_UUID=%s\n' "$volume_uuid" > /etc/legal-mcp/host-installed
+chown root:root /etc/legal-mcp/host-installed
+chmod 444 /etc/legal-mcp/host-installed
 
 # Keep real mutation tools behind logging wrappers so durability and deletion
 # ordering can be asserted without weakening their behavior.
@@ -271,8 +274,6 @@ fi
 for transaction in \
   /etc/legal-mcp/.auth-transaction \
   /etc/legal-mcp/.image-transaction.preparing \
-  /etc/legal-mcp/.image-transaction.flat-int8-preparing \
-  /etc/legal-mcp/.image-transaction.flat-int8-preparing-retired \
   /etc/legal-mcp/.image-transaction \
   /etc/legal-mcp/.image-transaction.retiring \
   /etc/legal-mcp/.host-tools-transaction.preparing \

@@ -6,7 +6,7 @@ use reqwest::blocking::Client;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, VecDeque};
 use std::fs;
-use std::net::TcpStream;
+use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Condvar, Mutex};
@@ -19,6 +19,7 @@ use url::Url;
 
 const CHROME_START_TIMEOUT: Duration = Duration::from_secs(15);
 const BROWSER_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+const MAX_BROWSER_REDIRECTS: usize = 5;
 const MAX_PENDING_FETCH_EVENTS: usize = 64;
 const CDP_MESSAGE_ENVELOPE_BYTES: u64 = 1024 * 1024;
 const CHROME_USER_AGENT_SUFFIX: &str = " Safari/537.36";
@@ -54,13 +55,35 @@ pub(crate) struct BrowserHttpTransport {
     available: Condvar,
 }
 
+struct ChromeChildGuard(Option<Child>);
+
+impl ChromeChildGuard {
+    fn child_mut(&mut self) -> &mut Child {
+        self.0.as_mut().expect("Chrome child guard is armed")
+    }
+
+    fn disarm(mut self) -> Child {
+        self.0.take().expect("Chrome child guard is armed")
+    }
+}
+
+impl Drop for ChromeChildGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 impl BrowserHttpTransport {
     pub(crate) fn new(max_response_bytes: u64) -> Result<Self> {
         let executable = chrome_executable()?;
         let version = chrome_version(&executable)?;
         let user_agent = chrome_user_agent(&version);
+        let resolver_rules = chrome_host_resolver_rules()?;
         let profile = tempfile::tempdir().context("creating Chrome source-fetch profile")?;
-        let mut child = Command::new(&executable)
+        let child = Command::new(&executable)
             .args([
                 "--headless=new",
                 "--disable-blink-features=AutomationControlled",
@@ -75,10 +98,14 @@ impl BrowserHttpTransport {
                 "--disable-default-apps",
                 "--disable-extensions",
                 "--disable-sync",
+                "--disable-breakpad",
+                "--disable-crash-reporter",
                 "--disable-gpu",
                 "--metrics-recording-only",
                 "--mute-audio",
+                "--no-proxy-server",
             ])
+            .arg(format!("--host-resolver-rules={resolver_rules}"))
             .arg(format!("--user-agent={user_agent}"))
             .arg(format!("--user-data-dir={}", profile.path().display()))
             .arg("about:blank")
@@ -87,14 +114,8 @@ impl BrowserHttpTransport {
             .stderr(Stdio::null())
             .spawn()
             .with_context(|| format!("starting browser transport with {}", executable.display()))?;
-        let port = match wait_for_debugger_port(profile.path(), &mut child) {
-            Ok(port) => port,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
-            }
-        };
+        let mut child = ChromeChildGuard(Some(child));
+        let port = wait_for_debugger_port(profile.path(), child.child_mut())?;
         let debugger = Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(10))
@@ -107,7 +128,7 @@ impl BrowserHttpTransport {
         }
         close_unpooled_chrome_tabs(&debugger, port, &tabs)?;
         Ok(Self {
-            child: Mutex::new(child),
+            child: Mutex::new(child.disarm()),
             _profile: profile,
             debugger,
             port,
@@ -294,12 +315,21 @@ impl ChromeTab {
             json!({
                 "patterns": [
                     {
+                        "urlPattern": "*",
+                        "requestStage": "Request"
+                    },
+                    {
                         "urlPattern": "https://www.judgments.fedcourt.gov.au/*",
                         "resourceType": "Document",
                         "requestStage": "Response"
                     },
                     {
                         "urlPattern": "https://www.fedcourt.gov.au/file-store/*",
+                        "resourceType": "Document",
+                        "requestStage": "Response"
+                    },
+                    {
+                        "urlPattern": "https://www.judgments.fedcourt.gov.au/files/*",
                         "resourceType": "Document",
                         "requestStage": "Response"
                     }
@@ -310,6 +340,9 @@ impl ChromeTab {
     }
 
     fn get(&mut self, url: &Url, limit: u64) -> Result<BrowserResponse> {
+        if !browser_source_url_allowed(url) {
+            bail!("Chrome source request is outside its approved HTTPS hosts");
+        }
         let started = Instant::now();
         let frame_tree = self.command("Page.getFrameTree", json!({}))?;
         let frame_id = frame_tree
@@ -320,15 +353,13 @@ impl ChromeTab {
             })?;
         self.send_command("Page.navigate", json!({ "url": url.as_str() }))?;
         let mut expected_url = url.clone();
+        let mut redirects = 0usize;
         let mut challenge = None;
         while started.elapsed() < BROWSER_REQUEST_TIMEOUT {
             let message = self.next_fetch_event()?;
             let parameters = message
                 .get("params")
                 .ok_or_else(|| anyhow!("Chrome Fetch.requestPaused event omitted params"))?;
-            let Some(status) = parameters.get("responseStatusCode").and_then(Value::as_u64) else {
-                continue;
-            };
             let request_id = parameters
                 .get("requestId")
                 .and_then(Value::as_str)
@@ -338,6 +369,28 @@ impl ChromeTab {
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("Chrome response event omitted request URL"))?;
             let event_url = Url::parse(final_url).context("parsing Chrome response URL")?;
+            let Some(status) = parameters.get("responseStatusCode").and_then(Value::as_u64) else {
+                let resource_type = parameters
+                    .get("resourceType")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let is_main_document = resource_type == "Document"
+                    && parameters.get("frameId").and_then(Value::as_str) == Some(frame_id);
+                let allowed = if is_main_document {
+                    browser_source_url_allowed(&event_url)
+                } else {
+                    browser_subresource_url_allowed(&event_url)
+                };
+                if !allowed {
+                    self.command(
+                        "Fetch.failRequest",
+                        json!({ "requestId": request_id, "errorReason": "BlockedByClient" }),
+                    )?;
+                    bail!("Chrome source request escaped its approved HTTPS hosts");
+                }
+                self.command("Fetch.continueRequest", json!({ "requestId": request_id }))?;
+                continue;
+            };
             if parameters.get("frameId").and_then(Value::as_str) != Some(frame_id)
                 || event_url != expected_url
             {
@@ -346,6 +399,9 @@ impl ChromeTab {
             }
             let headers = response_headers(parameters.get("responseHeaders"));
             if (300..400).contains(&status) {
+                if redirects >= MAX_BROWSER_REDIRECTS {
+                    bail!("Chrome source request exceeded {MAX_BROWSER_REDIRECTS} redirects");
+                }
                 log_browser_response(final_url, status, 0);
                 let location = headers
                     .get("location")
@@ -353,6 +409,10 @@ impl ChromeTab {
                 expected_url = event_url
                     .join(location)
                     .context("resolving Chrome redirect Location")?;
+                if !browser_source_url_allowed(&expected_url) {
+                    bail!("Chrome source redirect escaped its approved HTTPS hosts");
+                }
+                redirects += 1;
                 self.command("Fetch.continueResponse", json!({ "requestId": request_id }))?;
                 continue;
             }
@@ -460,6 +520,66 @@ impl ChromeTab {
             }
         }
     }
+}
+
+fn browser_source_url_allowed(url: &Url) -> bool {
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+    {
+        return false;
+    }
+    match url.host_str() {
+        Some("www.judgments.fedcourt.gov.au") => {
+            url.path().starts_with("/judgments/") || url.path().starts_with("/files/")
+        }
+        Some("www.fedcourt.gov.au") => url.path().starts_with("/file-store/"),
+        _ => false,
+    }
+}
+
+fn browser_subresource_url_allowed(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+        && match url.host_str() {
+            Some("www.judgments.fedcourt.gov.au" | "www.fedcourt.gov.au") => true,
+            Some("challenges.cloudflare.com") => url.path().starts_with("/turnstile/"),
+            _ => false,
+        }
+}
+
+fn chrome_host_resolver_rules() -> Result<String> {
+    let mut rules = Vec::new();
+    for host in [
+        "www.judgments.fedcourt.gov.au",
+        "www.fedcourt.gov.au",
+        "challenges.cloudflare.com",
+    ] {
+        let addresses = (host, 443)
+            .to_socket_addrs()
+            .with_context(|| format!("resolving approved browser source host `{host}`"))?
+            .map(|address| address.ip())
+            .filter(|address| crate::source::public_ip(*address))
+            .collect::<BTreeSet<IpAddr>>();
+        let address = addresses
+            .iter()
+            .find(|address| address.is_ipv4())
+            .copied()
+            .or_else(|| addresses.iter().next().copied())
+            .ok_or_else(|| {
+                anyhow!("approved browser source host `{host}` has no public address")
+            })?;
+        let rendered = match address {
+            IpAddr::V4(address) => address.to_string(),
+            IpAddr::V6(address) => format!("[{address}]"),
+        };
+        rules.push(format!("MAP {host} {rendered}"));
+    }
+    rules.push("MAP * ~NOTFOUND".to_string());
+    Ok(rules.join(", "))
 }
 
 fn chrome_executable() -> Result<PathBuf> {
@@ -654,6 +774,41 @@ mod tests {
     #[test]
     fn cdp_message_limit_covers_encoded_body_and_protocol_envelope() -> Result<()> {
         assert_eq!(cdp_message_limit(8 * 1024 * 1024)?, 17 * 1024 * 1024);
+        Ok(())
+    }
+
+    #[test]
+    fn browser_source_requests_cannot_escape_approved_https_paths() -> Result<()> {
+        assert!(browser_source_url_allowed(&Url::parse(
+            "https://www.judgments.fedcourt.gov.au/judgments/Judgments/fca/one"
+        )?));
+        assert!(browser_source_url_allowed(&Url::parse(
+            "https://www.fedcourt.gov.au/file-store/judgment.docx"
+        )?));
+        assert!(browser_source_url_allowed(&Url::parse(
+            "https://www.judgments.fedcourt.gov.au/files/judgment.docx"
+        )?));
+        assert!(browser_subresource_url_allowed(&Url::parse(
+            "https://www.judgments.fedcourt.gov.au/cdn-cgi/challenge.js"
+        )?));
+        assert!(browser_subresource_url_allowed(&Url::parse(
+            "https://challenges.cloudflare.com/turnstile/v0/api.js"
+        )?));
+        assert!(!browser_subresource_url_allowed(&Url::parse(
+            "https://challenges.cloudflare.com/other/api.js"
+        )?));
+        assert!(!browser_subresource_url_allowed(&Url::parse(
+            "https://metadata.google.internal/script.js"
+        )?));
+        for blocked in [
+            "http://www.judgments.fedcourt.gov.au/judgments/one",
+            "https://www.judgments.fedcourt.gov.au/other",
+            "https://www.fedcourt.gov.au/not-file-store/document.docx",
+            "https://127.0.0.1/file-store/document.docx",
+            "https://example.com/judgments/one",
+        ] {
+            assert!(!browser_source_url_allowed(&Url::parse(blocked)?));
+        }
         Ok(())
     }
 

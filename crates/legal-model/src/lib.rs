@@ -15,6 +15,20 @@ const PUBLIC_ID_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'#')
     .add(b'[')
     .add(b']');
+const MAX_PUBLIC_COMPONENT_BYTES: usize = 256;
+
+pub fn encode_public_component(value: &str) -> String {
+    percent_encode(value.as_bytes(), PUBLIC_ID_ENCODE_SET).to_string()
+}
+
+pub fn is_canonical_public_component(value: &str) -> bool {
+    if value.is_empty() || value.len() > MAX_PUBLIC_COMPONENT_BYTES {
+        return false;
+    }
+    percent_decode_str(value)
+        .decode_utf8()
+        .is_ok_and(|decoded| encode_public_component(&decoded) == value)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IdentityError(String);
@@ -118,7 +132,7 @@ impl DocumentId {
         format!(
             "{}:{}",
             self.source,
-            percent_encode(self.native_id.as_bytes(), PUBLIC_ID_ENCODE_SET)
+            encode_public_component(&self.native_id)
         )
     }
 }
@@ -140,6 +154,9 @@ impl FromStr for DocumentId {
             .decode_utf8()
             .map_err(|_| IdentityError::new("document reference contains invalid UTF-8"))?
             .into_owned();
+        if encode_public_component(&native_id) != encoded_native_id {
+            return Err(IdentityError::new("document reference is not canonical"));
+        }
         Self::new(source.parse()?, native_id)
     }
 }
@@ -229,7 +246,7 @@ impl AssetRef {
         format!(
             "{}:{}",
             self.source,
-            percent_encode(self.asset_id.as_bytes(), PUBLIC_ID_ENCODE_SET)
+            encode_public_component(&self.asset_id)
         )
     }
 }
@@ -251,14 +268,20 @@ impl FromStr for AssetRef {
             .decode_utf8()
             .map_err(|_| IdentityError::new("asset reference contains invalid UTF-8"))?
             .into_owned();
+        if encode_public_component(&asset_id) != encoded_asset_id {
+            return Err(IdentityError::new("asset reference is not canonical"));
+        }
         Self::new(source.parse()?, asset_id)
     }
 }
 
 fn validate_component(name: &str, value: &str) -> Result<(), IdentityError> {
-    if value.is_empty() || value.chars().any(char::is_control) {
+    if value.is_empty()
+        || value.chars().any(char::is_control)
+        || encode_public_component(value).len() > MAX_PUBLIC_COMPONENT_BYTES
+    {
         return Err(IdentityError::new(format!(
-            "{name} must be nonempty and contain no control characters"
+            "{name} must be nonempty, bounded, and contain no control characters"
         )));
     }
     Ok(())
@@ -286,6 +309,15 @@ mod tests {
         let rendered = id.to_string();
         assert_eq!(rendered, "ato:JUD/example%3Aone%3Fpoint=%E2%9C%93");
         assert_eq!(rendered.parse::<DocumentId>().unwrap(), id);
+    }
+
+    #[test]
+    fn public_references_reject_noncanonical_escapes_and_oversize_components() {
+        assert!("ato:JUD%2fONE".parse::<DocumentId>().is_err());
+        assert!("ato:JUD%2FONE".parse::<DocumentId>().is_err());
+        assert!("frl:asset%41".parse::<AssetRef>().is_err());
+        assert!(DocumentId::new("ato".parse().unwrap(), "x".repeat(257)).is_err());
+        assert!(AssetRef::new("frl".parse().unwrap(), "✓".repeat(29)).is_err());
     }
 
     #[test]

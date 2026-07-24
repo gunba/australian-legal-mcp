@@ -123,8 +123,7 @@ help_text="$("$BIN" --help 2>&1)"
 
 # Subcommands that MUST be present.
 for cmd in mcp serve activate rollback prune-generations stats verify search fetch \
-	get-definition build derive-schema11-from-schema10 \
-	derive-flat-int8-from-schema11-arroy-v20 source-update tree-crawl \
+	get-definition build source-update tree-crawl \
 	snapshot-reduce link-download scrape-diff help; do
 	if grep -qE "^[[:space:]]+${cmd}([[:space:]]|$)" <<<"$help_text"; then
 		ok "subcommand present: $cmd"
@@ -132,7 +131,8 @@ for cmd in mcp serve activate rollback prune-generations stats verify search fet
 		bad "subcommand missing: $cmd"
 	fi
 done
-for removed in update package-corpus publish-release; do
+for removed in update package-corpus publish-release derive-schema11-from-schema10 \
+	derive-flat-int8-from-schema11-arroy-v20; do
 	if grep -qE "^[[:space:]]+${removed}([[:space:]]|$)" <<<"$help_text"; then
 		bad "removed subcommand unexpectedly present: $removed"
 	else
@@ -160,9 +160,13 @@ assert_jq_count "stats FRL documents > 0" "$stats_json" '.source_stats.frl.docum
 assert_jq_nonempty "stats.index_version" "$stats_json" '.index_version'
 assert_jq_nonempty "stats.active_generation" "$stats_json" '.active_generation'
 assert_jq "stats.semantic_search_ready" "$stats_json" '.semantic_search_ready' 'true'
-verify_json="$("$BIN" verify)"
-assert_jq "verify generation matches stats" "$verify_json" '.active_generation' \
-	"$(printf '%s' "$stats_json" | jq -r '.active_generation')"
+assert_jq "stats.lexical_search_ready" "$stats_json" '.lexical_search_ready' 'true'
+if verify_json="$("$BIN" verify)"; then
+	assert_jq "verify generation matches stats" "$verify_json" '.active_generation' \
+		"$(printf '%s' "$stats_json" | jq -r '.active_generation')"
+else
+	bad "verify command failed"
+fi
 
 # ---------------- Section 3: CLI search ----------------
 

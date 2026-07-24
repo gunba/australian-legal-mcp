@@ -17,7 +17,7 @@ use crate::{ServerState, EMBEDDING_DIM, EMBEDDING_MODEL_ID};
 use anyhow::{anyhow, bail, Context, Result};
 #[cfg(test)]
 use legal_model::DocumentId;
-use legal_model::{SourceDescriptor, SourceId};
+use legal_model::{encode_public_component, SourceDescriptor, SourceId};
 use legal_source_sdk::{sha256_bytes, NormalizedDocument};
 use rayon::prelude::*;
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
@@ -505,7 +505,8 @@ where
                 Ok((embeddings.count_tokens(text)?, None))
             }
         },
-    )?;
+    )
+    .with_context(|| format!("chunking normalized document `{identity}`"))?;
     for chunk in &mut chunks {
         if chunk.embedding_token_ids.is_none() {
             chunk.embedding_token_ids = embeddings.prepare_document_tokens(&chunk.text)?;
@@ -584,16 +585,6 @@ fn existing_source_hashes(
 }
 
 fn delete_source_document(conn: &Connection, source_id: &SourceId, native_id: &str) -> Result<()> {
-    conn.execute(
-        "DELETE FROM chunks_fts WHERE rowid IN (
-             SELECT chunk_id FROM chunks WHERE source_id = ?1 AND native_id = ?2
-         )",
-        params![source_id.as_str(), native_id],
-    )?;
-    conn.execute(
-        "DELETE FROM title_fts WHERE source_id = ?1 AND native_id = ?2",
-        params![source_id.as_str(), native_id],
-    )?;
     conn.execute(
         "DELETE FROM documents WHERE source_id = ?1 AND native_id = ?2",
         params![source_id.as_str(), native_id],
@@ -676,12 +667,6 @@ fn insert_document(
          VALUES (?1, ?2, ?3, ?4, ?5)
          RETURNING chunk_id",
     )?;
-    let mut insert_chunk_fts =
-        conn.prepare_cached("INSERT INTO chunks_fts(rowid, text) VALUES (?1, ?2)")?;
-    #[cfg(test)]
-    let skip_chunk_fts = std::env::var_os("LEGAL_MCP_BENCH_SKIP_CHUNK_FTS").is_some();
-    #[cfg(not(test))]
-    let skip_chunk_fts = false;
     for chunk in &prepared.chunks {
         let chunk_id: i64 = insert_chunk
             .query_row(
@@ -700,9 +685,6 @@ fn insert_document(
                     chunk.ord
                 )
             })?;
-        if !skip_chunk_fts {
-            insert_chunk_fts.execute(params![chunk_id, chunk.text])?;
-        }
         chunk_ids.push((chunk_id, chunk.text.clone(), chunk.anchor.clone()));
 
         let text_sha256 = sha256_bytes(chunk.text.as_bytes());
@@ -730,7 +712,6 @@ fn insert_document(
     }
 
     drop(insert_chunk);
-    drop(insert_chunk_fts);
     let mut insert_anchor = conn.prepare_cached(
         "INSERT INTO doc_anchors(
             source_id, native_id, ord, kind, label, target_chunk_id,
@@ -740,7 +721,7 @@ fn insert_document(
     for (anchor_ord, reference) in (0_i64..).zip(prepared.anchor_refs.iter()) {
         let target_chunk_id = if reference.kind == "in_doc" {
             reference.target_anchor.as_deref().and_then(|name| {
-                let marker = format!("[anchor:{name}]");
+                let marker = format!("[anchor:{}]", encode_public_component(name));
                 chunk_ids
                     .iter()
                     .find(|(_, text, anchor)| {
@@ -791,17 +772,6 @@ fn insert_document(
             definition.body,
         ])?;
     }
-
-    conn.prepare_cached(
-        "INSERT INTO title_fts(source_id, native_id, title, headings)
-         VALUES (?1, ?2, ?3, ?4)",
-    )?
-    .execute(params![
-        source_id.as_str(),
-        native_id,
-        inventory.title,
-        prepared.headings
-    ])?;
 
     let mut insert_asset = conn.prepare_cached(
         "INSERT INTO document_assets
@@ -1435,31 +1405,6 @@ mod tests {
             conn.query_row(
                 "SELECT COUNT(*) FROM chunk_embeddings WHERE chunk_id = ?1",
                 [removed_chunk_id],
-                |row| row.get::<_, i64>(0),
-            )?,
-            0
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM chunks_fts WHERE rowid = ?1",
-                [removed_chunk_id],
-                |row| row.get::<_, i64>(0),
-            )?,
-            0
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH 'remove'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )?,
-            0
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM title_fts
-                 WHERE source_id = ?1 AND native_id = 'remove'",
-                [source_id.as_str()],
                 |row| row.get::<_, i64>(0),
             )?,
             0

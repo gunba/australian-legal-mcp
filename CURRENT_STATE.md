@@ -1,8 +1,8 @@
 # Current state
 
-Updated 2026-07-21 after the immutable v0.19.11 release, hosted flat-int8 v22
-runtime rollout, API-key revocation, public HarbourGrid evaluation, and reboot
-proof.
+Updated 2026-07-25 for the validated v0.20.0 schema-12 lexical cutover. The
+immutable v0.19.11 schema-11 v22 runtime remains hosted until the matching
+v0.20.0 image and validated schema-12 generation are deployed as one pair.
 
 ## Implemented product
 
@@ -11,14 +11,21 @@ proof.
   `fetch`.
 - Explicit source selection across ATO, FRL, Federal Court, High Court, NSW
   Caselaw, and five state-legislation sources.
-- Source-qualified schema 11 with typed document/chunk/asset references,
+- Source-qualified schema 12 with typed document/chunk/asset references,
   deterministic ranking, lossless continuations, cleaned structural HTML,
   exact stored official URLs, definitions, links, assets, and point-in-time
-  fetch URIs. Chunk FTS is contentless-delete and its postings/BM25 metadata
-  are digest-bound; authoritative text remains in `chunks`.
-- BM25 plus mdbr-leaf-ir semantic retrieval. A source-scoped mmap flat int8
+  fetch URIs. `legal.db` has no runtime FTS tables.
+- Strict BM25 runs in one deterministic `lexical/<source>.db` per source. Each
+  sidecar contains only compact filter/mapping metadata and contentless
+  chunk/title FTS5 tables. It is bound by source, corpus, legal DB hash,
+  source-text digests, FTS storage digests, file hash, and generation identity.
+  Search hydrates selected winners only from `legal.db`; title search remains
+  strict while direct native-ID hits are preserved.
+- Mdbr-leaf-ir semantic retrieval is unchanged. A source-scoped mmap flat int8
   sidecar is scanned exactly by one bounded four-thread pool, and SQLite
   normalized first-256-dimension vectors authoritatively rerank the candidates.
+- Schema 12 is a clean cut with no projection or compatibility command. Missing,
+  extra, corrupt, wrong-source, or hash-mismatched lexical artefacts fail closed.
 - Streamable HTTP rejects batches, validates protocol/content/origin/body limits,
   acknowledges notifications and response objects with 202, uses bounded
   workers/backpressure, emits structured request logs, exposes `/livez` and
@@ -26,6 +33,15 @@ proof.
 - Local HTTP transport is loopback-only. Hosted-container scope binds only
   inside a bridge, requires hosted authentication, and is published solely on
   host loopback behind Caddy.
+
+The final schema-12 generation's 1,193,025,536-byte Federal Court lexical
+sidecar passed strict post-build verification. The final Rust gate reopens the
+sidecar after Linux `POSIX_FADV_DONTNEED` for every run; 30 advised-cold runs
+measured 25.676 ms median, 29.863 ms p95 and 30.802 ms maximum. No result cache
+is used. Internal `search-timing` logs correlate actual queue, lexical,
+embedding, vector, fusion, hydration and total durations by request ID without
+exposing timings, queries, scores, model details or candidate counts in MCP
+responses.
 
 ## Canonical project data
 
@@ -45,7 +61,7 @@ data/validation
 data/archive
 ```
 
-Current authoritative source workspaces total 409,528 documents. Legacy and
+Current authoritative source workspaces total 409,549 documents. Legacy and
 rollback stores remain under `source-snapshots`; no destructive source cleanup
 has occurred.
 
@@ -54,11 +70,28 @@ has occurred.
 - All ten source adapters implement official discovery, adaptive acquisition,
   strict inventory/quality validation, normalization, source locking, and
   transactional commit.
+- Shared chunker format 9 holds headings until substantive body arrives,
+  repeats that structural context in exact-token continuations and embedding
+  input, and keeps canonical typed document, asset, anchor, and fetch markers
+  atomic through every splitting path. South Australian RTF normalization
+  preserves headings, lists and resolved internal/external links before the
+  shared chunker.
 - Federal Court uses ordinary HTTP for discovery and Chrome CDP only for
-  protected documents. UTF-8-first decoding plus official Word fallback repaired
-  three damaged judgments. Federal v5 has 72,981 committed documents and 16
+  protected documents. Structurally valid official HTML is preferred. Degraded
+  HTML falls through to structured official Word, rendering those same Word
+  bytes to PDF/OCR if structural parsing fails, and official PDF/OCR last.
+  Genuine DOCX numbering, numbered paragraphs and first-reference-ordered
+  footnotes are preserved.
+  Federal normalizer revision 2 has 73,036 committed documents and 16
   authoritative 404 omissions.
-- FRL has 32,771 records; five genuinely textless records retain metadata.
+- High Court categories are discovered dynamically from the official index with
+  bounded traversal and fail-closed listing validation. The official index has
+  no reported collection for 1960–1997 and labels 1906–1994 unreported coverage
+  incomplete; no guessed URL or third-party fallback fills that gap.
+- FRL schema-2 state has 32,732 authoritative in-force records. Exact official
+  public EPUB or Word renditions may recover unavailable API entities only when
+  title and authoritative timestamps match; PDF still requires official
+  extracted text.
 - The pinned model is `MongoDB/mdbr-leaf-ir` revision
   `1bb4fc387c49dee1c10c2b22f59db758be87dcaa`.
 - Deterministic model graph: 91,555,023 bytes,
@@ -156,14 +189,34 @@ one-off build/benchmark scratch files. Allocated project usage fell from about
 300 GiB immediately before that cleanup to about 203 GiB. Btrfs reflink sharing
 means the filesystem gained about 23 GiB rather than the full logical reduction.
 The active v22, v21 rollback parent, hosted Arroy v20 source, v19 DR corpus,
-prepared flat-v20 cutover copy, canonical source workspaces, models, deployment
-state, logs, and validation evidence were retained.
+canonical source workspaces, models, deployment state, logs, and validation
+evidence were retained.
 
-## V22 local corpus
+## Validated schema-12 release candidate
 
-The software tree is 0.19.11. Exact document-scoped lexical searches now narrow
-FTS work to the uniquely matched document while preserving wildcard,
-case-insensitive, and missing-scope behavior. The active local generation is
+The final chunker-format-9 generation is
+`624e214456dbb58b5ac231be5f296fa6079c49b9cb6e57fc8a22f1a5116dca33`:
+
+- schema 12, index `2026.07.24`, and minimum client v0.20.0;
+- 409,549 documents, 7,588,730 chunks/embeddings, and 20,943 definitions;
+- 15,635,169,280-byte `legal.db`, SHA-256
+  `5c4984ee7651dbec6f26988982f594873691ecb574cb217f407c5de6d2a9fd9e`;
+- ten source-scoped flat-int8 ANN and ten source-scoped SQLite lexical
+  sidecars; and
+- exact-tree/hash, SQLite integrity, foreign key, source binding, asset hash,
+  isolated activation, strict CUDA startup, all-seven-tool HarbourGrid, and
+  cold lexical validation passed.
+
+HarbourGrid completed with zero failures. Warm p95 was 15.316 ms for hybrid
+search, 7.956 ms for keyword search, and 6.817 ms for retrieval. Production
+remains on the matching v0.19.11/schema-11 pair until the v0.20.0 release gate
+completes.
+
+## V22 released corpus
+
+The released v0.19.11 schema-11 binary narrowed document-scoped lexical work
+while preserving wildcard, case-insensitive, and missing-scope behavior. Its
+active local generation is
 `937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939`:
 
 - minimum client 0.19.7, index `2026.07.19`, schema 11, and chunker format 6;
@@ -182,7 +235,7 @@ passed with zero failures, including formula text, typed asset discovery,
 `get_asset`, all expected authorities, warm keyword p95 363.234 ms, warm hybrid
 p95 516.406 ms, retrieval p95 11.636 ms, and readiness under concurrent load.
 
-## Local lifecycle and hosted cutover
+## Local lifecycle and hosted deployment
 
 Implemented hard cut:
 
@@ -243,31 +296,12 @@ Implemented hard cut:
   from the exact seven read-only descriptors. Entra works unchanged on Linode
   and remains the Microsoft 365 identity path.
 
-Schema-11 support includes maintainer-only
-`derive-schema11-from-schema10` and
-`derive-flat-int8-from-schema11-arroy-v20` commands. The first requires the exact
-typed immutable schema-10 parent and a fresh same-filesystem output, validates
-before and after projection, rebuilds only chunk FTS storage, clears the
-disposable cache, and writes the new manifest last. The one-shot v20 converter
-strictly validates the typed immutable Arroy generation and derives flat
-sidecars solely from authoritative SQLite vectors without model execution.
-
 The host deployment contract now also provides a transactional,
 version-matched `--upgrade-host-tools` operation, a publisher-accessible
 explicit and idempotent `abort`, and a fail-closed
 `update-image.sh --bootstrap-empty-host` image cutover. Upload or activation
-failure never triggers abort automatically. V0.19.8 upgraded the historical
-v0.19.5 launcher transactionally, detects rules through verbose UFW status,
-closes the exact commented web rules, and accepts prepared-bootstrap,
-configured-dark, or activated-dark state as explicitly defined by the operation.
-V0.19.9 first added the live proof and bridge but failed closed before
-transaction mutation because production `/run` is `noexec`. V0.19.10 makes only
-the two private adapter binds executable inside the recovery mount namespace,
-retains the exact live four-set process proof, and provides the release-bound
-bridge for the one pending
-v0.19.8 cutover. The launcher and updater bytes stay immutable; that unchanged
-updater advances and retires its own journal under the shared host lock.
-Under the shared host lock it atomically covers the publisher helper, wrapper,
+failure never triggers abort automatically. Under the shared host lock it
+atomically covers the publisher helper, wrapper,
 sudoers, `configure-auth`, `update-image`, installed Quadlet template, and V2
 marker/hashes; exact version, `SOURCE_COMMIT`, and release bytes are mandatory,
 and recovery uses the same bundle. Auth cutover now treats
@@ -292,13 +326,8 @@ Provider-neutral Microsoft assets render for custom DNS. On 2026-07-16 the
 reviewed OpenTofu plan created one Sydney `g6-standard-4` instance, one encrypted
 128-GiB Block Storage volume, and one creation-time Cloud Firewall. The host was
 bootstrapped with verified v0.18.1 artifacts and subsequently cut over to the
-v0.19.0 empty-host software contract. The v0.19.2 publisher-tool repair and v20 activation then succeeded. The
-v0.19.8 paired cutover later rejected Podman 4.9's `EffectiveCaps=null`
-observation and rolled back exactly. Immutable v0.19.9 failed closed before
-transaction mutation because production `/run` is `noexec`. Independently
-verified v0.19.10 preserved that source mount policy, used executable private
-file binds only inside its recovery namespace, proved all four live process
-capability sets empty, and let the unchanged v0.19.8 code retire its journal.
+v0.19.0 empty-host software contract. The v0.19.2 publisher-tool repair and v20
+activation then succeeded.
 
 Exact v0.19.10 host tools committed v22
 `937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939`.
@@ -306,7 +335,7 @@ Immutable v0.19.11 then advanced the host tools and same-generation runtime to
 commit `893b06c20e5fc2f33ca7633e636023ccb5762745` and image
 `ghcr.io/gunba/australian-legal-mcp@sha256:43be03afbdd78c509053200d0f61b35a1519e9d95f303b917f8023f4ae2a7470`.
 Arroy v20 is the sole hosted rollback; every image/auth/host-tool/corpus journal
-and compatibility-adapter path is absent. The service is public through exact
+is absent. The service is public through exact
 Caddy routes, port 51235 is host-loopback-only, and live bounding, effective,
 inheritable, and permitted capability sets are empty. Private and public
 HarbourGrid, typed formulas/assets, all seven tools, all ten source partitions,
@@ -336,4 +365,6 @@ Bicep/Blob work remains preserved as a secondary future provider path in
    live corpus host.
 
 High Court historical coverage remains bounded by the official site's available
-digitized collection. OALCC is reference-only clean-room research evidence.
+digitized collection: reported judgments have an official 1960–1997 gap and the
+1906–1994 unreported collection is explicitly incomplete. OALCC is
+reference-only clean-room research evidence.

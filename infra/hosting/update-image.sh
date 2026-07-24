@@ -21,16 +21,20 @@ For the one empty-host software cutover before the first corpus activation:
 To roll back an interrupted empty-host cutover, use the same release bundle:
   sudo update-image.sh --recover --bootstrap-empty-host
 
-For the one hard Arroy-v20 to flat-int8 hosted cutover, after the publisher has
-prepared and uploaded the target generation:
-  sudo /usr/local/sbin/legal-mcp-update-image --flat-int8-cutover \
+For an explicit incompatible image and prepared-generation transition:
+  sudo /usr/local/sbin/legal-mcp-update-image --pair-cutover \
     --generation TARGET_GENERATION \
-    --expected-current-generation ARROY_V20_GENERATION \
+    --expected-current-generation CURRENT_GENERATION \
     --image ghcr.io/gunba/australian-legal-mcp@sha256:DIGEST \
-    --version X.Y.Z --template PATH
-Recover an interrupted cutover through the same stable launcher:
-  sudo /usr/local/sbin/legal-mcp-update-image \
-    --recover --flat-int8-cutover
+    --version X.Y.Z --template PATH [--from-public]
+For an explicit transition back to a retained installed image/generation pair:
+  sudo /usr/local/sbin/legal-mcp-update-image --pair-rollback \
+    --generation RETAINED_GENERATION \
+    --expected-current-generation CURRENT_GENERATION \
+    --image ghcr.io/gunba/australian-legal-mcp@sha256:DIGEST \
+    --version X.Y.Z --template PATH [--from-public]
+Recover either interrupted pair operation through the installed launcher:
+  sudo /usr/local/sbin/legal-mcp-update-image --recover --pair-cutover
 
 If the configured mode contains api-key, stream one valid plaintext probe key
 on standard input. To roll back an update interrupted by power loss or SIGKILL:
@@ -78,23 +82,28 @@ AUTH_READY=/etc/legal-mcp/auth-ready
 TRANSACTION=/etc/legal-mcp/.image-transaction
 TRANSACTION_PREPARING=${TRANSACTION}.preparing
 TRANSACTION_PREPARING_RETIRED=${TRANSACTION}.preparing-retired
-CUTOVER_TRANSACTION_PREPARING=${TRANSACTION}.flat-int8-preparing
-CUTOVER_TRANSACTION_PREPARING_RETIRED=${TRANSACTION}.flat-int8-preparing-retired
+TRANSACTION_PREPARING_DELETION=${TRANSACTION}.preparing-deletion
 TRANSACTION_RETIRING=${TRANSACTION}.retiring
 TRANSACTION_RETIRED=${TRANSACTION}.retired
+TRANSACTION_DELETION=${TRANSACTION}.deletion
 SERVICE=legal-mcp.service
 NEW_IMAGE=''
 EXPECTED_VERSION=''
 SOURCE_TEMPLATE=''
 RECOVER=false
 BOOTSTRAP_EMPTY_HOST=false
-FLAT_INT8_CUTOVER=false
-CUTOVER_GENERATION=''
-CUTOVER_EXPECTED_CURRENT_GENERATION=''
-CUTOVER_START_ARM=/run/legal-mcp/flat-int8-cutover-start-armed
-CUTOVER_UPLOAD_AUTHORIZATION=''
+PAIR_CUTOVER=false
+PAIR_ROLLBACK=false
+PAIR_FROM_PUBLIC=false
+PAIR_GENERATION=''
+PAIR_EXPECTED_CURRENT_GENERATION=''
+PAIR_PERMIT=/run/legal-mcp/pair-cutover-starting
+PAIR_START_ARM=/run/legal-mcp/pair-cutover-start-armed
+PAIR_VERIFY_ROOT=/run/legal-mcp/pair-verification
+PAIR_TRANSACTION_BUILD=/etc/legal-mcp/.pair-transaction-build
 IMAGE_RETIREMENT_WAS_PENDING=false
 IMAGE_PREPARATION_WAS_PENDING=false
+PAIR_BUILD_WAS_PENDING=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --image) NEW_IMAGE="${2:-}"; shift 2 ;;
@@ -102,9 +111,11 @@ while [[ $# -gt 0 ]]; do
     --template) SOURCE_TEMPLATE="${2:-}"; shift 2 ;;
     --recover) RECOVER=true; shift ;;
     --bootstrap-empty-host) BOOTSTRAP_EMPTY_HOST=true; shift ;;
-    --flat-int8-cutover) FLAT_INT8_CUTOVER=true; shift ;;
-    --generation) CUTOVER_GENERATION="${2:-}"; shift 2 ;;
-    --expected-current-generation) CUTOVER_EXPECTED_CURRENT_GENERATION="${2:-}"; shift 2 ;;
+    --pair-cutover) PAIR_CUTOVER=true; shift ;;
+    --pair-rollback) PAIR_ROLLBACK=true; shift ;;
+    --generation) PAIR_GENERATION="${2:-}"; shift 2 ;;
+    --expected-current-generation) PAIR_EXPECTED_CURRENT_GENERATION="${2:-}"; shift 2 ;;
+    --from-public) PAIR_FROM_PUBLIC=true; shift ;;
     *) usage ;;
   esac
 done
@@ -309,7 +320,7 @@ read_probe_key() {
 }
 
 wait_for_exact_generation() {
-  local expected="$1" deadline=$((SECONDS + 180)) activity
+  local expected="$1" deadline=$((SECONDS + 600)) activity
   while (( SECONDS < deadline )); do
     if curl --fail --silent --max-time 5 http://127.0.0.1:51235/readyz 2>/dev/null |
       python3 -c 'import json,sys; value=json.load(sys.stdin); expected=sys.argv[1]; raise SystemExit(0 if value == {"status":"ok","generation":expected} else 1)' \
@@ -414,6 +425,26 @@ image_path_is_absent() {
   [[ ! -e "$1" && ! -L "$1" ]]
 }
 
+require_known_image_transaction_states() {
+  local path
+  while IFS= read -r -d '' path; do
+    case "$path" in
+      /etc/legal-mcp/.image-transaction|\
+      /etc/legal-mcp/.image-transaction.preparing|\
+      /etc/legal-mcp/.image-transaction.preparing-retired|\
+      /etc/legal-mcp/.image-transaction.preparing-deletion|\
+      /etc/legal-mcp/.image-transaction.retiring|\
+      /etc/legal-mcp/.image-transaction.retired|\
+      /etc/legal-mcp/.image-transaction.deletion) ;;
+      *)
+        echo "unknown image transaction state must be reviewed explicitly: $path" >&2
+        return 1
+        ;;
+    esac
+  done < <(find /etc/legal-mcp -mindepth 1 -maxdepth 1 \
+    -name '.image-transaction*' -print0)
+}
+
 require_image_transaction_directory() {
   local path="$1"
   [[ -d "$path" && ! -L "$path" \
@@ -423,15 +454,56 @@ require_image_transaction_directory() {
   }
 }
 
-delete_retired_image_directory() {
-  local path="$1"
-  image_path_is_absent "$path" && return 0
-  require_image_transaction_directory "$path"
-  rm -rf --one-file-system -- "$path"
-  image_path_is_absent "$path" || {
-    echo "image transaction cleanup did not complete: $path" >&2
+validate_image_deletion_marker() {
+  local marker="$1" expected_kind="$2"
+  bootstrap_require_regular "$marker" root root 600 || return 1
+  [[ "$(<"$marker")" = "$expected_kind" ]] || {
+    echo "image deletion marker has missing, corrupt, or foreign identity: $marker" >&2
     return 1
   }
+}
+
+delete_owned_image_transaction_directory() {
+  local path="$1" marker="$2" expected_kind="$3" found victim
+  if ! image_path_is_absent "$marker"; then
+    validate_image_deletion_marker "$marker" "$expected_kind"
+    if ! image_path_is_absent "$path"; then
+      require_image_transaction_directory "$path"
+      found="$(find "$path" -mindepth 1 -maxdepth 1 -print -quit)"
+      [[ -z "$found" ]] || {
+        echo "image deletion marker conflicts with non-empty state: $path" >&2
+        return 1
+      }
+      rmdir "$path"
+      sync -f /etc/legal-mcp
+    fi
+    rm -f -- "$marker"
+    image_path_is_absent "$marker" || return 1
+    sync -f /etc/legal-mcp
+    return 0
+  fi
+
+  require_image_transaction_directory "$path"
+  bootstrap_require_regular "$path/kind" root root 600 || return 1
+  [[ "$(<"$path/kind")" = "$expected_kind" ]] || {
+    echo "image transaction deletion refuses foreign owner: $path" >&2
+    return 1
+  }
+  while true; do
+    victim="$(find "$path" -mindepth 1 -maxdepth 1 ! -name kind -print -quit)"
+    [[ -n "$victim" ]] || break
+    rm -rf --one-file-system -- "$victim"
+    image_path_is_absent "$victim" || return 1
+    sync -f "$path"
+  done
+  image_path_is_absent "$marker" || return 1
+  mv -T "$path/kind" "$marker"
+  sync -f /etc/legal-mcp
+  validate_image_deletion_marker "$marker" "$expected_kind"
+  rmdir "$path"
+  sync -f /etc/legal-mcp
+  rm -f -- "$marker"
+  image_path_is_absent "$marker" || return 1
   sync -f /etc/legal-mcp
 }
 
@@ -452,15 +524,30 @@ retired_image_payload_state() {
 }
 
 retire_image_directory_for_deletion() {
-  local path="$1" retired_path="$2"
+  local path="$1" retired_path="$2" marker="$3" expected_kind="$4" found
   image_path_is_absent "$retired_path" || {
     echo "image deletion retirement already exists: $retired_path" >&2
     return 1
   }
+  image_path_is_absent "$marker" || {
+    echo "image deletion marker already exists: $marker" >&2
+    return 1
+  }
   require_image_transaction_directory "$path"
+  found="$(find "$path" -mindepth 1 -maxdepth 1 -print -quit)"
+  if [[ -z "$found" ]]; then
+    rmdir "$path"
+    sync -f /etc/legal-mcp
+    return 0
+  fi
+  bootstrap_require_regular "$path/kind" root root 600 || return 1
+  [[ "$(<"$path/kind")" = "$expected_kind" ]] || {
+    echo "image deletion retirement refuses foreign owner: $path" >&2
+    return 1
+  }
   mv -T "$path" "$retired_path"
   sync -f /etc/legal-mcp
-  delete_retired_image_directory "$retired_path"
+  delete_owned_image_transaction_directory "$retired_path" "$marker" "$expected_kind"
 }
 
 finalize_image_preparation_retirement() {
@@ -472,10 +559,13 @@ finalize_image_preparation_retirement() {
   if ! image_path_is_absent "$TRANSACTION_PREPARING"; then
     IMAGE_PREPARATION_WAS_PENDING=true
     retire_image_directory_for_deletion \
-      "$TRANSACTION_PREPARING" "$TRANSACTION_PREPARING_RETIRED"
-  elif ! image_path_is_absent "$TRANSACTION_PREPARING_RETIRED"; then
+      "$TRANSACTION_PREPARING" "$TRANSACTION_PREPARING_RETIRED" \
+      "$TRANSACTION_PREPARING_DELETION" LEGAL_MCP_BOOTSTRAP_IMAGE_TRANSACTION_V1
+  elif ! image_path_is_absent "$TRANSACTION_PREPARING_RETIRED" \
+    || ! image_path_is_absent "$TRANSACTION_PREPARING_DELETION"; then
     IMAGE_PREPARATION_WAS_PENDING=true
-    delete_retired_image_directory "$TRANSACTION_PREPARING_RETIRED"
+    delete_owned_image_transaction_directory "$TRANSACTION_PREPARING_RETIRED" \
+      "$TRANSACTION_PREPARING_DELETION" LEGAL_MCP_BOOTSTRAP_IMAGE_TRANSACTION_V1
   fi
 }
 
@@ -493,15 +583,18 @@ finalize_image_transaction_retirement() {
     mv -T "$TRANSACTION_RETIRING" "$TRANSACTION_RETIRED"
     sync -f /etc/legal-mcp
   fi
-  if ! image_path_is_absent "$TRANSACTION_RETIRED"; then
+  if ! image_path_is_absent "$TRANSACTION_RETIRED" \
+    || ! image_path_is_absent "$TRANSACTION_DELETION"; then
     IMAGE_RETIREMENT_WAS_PENDING=true
-    delete_retired_image_directory "$TRANSACTION_RETIRED"
+    delete_owned_image_transaction_directory "$TRANSACTION_RETIRED" \
+      "$TRANSACTION_DELETION" LEGAL_MCP_BOOTSTRAP_IMAGE_TRANSACTION_V1
   fi
 }
 
 retire_image_transaction() {
   if ! image_path_is_absent "$TRANSACTION_RETIRING" \
-    || ! image_path_is_absent "$TRANSACTION_RETIRED"; then
+    || ! image_path_is_absent "$TRANSACTION_RETIRED" \
+    || ! image_path_is_absent "$TRANSACTION_DELETION"; then
     echo 'image transaction retirement state is not clean' >&2
     return 1
   fi
@@ -509,7 +602,8 @@ retire_image_transaction() {
   sync -f /etc/legal-mcp
   mv -T "$TRANSACTION_RETIRING" "$TRANSACTION_RETIRED"
   sync -f /etc/legal-mcp
-  delete_retired_image_directory "$TRANSACTION_RETIRED"
+  delete_owned_image_transaction_directory "$TRANSACTION_RETIRED" \
+    "$TRANSACTION_DELETION" LEGAL_MCP_BOOTSTRAP_IMAGE_TRANSACTION_V1
 }
 
 bootstrap_path_is_absent() {
@@ -1107,8 +1201,6 @@ PY
     return 1
   }
   if ! bootstrap_path_is_absent /etc/legal-mcp/.auth-transaction \
-    || ! bootstrap_path_is_absent /etc/legal-mcp/.image-transaction.flat-int8-preparing \
-    || ! bootstrap_path_is_absent /etc/legal-mcp/.image-transaction.flat-int8-preparing-retired \
     || ! bootstrap_path_is_absent /etc/legal-mcp/.host-tools-transaction.preparing \
     || ! bootstrap_path_is_absent /etc/legal-mcp/.host-tools-transaction \
     || ! bootstrap_path_is_absent /etc/legal-mcp/.host-tools-transaction.retiring \
@@ -1723,8 +1815,6 @@ ordinary_require_no_foreign_transaction() {
     /etc/legal-mcp/.auth-transaction.preparing-retired \
     /etc/legal-mcp/.auth-transaction.retiring \
     /etc/legal-mcp/.auth-transaction.retired \
-    /etc/legal-mcp/.image-transaction.flat-int8-preparing \
-    /etc/legal-mcp/.image-transaction.flat-int8-preparing-retired \
     /etc/legal-mcp/.host-tools-transaction.building \
     /etc/legal-mcp/.host-tools-transaction.building-retired \
     /etc/legal-mcp/.host-tools-transaction.preparing \
@@ -2148,6 +2238,11 @@ ordinary_complete_retiring_transaction() {
 
 ordinary_complete_retired_transaction() {
   local payload_state saved_transaction="$TRANSACTION"
+  if ! image_path_is_absent "$TRANSACTION_DELETION"; then
+    delete_owned_image_transaction_directory "$TRANSACTION_RETIRED" \
+      "$TRANSACTION_DELETION" LEGAL_MCP_IMAGE_TRANSACTION_V2
+    return 0
+  fi
   # .retired is published only after the complete transaction and selected
   # live state were reverified and the parent rename was synced. Reverify while
   # the payload is complete; after recursive deletion removes its first member,
@@ -2165,7 +2260,8 @@ ordinary_complete_retired_transaction() {
     ordinary_read_transaction_probe_key
     ordinary_verify_retirement_outcome
   fi
-  delete_retired_image_directory "$TRANSACTION_RETIRED"
+  delete_owned_image_transaction_directory "$TRANSACTION_RETIRED" \
+    "$TRANSACTION_DELETION" LEGAL_MCP_IMAGE_TRANSACTION_V2
   TRANSACTION="$saved_transaction"
 }
 
@@ -2194,6 +2290,7 @@ ordinary_create_transaction() {
   local directory="$TRANSACTION_PREPARING" rendered
   image_path_is_absent "$directory" || return 1
   install -d -o root -g root -m 0700 "$directory"
+  printf '%s\n' LEGAL_MCP_IMAGE_TRANSACTION_V2 > "$directory/kind"
   install -o root -g root -m 0600 "$IMAGE_FILE" "$directory/saved-image"
   install -o root -g root -m 0600 "$QUADLET" "$directory/saved-quadlet"
   install -o root -g root -m 0600 "$TEMPLATE" "$directory/saved-template"
@@ -2209,7 +2306,6 @@ ordinary_create_transaction() {
   sed "s|__IMAGE_DIGEST__|$NEW_IMAGE|g" "$ORDINARY_SOURCE_TEMPLATE" > "$rendered"
   install -o root -g root -m 0600 "$rendered" "$directory/target-quadlet"
   rm -f "$rendered"
-  printf '%s\n' LEGAL_MCP_IMAGE_TRANSACTION_V2 > "$directory/kind"
   printf '%s\n' "$ORDINARY_VERSION" > "$directory/target-version"
   printf '%s\n' "$ORDINARY_REVISION" > "$directory/target-revision"
   printf '%s\n' "$ORDINARY_UPDATER_SHA256" > "$directory/updater-sha256"
@@ -2345,8 +2441,42 @@ ordinary_rollback() {
   exit "$status"
 }
 
+ordinary_preparation_payload_state() {
+  retired_image_payload_state "$1" \
+    kind target-version target-revision updater-sha256 retirement-outcome release-sha256 \
+    saved-sha256 target-sha256 saved-metadata target-metadata state \
+    saved-image saved-quadlet saved-template saved-runtime.env \
+    saved-api-keys.json saved-Caddyfile saved-auth-ready saved-active-generation \
+    target-image target-quadlet target-template
+}
+
 ordinary_recover_pending_state() {
-  local path
+  local path found
+  if ! image_path_is_absent "$TRANSACTION_PREPARING_DELETION"; then
+    for path in "$TRANSACTION_PREPARING" "$TRANSACTION" \
+      "$TRANSACTION_RETIRING" "$TRANSACTION_RETIRED" "$TRANSACTION_DELETION"; do
+      image_path_is_absent "$path" || {
+        echo 'image preparation deletion conflicts with another transaction phase' >&2
+        return 1
+      }
+    done
+    delete_owned_image_transaction_directory "$TRANSACTION_PREPARING_RETIRED" \
+      "$TRANSACTION_PREPARING_DELETION" LEGAL_MCP_IMAGE_TRANSACTION_V2
+    echo 'interrupted image preparation discarded'
+    return 0
+  fi
+  if ! image_path_is_absent "$TRANSACTION_DELETION"; then
+    for path in "$TRANSACTION_PREPARING" "$TRANSACTION_PREPARING_RETIRED" \
+      "$TRANSACTION" "$TRANSACTION_RETIRING"; do
+      image_path_is_absent "$path" || {
+        echo 'image deletion conflicts with another transaction phase' >&2
+        return 1
+      }
+    done
+    ordinary_complete_retired_transaction
+    echo 'interrupted image transaction retirement completed'
+    return 0
+  fi
   if ! image_path_is_absent "$TRANSACTION_PREPARING" \
     && ! image_path_is_absent "$TRANSACTION_PREPARING_RETIRED"; then
     echo 'image preparation has conflicting recovery states' >&2
@@ -2358,14 +2488,29 @@ ordinary_recover_pending_state() {
     return 1
   fi
   if ! image_path_is_absent "$TRANSACTION_PREPARING"; then
-    ordinary_validate_transaction "$TRANSACTION_PREPARING"
+    ordinary_preparation_payload_state "$TRANSACTION_PREPARING" >/dev/null
+    found="$(find "$TRANSACTION_PREPARING" -mindepth 1 -maxdepth 1 -print -quit)"
+    if [[ -z "$found" ]]; then
+      rmdir "$TRANSACTION_PREPARING"
+      sync -f /etc/legal-mcp
+      echo 'interrupted image preparation discarded'
+      return 0
+    fi
+    bootstrap_require_regular "$TRANSACTION_PREPARING/kind" root root 600
+    [[ "$(<"$TRANSACTION_PREPARING/kind")" = LEGAL_MCP_IMAGE_TRANSACTION_V2 ]] || {
+      echo 'ordinary recovery refuses a preparation owned by another image operation' >&2
+      return 1
+    }
     retire_image_directory_for_deletion \
-      "$TRANSACTION_PREPARING" "$TRANSACTION_PREPARING_RETIRED"
+      "$TRANSACTION_PREPARING" "$TRANSACTION_PREPARING_RETIRED" \
+      "$TRANSACTION_PREPARING_DELETION" LEGAL_MCP_IMAGE_TRANSACTION_V2
     echo 'interrupted image preparation discarded'
     return 0
   fi
-  if ! image_path_is_absent "$TRANSACTION_PREPARING_RETIRED"; then
-    delete_retired_image_directory "$TRANSACTION_PREPARING_RETIRED"
+  if ! image_path_is_absent "$TRANSACTION_PREPARING_RETIRED" \
+    || ! image_path_is_absent "$TRANSACTION_PREPARING_DELETION"; then
+    delete_owned_image_transaction_directory "$TRANSACTION_PREPARING_RETIRED" \
+      "$TRANSACTION_PREPARING_DELETION" LEGAL_MCP_IMAGE_TRANSACTION_V2
     echo 'interrupted image preparation discarded'
     return 0
   fi
@@ -2400,22 +2545,17 @@ ordinary_recover_pending_state() {
   echo 'interrupted image transaction retirement completed'
 }
 
-cutover_path_is_absent() {
-  image_path_is_absent "$1"
-}
-
-cutover_require_launcher_context() {
-  local permit=/run/legal-mcp/flat-int8-cutover-starting
-  local dispatch=/run/legal-mcp/host-tool-launcher-dispatch
-  local permit_pid permit_start actual_start uid_line cmdline
-  bootstrap_require_regular "$permit" root root 400 || {
-    echo 'flat-int8 cutover must run through the installed stable root launcher' >&2
+pair_require_launcher_context() {
+  local permit_pid permit_start actual_start uid_line cmdline dispatch
+  dispatch=/run/legal-mcp/host-tool-launcher-dispatch
+  bootstrap_require_regular "$PAIR_PERMIT" root root 400 || {
+    echo 'pair transition must run through the installed stable root launcher' >&2
     return 1
   }
-  bootstrap_require_acl "$permit" $'user::r--\ngroup::---\nother::---' || return 1
-  read -r permit_pid permit_start < "$permit" || return 1
+  bootstrap_require_acl "$PAIR_PERMIT" $'user::r--\ngroup::---\nother::---' || return 1
+  read -r permit_pid permit_start < "$PAIR_PERMIT" || return 1
   [[ "$permit_pid" =~ ^[1-9][0-9]*$ && "$permit_start" =~ ^[1-9][0-9]*$ \
-    && "$(wc -w < "$permit")" = 2 ]] || return 1
+    && "$(wc -w < "$PAIR_PERMIT")" = 2 ]] || return 1
   actual_start="$(python3 - "$permit_pid" <<'PY'
 import pathlib, sys
 value = pathlib.Path(f"/proc/{sys.argv[1]}/stat").read_text()
@@ -2426,12 +2566,14 @@ print(fields[19])
 PY
 )" || return 1
   [[ "$actual_start" = "$permit_start" ]] || return 1
-  uid_line="$(awk '$1 == "Uid:" {print $2 ":" $3 ":" $4 ":" $5}' "/proc/$permit_pid/status")" || return 1
+  uid_line="$(awk '$1 == "Uid:" {print $2 ":" $3 ":" $4 ":" $5}' "/proc/$permit_pid/status")" \
+    || return 1
   [[ "$uid_line" = 0:0:0:0 ]] || return 1
   cmdline="$(tr '\0' '\n' < "/proc/$permit_pid/cmdline")" || return 1
   grep -Fxq -- '--legal-mcp-launcher-internal' <<< "$cmdline" \
     && grep -Fxq update-image <<< "$cmdline" \
-    && grep -Fxq -- '--flat-int8-cutover' <<< "$cmdline" || return 1
+    && { grep -Fxq -- '--pair-cutover' <<< "$cmdline" \
+      || grep -Fxq -- '--pair-rollback' <<< "$cmdline"; } || return 1
   [[ -d "$dispatch" && ! -L "$dispatch" \
     && "$(stat -c '%U:%G:%a' "$dispatch")" = root:root:700 ]] || return 1
   for name in pid start-time role configure-auth update-image; do
@@ -2442,8 +2584,180 @@ PY
     && "$(<"$dispatch/role")" = update-image ]] || return 1
 }
 
-cutover_require_no_foreign_transaction() {
-  local allow_cutover="$1" path found
+pair_load_target_bundle() {
+  local requested_template="$1" requested_version="$2" binary_version
+  local resolved_template
+  local -a versions revisions
+  bootstrap_require_release_file "$requested_template"
+  resolved_template="$(readlink -f "$requested_template")"
+  PAIR_TARGET_BUNDLE_ROOT="$(cd "$(dirname "$resolved_template")/../.." && pwd -P)"
+  PAIR_TARGET_RELEASE_TEMPLATE="$PAIR_TARGET_BUNDLE_ROOT/infra/hosting/legal-mcp.container.template"
+  [[ "$resolved_template" = "$PAIR_TARGET_RELEASE_TEMPLATE" ]] || {
+    echo 'pair target template is not in a complete Linux release bundle' >&2
+    return 1
+  }
+  for path in \
+    "$PAIR_TARGET_BUNDLE_ROOT/Containerfile" \
+    "$PAIR_TARGET_BUNDLE_ROOT/SOURCE_COMMIT" \
+    "$PAIR_TARGET_BUNDLE_ROOT/libonnxruntime.so" \
+    "$PAIR_TARGET_RELEASE_TEMPLATE"; do
+    bootstrap_require_release_file "$path"
+  done
+  for path in \
+    "$PAIR_TARGET_BUNDLE_ROOT/legal-mcp" \
+    "$PAIR_TARGET_BUNDLE_ROOT/infra/hosting/configure-auth.sh" \
+    "$PAIR_TARGET_BUNDLE_ROOT/infra/hosting/update-image.sh" \
+    "$PAIR_TARGET_BUNDLE_ROOT/scripts/legal-mcp-host-deploy" \
+    "$PAIR_TARGET_BUNDLE_ROOT/scripts/legal-mcp-publisher-command"; do
+    bootstrap_require_release_file "$path" true
+  done
+  mapfile -t versions < <(
+    awk -F= '$1 == "ARG VERSION" {print $2}' "$PAIR_TARGET_BUNDLE_ROOT/Containerfile"
+  )
+  mapfile -t revisions < "$PAIR_TARGET_BUNDLE_ROOT/SOURCE_COMMIT"
+  [[ ${#versions[@]} -eq 1 && "${versions[0]}" = "$requested_version" \
+    && ${#revisions[@]} -eq 1 && "${revisions[0]}" =~ ^[0-9a-f]{40}$ ]] || {
+      echo 'pair target release version or SOURCE_COMMIT is invalid' >&2
+      return 1
+    }
+  PAIR_TARGET_VERSION="${versions[0]}"
+  PAIR_TARGET_REVISION="${revisions[0]}"
+  pair_validate_template_contract "$PAIR_TARGET_RELEASE_TEMPLATE" || {
+    echo 'pair target release lacks the hardened image service contract' >&2
+    return 1
+  }
+  binary_version="$(env -u LD_LIBRARY_PATH -u LD_PRELOAD \
+    "$PAIR_TARGET_BUNDLE_ROOT/legal-mcp" --version)"
+  [[ "$binary_version" = "legal-mcp $PAIR_TARGET_VERSION" ]] || {
+    echo 'pair target release binary version does not match its bundle' >&2
+    return 1
+  }
+  env -u LD_LIBRARY_PATH -u LD_PRELOAD \
+    ORT_DYLIB_PATH="$PAIR_TARGET_BUNDLE_ROOT/libonnxruntime.so" \
+    "$PAIR_TARGET_BUNDLE_ROOT/legal-mcp" verify-runtime \
+    | grep -Fq '"onnx_runtime_ready":true'
+}
+
+pair_require_fixed_host_identities() {
+  [[ "$(id -u legal-mcp)" = 971 && "$(id -g legal-mcp)" = 971 \
+    && "$(id -G legal-mcp)" = 971 ]] || {
+    echo 'pair service identity does not match fixed UID/GID 971' >&2
+    return 1
+  }
+  [[ "$(id -u legal-mcp-publisher)" = 973 \
+    && "$(id -g legal-mcp-publisher)" = 973 \
+    && "$(id -G legal-mcp-publisher)" = 973 ]] || {
+    echo 'pair publisher identity does not match fixed UID/GID 973' >&2
+    return 1
+  }
+}
+
+pair_validate_mount_contract() {
+  local target source fstype options xfs_details actual_uuid marker_uuid host_uuid directory
+  local -a marker host_marker
+  bootstrap_require_regular /etc/legal-mcp/host-installed root root 444 || return 1
+  bootstrap_require_acl /etc/legal-mcp/host-installed \
+    $'user::r--\ngroup::r--\nother::r--' || return 1
+  mapfile -t host_marker < /etc/legal-mcp/host-installed
+  [[ ${#host_marker[@]} -eq 2 && "${host_marker[0]}" = LEGAL_MCP_HOST_V1 \
+    && "${host_marker[1]}" =~ ^VOLUME_UUID=([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$ ]] || return 1
+  host_uuid="${BASH_REMATCH[1],,}"
+  read -r target source fstype options < <(
+    findmnt --noheadings --raw --output TARGET,SOURCE,FSTYPE,OPTIONS \
+      --target /srv/legal-mcp
+  )
+  [[ "$target" = /srv/legal-mcp && "$fstype" = xfs \
+    && ",$options," = *,noatime,* && ",$options," = *,nodev,* \
+    && ",$options," = *,noexec,* && ",$options," = *,nosuid,* ]] || {
+      echo 'pair transition requires the exact mounted XFS corpus volume' >&2
+      return 1
+    }
+  xfs_details="$(xfs_info /srv/legal-mcp)" || return 1
+  grep -Eq 'reflink=1([[:space:]]|$)' <<< "$xfs_details" \
+    && grep -Eq 'ftype=1([[:space:]]|$)' <<< "$xfs_details" || return 1
+  bootstrap_require_regular /srv/legal-mcp/.legal-mcp-volume root root 444 || return 1
+  bootstrap_require_acl /srv/legal-mcp/.legal-mcp-volume \
+    $'user::r--\ngroup::r--\nother::r--' || return 1
+  mapfile -t marker < /srv/legal-mcp/.legal-mcp-volume
+  [[ ${#marker[@]} -eq 2 && "${marker[0]}" = LEGAL_MCP_VOLUME_V1 \
+    && "${marker[1]}" =~ ^UUID=([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$ ]] || return 1
+  marker_uuid="${BASH_REMATCH[1],,}"
+  actual_uuid="$(blkid -s UUID -o value "$source" | tr '[:upper:]' '[:lower:]')" || return 1
+  [[ "$host_uuid" = "$marker_uuid" && "$actual_uuid" = "$marker_uuid" ]] || return 1
+  [[ -d /srv/legal-mcp && ! -L /srv/legal-mcp \
+    && "$(stat -c '%U:%G:%a' /srv/legal-mcp)" = root:legal-mcp:750 ]] || return 1
+  bootstrap_require_acl /srv/legal-mcp \
+    $'user::rwx\nuser:973:--x\ngroup::r-x\nmask::r-x\nother::---' || return 1
+  for directory in generations lifecycle state uploads; do
+    [[ -d "/srv/legal-mcp/$directory" && ! -L "/srv/legal-mcp/$directory" ]] || return 1
+  done
+  [[ "$(stat -c '%U:%G:%a' /srv/legal-mcp/generations)" = root:legal-mcp:750 \
+    && "$(stat -c '%U:%G:%a' /srv/legal-mcp/lifecycle)" = root:legal-mcp:750 \
+    && "$(stat -c '%U:%G:%a' /srv/legal-mcp/state)" = legal-mcp:legal-mcp:700 \
+    && "$(stat -c '%U:%G:%a' /srv/legal-mcp/uploads)" \
+      = legal-mcp-publisher:legal-mcp-publisher:700 ]] || return 1
+  bootstrap_require_acl /srv/legal-mcp/generations \
+    $'user::rwx\ngroup::r-x\nother::---' || return 1
+  bootstrap_require_acl /srv/legal-mcp/lifecycle \
+    $'user::rwx\ngroup::r-x\nother::---' || return 1
+  bootstrap_require_acl /srv/legal-mcp/state \
+    $'user::rwx\ngroup::---\nother::---' || return 1
+  bootstrap_require_acl /srv/legal-mcp/uploads \
+    $'user::rwx\ngroup::---\nother::---' || return 1
+  bootstrap_require_regular /srv/legal-mcp/lifecycle/LOCK root legal-mcp 640 || return 1
+  [[ "$(stat -c '%h' /srv/legal-mcp/lifecycle/LOCK)" = 1 ]] || return 1
+  bootstrap_require_acl /srv/legal-mcp/lifecycle/LOCK \
+    $'user::rw-\ngroup::r--\nother::---' || return 1
+  bootstrap_require_empty_regular /srv/legal-mcp/lifecycle/LIFECYCLE_LOCK root root 640 || return 1
+  [[ "$(stat -c '%h' /srv/legal-mcp/lifecycle/LIFECYCLE_LOCK)" = 1 ]] || return 1
+  bootstrap_require_acl /srv/legal-mcp/lifecycle/LIFECYCLE_LOCK \
+    $'user::rw-\ngroup::r--\nother::---' || return 1
+}
+
+pair_validate_template_contract() {
+  local template="$1"
+  [[ "$(grep -o '__IMAGE_DIGEST__' "$template" | wc -l)" = 1 \
+    && "$(grep -Fxc 'User=971:971' "$template")" = 1 \
+    && "$(grep -Fxc 'PublishPort=127.0.0.1:51235:51235' "$template")" = 1 \
+    && "$(grep -Fxc 'ReadOnly=true' "$template")" = 1 \
+    && "$(grep -Fxc 'DropCapability=all' "$template")" = 1 \
+    && "$(grep -Fxc 'NoNewPrivileges=true' "$template")" = 1 \
+    && "$(grep -Fxc 'ExecCondition=/usr/local/libexec/legal-mcp/host-tool-launcher --check-auth-ready' \
+      "$template")" = 1 \
+    && "$(grep -Fxc 'Volume=/srv/legal-mcp/generations:/var/lib/legal-mcp/generations:ro,nodev,nosuid,noexec' \
+      "$template")" = 1 \
+    && "$(grep -Fxc 'Volume=/srv/legal-mcp/lifecycle:/var/lib/legal-mcp/lifecycle:ro,nodev,nosuid,noexec' \
+      "$template")" = 1 \
+    && "$(grep -Fxc 'Volume=/srv/legal-mcp/state:/var/lib/legal-mcp/state:rw,nodev,nosuid,noexec' \
+      "$template")" = 1 \
+    && "$(grep -Fxc 'Volume=/etc/legal-mcp/api-keys.json:/run/secrets/legal-mcp-api-keys.json:ro,nodev,nosuid,noexec' \
+      "$template")" = 1 ]]
+}
+
+pair_validate_installed_template() {
+  pair_validate_template_contract "$TEMPLATE" || {
+    echo 'installed pair template lacks the exact hardened mount and service contract' >&2
+    return 1
+  }
+}
+
+pair_read_deployment_journal() {
+  local journal=/srv/legal-mcp/lifecycle/.deployment-transaction
+  bootstrap_require_regular "$journal" root root 600 || return 1
+  mapfile -t PAIR_DEPLOYMENT < "$journal"
+  [[ ${#PAIR_DEPLOYMENT[@]} -eq 3 \
+    && "${PAIR_DEPLOYMENT[0]}" =~ ^[0-9a-f]{64}$ \
+    && "${PAIR_DEPLOYMENT[1]}" =~ ^[0-9a-f]{64}$ \
+    && "${PAIR_DEPLOYMENT[2]}" =~ ^(prepared|activating|activated|rolling-back|rolled-back)$ ]] \
+    || return 1
+  PAIR_DEPLOYMENT_GENERATION="${PAIR_DEPLOYMENT[0]}"
+  PAIR_DEPLOYMENT_PREVIOUS="${PAIR_DEPLOYMENT[1]}"
+  PAIR_DEPLOYMENT_PHASE="${PAIR_DEPLOYMENT[2]}"
+}
+
+pair_require_no_foreign_transaction() {
+  local allow_pair="$1" path found
+  require_known_image_transaction_states || return 1
   for path in \
     /etc/legal-mcp/.auth-transaction.preparing \
     /etc/legal-mcp/.auth-transaction.preparing-retired \
@@ -2452,8 +2766,6 @@ cutover_require_no_foreign_transaction() {
     /etc/legal-mcp/.auth-transaction.retired \
     /etc/legal-mcp/.auth-transaction.legacy-v0192-preparing-retiring \
     /etc/legal-mcp/.auth-transaction.legacy-v0192-preparing-retired \
-    /etc/legal-mcp/.image-transaction.preparing \
-    /etc/legal-mcp/.image-transaction.preparing-retired \
     /etc/legal-mcp/.host-tools-transaction.building \
     /etc/legal-mcp/.host-tools-transaction.building-retired \
     /etc/legal-mcp/.host-tools-transaction.preparing \
@@ -2465,8 +2777,8 @@ cutover_require_no_foreign_transaction() {
     /etc/legal-mcp/.host-tools-transaction.rollback-retired \
     /etc/legal-mcp/.host-tools-transaction.publisher-restore \
     /etc/legal-mcp/.host-tools-transaction.publisher-restore-retired; do
-    cutover_path_is_absent "$path" || {
-      echo 'a foreign auth, host-tool, or corpus preparation transaction must be recovered first' >&2
+    image_path_is_absent "$path" || {
+      echo 'a foreign auth or host-tool transaction must be recovered first' >&2
       return 1
     }
   done
@@ -2476,185 +2788,273 @@ cutover_require_no_foreign_transaction() {
     echo 'a foreign authentication preparation must be recovered first' >&2
     return 1
   }
-  if [[ "$allow_cutover" = false ]]; then
-    for path in "$CUTOVER_TRANSACTION_PREPARING" \
-      "$CUTOVER_TRANSACTION_PREPARING_RETIRED" "$TRANSACTION" \
-      "$TRANSACTION_RETIRING" "$TRANSACTION_RETIRED"; do
-      cutover_path_is_absent "$path" || {
-        echo 'an image transaction already exists; use explicit flat-int8 recovery' >&2
+  if [[ "$allow_pair" = false ]]; then
+    for path in "$TRANSACTION_PREPARING" "$TRANSACTION_PREPARING_RETIRED" \
+      "$TRANSACTION_PREPARING_DELETION" "$TRANSACTION" \
+      "$TRANSACTION_RETIRING" "$TRANSACTION_RETIRED" "$TRANSACTION_DELETION"; do
+      image_path_is_absent "$path" || {
+        echo 'an image transaction already exists; use its explicit recovery route' >&2
         return 1
       }
     done
   fi
 }
 
-cutover_validate_mount_contract() {
-  local target source fstype options xfs_details actual_uuid marker_uuid directory
-  local -a marker
-  read -r target source fstype options < <(
-    findmnt --noheadings --raw --output TARGET,SOURCE,FSTYPE,OPTIONS \
-      --target /srv/legal-mcp
-  )
-  [[ "$target" = /srv/legal-mcp && "$fstype" = xfs \
-    && ",$options," = *,noatime,* && ",$options," = *,nodev,* \
-    && ",$options," = *,noexec,* && ",$options," = *,nosuid,* ]] || {
-      echo 'flat-int8 cutover requires the exact mounted XFS corpus volume' >&2
+pair_capture_image_identity() {
+  local image="$1" prefix="$2" version revision image_id
+  version="$(podman image inspect "$image" \
+    --format '{{index .Labels "org.opencontainers.image.version"}}')"
+  revision="$(podman image inspect "$image" \
+    --format '{{index .Labels "org.opencontainers.image.revision"}}')"
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$revision" =~ ^[0-9a-f]{40}$ ]] || {
+    echo 'recorded pair image version or revision is malformed' >&2
+    return 1
+  }
+  verify_image_runtime "$image" "$version" "$revision"
+  image_id="$(canonical_image_id \
+    "$(podman image inspect "$image" --format '{{.Id}}')")" || return 1
+  printf -v "${prefix}_VERSION" '%s' "$version"
+  printf -v "${prefix}_REVISION" '%s' "$revision"
+  printf -v "${prefix}_IMAGE_ID" '%s' "$image_id"
+}
+
+pair_require_configured_dark() {
+  local container_state running_image_id
+  image_path_is_absent "$AUTH_READY" || {
+    echo 'public pair maintenance requires explicit --from-public authorization' >&2
+    return 1
+  }
+  [[ "$(read_systemctl_enablement "$SERVICE")" = generated \
+    && "$(read_systemctl_activity "$SERVICE")" = inactive \
+    && "$(read_systemctl_enablement caddy.service)" = disabled \
+    && "$(read_systemctl_activity caddy.service)" = inactive \
+    && "$(ufw_rule_state 80)" = absent \
+    && "$(ufw_rule_state 443)" = absent ]] || {
+      echo 'pair transition requires the exact configured-dark host state' >&2
       return 1
     }
-  xfs_details="$(xfs_info /srv/legal-mcp)" || return 1
-  grep -Eq 'reflink=1([[:space:]]|$)' <<< "$xfs_details" \
-    && grep -Eq 'ftype=1([[:space:]]|$)' <<< "$xfs_details" || return 1
-  bootstrap_require_regular /srv/legal-mcp/.legal-mcp-volume root root 444 || return 1
-  bootstrap_require_acl /srv/legal-mcp/.legal-mcp-volume \
-    $'user::r--\ngroup::r--\nother::r--' || return 1
-  mapfile -t marker < /srv/legal-mcp/.legal-mcp-volume
-  [[ ${#marker[@]} -eq 2 && "${marker[0]}" = LEGAL_MCP_VOLUME_V1 \
-    && "${marker[1]}" =~ ^UUID=([0-9A-Fa-f-]{36})$ ]] || return 1
-  marker_uuid="${BASH_REMATCH[1],,}"
-  actual_uuid="$(blkid -s UUID -o value "$source" | tr '[:upper:]' '[:lower:]')" || return 1
-  [[ "$actual_uuid" = "$marker_uuid" ]] || return 1
-  [[ -d /srv/legal-mcp && ! -L /srv/legal-mcp \
-    && "$(stat -c '%U:%G:%a' /srv/legal-mcp)" = root:legal-mcp:750 ]] || return 1
-  bootstrap_require_acl /srv/legal-mcp \
-    $'user::rwx\nuser:973:--x\ngroup::r-x\nmask::r-x\nother::---' || return 1
-  for directory in generations lifecycle state uploads; do
-    [[ -d "/srv/legal-mcp/$directory" && ! -L "/srv/legal-mcp/$directory" ]] || return 1
-  done
-  bootstrap_require_regular /srv/legal-mcp/lifecycle/LOCK root legal-mcp 640 || return 1
-  bootstrap_require_empty_regular /srv/legal-mcp/lifecycle/LIFECYCLE_LOCK root root 640 || return 1
-}
-
-cutover_validate_generation_manifest() {
-  local manifest="$1" expected_format="$2"
-  bootstrap_require_regular "$manifest" "$3" "$4" "$5" || return 1
-  python3 - "$manifest" "$expected_format" <<'PY'
-import json, pathlib, sys
-path, expected = sys.argv[1:]
-value = json.loads(pathlib.Path(path).read_bytes())
-sources = {
-    "ato", "frl", "federal-court", "high-court", "nsw-caselaw",
-    "nsw-legislation", "qld-legislation", "wa-legislation",
-    "sa-legislation", "tas-legislation",
-}
-if value.get("schema_version") != 11 or set(value.get("ann", {})) != sources:
-    raise SystemExit(1)
-for source, ann in value["ann"].items():
-    if ann.get("source_id") != source or ann.get("path") != f"ann/{source}.ann":
-        raise SystemExit(1)
-    if ann.get("id_encoding") != "sqlite-chunk-id-u32":
-        raise SystemExit(1)
-    if expected == "arroy":
-        if not (ann.get("format") == "arroy-cosine-f32" and ann.get("format_version") == 3
-                and ann.get("library") == "arroy" and ann.get("library_version") == "0.6.4"):
-            raise SystemExit(1)
-    elif expected == "flat-int8":
-        if not (ann.get("format") == "flat-int8" and ann.get("format_version") == 1
-                and ann.get("metric") == "signed-int8-dot-exact"):
-            raise SystemExit(1)
-        if any(key in ann for key in ("library", "library_version", "trees", "seed", "rng")):
-            raise SystemExit(1)
-    else:
-        raise SystemExit(1)
-PY
-}
-
-cutover_read_deployment_journal() {
-  local journal=/srv/legal-mcp/lifecycle/.deployment-transaction
-  bootstrap_require_regular "$journal" root root 600 || return 1
-  mapfile -t CUTOVER_DEPLOYMENT < "$journal"
-  [[ ( ${#CUTOVER_DEPLOYMENT[@]} -eq 3 \
-      || ( ${#CUTOVER_DEPLOYMENT[@]} -eq 4 \
-        && "${CUTOVER_DEPLOYMENT[3]}" = flat-int8-cutover ) ) \
-    && "${CUTOVER_DEPLOYMENT[0]}" =~ ^[0-9a-f]{64}$ \
-    && "${CUTOVER_DEPLOYMENT[1]}" =~ ^[0-9a-f]{64}$ \
-    && "${CUTOVER_DEPLOYMENT[2]}" =~ ^(prepared|activating|activated|rolling-back|rolled-back)$ ]] \
-    || return 1
-  CUTOVER_DEPLOYMENT_GENERATION="${CUTOVER_DEPLOYMENT[0]}"
-  CUTOVER_DEPLOYMENT_PREVIOUS="${CUTOVER_DEPLOYMENT[1]}"
-  CUTOVER_DEPLOYMENT_PHASE="${CUTOVER_DEPLOYMENT[2]}"
-  if [[ ${#CUTOVER_DEPLOYMENT[@]} -eq 4 ]]; then
-    CUTOVER_DEPLOYMENT_KIND=flat-int8-cutover
-  else
-    CUTOVER_DEPLOYMENT_KIND=ordinary
+  ufw_is_fail_closed
+  ordinary_require_listener_topology none
+  container_state="$(podman_container_state australian-legal-mcp)" || return 1
+  if [[ "$container_state" = present ]]; then
+    running_image_id="$(canonical_image_id \
+      "$(podman inspect australian-legal-mcp --format '{{.Image}}')")" || return 1
+    [[ "$running_image_id" = "$PAIR_PRIOR_IMAGE_ID" ]] || return 1
   fi
+  PAIR_ORIGIN=dark
 }
 
-cutover_candidate_manifest() {
-  local target="$1" upload installed
-  upload="/srv/legal-mcp/uploads/$target"
-  installed="/srv/legal-mcp/generations/$target"
-  if [[ -d "$upload" && ! -L "$upload" \
-    && ! -e "$installed" && ! -L "$installed" ]]; then
-    printf '%s\n' "$upload/generation.json"
-  elif [[ -d "$installed" && ! -L "$installed" \
-    && ! -e "$upload" && ! -L "$upload" ]]; then
-    printf '%s\n' "$installed/generation.json"
-  else
-    echo 'cutover target must exist in exactly one prepared or installed location' >&2
+pair_require_public() {
+  local running_image_id host
+  ordinary_require_live_metadata
+  [[ "$(read_systemctl_enablement "$SERVICE")" = generated \
+    && "$(read_systemctl_activity "$SERVICE")" = active \
+    && "$(read_systemctl_enablement caddy.service)" = enabled \
+    && "$(read_systemctl_activity caddy.service)" = active \
+    && "$(ufw_rule_state 80)" = present \
+    && "$(ufw_rule_state 443)" = present ]] || {
+      echo '--from-public requires the exact authenticated public host state' >&2
+      return 1
+    }
+  ufw_is_fail_closed
+  ordinary_require_listener_topology public
+  wait_for_exact_generation "$PAIR_EXPECTED_CURRENT_GENERATION"
+  host="${EXTERNAL_URL#https://}"; host="${host%/mcp}"
+  ordinary_validate_caddy_contract "$host"
+  probe_auth_boundary http://127.0.0.1:51235/mcp \
+    http://127.0.0.1:51235/.well-known/oauth-protected-resource/mcp
+  probe_auth_boundary "$EXTERNAL_URL" \
+    "${EXTERNAL_URL%/mcp}/.well-known/oauth-protected-resource/mcp"
+  ordinary_probe_negative_caddy_routes "${EXTERNAL_URL%/mcp}"
+  running_image_id="$(canonical_image_id \
+    "$(podman inspect australian-legal-mcp --format '{{.Image}}')")" || return 1
+  [[ "$running_image_id" = "$PAIR_PRIOR_IMAGE_ID" ]] || return 1
+  PAIR_ORIGIN=public
+}
+
+pair_validate_manifest_file() {
+  local path="$1" owner="$2" group="$3" mode="$4"
+  ordinary_require_regular "$path" "$owner" "$group" "$mode"
+}
+
+pair_capture_baseline() {
+  local rendered image_state candidate_manifest authorization host
+  local -a current_image
+  pair_validate_mount_contract
+  pair_validate_installed_template
+  ordinary_require_static_live_metadata
+  load_runtime_contract "$RUNTIME_ENV"
+  read_probe_key
+  PAIR_PRIOR_GENERATION="$(</srv/legal-mcp/lifecycle/active-generation)"
+  [[ "$PAIR_PRIOR_GENERATION" = "$PAIR_EXPECTED_CURRENT_GENERATION" \
+    && "$PAIR_PRIOR_GENERATION" =~ ^[0-9a-f]{64}$ \
+    && "$PAIR_GENERATION" != "$PAIR_PRIOR_GENERATION" ]] || {
+      echo 'live generation does not match the explicit current pair' >&2
+      return 1
+    }
+  mapfile -t current_image < "$IMAGE_FILE"
+  [[ ${#current_image[@]} -eq 1 ]]
+  PAIR_PRIOR_IMAGE="${current_image[0]}"
+  [[ "$PAIR_PRIOR_IMAGE" =~ ^ghcr\.io/gunba/australian-legal-mcp@sha256:[0-9a-f]{64}$ \
+    && "$NEW_IMAGE" != "$PAIR_PRIOR_IMAGE" ]] || {
+      echo 'current and target pair image pins are malformed or identical' >&2
+      return 1
+    }
+  rendered="$(mktemp /run/legal-mcp-pair-current-quadlet.XXXXXX)"
+  sed "s|__IMAGE_DIGEST__|$PAIR_PRIOR_IMAGE|g" "$TEMPLATE" > "$rendered"
+  if ! cmp --silent "$rendered" "$QUADLET"; then
+    rm -f "$rendered"
+    echo 'current pair image, installed template, and Quadlet do not agree' >&2
     return 1
   fi
+  rm -f "$rendered"
+  image_state="$(podman_image_state "$PAIR_PRIOR_IMAGE")" || return 1
+  [[ "$image_state" = present ]] || {
+    echo 'current pair image is not present' >&2
+    return 1
+  }
+  pair_capture_image_identity "$PAIR_PRIOR_IMAGE" PAIR_PRIOR
+  pair_validate_manifest_file \
+    "/srv/legal-mcp/generations/$PAIR_PRIOR_GENERATION/generation.json" \
+    root legal-mcp 440
+  PAIR_PRIOR_MANIFEST_SHA256="$(sha256sum \
+    "/srv/legal-mcp/generations/$PAIR_PRIOR_GENERATION/generation.json" | awk '{print $1}')"
+  if [[ "$PAIR_FROM_PUBLIC" = true ]]; then
+    pair_require_public
+  else
+    pair_require_configured_dark
+  fi
+  host="${EXTERNAL_URL#https://}"; host="${host%/mcp}"
+  ordinary_validate_caddy_contract "$host"
+  podman run --rm --network=none --user=971:971 --read-only --cap-drop=all \
+    --security-opt=no-new-privileges --pids-limit=256 --memory=6g --memory-swap=6g \
+    --tmpfs=/tmp:rw,nodev,nosuid,noexec,size=64m,mode=1777 \
+    --volume=/srv/legal-mcp:/var/lib/legal-mcp:ro,nodev,nosuid,noexec \
+    "$PAIR_PRIOR_IMAGE" verify --quiet >/dev/null
+
+  authorization=/run/legal-mcp/authorized-upload
+  case "$PAIR_OPERATION" in
+    prepared)
+      pair_read_deployment_journal
+      [[ "$PAIR_DEPLOYMENT_GENERATION" = "$PAIR_GENERATION" \
+        && "$PAIR_DEPLOYMENT_PREVIOUS" = "$PAIR_PRIOR_GENERATION" \
+        && "$PAIR_DEPLOYMENT_PHASE" = prepared \
+        && -d "/srv/legal-mcp/uploads/$PAIR_GENERATION" \
+        && ! -L "/srv/legal-mcp/uploads/$PAIR_GENERATION" \
+        && ! -e "/srv/legal-mcp/generations/$PAIR_GENERATION" \
+        && ! -L "/srv/legal-mcp/generations/$PAIR_GENERATION" ]] || {
+          echo 'pair cutover requires one exact ordinary prepared generation' >&2
+          return 1
+        }
+      candidate_manifest="/srv/legal-mcp/uploads/$PAIR_GENERATION/generation.json"
+      pair_validate_manifest_file "$candidate_manifest" \
+        legal-mcp-publisher legal-mcp-publisher 600
+      bootstrap_require_regular "$authorization" root legal-mcp-publisher 440
+      [[ "$(<"$authorization")" = "$PAIR_GENERATION" ]] || {
+        echo 'prepared upload authorization does not match the pair target' >&2
+        return 1
+      }
+      PAIR_UPLOAD_AUTHORIZATION=present
+      ;;
+    installed)
+      if ! image_path_is_absent /srv/legal-mcp/lifecycle/.deployment-transaction \
+        || ! image_path_is_absent /srv/legal-mcp/lifecycle/.deployment-transaction.preparing \
+        || ! image_path_is_absent "$authorization"; then
+          echo 'pair rollback requires no corpus upload transaction' >&2
+          return 1
+      fi
+      [[ -d "/srv/legal-mcp/generations/$PAIR_GENERATION" \
+        && ! -L "/srv/legal-mcp/generations/$PAIR_GENERATION" \
+        && ! -e "/srv/legal-mcp/uploads/$PAIR_GENERATION" \
+        && ! -L "/srv/legal-mcp/uploads/$PAIR_GENERATION" ]] || {
+          echo 'pair rollback target is not one retained installed generation' >&2
+          return 1
+        }
+      candidate_manifest="/srv/legal-mcp/generations/$PAIR_GENERATION/generation.json"
+      pair_validate_manifest_file "$candidate_manifest" root legal-mcp 440
+      PAIR_UPLOAD_AUTHORIZATION=absent
+      ;;
+    *) return 1 ;;
+  esac
+  PAIR_TARGET_MANIFEST_SHA256="$(sha256sum "$candidate_manifest" | awk '{print $1}')"
+  [[ "$PAIR_PRIOR_MANIFEST_SHA256$PAIR_TARGET_MANIFEST_SHA256" =~ ^[0-9a-f]{128}$ ]]
 }
 
-cutover_render_state() {
+pair_render_state() {
   local destination="$1"
   cat > "$destination" <<EOF
-PUBLICATION_STATE=configured-dark
-SERVICE_ENABLEMENT=generated
-SERVICE_ACTIVITY=inactive
-CADDY_ENABLEMENT=disabled
-CADDY_ACTIVITY=inactive
-UFW_80=absent
-UFW_443=absent
+ORIGIN=$PAIR_ORIGIN
 AUTH_MODE=$AUTH_MODE
 EXTERNAL_URL=$EXTERNAL_URL
-PRIOR_GENERATION=$CUTOVER_EXPECTED_CURRENT_GENERATION
-TARGET_GENERATION=$CUTOVER_GENERATION
-OLD_IMAGE=$OLD_IMAGE
-OLD_IMAGE_ID=$OLD_IMAGE_ID
-OLD_IMAGE_VERSION=$CUTOVER_OLD_IMAGE_VERSION
-OLD_IMAGE_REVISION=$CUTOVER_OLD_IMAGE_REVISION
+PRIOR_GENERATION=$PAIR_PRIOR_GENERATION
+TARGET_GENERATION=$PAIR_GENERATION
+PRIOR_MANIFEST_SHA256=$PAIR_PRIOR_MANIFEST_SHA256
+TARGET_MANIFEST_SHA256=$PAIR_TARGET_MANIFEST_SHA256
+PRIOR_IMAGE=$PAIR_PRIOR_IMAGE
+PRIOR_IMAGE_ID=$PAIR_PRIOR_IMAGE_ID
+PRIOR_IMAGE_VERSION=$PAIR_PRIOR_VERSION
+PRIOR_IMAGE_REVISION=$PAIR_PRIOR_REVISION
 TARGET_IMAGE=$NEW_IMAGE
-TARGET_IMAGE_ID=$TARGET_IMAGE_ID
-PRIOR_MANIFEST_SHA256=$CUTOVER_PRIOR_MANIFEST_SHA256
-TARGET_MANIFEST_SHA256=$CUTOVER_TARGET_MANIFEST_SHA256
-UPLOAD_AUTHORIZATION=$CUTOVER_UPLOAD_AUTHORIZATION
+TARGET_IMAGE_ID=$PAIR_TARGET_IMAGE_ID
+TARGET_IMAGE_VERSION=$PAIR_TARGET_VERSION
+TARGET_IMAGE_REVISION=$PAIR_TARGET_REVISION
+TARGET_RELEASE_TEMPLATE_SHA256=$(sha256sum "$TEMPLATE" | awk '{print $1}')
+UPLOAD_AUTHORIZATION=$PAIR_UPLOAD_AUTHORIZATION
 EOF
 }
 
-cutover_create_transaction() {
-  local directory="$CUTOVER_TRANSACTION_PREPARING" rendered manifest
-  cutover_path_is_absent "$directory" || return 1
+pair_discard_unpublished_build() {
+  image_path_is_absent "$PAIR_TRANSACTION_BUILD" && return 0
+  require_image_transaction_directory "$PAIR_TRANSACTION_BUILD"
+  PAIR_BUILD_WAS_PENDING=true
+  rm -rf --one-file-system -- "$PAIR_TRANSACTION_BUILD"
+  image_path_is_absent "$PAIR_TRANSACTION_BUILD" || return 1
+  sync -f /etc/legal-mcp
+}
+
+pair_create_transaction() {
+  local directory="$PAIR_TRANSACTION_BUILD" rendered
+  image_path_is_absent "$directory" || return 1
+  image_path_is_absent "$TRANSACTION_PREPARING" || return 1
   install -d -o root -g root -m 0700 "$directory"
+  printf '%s\n' LEGAL_MCP_IMAGE_GENERATION_PAIR_TRANSACTION_V1 > "$directory/kind"
+  printf '%s\n' "$PAIR_OPERATION" > "$directory/operation"
+  printf '%s\n' "$PAIR_PRIOR_GENERATION" > "$directory/prior-generation"
+  printf '%s\n' "$PAIR_GENERATION" > "$directory/target-generation"
+  printf '%s\n' prepared > "$directory/phase"
+  printf '%s\n' pending > "$directory/retirement-outcome"
   install -o root -g root -m 0600 "$IMAGE_FILE" "$directory/saved-image"
   install -o root -g root -m 0600 "$QUADLET" "$directory/saved-quadlet"
   install -o root -g root -m 0600 "$TEMPLATE" "$directory/saved-template"
   install -o root -g root -m 0600 "$RUNTIME_ENV" "$directory/saved-runtime.env"
   install -o root -g root -m 0600 "$API_KEYS" "$directory/saved-api-keys.json"
   install -o root -g root -m 0600 "$CADDYFILE" "$directory/saved-Caddyfile"
-  cutover_path_is_absent "$AUTH_READY"
-  install -o root -g root -m 0600 /dev/null "$directory/saved-auth-ready"
+  if image_path_is_absent "$AUTH_READY"; then
+    install -o root -g root -m 0600 /dev/null "$directory/saved-auth-ready"
+  else
+    install -o root -g root -m 0600 "$AUTH_READY" "$directory/saved-auth-ready"
+  fi
   install -o root -g root -m 0600 /srv/legal-mcp/lifecycle/active-generation \
     "$directory/saved-active-generation"
-  install -o root -g root -m 0600 /srv/legal-mcp/lifecycle/.deployment-transaction \
-    "$directory/saved-deployment-journal"
-  if [[ "$CUTOVER_UPLOAD_AUTHORIZATION" = present ]]; then
+  if [[ "$PAIR_OPERATION" = prepared ]]; then
+    install -o root -g root -m 0600 /srv/legal-mcp/lifecycle/.deployment-transaction \
+      "$directory/saved-deployment-journal"
     install -o root -g root -m 0600 /run/legal-mcp/authorized-upload \
       "$directory/saved-upload-authorization"
   else
-    : > "$directory/saved-upload-authorization"
+    install -o root -g root -m 0600 /dev/null "$directory/saved-deployment-journal"
+    install -o root -g root -m 0600 /dev/null "$directory/saved-upload-authorization"
   fi
   printf '%s\n' "$NEW_IMAGE" > "$directory/target-image"
-  install -o root -g root -m 0600 "$ORDINARY_SOURCE_TEMPLATE" "$directory/target-template"
-  rendered="$(mktemp /run/legal-mcp-cutover-quadlet.XXXXXX)"
-  sed "s|__IMAGE_DIGEST__|$NEW_IMAGE|g" "$ORDINARY_SOURCE_TEMPLATE" > "$rendered"
+  install -o root -g root -m 0600 "$TEMPLATE" "$directory/target-template"
+  rendered="$(mktemp /run/legal-mcp-pair-target-quadlet.XXXXXX)"
+  sed "s|__IMAGE_DIGEST__|$NEW_IMAGE|g" "$TEMPLATE" > "$rendered"
   install -o root -g root -m 0600 "$rendered" "$directory/target-quadlet"
   rm -f "$rendered"
-  printf '%s' "$CUTOVER_GENERATION" > "$directory/target-active-generation"
-  printf '%s\n' LEGAL_MCP_FLAT_INT8_CUTOVER_TRANSACTION_V1 > "$directory/kind"
-  printf '%s\n' "$ORDINARY_VERSION" > "$directory/target-version"
-  printf '%s\n' "$ORDINARY_REVISION" > "$directory/target-revision"
+  printf '%s' "$PAIR_GENERATION" > "$directory/target-active-generation"
+  printf '%s\n' "$ORDINARY_VERSION" > "$directory/coordinator-version"
+  printf '%s\n' "$ORDINARY_REVISION" > "$directory/coordinator-revision"
   printf '%s\n' "$ORDINARY_UPDATER_SHA256" > "$directory/updater-sha256"
-  printf '%s\n' pending > "$directory/retirement-outcome"
   ordinary_render_release_manifest "$directory/release-sha256"
   ordinary_render_metadata_manifest "$directory/saved-metadata"
   ordinary_render_metadata_manifest "$directory/target-metadata"
@@ -2670,21 +3070,26 @@ cutover_create_transaction() {
     "$directory/saved-api-keys.json" "$directory/saved-Caddyfile" \
     "$directory/saved-auth-ready" "$directory/target-active-generation" \
     "$directory/target-sha256"
-  cutover_render_state "$directory/state"
+  pair_render_state "$directory/state"
+  chown root:root "$directory"/*
   chmod 600 "$directory"/*
   sync -f "$directory"
-  cutover_validate_transaction "$directory"
-  mv -T "$directory" "$TRANSACTION"
+  pair_validate_transaction "$directory"
+  mv -T "$directory" "$TRANSACTION_PREPARING"
+  sync -f /etc/legal-mcp
+  sync -f "$TRANSACTION_PREPARING"
+  pair_validate_transaction "$TRANSACTION_PREPARING"
+  mv -T "$TRANSACTION_PREPARING" "$TRANSACTION"
   sync -f /etc/legal-mcp
 }
 
-cutover_validate_transaction() {
+pair_validate_transaction() {
   local directory="$1" name rendered manifest metadata release_manifest
-  local -a kind version revision updater outcome state saved_deployment saved_authorization
+  local -a kind operation coordinator_version coordinator_revision updater outcome phase state
   require_image_transaction_directory "$directory"
-  cutover_reconcile_outcome_preparation "$directory"
-  for name in kind target-version target-revision updater-sha256 retirement-outcome \
-    release-sha256 saved-sha256 target-sha256 saved-metadata target-metadata state \
+  for name in kind operation prior-generation target-generation phase retirement-outcome \
+    coordinator-version coordinator-revision updater-sha256 release-sha256 \
+    saved-sha256 target-sha256 saved-metadata target-metadata state \
     saved-image saved-quadlet saved-template saved-runtime.env saved-api-keys.json \
     saved-Caddyfile saved-auth-ready saved-active-generation saved-deployment-journal \
     saved-upload-authorization target-image target-quadlet target-template \
@@ -2692,48 +3097,58 @@ cutover_validate_transaction() {
     ordinary_require_regular "$directory/$name" root root 600 || return 1
   done
   bootstrap_directory_contains_only "$directory" \
-    kind target-version target-revision updater-sha256 retirement-outcome \
-    release-sha256 saved-sha256 target-sha256 saved-metadata target-metadata state \
+    kind operation prior-generation target-generation phase retirement-outcome \
+    coordinator-version coordinator-revision updater-sha256 release-sha256 \
+    saved-sha256 target-sha256 saved-metadata target-metadata state \
     saved-image saved-quadlet saved-template saved-runtime.env saved-api-keys.json \
     saved-Caddyfile saved-auth-ready saved-active-generation saved-deployment-journal \
     saved-upload-authorization target-image target-quadlet target-template \
     target-active-generation || {
-      echo 'flat-int8 cutover transaction contains unexpected state' >&2
+      echo 'pair transaction contains unexpected durable state' >&2
       return 1
     }
   mapfile -t kind < "$directory/kind"
-  mapfile -t version < "$directory/target-version"
-  mapfile -t revision < "$directory/target-revision"
+  mapfile -t operation < "$directory/operation"
+  mapfile -t coordinator_version < "$directory/coordinator-version"
+  mapfile -t coordinator_revision < "$directory/coordinator-revision"
   mapfile -t updater < "$directory/updater-sha256"
   mapfile -t outcome < "$directory/retirement-outcome"
+  mapfile -t phase < "$directory/phase"
   [[ ${#kind[@]} -eq 1 \
-    && "${kind[0]}" = LEGAL_MCP_FLAT_INT8_CUTOVER_TRANSACTION_V1 \
-    && ${#version[@]} -eq 1 && "${version[0]}" = "$ORDINARY_VERSION" \
-    && ${#revision[@]} -eq 1 && "${revision[0]}" = "$ORDINARY_REVISION" \
+    && "${kind[0]}" = LEGAL_MCP_IMAGE_GENERATION_PAIR_TRANSACTION_V1 \
+    && ${#operation[@]} -eq 1 && "${operation[0]}" =~ ^(prepared|installed)$ \
+    && ${#coordinator_version[@]} -eq 1 \
+    && "${coordinator_version[0]}" = "$ORDINARY_VERSION" \
+    && ${#coordinator_revision[@]} -eq 1 \
+    && "${coordinator_revision[0]}" = "$ORDINARY_REVISION" \
     && ${#updater[@]} -eq 1 && "${updater[0]}" = "$ORDINARY_UPDATER_SHA256" \
-    && ${#outcome[@]} -eq 1 && "${outcome[0]}" =~ ^(pending|saved|target)$ ]] || {
-      echo 'flat-int8 cutover transaction is not bound to this exact release updater' >&2
+    && ${#outcome[@]} -eq 1 && "${outcome[0]}" =~ ^(pending|saved|target)$ \
+    && ${#phase[@]} -eq 1 \
+    && "${phase[0]}" =~ ^(prepared|darkening|dark|sealing|sealed|target-files|activating|activated|verifying|proved|committing|committed)$ ]] || {
+      echo 'pair transaction does not belong to this exact installed coordinator' >&2
       return 1
     }
-  CUTOVER_RETIREMENT_OUTCOME="${outcome[0]}"
-  release_manifest="$(mktemp /run/legal-mcp-cutover-release.XXXXXX)"
+  PAIR_OPERATION="${operation[0]}"
+  PAIR_RETIREMENT_OUTCOME="${outcome[0]}"
+  PAIR_PHASE="${phase[0]}"
+  release_manifest="$(mktemp /run/legal-mcp-pair-release.XXXXXX)"
   ordinary_render_release_manifest "$release_manifest"
   if ! cmp --silent "$release_manifest" "$directory/release-sha256"; then
     rm -f "$release_manifest"
-    echo 'flat-int8 cutover release-byte manifest changed' >&2
+    echo 'pair transaction coordinator release bytes changed' >&2
     return 1
   fi
   rm -f "$release_manifest"
-  metadata="$(mktemp /run/legal-mcp-cutover-metadata.XXXXXX)"
+  metadata="$(mktemp /run/legal-mcp-pair-metadata.XXXXXX)"
   ordinary_render_metadata_manifest "$metadata"
   if ! cmp --silent "$metadata" "$directory/saved-metadata" \
     || ! cmp --silent "$metadata" "$directory/target-metadata"; then
     rm -f "$metadata"
-    echo 'flat-int8 cutover metadata contract changed' >&2
+    echo 'pair transaction host metadata contract changed' >&2
     return 1
   fi
   rm -f "$metadata"
-  manifest="$(mktemp /run/legal-mcp-cutover-hashes.XXXXXX)"
+  manifest="$(mktemp /run/legal-mcp-pair-hashes.XXXXXX)"
   ordinary_render_hash_manifest \
     "$directory/saved-image" "$directory/saved-quadlet" \
     "$directory/saved-template" "$directory/saved-runtime.env" \
@@ -2741,7 +3156,7 @@ cutover_validate_transaction() {
     "$directory/saved-auth-ready" "$directory/saved-active-generation" "$manifest"
   if ! cmp --silent "$manifest" "$directory/saved-sha256"; then
     rm -f "$manifest"
-    echo 'saved flat-int8 cutover bytes do not match their hashes' >&2
+    echo 'saved pair bytes do not match their hash manifest' >&2
     return 1
   fi
   ordinary_render_hash_manifest \
@@ -2751,291 +3166,295 @@ cutover_validate_transaction() {
     "$directory/saved-auth-ready" "$directory/target-active-generation" "$manifest"
   if ! cmp --silent "$manifest" "$directory/target-sha256"; then
     rm -f "$manifest"
-    echo 'target flat-int8 cutover bytes do not match their hashes' >&2
+    echo 'target pair bytes do not match their hash manifest' >&2
     return 1
   fi
   rm -f "$manifest"
 
   mapfile -t state < "$directory/state"
-  [[ ${#state[@]} -eq 20 \
-    && "${state[0]}" = PUBLICATION_STATE=configured-dark \
-    && "${state[1]}" = SERVICE_ENABLEMENT=generated \
-    && "${state[2]}" = SERVICE_ACTIVITY=inactive \
-    && "${state[3]}" = CADDY_ENABLEMENT=disabled \
-    && "${state[4]}" = CADDY_ACTIVITY=inactive \
-    && "${state[5]}" = UFW_80=absent \
-    && "${state[6]}" = UFW_443=absent \
-    && "${state[7]}" =~ ^AUTH_MODE=(api-key|entra|entra\+api-key)$ \
-    && "${state[8]}" =~ ^EXTERNAL_URL=https://[a-z0-9.-]+/mcp$ \
-    && "${state[9]}" =~ ^PRIOR_GENERATION=([0-9a-f]{64})$ ]] || {
-      echo 'flat-int8 cutover saved service state is malformed' >&2
+  [[ ${#state[@]} -eq 17 \
+    && "${state[0]}" =~ ^ORIGIN=(dark|public)$ \
+    && "${state[1]}" =~ ^AUTH_MODE=(api-key|entra|entra\+api-key)$ \
+    && "${state[2]}" =~ ^EXTERNAL_URL=https://[a-z0-9.-]+/mcp$ \
+    && "${state[3]}" =~ ^PRIOR_GENERATION=([0-9a-f]{64})$ ]] || {
+      echo 'pair transaction state is malformed' >&2
       return 1
     }
-  CUTOVER_PRIOR_GENERATION="${state[9]#*=}"
-  [[ "${state[10]}" =~ ^TARGET_GENERATION=([0-9a-f]{64})$ ]]
-  CUTOVER_TARGET_GENERATION="${state[10]#*=}"
-  [[ "$CUTOVER_PRIOR_GENERATION" != "$CUTOVER_TARGET_GENERATION" ]]
-  [[ "${state[11]}" =~ ^OLD_IMAGE=(ghcr\.io/gunba/australian-legal-mcp@sha256:[0-9a-f]{64})$ ]]
-  CUTOVER_OLD_IMAGE="${state[11]#*=}"
-  [[ "${state[12]}" =~ ^OLD_IMAGE_ID=(sha256:[0-9a-f]{64})$ ]]
-  CUTOVER_OLD_IMAGE_ID="${state[12]#*=}"
-  [[ "${state[13]}" =~ ^OLD_IMAGE_VERSION=([0-9]+\.[0-9]+\.[0-9]+)$ ]]
-  CUTOVER_OLD_IMAGE_VERSION="${state[13]#*=}"
-  [[ "${state[14]}" =~ ^OLD_IMAGE_REVISION=([0-9a-f]{40})$ ]]
-  CUTOVER_OLD_IMAGE_REVISION="${state[14]#*=}"
-  [[ "${state[15]}" =~ ^TARGET_IMAGE=(ghcr\.io/gunba/australian-legal-mcp@sha256:[0-9a-f]{64})$ ]]
-  CUTOVER_TARGET_IMAGE="${state[15]#*=}"
-  [[ "${state[16]}" =~ ^TARGET_IMAGE_ID=(sha256:[0-9a-f]{64})$ ]]
-  CUTOVER_TARGET_IMAGE_ID="${state[16]#*=}"
-  [[ "${state[17]}" =~ ^PRIOR_MANIFEST_SHA256=([0-9a-f]{64})$ ]]
-  CUTOVER_PRIOR_MANIFEST_SHA256="${state[17]#*=}"
-  [[ "${state[18]}" =~ ^TARGET_MANIFEST_SHA256=([0-9a-f]{64})$ ]]
-  CUTOVER_TARGET_MANIFEST_SHA256="${state[18]#*=}"
-  [[ "${state[19]}" =~ ^UPLOAD_AUTHORIZATION=(present|absent)$ ]]
-  CUTOVER_UPLOAD_AUTHORIZATION="${state[19]#*=}"
-  [[ "$CUTOVER_OLD_IMAGE" != "$CUTOVER_TARGET_IMAGE" ]]
-  TRANSACTION_CADDY_ENABLEMENT=disabled
-  TRANSACTION_CADDY_ACTIVITY=inactive
-  TRANSACTION_UFW_80=absent
-  TRANSACTION_UFW_443=absent
-  TRANSACTION_AUTH_MODE="${state[7]#*=}"
-  TRANSACTION_EXTERNAL_URL="${state[8]#*=}"
-  TRANSACTION_OLD_IMAGE="$CUTOVER_OLD_IMAGE"
-  TRANSACTION_OLD_IMAGE_ID="$CUTOVER_OLD_IMAGE_ID"
-  TRANSACTION_TARGET_IMAGE="$CUTOVER_TARGET_IMAGE"
-  TRANSACTION_TARGET_IMAGE_ID="$CUTOVER_TARGET_IMAGE_ID"
-  mapfile -t saved_deployment < "$directory/saved-deployment-journal"
-  [[ ( ${#saved_deployment[@]} -eq 3 \
-      || ( ${#saved_deployment[@]} -eq 4 \
-        && "${saved_deployment[3]}" = flat-int8-cutover ) ) \
-    && "${saved_deployment[0]}" = "$CUTOVER_TARGET_GENERATION" \
-    && "${saved_deployment[1]}" = "$CUTOVER_PRIOR_GENERATION" \
-    && ( ( ${#saved_deployment[@]} -eq 3 && "${saved_deployment[2]}" = prepared ) \
-      || ( ${#saved_deployment[@]} -eq 4 && "${saved_deployment[2]}" = rolled-back ) ) ]] \
-    || {
-      echo 'saved corpus transaction is not an exact prepared cutover binding' >&2
-      return 1
-    }
-  [[ "$(<"$directory/saved-active-generation")" = "$CUTOVER_PRIOR_GENERATION" \
-    && "$(<"$directory/target-active-generation")" = "$CUTOVER_TARGET_GENERATION" \
-    && "$(<"$directory/saved-image")" = "$CUTOVER_OLD_IMAGE" \
-    && "$(<"$directory/target-image")" = "$CUTOVER_TARGET_IMAGE" ]] || return 1
-  if [[ "$CUTOVER_UPLOAD_AUTHORIZATION" = present ]]; then
-    mapfile -t saved_authorization < "$directory/saved-upload-authorization"
-    [[ ${#saved_authorization[@]} -eq 1 \
-      && "${saved_authorization[0]}" = "$CUTOVER_TARGET_GENERATION" ]] || return 1
-  else
-    [[ "$(stat -c '%s' "$directory/saved-upload-authorization")" = 0 ]] || return 1
-  fi
-  [[ "$(grep -o '__IMAGE_DIGEST__' "$directory/saved-template" | wc -l)" = 1 \
-    && "$(grep -o '__IMAGE_DIGEST__' "$directory/target-template" | wc -l)" = 1 ]]
-  rendered="$(mktemp /run/legal-mcp-cutover-rendered.XXXXXX)"
-  sed "s|__IMAGE_DIGEST__|$CUTOVER_OLD_IMAGE|g" "$directory/saved-template" > "$rendered"
-  cmp --silent "$rendered" "$directory/saved-quadlet" || {
-    rm -f "$rendered"; return 1;
-  }
-  sed "s|__IMAGE_DIGEST__|$CUTOVER_TARGET_IMAGE|g" "$directory/target-template" > "$rendered"
-  if ! cmp --silent "$rendered" "$directory/target-quadlet" \
-    || ! cmp --silent "$directory/target-template" "$ORDINARY_SOURCE_TEMPLATE"; then
-    rm -f "$rendered"
-    return 1
-  fi
-  rm -f "$rendered"
+  PAIR_ORIGIN="${state[0]#*=}"
+  PAIR_AUTH_MODE="${state[1]#*=}"
+  PAIR_EXTERNAL_URL="${state[2]#*=}"
+  PAIR_PRIOR_GENERATION="${state[3]#*=}"
+  [[ "${state[4]}" =~ ^TARGET_GENERATION=([0-9a-f]{64})$ ]]
+  PAIR_TARGET_GENERATION="${state[4]#*=}"
+  [[ "$PAIR_PRIOR_GENERATION" != "$PAIR_TARGET_GENERATION" \
+    && "$(<"$directory/prior-generation")" = "$PAIR_PRIOR_GENERATION" \
+    && "$(<"$directory/target-generation")" = "$PAIR_TARGET_GENERATION" ]]
+  [[ "${state[5]}" =~ ^PRIOR_MANIFEST_SHA256=([0-9a-f]{64})$ ]]
+  PAIR_PRIOR_MANIFEST_SHA256="${state[5]#*=}"
+  [[ "${state[6]}" =~ ^TARGET_MANIFEST_SHA256=([0-9a-f]{64})$ ]]
+  PAIR_TARGET_MANIFEST_SHA256="${state[6]#*=}"
+  [[ "${state[7]}" =~ ^PRIOR_IMAGE=(ghcr\.io/gunba/australian-legal-mcp@sha256:[0-9a-f]{64})$ ]]
+  PAIR_PRIOR_IMAGE="${state[7]#*=}"
+  [[ "${state[8]}" =~ ^PRIOR_IMAGE_ID=(sha256:[0-9a-f]{64})$ ]]
+  PAIR_PRIOR_IMAGE_ID="${state[8]#*=}"
+  [[ "${state[9]}" =~ ^PRIOR_IMAGE_VERSION=([0-9]+\.[0-9]+\.[0-9]+)$ ]]
+  PAIR_PRIOR_VERSION="${state[9]#*=}"
+  [[ "${state[10]}" =~ ^PRIOR_IMAGE_REVISION=([0-9a-f]{40})$ ]]
+  PAIR_PRIOR_REVISION="${state[10]#*=}"
+  [[ "${state[11]}" =~ ^TARGET_IMAGE=(ghcr\.io/gunba/australian-legal-mcp@sha256:[0-9a-f]{64})$ ]]
+  PAIR_TARGET_IMAGE="${state[11]#*=}"
+  [[ "${state[12]}" =~ ^TARGET_IMAGE_ID=(sha256:[0-9a-f]{64})$ ]]
+  PAIR_TARGET_IMAGE_ID="${state[12]#*=}"
+  [[ "${state[13]}" =~ ^TARGET_IMAGE_VERSION=([0-9]+\.[0-9]+\.[0-9]+)$ ]]
+  PAIR_TARGET_VERSION="${state[13]#*=}"
+  [[ "${state[14]}" =~ ^TARGET_IMAGE_REVISION=([0-9a-f]{40})$ ]]
+  PAIR_TARGET_REVISION="${state[14]#*=}"
+  [[ "${state[15]}" =~ ^TARGET_RELEASE_TEMPLATE_SHA256=([0-9a-f]{64})$ \
+    && "${state[15]#*=}" = "$(sha256sum "$directory/target-template" | awk '{print $1}')" \
+    && "${state[16]}" =~ ^UPLOAD_AUTHORIZATION=(present|absent)$ ]]
+  PAIR_UPLOAD_AUTHORIZATION="${state[16]#*=}"
+  [[ "$PAIR_PRIOR_IMAGE" != "$PAIR_TARGET_IMAGE" \
+    && "$(<"$directory/saved-image")" = "$PAIR_PRIOR_IMAGE" \
+    && "$(<"$directory/target-image")" = "$PAIR_TARGET_IMAGE" \
+    && "$(<"$directory/saved-active-generation")" = "$PAIR_PRIOR_GENERATION" \
+    && "$(<"$directory/target-active-generation")" = "$PAIR_TARGET_GENERATION" ]]
   load_runtime_contract "$directory/saved-runtime.env"
-  [[ "$AUTH_MODE" = "$TRANSACTION_AUTH_MODE" \
-    && "$EXTERNAL_URL" = "$TRANSACTION_EXTERNAL_URL" ]]
+  [[ "$AUTH_MODE" = "$PAIR_AUTH_MODE" && "$EXTERNAL_URL" = "$PAIR_EXTERNAL_URL" ]]
+  pair_validate_template_contract "$directory/saved-template"
+  pair_validate_template_contract "$directory/target-template"
+  rendered="$(mktemp /run/legal-mcp-pair-rendered.XXXXXX)"
+  sed "s|__IMAGE_DIGEST__|$PAIR_PRIOR_IMAGE|g" "$directory/saved-template" > "$rendered"
+  cmp --silent "$rendered" "$directory/saved-quadlet" || { rm -f "$rendered"; return 1; }
+  sed "s|__IMAGE_DIGEST__|$PAIR_TARGET_IMAGE|g" "$directory/target-template" > "$rendered"
+  cmp --silent "$rendered" "$directory/target-quadlet" || { rm -f "$rendered"; return 1; }
+  rm -f "$rendered"
+  case "$PAIR_OPERATION" in
+    prepared)
+      mapfile -t PAIR_SAVED_DEPLOYMENT < "$directory/saved-deployment-journal"
+      [[ ${#PAIR_SAVED_DEPLOYMENT[@]} -eq 3 \
+        && "${PAIR_SAVED_DEPLOYMENT[0]}" = "$PAIR_TARGET_GENERATION" \
+        && "${PAIR_SAVED_DEPLOYMENT[1]}" = "$PAIR_PRIOR_GENERATION" \
+        && "${PAIR_SAVED_DEPLOYMENT[2]}" = prepared \
+        && "$PAIR_UPLOAD_AUTHORIZATION" = present \
+        && "$(<"$directory/saved-upload-authorization")" = "$PAIR_TARGET_GENERATION" ]]
+      ;;
+    installed)
+      [[ "$PAIR_UPLOAD_AUTHORIZATION" = absent \
+        && "$(stat -c '%s' "$directory/saved-deployment-journal")" = 0 \
+        && "$(stat -c '%s' "$directory/saved-upload-authorization")" = 0 ]]
+      ;;
+  esac
 }
 
-cutover_reconcile_outcome_preparation() {
-  local directory="$1" preparing="$1/retirement-outcome.preparing"
-  cutover_path_is_absent "$preparing" && return 0
-  require_image_transaction_directory "$directory"
-  [[ -f "$preparing" || -L "$preparing" ]] || {
-    echo 'flat-int8 outcome preparation has an unsafe file type' >&2
-    return 1
-  }
-  rm -f -- "$preparing"
-  cutover_path_is_absent "$preparing" || return 1
-  sync -f "$directory"
+pair_reconcile_field_preparations() {
+  local directory="$1" path changed=false
+  for path in "$directory/phase.preparing" \
+    "$directory/retirement-outcome.preparing"; do
+    image_path_is_absent "$path" && continue
+    ordinary_require_regular "$path" root root 600 || return 1
+    rm -f -- "$path"
+    image_path_is_absent "$path" || return 1
+    changed=true
+  done
+  if [[ "$changed" = true ]]; then sync -f "$directory"; fi
 }
 
-cutover_validate_template_contract() {
-  local template="$1"
-  [[ "$(grep -Fxc 'User=971:971' "$template")" = 1 \
-    && "$(grep -Fxc 'PublishPort=127.0.0.1:51235:51235' "$template")" = 1 \
-    && "$(grep -Fxc 'ReadOnly=true' "$template")" = 1 \
-    && "$(grep -Fxc 'DropCapability=all' "$template")" = 1 \
-    && "$(grep -Fxc 'NoNewPrivileges=true' "$template")" = 1 \
-    && "$(grep -Fxc 'ExecCondition=/usr/local/libexec/legal-mcp/host-tool-launcher --check-auth-ready' "$template")" = 1 \
-    && "$(grep -Fc 'Volume=/srv/legal-mcp/generations:/var/lib/legal-mcp/generations:ro,nodev,nosuid,noexec' "$template")" = 1 \
-    && "$(grep -Fc 'Volume=/srv/legal-mcp/lifecycle:/var/lib/legal-mcp/lifecycle:ro,nodev,nosuid,noexec' "$template")" = 1 \
-    && "$(grep -Fc 'Volume=/srv/legal-mcp/state:/var/lib/legal-mcp/state:rw,nodev,nosuid,noexec' "$template")" = 1 ]] || {
-      echo 'flat-int8 cutover template lacks the exact hardened mount/service contract' >&2
+pair_replace_field() {
+  local name="$1" value="$2" preparation
+  preparation="$TRANSACTION/$name.preparing"
+  image_path_is_absent "$preparation" || return 1
+  printf '%s\n' "$value" > "$preparation"
+  chown root:root "$preparation"
+  chmod 600 "$preparation"
+  sync -f "$preparation"
+  mv -fT "$preparation" "$TRANSACTION/$name"
+  sync -f "$TRANSACTION"
+}
+
+pair_write_phase() {
+  local requested_phase="$1"
+  [[ "$requested_phase" =~ ^(prepared|darkening|dark|sealing|sealed|target-files|activating|activated|verifying|proved|committing|committed)$ ]]
+  pair_reconcile_field_preparations "$TRANSACTION"
+  pair_validate_transaction "$TRANSACTION"
+  pair_replace_field phase "$requested_phase"
+  pair_validate_transaction "$TRANSACTION"
+  [[ "$PAIR_PHASE" = "$requested_phase" ]]
+}
+
+pair_write_outcome() {
+  local choice="$1"
+  [[ "$choice" = saved || "$choice" = target ]]
+  pair_reconcile_field_preparations "$TRANSACTION"
+  pair_validate_transaction "$TRANSACTION"
+  if [[ "$PAIR_RETIREMENT_OUTCOME" = "$choice" ]]; then return 0; fi
+  [[ "$PAIR_RETIREMENT_OUTCOME" = pending ]] || return 1
+  pair_replace_field retirement-outcome "$choice"
+  pair_validate_transaction "$TRANSACTION"
+  [[ "$PAIR_RETIREMENT_OUTCOME" = "$choice" ]]
+}
+
+pair_cleanup_verification_root() {
+  image_path_is_absent "$PAIR_VERIFY_ROOT" && return 0
+  [[ -d "$PAIR_VERIFY_ROOT" && ! -L "$PAIR_VERIFY_ROOT" \
+    && "$(stat -c '%u:%g:%a' "$PAIR_VERIFY_ROOT")" = 971:971:700 ]] || {
+      echo 'ephemeral pair verification root is unsafe' >&2
       return 1
     }
-}
-
-cutover_clear_upload_authorization() {
-  local authorization=/run/legal-mcp/authorized-upload
-  cutover_path_is_absent "$authorization" && return 0
-  bootstrap_require_regular "$authorization" root legal-mcp-publisher 440 || return 1
-  [[ "$(<"$authorization")" = "$CUTOVER_TARGET_GENERATION" ]] || {
-    echo 'upload authorization is foreign to the coordinated generation' >&2
-    return 1
-  }
-  rm -f -- "$authorization"
-  cutover_path_is_absent "$authorization" || return 1
+  rm -rf --one-file-system -- "$PAIR_VERIFY_ROOT"
+  image_path_is_absent "$PAIR_VERIFY_ROOT" || return 1
   sync -f /run/legal-mcp
 }
 
-cutover_restore_upload_authorization() {
+pair_clear_upload_authorization() {
   local authorization=/run/legal-mcp/authorized-upload
-  if [[ "$CUTOVER_UPLOAD_AUTHORIZATION" = present ]]; then
-    if ! cutover_path_is_absent "$authorization"; then
+  image_path_is_absent "$authorization" && return 0
+  bootstrap_require_regular "$authorization" root legal-mcp-publisher 440 || return 1
+  [[ "$(<"$authorization")" = "$PAIR_TARGET_GENERATION" ]] || {
+    echo 'upload authorization is foreign to the pair transaction' >&2
+    return 1
+  }
+  rm -f -- "$authorization"
+  image_path_is_absent "$authorization" || return 1
+  sync -f /run/legal-mcp
+}
+
+pair_restore_upload_authorization() {
+  local authorization=/run/legal-mcp/authorized-upload
+  if [[ "$PAIR_OPERATION" = prepared && "$PAIR_UPLOAD_AUTHORIZATION" = present ]]; then
+    if ! image_path_is_absent "$authorization"; then
       bootstrap_require_regular "$authorization" root legal-mcp-publisher 440 || return 1
       cmp --silent "$authorization" "$TRANSACTION/saved-upload-authorization"
       return
     fi
     ordinary_atomic_install "$TRANSACTION/saved-upload-authorization" \
       "$authorization" root legal-mcp-publisher 440
-    bootstrap_require_regular "$authorization" root legal-mcp-publisher 440
-    cmp --silent "$authorization" "$TRANSACTION/saved-upload-authorization"
   else
-    cutover_path_is_absent "$authorization"
+    image_path_is_absent "$authorization"
   fi
 }
 
-cutover_upload_authorization_matches() {
+pair_upload_authorization_matches() {
   local authorization=/run/legal-mcp/authorized-upload
-  if [[ "$CUTOVER_UPLOAD_AUTHORIZATION" = present ]]; then
-    bootstrap_require_regular "$authorization" root legal-mcp-publisher 440
-    cmp --silent "$authorization" "$TRANSACTION/saved-upload-authorization"
+  if [[ "$PAIR_OPERATION" = prepared && "$PAIR_UPLOAD_AUTHORIZATION" = present ]]; then
+    bootstrap_require_regular "$authorization" root legal-mcp-publisher 440 \
+      && cmp --silent "$authorization" "$TRANSACTION/saved-upload-authorization"
   else
-    cutover_path_is_absent "$authorization"
+    image_path_is_absent "$authorization"
   fi
 }
 
-cutover_force_dark() {
+pair_force_dark() {
   local activity
-  if ! cutover_path_is_absent "$CUTOVER_START_ARM"; then
-    bootstrap_require_regular "$CUTOVER_START_ARM" root root 400 || return 1
-    rm -f -- "$CUTOVER_START_ARM"
+  if ! image_path_is_absent "$PAIR_START_ARM"; then
+    bootstrap_require_regular "$PAIR_START_ARM" root root 400 || return 1
+    rm -f -- "$PAIR_START_ARM"
     sync -f /run/legal-mcp
   fi
-  if ! cutover_path_is_absent "$AUTH_READY"; then
+  if ! image_path_is_absent "$AUTH_READY"; then
     ordinary_require_regular "$AUTH_READY" root root 444 || return 1
     [[ "$(stat -c '%s' "$AUTH_READY")" = 0 \
       && "$(getfacl --absolute-names --numeric --omit-header "$AUTH_READY")" \
         = $'user::r--\ngroup::r--\nother::r--' ]] || return 1
-    if [[ -d "$TRANSACTION" && ! -L "$TRANSACTION" ]]; then
-      cmp --silent "$AUTH_READY" "$TRANSACTION/saved-auth-ready" || return 1
-    fi
     rm -f -- "$AUTH_READY"
     sync -f /etc/legal-mcp
   fi
   close_ingress
   activity="$(read_systemctl_activity "$SERVICE")" || return 1
-  if [[ "$activity" = active ]]; then
-    systemctl stop "$SERVICE"
-  fi
+  if [[ "$activity" = active ]]; then systemctl stop "$SERVICE"; fi
+  pair_cleanup_verification_root
+  pair_clear_upload_authorization
   [[ "$(read_systemctl_enablement "$SERVICE")" = generated \
     && "$(read_systemctl_activity "$SERVICE")" = inactive \
     && "$(read_systemctl_enablement caddy.service)" = disabled \
     && "$(read_systemctl_activity caddy.service)" = inactive \
     && "$(ufw_rule_state 80)" = absent \
     && "$(ufw_rule_state 443)" = absent ]] || return 1
-  cutover_path_is_absent "$AUTH_READY" || return 1
+  image_path_is_absent "$AUTH_READY" && image_path_is_absent "$PAIR_START_ARM"
   ordinary_require_listener_topology none
-  cutover_clear_upload_authorization
+  ufw_is_fail_closed
 }
 
-cutover_arm_private_start() {
-  local context=/run/legal-mcp/flat-int8-cutover-starting temporary
-  bootstrap_require_regular "$context" root root 400 || return 1
-  cutover_path_is_absent "$CUTOVER_START_ARM" || return 1
-  temporary="$(mktemp /run/legal-mcp/.flat-int8-cutover-start-armed.XXXXXX)"
-  install -o root -g root -m 0400 "$context" "$temporary"
-  sync -f "$temporary"
-  mv -fT "$temporary" "$CUTOVER_START_ARM"
-  sync -f /run/legal-mcp
-  bootstrap_require_regular "$CUTOVER_START_ARM" root root 400
-  cmp --silent "$context" "$CUTOVER_START_ARM"
-}
-
-cutover_current_file_matches() {
-  ordinary_current_file_matches "$1" "$2" "$3"
-}
-
-cutover_validate_upload_manifest() {
-  local manifest="$1" owner group mode
-  read -r owner group mode < <(stat -c '%U %G %a' "$manifest") || return 1
-  case "$owner:$group:$mode" in
-    root:legal-mcp:440|root:legal-mcp:640|\
-    legal-mcp-publisher:legal-mcp-publisher:440|\
-    legal-mcp-publisher:legal-mcp-publisher:600|\
-    legal-mcp-publisher:legal-mcp-publisher:640) ;;
-    *)
-      echo 'cutover upload manifest is outside the sealed/normalizing/publisher restoration states' >&2
-      return 1
+pair_candidate_manifest() {
+  local upload installed
+  upload="/srv/legal-mcp/uploads/$PAIR_TARGET_GENERATION"
+  installed="/srv/legal-mcp/generations/$PAIR_TARGET_GENERATION"
+  case "$PAIR_OPERATION" in
+    prepared)
+      if [[ -d "$upload" && ! -L "$upload" \
+        && ! -e "$installed" && ! -L "$installed" ]]; then
+        printf '%s\n' "$upload/generation.json"
+      elif [[ -d "$installed" && ! -L "$installed" \
+        && ! -e "$upload" && ! -L "$upload" ]]; then
+        printf '%s\n' "$installed/generation.json"
+      else
+        echo 'prepared pair target must exist in exactly one location' >&2
+        return 1
+      fi
+      ;;
+    installed)
+      [[ -d "$installed" && ! -L "$installed" \
+        && ! -e "$upload" && ! -L "$upload" ]] || return 1
+      printf '%s\n' "$installed/generation.json"
       ;;
   esac
-  cutover_validate_generation_manifest "$manifest" flat-int8 "$owner" "$group" "$mode"
 }
 
-cutover_validate_recoverable_live_state() {
+pair_validate_recoverable_live_state() {
   local pointer candidate_manifest container_state running_image_id
-  ordinary_require_regular "$IMAGE_FILE" root root 600
-  ordinary_require_regular "$QUADLET" root root 644
-  ordinary_require_regular "$TEMPLATE" root root 644
-  ordinary_require_regular "$RUNTIME_ENV" root root 600
-  ordinary_require_regular "$API_KEYS" legal-mcp legal-mcp 400
-  ordinary_require_regular "$CADDYFILE" root caddy 640
-  ordinary_require_regular /srv/legal-mcp/lifecycle/active-generation root root 644
-  [[ "$(stat -c '%s' /srv/legal-mcp/lifecycle/active-generation)" = 64 ]]
-  cutover_current_file_matches "$IMAGE_FILE" \
+  ordinary_require_static_live_metadata
+  ordinary_current_file_matches "$IMAGE_FILE" \
     "$TRANSACTION/saved-image" "$TRANSACTION/target-image"
-  cutover_current_file_matches "$QUADLET" \
+  ordinary_current_file_matches "$QUADLET" \
     "$TRANSACTION/saved-quadlet" "$TRANSACTION/target-quadlet"
-  cutover_current_file_matches "$TEMPLATE" \
+  ordinary_current_file_matches "$TEMPLATE" \
     "$TRANSACTION/saved-template" "$TRANSACTION/target-template"
   cmp --silent "$RUNTIME_ENV" "$TRANSACTION/saved-runtime.env"
   cmp --silent "$API_KEYS" "$TRANSACTION/saved-api-keys.json"
   cmp --silent "$CADDYFILE" "$TRANSACTION/saved-Caddyfile"
-  cutover_path_is_absent "$AUTH_READY"
+  image_path_is_absent "$AUTH_READY"
   pointer="$(</srv/legal-mcp/lifecycle/active-generation)"
-  [[ "$pointer" = "$CUTOVER_PRIOR_GENERATION" \
-    || "$pointer" = "$CUTOVER_TARGET_GENERATION" ]] || {
-      echo 'cutover recovery found a generation outside the prior/target pair' >&2
+  [[ "$pointer" = "$PAIR_PRIOR_GENERATION" \
+    || "$pointer" = "$PAIR_TARGET_GENERATION" ]] || {
+      echo 'pair recovery found a generation outside the recorded pair' >&2
       return 1
     }
-  [[ "$(sha256sum "/srv/legal-mcp/generations/$CUTOVER_PRIOR_GENERATION/generation.json" | awk '{print $1}')" \
-    = "$CUTOVER_PRIOR_MANIFEST_SHA256" ]] || return 1
-  cutover_validate_generation_manifest \
-    "/srv/legal-mcp/generations/$CUTOVER_PRIOR_GENERATION/generation.json" \
-    arroy root legal-mcp 440 || return 1
-  if [[ -e /srv/legal-mcp/lifecycle/.deployment-transaction \
-    || -L /srv/legal-mcp/lifecycle/.deployment-transaction ]]; then
-    cutover_read_deployment_journal || return 1
-    [[ "$CUTOVER_DEPLOYMENT_GENERATION" = "$CUTOVER_TARGET_GENERATION" \
-      && "$CUTOVER_DEPLOYMENT_PREVIOUS" = "$CUTOVER_PRIOR_GENERATION" ]] || return 1
-    candidate_manifest="$(cutover_candidate_manifest "$CUTOVER_TARGET_GENERATION")" || return 1
-    [[ "$(sha256sum "$candidate_manifest" | awk '{print $1}')" \
-      = "$CUTOVER_TARGET_MANIFEST_SHA256" ]] || return 1
-    if [[ "$candidate_manifest" == /srv/legal-mcp/uploads/* ]]; then
-      cutover_validate_upload_manifest "$candidate_manifest"
+  [[ "$(sha256sum "/srv/legal-mcp/generations/$PAIR_PRIOR_GENERATION/generation.json" \
+    | awk '{print $1}')" = "$PAIR_PRIOR_MANIFEST_SHA256" ]] || return 1
+  pair_validate_manifest_file \
+    "/srv/legal-mcp/generations/$PAIR_PRIOR_GENERATION/generation.json" \
+    root legal-mcp 440
+  candidate_manifest="$(pair_candidate_manifest)" || return 1
+  [[ "$(sha256sum "$candidate_manifest" | awk '{print $1}')" \
+    = "$PAIR_TARGET_MANIFEST_SHA256" ]] || return 1
+  if [[ "$candidate_manifest" == /srv/legal-mcp/uploads/* ]]; then
+    local owner group mode
+    read -r owner group mode < <(stat -c '%U %G %a' "$candidate_manifest")
+    case "$owner:$group:$mode" in
+      root:legal-mcp:600|root:legal-mcp:440|\
+      legal-mcp-publisher:legal-mcp-publisher:600|\
+      legal-mcp-publisher:legal-mcp-publisher:440) ;;
+      *)
+        echo 'pair upload manifest is outside its recoverable ownership states' >&2
+        return 1
+        ;;
+    esac
+  else
+    pair_validate_manifest_file "$candidate_manifest" root legal-mcp 440
+  fi
+  if [[ "$PAIR_OPERATION" = prepared ]]; then
+    if ! image_path_is_absent /srv/legal-mcp/lifecycle/.deployment-transaction; then
+      pair_read_deployment_journal
+      [[ "$PAIR_DEPLOYMENT_GENERATION" = "$PAIR_TARGET_GENERATION" \
+        && "$PAIR_DEPLOYMENT_PREVIOUS" = "$PAIR_PRIOR_GENERATION" ]] || return 1
     else
-      cutover_validate_generation_manifest "$candidate_manifest" flat-int8 root legal-mcp 440
+      [[ "$PAIR_RETIREMENT_OUTCOME" = target \
+        && "$pointer" = "$PAIR_TARGET_GENERATION" ]] || return 1
     fi
   else
-    [[ "$CUTOVER_RETIREMENT_OUTCOME" = target \
-      && "$pointer" = "$CUTOVER_TARGET_GENERATION" ]] || {
-        echo 'cutover corpus journal disappeared before the target commit decision' >&2
-        return 1
-      }
-    [[ "$(sha256sum "/srv/legal-mcp/generations/$CUTOVER_TARGET_GENERATION/generation.json" | awk '{print $1}')" \
-      = "$CUTOVER_TARGET_MANIFEST_SHA256" ]] || return 1
+    image_path_is_absent /srv/legal-mcp/lifecycle/.deployment-transaction
   fi
-  [[ "$(read_systemctl_activity "$SERVICE")" = inactive \
+  [[ "$(read_systemctl_enablement "$SERVICE")" = generated \
+    && "$(read_systemctl_activity "$SERVICE")" = inactive \
     && "$(read_systemctl_enablement caddy.service)" = disabled \
     && "$(read_systemctl_activity caddy.service)" = inactive \
     && "$(ufw_rule_state 80)" = absent \
@@ -3045,19 +3464,50 @@ cutover_validate_recoverable_live_state() {
   if [[ "$container_state" = present ]]; then
     running_image_id="$(canonical_image_id \
       "$(podman inspect australian-legal-mcp --format '{{.Image}}')")" || return 1
-    [[ "$running_image_id" = "$CUTOVER_OLD_IMAGE_ID" \
-      || "$running_image_id" = "$CUTOVER_TARGET_IMAGE_ID" ]] || return 1
+    [[ "$running_image_id" = "$PAIR_PRIOR_IMAGE_ID" \
+      || "$running_image_id" = "$PAIR_TARGET_IMAGE_ID" ]] || return 1
   fi
   ufw_is_fail_closed
 }
 
-cutover_call_host_deploy() {
-  LEGAL_MCP_HOST_TRANSACTION_LOCK_FD="$HOST_LOCK_FD" \
-  LEGAL_MCP_FLAT_INT8_CUTOVER=1 \
-    /usr/local/sbin/legal-mcp-host-deploy "$1" "$CUTOVER_TARGET_GENERATION"
+pair_reconcile_live_file_preparations() {
+  local path expected_mode
+  for path in /etc/legal-mcp/.pair-image.preparing \
+    /etc/containers/systemd/.pair-quadlet.preparing \
+    /usr/local/libexec/legal-mcp/.pair-template.preparing; do
+    image_path_is_absent "$path" && continue
+    if [[ "$path" = /etc/legal-mcp/.pair-image.preparing ]]; then
+      expected_mode=600
+    else
+      expected_mode=644
+    fi
+    [[ -f "$path" && ! -L "$path" \
+      && "$(stat -c '%U:%G:%a:%h' "$path")" = "root:root:$expected_mode:1" ]] || {
+        echo "unsafe pair live-file preparation: $path" >&2
+        return 1
+      }
+    rm -f -- "$path"
+    image_path_is_absent "$path" || return 1
+    sync -f "$(dirname "$path")"
+  done
 }
 
-cutover_install_pair_files() {
+pair_install_live_file() {
+  local source="$1" destination="$2" mode="$3" preparation
+  case "$destination" in
+    "$IMAGE_FILE") preparation=/etc/legal-mcp/.pair-image.preparing ;;
+    "$QUADLET") preparation=/etc/containers/systemd/.pair-quadlet.preparing ;;
+    "$TEMPLATE") preparation=/usr/local/libexec/legal-mcp/.pair-template.preparing ;;
+    *) return 1 ;;
+  esac
+  image_path_is_absent "$preparation" || return 1
+  install -o root -g root -m "$mode" "$source" "$preparation"
+  sync -f "$preparation"
+  mv -fT "$preparation" "$destination"
+  sync -f "$(dirname "$destination")"
+}
+
+pair_install_files() {
   local choice="$1" image_source quadlet_source template_source
   case "$choice" in
     saved)
@@ -3072,9 +3522,10 @@ cutover_install_pair_files() {
       ;;
     *) return 1 ;;
   esac
-  ordinary_atomic_install "$image_source" "$IMAGE_FILE" root root 600
-  ordinary_atomic_install "$quadlet_source" "$QUADLET" root root 644
-  ordinary_atomic_install "$template_source" "$TEMPLATE" root root 644
+  pair_reconcile_live_file_preparations
+  pair_install_live_file "$image_source" "$IMAGE_FILE" 600
+  pair_install_live_file "$quadlet_source" "$QUADLET" 644
+  pair_install_live_file "$template_source" "$TEMPLATE" 644
   systemctl daemon-reload
   cmp --silent "$image_source" "$IMAGE_FILE"
   cmp --silent "$quadlet_source" "$QUADLET"
@@ -3082,115 +3533,140 @@ cutover_install_pair_files() {
   [[ "$(read_systemctl_enablement "$SERVICE")" = generated ]]
 }
 
-cutover_require_image_id() {
-  local image="$1" expected_id="$2" state resolved
+pair_require_image_runtime() {
+  local image="$1" image_id="$2" version="$3" revision="$4" state resolved
   state="$(podman_image_state "$image")" || return 1
   [[ "$state" = present ]] || podman pull "$image"
   resolved="$(canonical_image_id \
     "$(podman image inspect "$image" --format '{{.Id}}')")" || return 1
-  [[ "$resolved" = "$expected_id" ]] || {
-    echo 'cutover image pin no longer resolves to its recorded image ID' >&2
+  [[ "$resolved" = "$image_id" ]] || {
+    echo 'pair image pin no longer resolves to its recorded image ID' >&2
     return 1
   }
+  verify_image_runtime "$image" "$version" "$revision"
 }
 
-cutover_verify_offline_pair() {
-  local choice="$1" image image_id generation expected_manifest expected_hash format
-  case "$choice" in
-    saved)
-      image="$CUTOVER_OLD_IMAGE"
-      image_id="$CUTOVER_OLD_IMAGE_ID"
-      generation="$CUTOVER_PRIOR_GENERATION"
-      expected_manifest="$TRANSACTION/saved-sha256"
-      expected_hash="$CUTOVER_PRIOR_MANIFEST_SHA256"
-      format=arroy
-      ;;
-    target)
-      image="$CUTOVER_TARGET_IMAGE"
-      image_id="$CUTOVER_TARGET_IMAGE_ID"
-      generation="$CUTOVER_TARGET_GENERATION"
-      expected_manifest="$TRANSACTION/target-sha256"
-      expected_hash="$CUTOVER_TARGET_MANIFEST_SHA256"
-      format=flat-int8
-      ;;
-    *) return 1 ;;
-  esac
-  cutover_require_image_id "$image" "$image_id"
-  [[ "$(</srv/legal-mcp/lifecycle/active-generation)" = "$generation" \
-    && "$(sha256sum "/srv/legal-mcp/generations/$generation/generation.json" | awk '{print $1}')" \
-      = "$expected_hash" ]] || return 1
-  cutover_validate_generation_manifest \
-    "/srv/legal-mcp/generations/$generation/generation.json" "$format" root legal-mcp 440
-  local live_manifest
-  live_manifest="$(mktemp /run/legal-mcp-cutover-live.XXXXXX)"
-  ordinary_render_hash_manifest "$IMAGE_FILE" "$QUADLET" "$TEMPLATE" \
-    "$RUNTIME_ENV" "$API_KEYS" "$CADDYFILE" "$TRANSACTION/saved-auth-ready" \
-    /srv/legal-mcp/lifecycle/active-generation "$live_manifest"
-  if ! cmp --silent "$live_manifest" "$expected_manifest"; then
-    rm -f "$live_manifest"
-    return 1
-  fi
-  rm -f "$live_manifest"
-  podman run --rm --network=none --user=0:0 --read-only --cap-drop=all \
+pair_verify_generation_view() {
+  local image="$1" view_generation="$2" candidate="$3" status
+  pair_cleanup_verification_root
+  install -d -o 971 -g 971 -m 0700 "$PAIR_VERIFY_ROOT"
+  install -d -o 971 -g 971 -m 0750 "$PAIR_VERIFY_ROOT/lifecycle"
+  install -d -o 971 -g 971 -m 0700 "$PAIR_VERIFY_ROOT/state"
+  install -o 971 -g 971 -m 0640 /dev/null "$PAIR_VERIFY_ROOT/lifecycle/LOCK"
+  printf '%s' "$view_generation" > "$PAIR_VERIFY_ROOT/lifecycle/active-generation"
+  chown 971:971 "$PAIR_VERIFY_ROOT/lifecycle/active-generation"
+  chmod 644 "$PAIR_VERIFY_ROOT/lifecycle/active-generation"
+  sync -f "$PAIR_VERIFY_ROOT/lifecycle"
+  set +e
+  podman run --rm --network=none --user=971:971 --read-only --cap-drop=all \
     --security-opt=no-new-privileges --pids-limit=256 --memory=6g --memory-swap=6g \
     --tmpfs=/tmp:rw,nodev,nosuid,noexec,size=64m,mode=1777 \
-    --volume=/srv/legal-mcp:/var/lib/legal-mcp:ro,nodev,nosuid \
+    --volume="$candidate:/var/lib/legal-mcp/generations/$view_generation:ro,nodev,nosuid,noexec" \
+    --volume="$PAIR_VERIFY_ROOT/lifecycle:/var/lib/legal-mcp/lifecycle:ro,nodev,nosuid,noexec" \
+    --volume="$PAIR_VERIFY_ROOT/state:/var/lib/legal-mcp/state:rw,nodev,nosuid,noexec" \
     "$image" verify --quiet >/dev/null
+  status=$?
+  set -e
+  pair_cleanup_verification_root
+  return "$status"
 }
 
-cutover_verify_running_capabilities() {
-  local report
-  report="$(podman top australian-legal-mcp capbnd capeff capinh capprm)" || {
-    echo 'could not inspect running container capability sets' >&2
-    return 1
-  }
-  if ! python3 - "$report" <<'PY'
-import sys
-
-lines = sys.argv[1].splitlines()
-expected_header = "BOUNDING CAPS EFFECTIVE CAPS INHERITED CAPS PERMITTED CAPS"
-if not lines or " ".join(lines[0].split()) != expected_header or len(lines) < 2:
-    raise SystemExit(1)
-for line in lines[1:]:
-    fields = line.split()
-    if fields != ["none", "none", "none", "none"]:
-        raise SystemExit(1)
-PY
-  then
+pair_require_incompatible_target() {
+  if podman run --rm --network=none --user=971:971 --read-only --cap-drop=all \
+    --security-opt=no-new-privileges --pids-limit=256 --memory=6g --memory-swap=6g \
+    --tmpfs=/tmp:rw,nodev,nosuid,noexec,size=64m,mode=1777 \
+    --volume=/srv/legal-mcp:/var/lib/legal-mcp:ro,nodev,nosuid,noexec \
+    "$NEW_IMAGE" verify --quiet >/dev/null 2>&1; then
+    echo 'target image accepts the current generation; use ordinary same-schema routes' >&2
     return 1
   fi
 }
 
-cutover_verify_running_constraints() {
-  local expected_image_id="$1" image_id user root_read_only network port mounts
+pair_call_host_deploy() {
+  LEGAL_MCP_HOST_TRANSACTION_LOCK_FD="$HOST_LOCK_FD" \
+  LEGAL_MCP_PAIR_COORDINATOR=1 \
+    /usr/local/sbin/legal-mcp-host-deploy "$1" "$PAIR_TARGET_GENERATION"
+}
+
+pair_arm_private_start() {
+  local temporary
+  bootstrap_require_regular "$PAIR_PERMIT" root root 400 || return 1
+  image_path_is_absent "$PAIR_START_ARM" || return 1
+  temporary="$(mktemp /run/legal-mcp/.pair-cutover-start-armed.XXXXXX)"
+  install -o root -g root -m 0400 "$PAIR_PERMIT" "$temporary"
+  sync -f "$temporary"
+  mv -fT "$temporary" "$PAIR_START_ARM"
+  sync -f /run/legal-mcp
+  bootstrap_require_regular "$PAIR_START_ARM" root root 400
+  cmp --silent "$PAIR_PERMIT" "$PAIR_START_ARM"
+}
+
+pair_disarm_private_start() {
+  image_path_is_absent "$PAIR_START_ARM" && return 0
+  bootstrap_require_regular "$PAIR_START_ARM" root root 400 || return 1
+  rm -f -- "$PAIR_START_ARM"
+  sync -f /run/legal-mcp
+  image_path_is_absent "$PAIR_START_ARM"
+}
+
+pair_verify_running_capabilities() {
+  local report
+  report="$(podman top australian-legal-mcp capbnd capeff capinh capprm)" || return 1
+  python3 - "$report" <<'PY'
+import sys
+lines = sys.argv[1].splitlines()
+if not lines or " ".join(lines[0].split()) != "BOUNDING CAPS EFFECTIVE CAPS INHERITED CAPS PERMITTED CAPS" or len(lines) < 2:
+    raise SystemExit(1)
+for line in lines[1:]:
+    if line.split() != ["none", "none", "none", "none"]:
+        raise SystemExit(1)
+PY
+}
+
+pair_verify_running_constraints() {
+  local expected_image_id="$1" image_id user root_read_only network port mounts binds
   image_id="$(canonical_image_id \
     "$(podman inspect australian-legal-mcp --format '{{.Image}}')")" || return 1
   user="$(podman inspect australian-legal-mcp --format '{{.Config.User}}')" || return 1
-  root_read_only="$(podman inspect australian-legal-mcp --format '{{.HostConfig.ReadonlyRootfs}}')" || return 1
-  network="$(podman inspect australian-legal-mcp --format '{{.HostConfig.NetworkMode}}')" || return 1
+  root_read_only="$(podman inspect australian-legal-mcp --format '{{.HostConfig.ReadonlyRootfs}}')" \
+    || return 1
+  network="$(podman inspect australian-legal-mcp --format '{{.HostConfig.NetworkMode}}')" \
+    || return 1
   port="$(podman port australian-legal-mcp 51235/tcp)" || return 1
   mounts="$(podman inspect australian-legal-mcp --format '{{json .Mounts}}')" || return 1
-  [[ "$image_id" = "$expected_image_id" \
-    && "$user" = 971:971 && "$root_read_only" = true && "$network" = bridge \
+  binds="$(podman inspect australian-legal-mcp --format '{{json .HostConfig.Binds}}')" || return 1
+  [[ "$image_id" = "$expected_image_id" && "$user" = 971:971 \
+    && "$root_read_only" = true && "$network" = bridge \
     && "$port" = 127.0.0.1:51235 ]] || {
-      echo 'running cutover container violates its exact image/user/network contract' >&2
+      echo 'running pair container violates its exact image, identity, or loopback contract' >&2
       return 1
     }
-  cutover_verify_running_capabilities || {
-    echo 'running cutover container has a malformed or non-empty capability set' >&2
-    return 1
-  }
-  python3 - "$mounts" <<'PY'
+  pair_verify_running_capabilities
+  python3 - "$mounts" "$binds" <<'PY'
 import json, sys
 mounts = json.loads(sys.argv[1])
+binds = json.loads(sys.argv[2])
 expected = {
     "/var/lib/legal-mcp/generations": ("/srv/legal-mcp/generations", False),
     "/var/lib/legal-mcp/lifecycle": ("/srv/legal-mcp/lifecycle", False),
     "/var/lib/legal-mcp/state": ("/srv/legal-mcp/state", True),
     "/run/secrets/legal-mcp-api-keys.json": ("/etc/legal-mcp/api-keys.json", False),
 }
-if len(mounts) != len(expected):
-    raise SystemExit(1)
+expected_binds = {
+    "/var/lib/legal-mcp/generations": (
+        "/srv/legal-mcp/generations", {"ro", "nodev", "nosuid", "noexec"}
+    ),
+    "/var/lib/legal-mcp/lifecycle": (
+        "/srv/legal-mcp/lifecycle", {"ro", "nodev", "nosuid", "noexec"}
+    ),
+    "/var/lib/legal-mcp/state": (
+        "/srv/legal-mcp/state", {"rw", "nodev", "nosuid", "noexec"}
+    ),
+    "/run/secrets/legal-mcp-api-keys.json": (
+        "/etc/legal-mcp/api-keys.json", {"ro", "nodev", "nosuid", "noexec"}
+    ),
+}
+podman_bind_options = {"rbind", "rprivate"}
 seen = {}
 for item in mounts:
     destination = item.get("Destination")
@@ -3198,550 +3674,608 @@ for item in mounts:
         if destination in seen:
             raise SystemExit(1)
         seen[destination] = (item.get("Source"), item.get("RW"))
-if seen != expected:
+if seen != expected or len(mounts) != len(expected):
+    raise SystemExit(1)
+if not isinstance(binds, list) or len(binds) != len(expected_binds):
+    raise SystemExit(1)
+seen_binds = set()
+for bind in binds:
+    if not isinstance(bind, str):
+        raise SystemExit(1)
+    parts = bind.split(":", 2)
+    if len(parts) != 3:
+        raise SystemExit(1)
+    source, destination, raw_options = parts
+    if destination in seen_binds or destination not in expected_binds:
+        raise SystemExit(1)
+    seen_binds.add(destination)
+    expected_source, required_options = expected_binds[destination]
+    options = raw_options.split(",")
+    option_set = set(options)
+    if (source != expected_source or len(options) != len(option_set)
+            or not required_options.issubset(option_set)
+            or not option_set.difference(required_options).issubset(podman_bind_options)):
+        raise SystemExit(1)
+if seen_binds != set(expected_binds):
     raise SystemExit(1)
 PY
 }
 
-cutover_disarm_private_start() {
-  cutover_path_is_absent "$CUTOVER_START_ARM" && return 0
-  bootstrap_require_regular "$CUTOVER_START_ARM" root root 400 || return 1
-  rm -f -- "$CUTOVER_START_ARM"
-  sync -f /run/legal-mcp
-  cutover_path_is_absent "$CUTOVER_START_ARM"
-}
-
-cutover_verify_dark_pair() {
-  local expected_manifest="$1" expected_id="$2" expected_generation="$3"
-  local manifest container_state running_image_id
+pair_verify_dark() {
+  local choice="$1" expected_manifest expected_image expected_id expected_generation
+  local version revision manifest
+  case "$choice" in
+    saved)
+      expected_manifest="$TRANSACTION/saved-sha256"
+      expected_image="$PAIR_PRIOR_IMAGE"
+      expected_id="$PAIR_PRIOR_IMAGE_ID"
+      expected_generation="$PAIR_PRIOR_GENERATION"
+      version="$PAIR_PRIOR_VERSION"
+      revision="$PAIR_PRIOR_REVISION"
+      ;;
+    target)
+      expected_manifest="$TRANSACTION/target-sha256"
+      expected_image="$PAIR_TARGET_IMAGE"
+      expected_id="$PAIR_TARGET_IMAGE_ID"
+      expected_generation="$PAIR_TARGET_GENERATION"
+      version="$PAIR_TARGET_VERSION"
+      revision="$PAIR_TARGET_REVISION"
+      ;;
+    *) return 1 ;;
+  esac
   ordinary_require_static_live_metadata
-  manifest="$(mktemp /run/legal-mcp-cutover-dark-live.XXXXXX)"
+  manifest="$(mktemp /run/legal-mcp-pair-live.XXXXXX)"
   ordinary_render_hash_manifest "$IMAGE_FILE" "$QUADLET" "$TEMPLATE" \
     "$RUNTIME_ENV" "$API_KEYS" "$CADDYFILE" "$TRANSACTION/saved-auth-ready" \
     /srv/legal-mcp/lifecycle/active-generation "$manifest"
   if ! cmp --silent "$manifest" "$expected_manifest"; then
     rm -f "$manifest"
-    echo 'configured-dark cutover pair does not match its exact manifest' >&2
+    echo 'configured-dark pair does not match its exact transaction manifest' >&2
     return 1
   fi
   rm -f "$manifest"
-  cutover_require_image_id "$(<"$IMAGE_FILE")" "$expected_id"
+  pair_require_image_runtime "$expected_image" "$expected_id" "$version" "$revision"
   [[ "$(</srv/legal-mcp/lifecycle/active-generation)" = "$expected_generation" \
     && "$(read_systemctl_enablement "$SERVICE")" = generated \
     && "$(read_systemctl_activity "$SERVICE")" = inactive \
     && "$(read_systemctl_enablement caddy.service)" = disabled \
     && "$(read_systemctl_activity caddy.service)" = inactive \
-    && "$(ufw_rule_state 80)" = absent \
-    && "$(ufw_rule_state 443)" = absent ]] || return 1
-  cutover_path_is_absent "$AUTH_READY"
-  cutover_path_is_absent "$CUTOVER_START_ARM"
+    && "$(ufw_rule_state 80)" = absent && "$(ufw_rule_state 443)" = absent ]]
+  image_path_is_absent "$AUTH_READY" && image_path_is_absent "$PAIR_START_ARM"
   ordinary_require_listener_topology none
   ufw_is_fail_closed
-  container_state="$(podman_container_state australian-legal-mcp)" || return 1
-  if [[ "$container_state" = present ]]; then
-    running_image_id="$(canonical_image_id \
-      "$(podman inspect australian-legal-mcp --format '{{.Image}}')")" || return 1
-    [[ "$running_image_id" = "$expected_id" ]] || return 1
-  fi
-  cutover_validate_mount_contract
+  pair_validate_mount_contract
 }
 
-cutover_start_and_prove_pair() {
-  local choice="$1" expected_id expected_generation expected_manifest
+pair_start_and_prove() {
+  local choice="$1" expected_id expected_generation
   case "$choice" in
     saved)
-      expected_id="$CUTOVER_OLD_IMAGE_ID"
-      expected_generation="$CUTOVER_PRIOR_GENERATION"
-      expected_manifest="$TRANSACTION/saved-sha256"
+      expected_id="$PAIR_PRIOR_IMAGE_ID"
+      expected_generation="$PAIR_PRIOR_GENERATION"
       ;;
     target)
-      expected_id="$CUTOVER_TARGET_IMAGE_ID"
-      expected_generation="$CUTOVER_TARGET_GENERATION"
-      expected_manifest="$TRANSACTION/target-sha256"
+      expected_id="$PAIR_TARGET_IMAGE_ID"
+      expected_generation="$PAIR_TARGET_GENERATION"
       ;;
     *) return 1 ;;
   esac
   TRANSACTION_GENERATION="$expected_generation"
+  TRANSACTION_AUTH_MODE="$PAIR_AUTH_MODE"
+  TRANSACTION_EXTERNAL_URL="$PAIR_EXTERNAL_URL"
   load_runtime_contract "$TRANSACTION/saved-runtime.env"
-  [[ "$AUTH_MODE" = "$TRANSACTION_AUTH_MODE" \
-    && "$EXTERNAL_URL" = "$TRANSACTION_EXTERNAL_URL" ]]
-  [[ "$(read_systemctl_activity "$SERVICE")" = inactive \
-    && "$(read_systemctl_enablement "$SERVICE")" = generated \
-    && "$(ufw_rule_state 80)" = absent \
-    && "$(ufw_rule_state 443)" = absent \
-    && "$(read_systemctl_activity caddy.service)" = inactive \
-    && "$(read_systemctl_enablement caddy.service)" = disabled ]]
-  cutover_arm_private_start
+  pair_arm_private_start
   systemctl start "$SERVICE"
   ordinary_verify_private_runtime "$expected_id"
-  cutover_verify_running_constraints "$expected_id"
+  pair_verify_running_constraints "$expected_id"
   systemctl stop "$SERVICE"
   [[ "$(read_systemctl_activity "$SERVICE")" = inactive ]]
-  cutover_disarm_private_start
-  cutover_verify_dark_pair "$expected_manifest" "$expected_id" "$expected_generation"
+  pair_disarm_private_start
+  pair_verify_dark "$choice"
 }
 
-cutover_write_outcome() {
-  local choice="$1" preparing="$TRANSACTION/retirement-outcome.preparing"
-  [[ "$choice" = saved || "$choice" = target ]]
-  cutover_validate_transaction "$TRANSACTION"
-  if [[ "$CUTOVER_RETIREMENT_OUTCOME" = "$choice" ]]; then return 0; fi
-  [[ "$CUTOVER_RETIREMENT_OUTCOME" = pending ]] || return 1
-  cutover_path_is_absent "$preparing" || return 1
-  install -o root -g root -m 0600 /dev/null "$preparing"
-  printf '%s\n' "$choice" > "$preparing"
-  chown root:root "$preparing"
-  chmod 600 "$preparing"
-  sync -f "$preparing"
-  mv -fT "$preparing" "$TRANSACTION/retirement-outcome"
-  sync -f "$TRANSACTION"
-  cutover_validate_transaction "$TRANSACTION"
-  [[ "$CUTOVER_RETIREMENT_OUTCOME" = "$choice" ]]
-}
-
-cutover_verify_committed_pair() {
-  local choice="$1" expected_manifest expected_id expected_generation
+pair_verify_offline() {
+  local choice="$1" image image_id version revision generation manifest_sha
   case "$choice" in
     saved)
-      expected_manifest="$TRANSACTION/saved-sha256"
-      expected_id="$CUTOVER_OLD_IMAGE_ID"
-      expected_generation="$CUTOVER_PRIOR_GENERATION"
-      [[ -e /srv/legal-mcp/lifecycle/.deployment-transaction \
-        && ! -L /srv/legal-mcp/lifecycle/.deployment-transaction ]] || return 1
-      cutover_read_deployment_journal
-      [[ "$CUTOVER_DEPLOYMENT_GENERATION" = "$CUTOVER_TARGET_GENERATION" \
-        && "$CUTOVER_DEPLOYMENT_PREVIOUS" = "$CUTOVER_PRIOR_GENERATION" \
-        && "$CUTOVER_DEPLOYMENT_KIND" = ordinary \
-        && "$CUTOVER_DEPLOYMENT_PHASE" = prepared ]] || return 1
-      cutover_validate_generation_manifest \
-        "/srv/legal-mcp/uploads/$CUTOVER_TARGET_GENERATION/generation.json" \
-        flat-int8 legal-mcp-publisher legal-mcp-publisher 600
-      [[ "$(sha256sum "/srv/legal-mcp/uploads/$CUTOVER_TARGET_GENERATION/generation.json" \
-        | awk '{print $1}')" = "$CUTOVER_TARGET_MANIFEST_SHA256" ]]
-      cutover_upload_authorization_matches
+      image="$PAIR_PRIOR_IMAGE"; image_id="$PAIR_PRIOR_IMAGE_ID"
+      version="$PAIR_PRIOR_VERSION"; revision="$PAIR_PRIOR_REVISION"
+      generation="$PAIR_PRIOR_GENERATION"; manifest_sha="$PAIR_PRIOR_MANIFEST_SHA256"
       ;;
     target)
-      expected_manifest="$TRANSACTION/target-sha256"
-      expected_id="$CUTOVER_TARGET_IMAGE_ID"
-      expected_generation="$CUTOVER_TARGET_GENERATION"
-      cutover_path_is_absent /srv/legal-mcp/lifecycle/.deployment-transaction
-      cutover_path_is_absent /run/legal-mcp/authorized-upload
+      image="$PAIR_TARGET_IMAGE"; image_id="$PAIR_TARGET_IMAGE_ID"
+      version="$PAIR_TARGET_VERSION"; revision="$PAIR_TARGET_REVISION"
+      generation="$PAIR_TARGET_GENERATION"; manifest_sha="$PAIR_TARGET_MANIFEST_SHA256"
       ;;
     *) return 1 ;;
   esac
-  TRANSACTION_GENERATION="$expected_generation"
-  ordinary_read_transaction_probe_key
-  cutover_verify_dark_pair "$expected_manifest" "$expected_id" "$expected_generation"
+  pair_require_image_runtime "$image" "$image_id" "$version" "$revision"
+  [[ "$(</srv/legal-mcp/lifecycle/active-generation)" = "$generation" \
+    && "$(sha256sum "/srv/legal-mcp/generations/$generation/generation.json" \
+      | awk '{print $1}')" = "$manifest_sha" ]]
+  podman run --rm --network=none --user=971:971 --read-only --cap-drop=all \
+    --security-opt=no-new-privileges --pids-limit=256 --memory=6g --memory-swap=6g \
+    --tmpfs=/tmp:rw,nodev,nosuid,noexec,size=64m,mode=1777 \
+    --volume=/srv/legal-mcp:/var/lib/legal-mcp:ro,nodev,nosuid,noexec \
+    "$image" verify --quiet >/dev/null
 }
 
-cutover_delete_retired_transaction() {
-  delete_retired_image_directory "$1"
+pair_read_transaction_probe_key() {
+  load_runtime_contract "$TRANSACTION/saved-runtime.env"
+  [[ "$AUTH_MODE" = "$PAIR_AUTH_MODE" && "$EXTERNAL_URL" = "$PAIR_EXTERNAL_URL" ]]
+  if [[ "$HAS_API" = true \
+    && "${PROBE_API_KEY:-}" =~ ^[a-z0-9][a-z0-9_-]{0,63}\.[A-Za-z0-9_-]{43}$ ]]; then
+    return 0
+  fi
+  read_probe_key
 }
 
-cutover_retire_transaction() {
+pair_verify_committed() {
   local choice="$1"
-  cutover_validate_transaction "$TRANSACTION"
-  [[ "$CUTOVER_RETIREMENT_OUTCOME" = "$choice" ]]
-  cutover_verify_committed_pair "$choice"
-  cutover_path_is_absent "$TRANSACTION_RETIRING"
-  cutover_path_is_absent "$TRANSACTION_RETIRED"
-  mv -T "$TRANSACTION" "$TRANSACTION_RETIRING"
+  pair_verify_dark "$choice"
+  case "$PAIR_OPERATION:$choice" in
+    prepared:saved)
+      pair_read_deployment_journal
+      [[ "$PAIR_DEPLOYMENT_GENERATION" = "$PAIR_TARGET_GENERATION" \
+        && "$PAIR_DEPLOYMENT_PREVIOUS" = "$PAIR_PRIOR_GENERATION" \
+        && "$PAIR_DEPLOYMENT_PHASE" = prepared \
+        && -d "/srv/legal-mcp/uploads/$PAIR_TARGET_GENERATION" \
+        && ! -L "/srv/legal-mcp/uploads/$PAIR_TARGET_GENERATION" \
+        && "$(stat -c '%U:%G:%a' "/srv/legal-mcp/uploads/$PAIR_TARGET_GENERATION")" \
+          = legal-mcp-publisher:legal-mcp-publisher:700 \
+        && ! -e "/srv/legal-mcp/generations/$PAIR_TARGET_GENERATION" \
+        && ! -L "/srv/legal-mcp/generations/$PAIR_TARGET_GENERATION" ]]
+      pair_upload_authorization_matches
+      ;;
+    prepared:target)
+      image_path_is_absent /srv/legal-mcp/lifecycle/.deployment-transaction
+      image_path_is_absent /run/legal-mcp/authorized-upload
+      [[ -d "/srv/legal-mcp/generations/$PAIR_PRIOR_GENERATION" \
+        && ! -L "/srv/legal-mcp/generations/$PAIR_PRIOR_GENERATION" \
+        && -d "/srv/legal-mcp/generations/$PAIR_TARGET_GENERATION" \
+        && ! -L "/srv/legal-mcp/generations/$PAIR_TARGET_GENERATION" ]]
+      ;;
+    installed:saved|installed:target)
+      image_path_is_absent /srv/legal-mcp/lifecycle/.deployment-transaction
+      image_path_is_absent /run/legal-mcp/authorized-upload
+      [[ -d "/srv/legal-mcp/generations/$PAIR_PRIOR_GENERATION" \
+        && ! -L "/srv/legal-mcp/generations/$PAIR_PRIOR_GENERATION" \
+        && -d "/srv/legal-mcp/generations/$PAIR_TARGET_GENERATION" \
+        && ! -L "/srv/legal-mcp/generations/$PAIR_TARGET_GENERATION" ]]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+pair_retired_payload_state() {
+  retired_image_payload_state "$1" \
+    kind operation prior-generation target-generation phase retirement-outcome \
+    coordinator-version coordinator-revision updater-sha256 release-sha256 \
+    saved-sha256 target-sha256 saved-metadata target-metadata state \
+    saved-image saved-quadlet saved-template saved-runtime.env saved-api-keys.json \
+    saved-Caddyfile saved-auth-ready saved-active-generation saved-deployment-journal \
+    saved-upload-authorization target-image target-quadlet target-template \
+    target-active-generation
+}
+
+pair_validate_deletion_marker() {
+  bootstrap_require_regular "$TRANSACTION_DELETION" root root 600 || return 1
+  [[ "$(<"$TRANSACTION_DELETION")" \
+    = LEGAL_MCP_IMAGE_GENERATION_PAIR_TRANSACTION_V1 ]] || {
+      echo 'pair deletion marker has missing, corrupt, or foreign identity' >&2
+      return 1
+    }
+}
+
+pair_delete_retired_transaction() {
+  local found victim
+  if ! image_path_is_absent "$TRANSACTION_DELETION"; then
+    pair_validate_deletion_marker
+    if ! image_path_is_absent "$TRANSACTION_RETIRED"; then
+      require_image_transaction_directory "$TRANSACTION_RETIRED"
+      found="$(find "$TRANSACTION_RETIRED" -mindepth 1 -maxdepth 1 -print -quit)"
+      [[ -z "$found" ]] || {
+        echo 'pair deletion marker conflicts with non-empty retired state' >&2
+        return 1
+      }
+      rmdir "$TRANSACTION_RETIRED"
+      sync -f /etc/legal-mcp
+    fi
+    rm -f -- "$TRANSACTION_DELETION"
+    image_path_is_absent "$TRANSACTION_DELETION" || return 1
+    sync -f /etc/legal-mcp
+    return 0
+  fi
+
+  require_image_transaction_directory "$TRANSACTION_RETIRED"
+  bootstrap_directory_contains_only "$TRANSACTION_RETIRED" \
+    kind operation prior-generation target-generation phase retirement-outcome \
+    coordinator-version coordinator-revision updater-sha256 release-sha256 \
+    saved-sha256 target-sha256 saved-metadata target-metadata state \
+    saved-image saved-quadlet saved-template saved-runtime.env saved-api-keys.json \
+    saved-Caddyfile saved-auth-ready saved-active-generation saved-deployment-journal \
+    saved-upload-authorization target-image target-quadlet target-template \
+    target-active-generation || return 1
+  bootstrap_require_regular "$TRANSACTION_RETIRED/kind" root root 600 || return 1
+  [[ "$(<"$TRANSACTION_RETIRED/kind")" \
+    = LEGAL_MCP_IMAGE_GENERATION_PAIR_TRANSACTION_V1 ]] || {
+      echo 'retired pair transaction identity is missing, corrupt, or foreign' >&2
+      return 1
+    }
+  while true; do
+    victim="$(find "$TRANSACTION_RETIRED" -mindepth 1 -maxdepth 1 \
+      ! -name kind -print -quit)"
+    [[ -n "$victim" ]] || break
+    rm -rf --one-file-system -- "$victim"
+    image_path_is_absent "$victim" || return 1
+    sync -f "$TRANSACTION_RETIRED"
+  done
+  mv -T "$TRANSACTION_RETIRED/kind" "$TRANSACTION_DELETION"
   sync -f /etc/legal-mcp
+  pair_validate_deletion_marker
+  rmdir "$TRANSACTION_RETIRED"
+  sync -f /etc/legal-mcp
+  rm -f -- "$TRANSACTION_DELETION"
+  image_path_is_absent "$TRANSACTION_DELETION" || return 1
+  sync -f /etc/legal-mcp
+}
+
+pair_complete_retired_transaction() {
+  local payload_state saved_transaction="$TRANSACTION"
+  payload_state="$(pair_retired_payload_state "$TRANSACTION_RETIRED")"
+  if [[ "$payload_state" = complete ]]; then
+    TRANSACTION="$TRANSACTION_RETIRED"
+    pair_validate_transaction "$TRANSACTION"
+    [[ "$PAIR_RETIREMENT_OUTCOME" = saved || "$PAIR_RETIREMENT_OUTCOME" = target ]]
+    pair_read_transaction_probe_key
+    pair_verify_committed "$PAIR_RETIREMENT_OUTCOME"
+  fi
+  pair_delete_retired_transaction
+  TRANSACTION="$saved_transaction"
+}
+
+pair_complete_retiring_transaction() {
+  local saved_transaction="$TRANSACTION"
+  TRANSACTION="$TRANSACTION_RETIRING"
+  pair_validate_transaction "$TRANSACTION"
+  [[ "$PAIR_RETIREMENT_OUTCOME" = saved || "$PAIR_RETIREMENT_OUTCOME" = target ]]
+  pair_read_transaction_probe_key
+  pair_verify_committed "$PAIR_RETIREMENT_OUTCOME"
+  image_path_is_absent "$TRANSACTION_RETIRED"
   mv -T "$TRANSACTION_RETIRING" "$TRANSACTION_RETIRED"
   sync -f /etc/legal-mcp
-  cutover_delete_retired_transaction "$TRANSACTION_RETIRED"
+  TRANSACTION="$saved_transaction"
+  pair_complete_retired_transaction
 }
 
-cutover_restore_pair() {
-  cutover_force_dark
-  cutover_validate_recoverable_live_state
-  cutover_install_pair_files saved
-  cutover_call_host_deploy cutover-rollback >/dev/null
-  cutover_verify_offline_pair saved
-  cutover_start_and_prove_pair saved
-  cutover_write_outcome saved
-  cutover_call_host_deploy cutover-commit >/dev/null
-  cutover_restore_upload_authorization
-  cutover_verify_committed_pair saved
-  cutover_retire_transaction saved
+pair_retire_transaction() {
+  local choice="$1"
+  pair_validate_transaction "$TRANSACTION"
+  [[ "$PAIR_RETIREMENT_OUTCOME" = "$choice" ]]
+  pair_verify_committed "$choice"
+  image_path_is_absent "$TRANSACTION_RETIRING"
+  image_path_is_absent "$TRANSACTION_RETIRED"
+  mv -T "$TRANSACTION" "$TRANSACTION_RETIRING"
+  sync -f /etc/legal-mcp
+  pair_complete_retiring_transaction
 }
 
-cutover_finish_target_pair() {
-  cutover_force_dark
-  cutover_validate_recoverable_live_state
-  cutover_install_pair_files target
-  if [[ -e /srv/legal-mcp/lifecycle/.deployment-transaction \
-    && ! -L /srv/legal-mcp/lifecycle/.deployment-transaction ]]; then
-    cutover_call_host_deploy cutover-activate >/dev/null
-  else
-    [[ "$CUTOVER_RETIREMENT_OUTCOME" = target \
-      && "$(</srv/legal-mcp/lifecycle/active-generation)" \
-        = "$CUTOVER_TARGET_GENERATION" ]] || return 1
+pair_restore_saved() {
+  pair_force_dark
+  pair_validate_recoverable_live_state
+  pair_write_phase committing
+  pair_install_files saved
+  pair_call_host_deploy pair-restore >/dev/null
+  pair_verify_offline saved
+  pair_start_and_prove saved
+  pair_write_outcome saved
+  pair_call_host_deploy pair-commit >/dev/null
+  pair_restore_upload_authorization
+  pair_write_phase committed
+  pair_verify_committed saved
+  pair_retire_transaction saved
+}
+
+pair_finish_target() {
+  pair_force_dark
+  pair_validate_recoverable_live_state
+  pair_write_phase target-files
+  pair_install_files target
+  if [[ "$(</srv/legal-mcp/lifecycle/active-generation)" != "$PAIR_TARGET_GENERATION" ]]; then
+    pair_write_phase activating
+    pair_call_host_deploy pair-activate >/dev/null
+  elif [[ "$PAIR_OPERATION" = prepared \
+    && ! -e /srv/legal-mcp/lifecycle/.deployment-transaction ]]; then
+    [[ "$PAIR_RETIREMENT_OUTCOME" = target ]] || return 1
   fi
-  cutover_verify_offline_pair target
-  cutover_start_and_prove_pair target
-  cutover_write_outcome target
-  if [[ -e /srv/legal-mcp/lifecycle/.deployment-transaction \
-    && ! -L /srv/legal-mcp/lifecycle/.deployment-transaction ]]; then
-    cutover_call_host_deploy cutover-commit >/dev/null
+  pair_write_phase activated
+  pair_verify_offline target
+  pair_write_phase verifying
+  pair_start_and_prove target
+  pair_write_phase proved
+  pair_write_outcome target
+  pair_write_phase committing
+  if [[ "$PAIR_OPERATION" = installed \
+    || -e /srv/legal-mcp/lifecycle/.deployment-transaction ]]; then
+    pair_call_host_deploy pair-commit >/dev/null
   fi
-  cutover_verify_committed_pair target
-  cutover_retire_transaction target
+  pair_write_phase committed
+  pair_verify_committed target
+  pair_retire_transaction target
 }
 
-cutover_failure_rollback() {
+pair_failure_recovery() {
   local status=$? recovery_status
   trap - ERR HUP INT TERM EXIT
   set +e
   (
     set -e
-    cutover_validate_transaction "$TRANSACTION"
-    ordinary_read_transaction_probe_key
-    if [[ "$CUTOVER_RETIREMENT_OUTCOME" = target ]]; then
-      cutover_finish_target_pair
-    else
-      cutover_restore_pair
-    fi
+    pair_reconcile_field_preparations "$TRANSACTION"
+    pair_reconcile_live_file_preparations
+    pair_validate_transaction "$TRANSACTION"
+    pair_read_transaction_probe_key
+    case "$PAIR_RETIREMENT_OUTCOME" in
+      target) pair_finish_target ;;
+      saved|pending) pair_restore_saved ;;
+      *) exit 1 ;;
+    esac
   )
   recovery_status=$?
   set -e
   unset PROBE_API_KEY
   if [[ $recovery_status -ne 0 ]]; then
-    echo 'flat-int8 cutover failed; service and ingress remain off and explicit recovery is required' >&2
+    echo 'pair transition failed; service and ingress remain off and explicit pair recovery is required' >&2
     exit 1
   fi
-  if [[ "$CUTOVER_RETIREMENT_OUTCOME" = target ]]; then
-    echo 'flat-int8 cutover had committed and recovery completed the target pair' >&2
+  if [[ "$PAIR_RETIREMENT_OUTCOME" = target ]]; then
+    echo 'pair transition had committed; recovery completed the target pair' >&2
   else
-    echo 'flat-int8 cutover rolled both generation and image/template back' >&2
+    echo 'pair transition rolled back the image and generation together' >&2
   fi
   exit "$status"
 }
 
-cutover_capture_configured_dark_image_baseline() {
-  local rendered image_state container_state running_image_id host
-  local -a current_image
-  ordinary_require_static_live_metadata
-  cutover_path_is_absent "$AUTH_READY" || {
-    echo 'flat-int8 cutover requires configured authentication with auth-ready absent' >&2
-    return 1
-  }
-  EXPECTED_GENERATION="$(</srv/legal-mcp/lifecycle/active-generation)"
-  [[ "$EXPECTED_GENERATION" =~ ^[0-9a-f]{64}$ ]]
-  mapfile -t current_image < "$IMAGE_FILE"
-  [[ ${#current_image[@]} -eq 1 ]]
-  OLD_IMAGE="${current_image[0]}"
-  [[ "$(stat -c '%s' "$IMAGE_FILE")" = "$(( ${#OLD_IMAGE} + 1 ))" \
-    && "$OLD_IMAGE" =~ ^ghcr\.io/gunba/australian-legal-mcp@sha256:[0-9a-f]{64}$ \
-    && "$NEW_IMAGE" != "$OLD_IMAGE" ]] || {
-      echo 'current and target cutover image pins are malformed or identical' >&2
-      return 1
-    }
-  [[ "$(grep -o '__IMAGE_DIGEST__' "$TEMPLATE" | wc -l)" = 1 ]]
-  rendered="$(mktemp /run/legal-mcp-cutover-current-quadlet.XXXXXX)"
-  sed "s|__IMAGE_DIGEST__|$OLD_IMAGE|g" "$TEMPLATE" > "$rendered"
-  if ! cmp --silent "$rendered" "$QUADLET"; then
-    rm -f "$rendered"
-    echo 'configured-dark image, template, and rendered Quadlet do not agree' >&2
-    return 1
+pair_force_preparation_dark() {
+  local activity
+  if ! image_path_is_absent "$PAIR_START_ARM"; then
+    bootstrap_require_regular "$PAIR_START_ARM" root root 400 || return 1
+    rm -f -- "$PAIR_START_ARM"
+    sync -f /run/legal-mcp
   fi
-  rm -f "$rendered"
-  image_state="$(podman_image_state "$OLD_IMAGE")" || return 1
-  [[ "$image_state" = present ]] || {
-    echo 'configured-dark rollback image is not present' >&2
-    return 1
-  }
-  OLD_IMAGE_ID="$(canonical_image_id \
-    "$(podman image inspect "$OLD_IMAGE" --format '{{.Id}}')")" || return 1
-  container_state="$(podman_container_state australian-legal-mcp)" || return 1
-  if [[ "$container_state" = present ]]; then
-    running_image_id="$(canonical_image_id \
-      "$(podman inspect australian-legal-mcp --format '{{.Image}}')")" || return 1
-    [[ "$running_image_id" = "$OLD_IMAGE_ID" ]] || {
-      echo 'configured-dark container is outside the rollback image identity' >&2
-      return 1
-    }
+  if ! image_path_is_absent "$AUTH_READY"; then
+    ordinary_require_regular "$AUTH_READY" root root 444 || return 1
+    [[ "$(stat -c '%s' "$AUTH_READY")" = 0 \
+      && "$(getfacl --absolute-names --numeric --omit-header "$AUTH_READY")" \
+        = $'user::r--\ngroup::r--\nother::r--' ]] || return 1
+    rm -f -- "$AUTH_READY"
+    sync -f /etc/legal-mcp
   fi
+  close_ingress
+  activity="$(read_systemctl_activity "$SERVICE")" || return 1
+  if [[ "$activity" = active ]]; then systemctl stop "$SERVICE"; fi
+  pair_cleanup_verification_root
   [[ "$(read_systemctl_enablement "$SERVICE")" = generated \
     && "$(read_systemctl_activity "$SERVICE")" = inactive \
     && "$(read_systemctl_enablement caddy.service)" = disabled \
     && "$(read_systemctl_activity caddy.service)" = inactive \
     && "$(ufw_rule_state 80)" = absent \
-    && "$(ufw_rule_state 443)" = absent ]] || {
-      echo 'flat-int8 cutover requires the exact configured-dark service and ingress matrix' >&2
-      return 1
-    }
-  ufw_is_fail_closed
+    && "$(ufw_rule_state 443)" = absent ]] || return 1
+  image_path_is_absent "$AUTH_READY" && image_path_is_absent "$PAIR_START_ARM"
   ordinary_require_listener_topology none
-  host="${EXTERNAL_URL#https://}"
-  host="${host%/mcp}"
-  ordinary_validate_caddy_contract "$host"
-  CADDY_ENABLEMENT=disabled
-  CADDY_ACTIVITY=inactive
-  UFW_80=absent
-  UFW_443=absent
+  ufw_is_fail_closed
 }
 
-cutover_capture_baseline() {
-  local candidate_manifest old_source old_title old_description old_licenses
-  local old_digest old_binary_version authorization
-  cutover_validate_mount_contract
-  cutover_validate_template_contract "$ORDINARY_SOURCE_TEMPLATE"
-  ordinary_require_static_live_metadata
-  load_runtime_contract "$RUNTIME_ENV"
-  read_probe_key
-  cutover_capture_configured_dark_image_baseline
-  [[ "$EXPECTED_GENERATION" = "$CUTOVER_EXPECTED_CURRENT_GENERATION" ]] || {
-    echo 'live generation is not the explicitly expected Arroy v20 generation' >&2
-    return 1
-  }
-  cutover_read_deployment_journal
-  [[ "$CUTOVER_DEPLOYMENT_GENERATION" = "$CUTOVER_GENERATION" \
-    && "$CUTOVER_DEPLOYMENT_PREVIOUS" = "$CUTOVER_EXPECTED_CURRENT_GENERATION" \
-    && ( ( "$CUTOVER_DEPLOYMENT_KIND" = ordinary \
-        && "$CUTOVER_DEPLOYMENT_PHASE" = prepared ) \
-      || ( "$CUTOVER_DEPLOYMENT_KIND" = flat-int8-cutover \
-        && "$CUTOVER_DEPLOYMENT_PHASE" = rolled-back ) ) ]] || {
-      echo 'corpus deployment transaction is not the exact prepared flat-int8 target' >&2
-      return 1
-    }
-  candidate_manifest="$(cutover_candidate_manifest "$CUTOVER_GENERATION")" || return 1
-  if [[ "$CUTOVER_DEPLOYMENT_KIND" = ordinary ]]; then
-    [[ "$candidate_manifest" == /srv/legal-mcp/uploads/* ]] || return 1
-    cutover_validate_generation_manifest "$candidate_manifest" flat-int8 \
-      legal-mcp-publisher legal-mcp-publisher 600
-  else
-    [[ "$candidate_manifest" == /srv/legal-mcp/generations/* ]] || return 1
-    cutover_validate_generation_manifest "$candidate_manifest" flat-int8 root legal-mcp 440
-  fi
-  cutover_validate_generation_manifest \
-    "/srv/legal-mcp/generations/$CUTOVER_EXPECTED_CURRENT_GENERATION/generation.json" \
-    arroy root legal-mcp 440
-  CUTOVER_PRIOR_MANIFEST_SHA256="$(sha256sum \
-    "/srv/legal-mcp/generations/$CUTOVER_EXPECTED_CURRENT_GENERATION/generation.json" | awk '{print $1}')"
-  CUTOVER_TARGET_MANIFEST_SHA256="$(sha256sum "$candidate_manifest" | awk '{print $1}')"
-  [[ "$CUTOVER_PRIOR_MANIFEST_SHA256$CUTOVER_TARGET_MANIFEST_SHA256" \
-    =~ ^[0-9a-f]{128}$ ]]
-  authorization=/run/legal-mcp/authorized-upload
-  CUTOVER_UPLOAD_AUTHORIZATION=absent
-  if ! cutover_path_is_absent "$authorization"; then
-    bootstrap_require_regular "$authorization" root legal-mcp-publisher 440
-    [[ "$(<"$authorization")" = "$CUTOVER_GENERATION" ]] || {
-      echo 'upload authorization belongs to a foreign generation' >&2
-      return 1
-    }
-    CUTOVER_UPLOAD_AUTHORIZATION=present
-  fi
-  old_title="$(podman image inspect "$OLD_IMAGE" --format '{{index .Labels "org.opencontainers.image.title"}}')"
-  old_description="$(podman image inspect "$OLD_IMAGE" --format '{{index .Labels "org.opencontainers.image.description"}}')"
-  old_source="$(podman image inspect "$OLD_IMAGE" --format '{{index .Labels "org.opencontainers.image.source"}}')"
-  CUTOVER_OLD_IMAGE_VERSION="$(podman image inspect "$OLD_IMAGE" --format '{{index .Labels "org.opencontainers.image.version"}}')"
-  CUTOVER_OLD_IMAGE_REVISION="$(podman image inspect "$OLD_IMAGE" --format '{{index .Labels "org.opencontainers.image.revision"}}')"
-  old_licenses="$(podman image inspect "$OLD_IMAGE" --format '{{index .Labels "org.opencontainers.image.licenses"}}')"
-  old_digest="$(podman image inspect "$OLD_IMAGE" --format '{{.Digest}}')"
-  [[ "$old_title" = 'Australian Legal MCP' \
-    && "$old_description" = 'Source-grounded Australian legal MCP server' \
-    && "$old_source" = https://github.com/gunba/australian-legal-mcp \
-    && "$CUTOVER_OLD_IMAGE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ \
-    && "$CUTOVER_OLD_IMAGE_REVISION" =~ ^[0-9a-f]{40}$ \
-    && "$old_licenses" = MIT && "$old_digest" = "${OLD_IMAGE##*@}" ]] || {
-      echo 'live Arroy image labels are not exact enough for coordinated rollback' >&2
-      return 1
-    }
-  old_binary_version="$(podman run --rm --network=none --read-only --cap-drop=all \
-    --security-opt=no-new-privileges "$OLD_IMAGE" --version)"
-  [[ "$old_binary_version" = "legal-mcp $CUTOVER_OLD_IMAGE_VERSION" ]] || {
-    echo 'live Arroy image binary does not match its exact rollback labels' >&2
-    return 1
-  }
-  podman run --rm --network=none --read-only --cap-drop=all \
-    --security-opt=no-new-privileges "$OLD_IMAGE" verify-runtime \
-    | grep -Fq '"onnx_runtime_ready":true'
-}
-
-cutover_require_flat_only_target() {
-  [[ "$(</srv/legal-mcp/lifecycle/active-generation)" \
-    = "$CUTOVER_EXPECTED_CURRENT_GENERATION" ]] || return 1
-  if podman run --rm --network=none --user=0:0 --read-only --cap-drop=all \
-    --security-opt=no-new-privileges --pids-limit=256 --memory=6g --memory-swap=6g \
-    --tmpfs=/tmp:rw,nodev,nosuid,noexec,size=64m,mode=1777 \
-    --volume=/srv/legal-mcp:/var/lib/legal-mcp:ro,nodev,nosuid \
-    "$NEW_IMAGE" verify --quiet >/dev/null 2>&1; then
-    echo 'target image accepted the live Arroy generation and is not flat-only' >&2
-    return 1
-  fi
-}
-
-cutover_discard_incomplete_preparation() {
-  local path="$1"
+pair_discard_preparation() {
+  local path="$1" found owner_kind=''
   require_image_transaction_directory "$path"
-  rm -rf --one-file-system -- "$path"
-  cutover_path_is_absent "$path"
-  sync -f /etc/legal-mcp
+  pair_retired_payload_state "$path" >/dev/null
+  found="$(find "$path" -mindepth 1 -maxdepth 1 -print -quit)" || return 1
+  if [[ -n "$found" ]]; then
+    if [[ -f "$path/kind" && ! -L "$path/kind" ]]; then
+      ordinary_require_regular "$path/kind" root root 600 || return 1
+      owner_kind="$(<"$path/kind")"
+      [[ "$owner_kind" = LEGAL_MCP_IMAGE_GENERATION_PAIR_TRANSACTION_V1 ]] || {
+        echo 'pair recovery refuses a preparation owned by another image operation' >&2
+        return 1
+      }
+    else
+      echo 'non-empty image preparation has no recoverable owner marker' >&2
+      return 1
+    fi
+  fi
+  pair_force_preparation_dark
+  retire_image_directory_for_deletion "$path" "$TRANSACTION_PREPARING_RETIRED" \
+    "$TRANSACTION_PREPARING_DELETION" \
+    LEGAL_MCP_IMAGE_GENERATION_PAIR_TRANSACTION_V1
 }
 
-cutover_verify_unchanged_configured_dark_baseline() {
-  ordinary_require_static_live_metadata
-  load_runtime_contract "$RUNTIME_ENV"
-  read_probe_key
-  cutover_capture_configured_dark_image_baseline
-}
-
-cutover_complete_retirement() {
-  local directory="$1" choice payload_state saved_transaction="$TRANSACTION"
-  if [[ "$directory" = "$TRANSACTION_RETIRED" ]]; then
-    payload_state="$(retired_image_payload_state "$TRANSACTION_RETIRED" \
-      kind target-version target-revision updater-sha256 retirement-outcome \
-      release-sha256 saved-sha256 target-sha256 saved-metadata target-metadata state \
-      saved-image saved-quadlet saved-template saved-runtime.env saved-api-keys.json \
-      saved-Caddyfile saved-auth-ready saved-active-generation saved-deployment-journal \
-      saved-upload-authorization target-image target-quadlet target-template \
-      target-active-generation)"
+pair_recover_pending_state() {
+  local saved_transaction="$TRANSACTION" payload_state path state_count=0
+  if ! image_path_is_absent "$TRANSACTION_PREPARING_DELETION"; then
+    for path in "$TRANSACTION_PREPARING" "$TRANSACTION" \
+      "$TRANSACTION_RETIRING" "$TRANSACTION_RETIRED" "$TRANSACTION_DELETION"; do
+      image_path_is_absent "$path" || {
+        echo 'pair preparation deletion conflicts with another transaction phase' >&2
+        return 1
+      }
+    done
+    pair_force_preparation_dark
+    delete_owned_image_transaction_directory "$TRANSACTION_PREPARING_RETIRED" \
+      "$TRANSACTION_PREPARING_DELETION" \
+      LEGAL_MCP_IMAGE_GENERATION_PAIR_TRANSACTION_V1
+    echo 'interrupted pair transaction preparation retirement completed'
+    return 0
+  fi
+  for path in "$TRANSACTION_PREPARING" "$TRANSACTION_PREPARING_RETIRED" \
+    "$TRANSACTION" "$TRANSACTION_RETIRING" "$TRANSACTION_RETIRED"; do
+    image_path_is_absent "$path" || state_count=$((state_count + 1))
+  done
+  if ! image_path_is_absent "$TRANSACTION_DELETION"; then
+    if (( state_count > 1 )) \
+      || { (( state_count == 1 )) \
+        && image_path_is_absent "$TRANSACTION_RETIRED"; }; then
+      echo 'pair deletion marker conflicts with another transaction phase' >&2
+      return 1
+    fi
+    pair_delete_retired_transaction
+    echo 'interrupted pair transaction retirement completed'
+    return 0
+  fi
+  [[ $state_count -le 1 ]] || {
+    echo 'pair transaction has conflicting durable phases' >&2
+    return 1
+  }
+  if ! image_path_is_absent "$TRANSACTION_PREPARING" \
+    && ! image_path_is_absent "$TRANSACTION_PREPARING_RETIRED"; then
+    echo 'pair preparation has conflicting recovery states' >&2
+    return 1
+  fi
+  if ! image_path_is_absent "$TRANSACTION_RETIRING" \
+    && ! image_path_is_absent "$TRANSACTION_RETIRED"; then
+    echo 'pair retirement has conflicting recovery states' >&2
+    return 1
+  fi
+  if ! image_path_is_absent "$TRANSACTION_PREPARING"; then
+    pair_discard_preparation "$TRANSACTION_PREPARING"
+    echo 'interrupted pair transaction preparation discarded before host mutation'
+    return 0
+  fi
+  if ! image_path_is_absent "$TRANSACTION_PREPARING_RETIRED" \
+    || ! image_path_is_absent "$TRANSACTION_PREPARING_DELETION"; then
+    pair_force_preparation_dark
+    if image_path_is_absent "$TRANSACTION_PREPARING_DELETION"; then
+      pair_retired_payload_state "$TRANSACTION_PREPARING_RETIRED" >/dev/null
+    fi
+    delete_owned_image_transaction_directory "$TRANSACTION_PREPARING_RETIRED" \
+      "$TRANSACTION_PREPARING_DELETION" \
+      LEGAL_MCP_IMAGE_GENERATION_PAIR_TRANSACTION_V1
+    echo 'interrupted pair transaction preparation retirement completed'
+    return 0
+  fi
+  if ! image_path_is_absent "$TRANSACTION_RETIRING"; then
+    pair_complete_retiring_transaction
+    echo 'interrupted pair transaction retirement completed'
+    return 0
+  fi
+  if ! image_path_is_absent "$TRANSACTION_RETIRED"; then
+    payload_state="$(pair_retired_payload_state "$TRANSACTION_RETIRED")"
     if [[ "$payload_state" = complete ]]; then
       TRANSACTION="$TRANSACTION_RETIRED"
-      cutover_validate_transaction "$TRANSACTION"
-      choice="$CUTOVER_RETIREMENT_OUTCOME"
-      [[ "$choice" = saved || "$choice" = target ]]
-      if [[ "$choice" = saved ]]; then cutover_restore_upload_authorization; fi
-      ordinary_read_transaction_probe_key
-      cutover_verify_committed_pair "$choice"
+      pair_validate_transaction "$TRANSACTION"
+      TRANSACTION="$saved_transaction"
     fi
-    delete_retired_image_directory "$TRANSACTION_RETIRED"
-    TRANSACTION="$saved_transaction"
+    pair_complete_retired_transaction
+    echo 'interrupted pair transaction retirement completed'
     return 0
   fi
-  TRANSACTION="$directory"
-  cutover_validate_transaction "$TRANSACTION"
-  choice="$CUTOVER_RETIREMENT_OUTCOME"
-  [[ "$choice" = saved || "$choice" = target ]]
-  if [[ "$choice" = saved ]]; then cutover_restore_upload_authorization; fi
-  ordinary_read_transaction_probe_key
-  cutover_verify_committed_pair "$choice"
-  if [[ "$directory" = "$TRANSACTION_RETIRING" ]]; then
-    cutover_path_is_absent "$TRANSACTION_RETIRED"
-    mv -T "$TRANSACTION_RETIRING" "$TRANSACTION_RETIRED"
-    sync -f /etc/legal-mcp
-    TRANSACTION="$TRANSACTION_RETIRED"
-    cutover_validate_transaction "$TRANSACTION"
-    [[ "$CUTOVER_RETIREMENT_OUTCOME" = "$choice" ]]
-    cutover_verify_committed_pair "$choice"
+  if image_path_is_absent "$TRANSACTION"; then
+    if [[ "$PAIR_BUILD_WAS_PENDING" = true ]]; then
+      pair_force_preparation_dark
+      echo 'interrupted unpublished pair preparation discarded before host mutation'
+      return 0
+    fi
+    echo 'no pair transaction exists' >&2
+    return 1
   fi
-  delete_retired_image_directory "$TRANSACTION"
-  TRANSACTION="$saved_transaction"
+  bootstrap_require_regular "$TRANSACTION/kind" root root 600
+  [[ "$(<"$TRANSACTION/kind")" \
+    = LEGAL_MCP_IMAGE_GENERATION_PAIR_TRANSACTION_V1 ]] || {
+      echo 'pair recovery refuses a transaction owned by another image operation' >&2
+      return 1
+    }
+  pair_reconcile_live_file_preparations
+  pair_reconcile_field_preparations "$TRANSACTION"
+  pair_validate_transaction "$TRANSACTION"
+  pair_read_transaction_probe_key
+  case "$PAIR_RETIREMENT_OUTCOME" in
+    target)
+      pair_finish_target
+      echo 'interrupted pair transaction completed the committed target pair'
+      ;;
+    saved)
+      pair_restore_saved
+      echo 'interrupted pair transaction completed the committed saved pair'
+      ;;
+    pending)
+      pair_restore_saved
+      echo 'interrupted pair transaction rolled back the image and generation together'
+      ;;
+  esac
+  unset PROBE_API_KEY
 }
 
-cutover_recover_pending_state() {
-  local path outcome
-  if ! cutover_path_is_absent "$CUTOVER_TRANSACTION_PREPARING" \
-    && ! cutover_path_is_absent "$CUTOVER_TRANSACTION_PREPARING_RETIRED"; then
-    echo 'flat-int8 cutover preparation has conflicting recovery states' >&2
-    return 1
-  fi
-  if ! cutover_path_is_absent "$TRANSACTION_RETIRING" \
-    && ! cutover_path_is_absent "$TRANSACTION_RETIRED"; then
-    echo 'flat-int8 cutover retirement has conflicting recovery states' >&2
-    return 1
-  fi
-  if ! cutover_path_is_absent "$CUTOVER_TRANSACTION_PREPARING"; then
-    cutover_discard_incomplete_preparation "$CUTOVER_TRANSACTION_PREPARING"
-    cutover_verify_unchanged_configured_dark_baseline
-    echo 'interrupted flat-int8 cutover preparation discarded; prior pair remains configured-dark'
-    return 0
-  fi
-  if ! cutover_path_is_absent "$CUTOVER_TRANSACTION_PREPARING_RETIRED"; then
-    cutover_discard_incomplete_preparation "$CUTOVER_TRANSACTION_PREPARING_RETIRED"
-    cutover_verify_unchanged_configured_dark_baseline
-    echo 'interrupted flat-int8 cutover preparation retirement completed; prior pair remains configured-dark'
-    return 0
-  fi
-  if ! cutover_path_is_absent "$TRANSACTION_RETIRING"; then
-    cutover_complete_retirement "$TRANSACTION_RETIRING"
-    echo 'interrupted flat-int8 cutover commit retirement completed'
-    return 0
-  fi
-  if ! cutover_path_is_absent "$TRANSACTION_RETIRED"; then
-    cutover_complete_retirement "$TRANSACTION_RETIRED"
-    echo 'interrupted flat-int8 cutover commit retirement completed'
-    return 0
-  fi
-  path="$TRANSACTION"
-  cutover_path_is_absent "$path" && {
-    echo 'no flat-int8 cutover transaction exists' >&2
-    return 1
-  }
-  cutover_validate_transaction "$path"
-  outcome="$CUTOVER_RETIREMENT_OUTCOME"
-  ordinary_read_transaction_probe_key
-  if [[ "$outcome" = target ]]; then
-    cutover_finish_target_pair
-    echo 'interrupted flat-int8 cutover recovered the committed target pair'
-  else
-    cutover_restore_pair
-    echo 'interrupted flat-int8 cutover rolled back both generation and image/template'
-  fi
-}
-
-run_flat_int8_cutover() {
-  [[ "$CUTOVER_GENERATION" =~ ^[0-9a-f]{64}$ \
-    && "$CUTOVER_EXPECTED_CURRENT_GENERATION" =~ ^[0-9a-f]{64}$ \
-    && "$CUTOVER_GENERATION" != "$CUTOVER_EXPECTED_CURRENT_GENERATION" \
+run_pair_operation() {
+  [[ "$PAIR_GENERATION" =~ ^[0-9a-f]{64}$ \
+    && "$PAIR_EXPECTED_CURRENT_GENERATION" =~ ^[0-9a-f]{64}$ \
+    && "$PAIR_GENERATION" != "$PAIR_EXPECTED_CURRENT_GENERATION" \
     && "$NEW_IMAGE" =~ ^ghcr\.io/gunba/australian-legal-mcp@sha256:[0-9a-f]{64}$ \
     && "$EXPECTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ \
     && -n "$SOURCE_TEMPLATE" ]] || usage
-  cutover_require_no_foreign_transaction false
-  ordinary_load_release_bundle "$SOURCE_TEMPLATE" "$EXPECTED_VERSION"
-  cutover_capture_baseline
+  pair_require_no_foreign_transaction false
+  ordinary_load_release_bundle '' ''
+  pair_load_target_bundle "$SOURCE_TEMPLATE" "$EXPECTED_VERSION"
+  pair_capture_baseline
   podman pull "$NEW_IMAGE"
-  verify_image_runtime "$NEW_IMAGE" "$ORDINARY_VERSION" "$ORDINARY_REVISION"
-  cutover_require_flat_only_target
-  TARGET_IMAGE_ID="$(canonical_image_id \
+  verify_image_runtime "$NEW_IMAGE" "$PAIR_TARGET_VERSION" "$PAIR_TARGET_REVISION"
+  PAIR_TARGET_IMAGE_ID="$(canonical_image_id \
     "$(podman image inspect "$NEW_IMAGE" --format '{{.Id}}')")"
-  CUTOVER_TARGET_GENERATION="$CUTOVER_GENERATION"
-  CUTOVER_PRIOR_GENERATION="$CUTOVER_EXPECTED_CURRENT_GENERATION"
-  cutover_create_transaction
-  trap cutover_failure_rollback ERR HUP INT TERM EXIT
-  cutover_validate_transaction "$TRANSACTION"
-  cutover_force_dark
-  cutover_validate_recoverable_live_state
-  cutover_install_pair_files target
-  cutover_call_host_deploy cutover-activate >/dev/null
-  cutover_verify_offline_pair target
-  cutover_start_and_prove_pair target
-  cutover_write_outcome target
-  cutover_call_host_deploy cutover-commit >/dev/null
-  cutover_verify_committed_pair target
+  pair_require_incompatible_target
+  pair_create_transaction
+  trap pair_failure_recovery ERR HUP INT TERM EXIT
+  pair_write_phase darkening
+  pair_force_dark
+  pair_write_phase dark
+  pair_validate_recoverable_live_state
+  pair_write_phase sealing
+  pair_call_host_deploy pair-seal >/dev/null
+  candidate_manifest="$(pair_candidate_manifest)"
+  [[ "$(sha256sum "$candidate_manifest" | awk '{print $1}')" \
+    = "$PAIR_TARGET_MANIFEST_SHA256" ]]
+  pair_verify_generation_view "$PAIR_TARGET_IMAGE" "$PAIR_TARGET_GENERATION" \
+    "$(dirname "$candidate_manifest")"
+  pair_write_phase sealed
+  pair_finish_target
   trap - ERR HUP INT TERM EXIT
-  cutover_retire_transaction target
   unset PROBE_API_KEY
-  echo "flat-int8 cutover committed generation $CUTOVER_TARGET_GENERATION with $CUTOVER_TARGET_IMAGE"
+  echo "image/generation pair committed: $PAIR_TARGET_IMAGE $PAIR_TARGET_GENERATION; public ingress remains closed"
 }
 
-if [[ "$FLAT_INT8_CUTOVER" = false \
-  && -n "$CUTOVER_GENERATION$CUTOVER_EXPECTED_CURRENT_GENERATION" ]]; then
-  usage
-fi
-
-if [[ "$FLAT_INT8_CUTOVER" = true ]]; then
-  [[ "$BOOTSTRAP_EMPTY_HOST" = false ]] || usage
-  for command_name in awk blkid caddy cmp curl find findmnt flock getfacl grep \
-    install mktemp mv podman python3 readlink sha256sum ss stat sync systemctl \
+if [[ "$PAIR_CUTOVER" = true || "$PAIR_ROLLBACK" = true ]]; then
+  [[ "$BOOTSTRAP_EMPTY_HOST" = false \
+    && ! ( "$PAIR_CUTOVER" = true && "$PAIR_ROLLBACK" = true ) ]] || usage
+  for command_name in awk blkid caddy cmp curl find findmnt flock getfacl grep id \
+    install mktemp mv podman python3 readlink rmdir sha256sum ss stat sync systemctl \
     ufw visudo xfs_info; do
     command -v "$command_name" >/dev/null || {
-      echo "missing flat-int8 cutover dependency: $command_name" >&2
+      echo "missing image/generation pair dependency: $command_name" >&2
       exit 1
     }
   done
-  cutover_require_launcher_context
+  pair_discard_unpublished_build
+  require_known_image_transaction_states
+  pair_require_launcher_context
+  pair_require_fixed_host_identities
   if [[ "$RECOVER" = true ]]; then
-    [[ -z "$NEW_IMAGE$EXPECTED_VERSION$SOURCE_TEMPLATE$CUTOVER_GENERATION$CUTOVER_EXPECTED_CURRENT_GENERATION" ]] \
-      || usage
+    [[ "$PAIR_CUTOVER" = true && "$PAIR_ROLLBACK" = false \
+      && -z "$NEW_IMAGE$EXPECTED_VERSION$SOURCE_TEMPLATE$PAIR_GENERATION$PAIR_EXPECTED_CURRENT_GENERATION" \
+      && "$PAIR_FROM_PUBLIC" = false ]] || usage
     ordinary_load_release_bundle '' ''
-    cutover_require_no_foreign_transaction true
-    cutover_recover_pending_state
+    pair_require_no_foreign_transaction true
+    pair_recover_pending_state
   else
-    run_flat_int8_cutover
+    if [[ "$PAIR_CUTOVER" = true ]]; then
+      PAIR_OPERATION=prepared
+    else
+      PAIR_OPERATION=installed
+    fi
+    run_pair_operation
   fi
   exit 0
+fi
+
+if [[ -n "$PAIR_GENERATION$PAIR_EXPECTED_CURRENT_GENERATION" \
+  || "$PAIR_FROM_PUBLIC" = true ]]; then
+  usage
 fi
 
 if [[ "$BOOTSTRAP_EMPTY_HOST" = true ]]; then
@@ -3751,6 +4285,26 @@ if [[ "$BOOTSTRAP_EMPTY_HOST" = true ]]; then
       echo "missing empty-host image dependency: $command_name" >&2
       exit 1
     }
+  done
+  pair_discard_unpublished_build
+  require_known_image_transaction_states
+  image_path_is_absent "$TRANSACTION_PREPARING_DELETION" || {
+    validate_image_deletion_marker "$TRANSACTION_PREPARING_DELETION" \
+      LEGAL_MCP_BOOTSTRAP_IMAGE_TRANSACTION_V1
+  }
+  image_path_is_absent "$TRANSACTION_DELETION" || {
+    validate_image_deletion_marker "$TRANSACTION_DELETION" \
+      LEGAL_MCP_BOOTSTRAP_IMAGE_TRANSACTION_V1
+  }
+  for path in "$TRANSACTION_PREPARING" "$TRANSACTION_PREPARING_RETIRED" \
+    "$TRANSACTION" "$TRANSACTION_RETIRING" "$TRANSACTION_RETIRED"; do
+    if [[ -f "$path/kind" && ! -L "$path/kind" ]]; then
+      bootstrap_require_regular "$path/kind" root root 600
+      [[ "$(<"$path/kind")" = LEGAL_MCP_BOOTSTRAP_IMAGE_TRANSACTION_V1 ]] || {
+        echo 'empty-host recovery refuses an image transaction owned by another operation' >&2
+        exit 1
+      }
+    fi
   done
   finalize_image_transaction_retirement
   finalize_image_preparation_retirement
@@ -3794,6 +4348,8 @@ for command_name in awk caddy cmp curl find flock getfacl grep install mktemp mv
     exit 1
   }
 done
+pair_discard_unpublished_build
+require_known_image_transaction_states
 
 if [[ "$RECOVER" = true ]]; then
   [[ -z "$NEW_IMAGE$EXPECTED_VERSION$SOURCE_TEMPLATE" ]] || usage
@@ -3809,7 +4365,8 @@ fi
 ordinary_load_release_bundle "$SOURCE_TEMPLATE" "$EXPECTED_VERSION"
 ordinary_require_no_foreign_transaction
 for path in "$TRANSACTION_PREPARING" "$TRANSACTION_PREPARING_RETIRED" \
-  "$TRANSACTION" "$TRANSACTION_RETIRING" "$TRANSACTION_RETIRED"; do
+  "$TRANSACTION_PREPARING_DELETION" "$TRANSACTION" \
+  "$TRANSACTION_RETIRING" "$TRANSACTION_RETIRED" "$TRANSACTION_DELETION"; do
   image_path_is_absent "$path" || {
     echo 'an image transaction already exists; recover it with this exact release bundle first' >&2
     exit 1

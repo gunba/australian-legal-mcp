@@ -12,7 +12,7 @@ runtime never scrapes, embeds, builds, packages, or publishes corpus/model
 artifacts. GitHub Releases contain software binaries only. Flat-int8 v22 is
 active on the Linode with exact v0.19.11 host tools and runtime image. Caddy exposes
 only the authenticated public routes while port 51235 remains loopback-only;
-all recovery/cutover journals are retired. Private/public HarbourGrid,
+all deployment journals are retired. Private/public HarbourGrid,
 all-seven-tool/all-ten-source, capability, revocation, and reboot proofs passed.
 Current API-key IDs are `local-pi` and `work-laptop`; the prior
 `enterprise-laptop` key is revoked. The Linode hostname is temporary test DNS,
@@ -67,16 +67,13 @@ set and atomically exchange the whole set. Builds consume committed workspaces
 only and always create a fresh `legal.db` generation. Reuse vectors solely by
 exact model ID and chunk-text hash.
 
-Every generation binds SQLite, the pinned model/tokenizer, and one deterministic
-ANN sidecar per source. ANN finds candidates; SQLite int8 vectors provide exact
-authoritative reranking. Schema 11 uses contentless-delete `chunks_fts`, keeps
-authoritative text in `chunks`, and digest-binds FTS postings/BM25 metadata.
-
-The one supported schema migration is `derive-schema11-from-schema10`. It uses
-SQLite FTS tokenization over existing chunk text to rebuild only chunk FTS
-storage and creates a fresh validated generation. It performs no acquisition,
-OCR, rechunking, model tokenization, model execution, re-embedding, or ANN
-rebuild; model, tokenizer, and ANN artifacts remain identical.
+Every generation binds SQLite, the pinned model/tokenizer, one deterministic
+ANN sidecar per source, and one deterministic lexical SQLite sidecar per source.
+ANN finds candidates; SQLite int8 vectors provide exact authoritative
+reranking. Schema 12 keeps runtime FTS out of `legal.db`. Each source-only
+lexical sidecar contains compact filters/mappings and contentless chunk/title
+FTS only. Keyword and title FTS are strict-only, and final payloads hydrate from
+`legal.db`. There is no schema migration or compatibility command.
 
 ## Build and hosting workflow
 
@@ -88,21 +85,20 @@ scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
 
-Software is 0.19.11. Exact document-scoped FTS narrowing preserves wildcard
-and case-insensitive scope semantics. Chunker-format-6 flat-int8 v22
-`937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939` is active
-and strictly verified locally and on the Linode. Arroy v20
+Unreleased version 0.20.0 accepts schema 12 only and needs a fresh generation
+before activation. Exact document-scoped FTS narrowing preserves wildcard and
+case-insensitive scope semantics. The released v0.19.11 schema-11
+chunker-format-6 flat-int8 v22 generation
+`937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939` remains
+active on the Linode with its matching binary. Arroy v20
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` is the
 sole hosted rollback generation. Retain local v19 with its matching v0.18.1
 binary/image as the schema-10 disaster-recovery fallback; the schema-11 binary
 cannot roll back to schema 10.
 
 Immutable v0.19.11 release assets and OCI attestations were independently
-verified. Its exact host tools and digest-pinned image are live. The retained
-v0.19.10 bundle's one-time bridge retired the v0.19.8 transaction without
-changing the old bytes, and the corrected cutover retired its own journal. Live
-bounding, effective,
-inheritable, and permitted capability sets are empty. The prior `second-client`
+verified. Its exact host tools and digest-pinned image are live. Live bounding,
+effective, inheritable, and permitted capability sets are empty. The prior `second-client`
 and `enterprise-laptop` keys are revoked and must not be restored.
 
 The unpacked model is under `data/models/mdbr-leaf-ir-standard`. Maintainer

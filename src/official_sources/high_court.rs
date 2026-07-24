@@ -4,6 +4,13 @@ pub(super) static ADAPTER: HighCourt = HighCourt;
 pub(super) struct HighCourt;
 
 const HOST: &str = "www.hcourt.gov.au";
+const JUDGMENTS_INDEX_PATH: &str = "/cases-and-judgments/judgments";
+const JUDGMENT_CATEGORY_PATH_PREFIX: &str = "/cases-and-judgments/judgments/";
+const MAX_JUDGMENT_CATEGORY_CANDIDATES: usize = 64;
+const MAX_JUDGMENTS: usize = 100_000;
+// Official-only coverage follows the categories published by the Court. The
+// landing page currently leaves a reported-judgment gap from 1960 through 1997,
+// and describes its separate 1906-1994 unreported collection as incomplete.
 // The Court's per-judgment CLR scans can exceed 170 MiB.
 const MAX_HISTORICAL_JUDGMENT_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -24,6 +31,14 @@ impl OfficialAdapter for HighCourt {
         }
     }
 
+    fn normalization_revision(&self) -> Option<&'static str> {
+        Some("1")
+    }
+
+    fn minimum_snapshot_retention_percent(&self) -> usize {
+        99
+    }
+
     fn discover(
         &self,
         client: &OfficialHttpClient,
@@ -38,6 +53,7 @@ impl OfficialAdapter for HighCourt {
         entry: &DiscoveredDocument,
     ) -> Result<Option<AcquiredDocument>> {
         let landing = client.get(&entry.renditions[0].url, "text/html", MAX_DOCUMENT_BYTES)?;
+        validate_exact_hca_response_url(&entry.renditions[0].url, &landing.final_url)?;
         if landing.status == StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -73,6 +89,8 @@ impl OfficialAdapter for HighCourt {
                     drop_ids: &[],
                     drop_classes: &[],
                     heading_classes: &[],
+                    preserve_same_document_fragments: false,
+                    repair_broken_links: false,
                 },
             )?;
             let mut acquired = make_acquired_html(normalized, entry.canonical_url.clone());
@@ -124,6 +142,7 @@ impl OfficialAdapter for HighCourt {
                 "application/octet-stream",
                 MAX_HISTORICAL_JUDGMENT_BYTES,
             )?;
+            validate_exact_hca_response_url(&url, &payload.final_url)?;
             if !payload.status.is_success()
                 || payload
                     .bytes
@@ -158,6 +177,14 @@ impl OfficialAdapter for HighCourt {
         }
         Ok(None)
     }
+}
+
+fn validate_exact_hca_response_url(requested: &str, final_url: &Url) -> Result<()> {
+    let requested = Url::parse(requested).context("parsing requested High Court URL")?;
+    if final_url != &requested {
+        bail!("High Court response URL differs from the requested official resource");
+    }
+    Ok(())
 }
 
 fn normalize_hca_download(
@@ -198,76 +225,429 @@ fn discover_current_site(
     client: &OfficialHttpClient,
     concurrency: usize,
 ) -> Result<Vec<DiscoveredDocument>> {
-    let bases = [
-        format!("https://{HOST}/cases-and-judgments/judgments/judgments-1998-current"),
-        format!("https://{HOST}/cases-and-judgments/judgments/single-justice-judgments"),
-        format!("https://{HOST}/cases-and-judgments/judgments/1-clr-100-clr"),
-        format!("https://{HOST}/cases-and-judgments/judgments/unreported-judgments"),
-    ];
-    let first_pages = parallel_map(concurrency, bases.to_vec(), |base| {
-        let payload = client.get_required(&base, "text/html", MAX_INDEX_BYTES)?;
-        let html = decode_utf8(&payload.bytes)?;
-        let (total, last_page) = current_page_bounds(&html)?;
-        Ok((base, total, last_page, html))
-    })?;
-    let mut page_requests = Vec::new();
-    let mut documents = Vec::new();
-    let mut expected_total = 0usize;
-    for (base, total, last_page, first_html) in first_pages {
-        expected_total += total;
-        documents.extend(parse_current_page(&first_html)?);
-        for page in 1..=last_page {
-            page_requests.push(format!("{base}?page={page}"));
+    let index_url = judgments_index_url()?;
+    let payload = client.get_required(index_url.as_str(), "text/html", MAX_INDEX_BYTES)?;
+    validate_discovery_response_url(&index_url, &payload.final_url)?;
+    let index_html = decode_utf8(&payload.bytes)?;
+    discover_from_index(&index_html, concurrency, |url| {
+        let payload = client.get_required(url.as_str(), "text/html", MAX_INDEX_BYTES)?;
+        validate_discovery_response_url(url, &payload.final_url)?;
+        decode_utf8(&payload.bytes)
+    })
+}
+
+struct JudgmentCategory {
+    url: Url,
+    total: usize,
+    last_page: usize,
+    ranges: Vec<ResultRange>,
+    documents: Vec<DiscoveredDocument>,
+}
+
+enum CategoryPage {
+    JudgmentListing {
+        total: usize,
+        last_page: usize,
+        range: ResultRange,
+        documents: Vec<DiscoveredDocument>,
+    },
+    ResourceCollection,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResultRange {
+    first: usize,
+    last: usize,
+    total: usize,
+}
+
+impl ResultRange {
+    fn displayed(self) -> usize {
+        if self.total == 0 {
+            0
+        } else {
+            self.last - self.first + 1
         }
     }
-    let pages = parallel_map(concurrency, page_requests, |url| {
-        let payload = client.get_required(&url, "text/html", MAX_INDEX_BYTES)?;
-        parse_current_page(&decode_utf8(&payload.bytes)?)
+}
+
+fn discover_from_index<F>(
+    index_html: &str,
+    concurrency: usize,
+    fetch_html: F,
+) -> Result<Vec<DiscoveredDocument>>
+where
+    F: Fn(&Url) -> Result<String> + Send + Sync,
+{
+    let category_urls = parse_judgment_category_urls(index_html)?;
+    let first_pages = parallel_map(concurrency, category_urls, |url| {
+        let html =
+            fetch_html(&url).with_context(|| format!("fetching High Court category {url}"))?;
+        match classify_category_page(&html, &url)? {
+            CategoryPage::JudgmentListing {
+                total,
+                last_page,
+                range,
+                documents,
+            } => Ok(Some(JudgmentCategory {
+                url,
+                total,
+                last_page,
+                ranges: vec![range],
+                documents,
+            })),
+            CategoryPage::ResourceCollection => Ok(None),
+        }
     })?;
-    documents.extend(pages.into_iter().flatten());
+    let mut categories = first_pages.into_iter().flatten().collect::<Vec<_>>();
+    if categories.is_empty() {
+        bail!("High Court judgments index has no judgment categories");
+    }
+    let expected_total = categories.iter().try_fold(0usize, |total, category| {
+        total
+            .checked_add(category.total)
+            .filter(|total| *total <= MAX_JUDGMENTS)
+            .ok_or_else(|| anyhow!("High Court judgment inventory exceeds its discovery bound"))
+    })?;
+    let mut page_requests = Vec::new();
+    for (category_index, category) in categories.iter().enumerate() {
+        for page in 1..=category.last_page {
+            page_requests.push((
+                category_index,
+                category.total,
+                category_page_url(&category.url, page),
+            ));
+        }
+    }
+    let pages = parallel_map(
+        concurrency,
+        page_requests,
+        |(category_index, expected_total, url)| {
+            let html =
+                fetch_html(&url).with_context(|| format!("fetching High Court page {url}"))?;
+            match classify_category_page(&html, &url)? {
+                CategoryPage::JudgmentListing {
+                    total,
+                    range,
+                    documents,
+                    ..
+                } if total == expected_total => Ok((category_index, range, documents)),
+                CategoryPage::JudgmentListing { total, .. } => bail!(
+                    "High Court category page {url} changed its result total from {expected_total} to {total}"
+                ),
+                CategoryPage::ResourceCollection => {
+                    bail!("High Court judgment category page {url} became a different collection")
+                }
+            }
+        },
+    )?;
+    for (category_index, range, documents) in pages {
+        categories[category_index].ranges.push(range);
+        categories[category_index].documents.extend(documents);
+    }
+    let mut documents = Vec::with_capacity(expected_total);
+    for mut category in categories {
+        category.ranges.sort_by_key(|range| range.first);
+        let mut expected_first = if category.total == 0 { 0 } else { 1 };
+        for range in &category.ranges {
+            if range.first != expected_first || range.total != category.total {
+                bail!(
+                    "High Court category {} has an overlapping or incomplete result-range partition",
+                    category.url
+                );
+            }
+            expected_first = if category.total == 0 {
+                0
+            } else {
+                range
+                    .last
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("High Court result range overflow"))?
+            };
+        }
+        if (category.total == 0 && category.ranges.len() != 1)
+            || (category.total > 0 && expected_first != category.total + 1)
+        {
+            bail!(
+                "High Court category {} does not cover its complete result range",
+                category.url
+            );
+        }
+        if category.documents.len() != category.total {
+            bail!(
+                "High Court category {} expected {} judgments but parsed {}",
+                category.url,
+                category.total,
+                category.documents.len()
+            );
+        }
+        documents.extend(category.documents);
+    }
     if documents.len() != expected_total {
         bail!(
-            "current High Court discovery expected {expected_total} judgments but parsed {}",
+            "High Court discovery expected {expected_total} judgments but parsed {}",
             documents.len()
         );
     }
+    validate_judgment_inventory(&documents)?;
     Ok(documents)
 }
 
-fn current_page_bounds(html: &str) -> Result<(usize, usize)> {
-    let total = regex::Regex::new(r"Displaying\s+\d+\s+-\s+\d+\s+of\s+([\d,]+)\s+results")?
-        .captures(html)
-        .and_then(|captures| captures.get(1))
-        .map(|value| value.as_str().replace(',', ""))
-        .ok_or_else(|| anyhow!("current High Court index has no result total"))?
-        .parse::<usize>()?;
-    let parsed = Html::parse_document(html);
-    let selector = Selector::parse("a[href*='page=']")
-        .map_err(|_| anyhow!("invalid current High Court pager selector"))?;
-    let last_page = parsed
-        .select(&selector)
-        .filter_map(|element| element.value().attr("href"))
-        .filter_map(|href| Url::parse("https://example.invalid/").ok()?.join(href).ok())
-        .flat_map(|url| {
-            url.query_pairs()
-                .filter_map(|(key, value)| {
-                    (key == "page")
-                        .then(|| value.parse::<usize>().ok())
-                        .flatten()
-                })
-                .collect::<Vec<_>>()
-        })
-        .max()
-        .unwrap_or(0);
-    if total > 20_000 || last_page > 2_000 {
-        bail!("current High Court index exceeds its discovery bound");
-    }
-    Ok((total, last_page))
+fn judgments_index_url() -> Result<Url> {
+    Url::parse(&format!("https://{HOST}{JUDGMENTS_INDEX_PATH}")).map_err(Into::into)
 }
 
-fn parse_current_page(html: &str) -> Result<Vec<DiscoveredDocument>> {
+fn parse_judgment_category_urls(html: &str) -> Result<Vec<Url>> {
+    parse_judgment_category_urls_with_limit(html, MAX_JUDGMENT_CATEGORY_CANDIDATES)
+}
+
+fn parse_judgment_category_urls_with_limit(html: &str, maximum: usize) -> Result<Vec<Url>> {
     let parsed = Html::parse_document(html);
-    let row_selector = Selector::parse("a.views-row-item-judgement[href]")
+    let selector = Selector::parse("main a[href]")
+        .map_err(|_| anyhow!("invalid High Court category selector"))?;
+    let title_selector = Selector::parse("main .field--name-field-title a[href]")
+        .map_err(|_| anyhow!("invalid High Court category-title selector"))?;
+    let index_url = judgments_index_url()?;
+    let mut summary_collections = BTreeSet::new();
+    for element in parsed.select(&title_selector) {
+        let title = element
+            .text()
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        if !title.contains("summar") {
+            continue;
+        }
+        let Some(href) = element.value().attr("href") else {
+            continue;
+        };
+        let Ok(url) = index_url.join(href) else {
+            continue;
+        };
+        if is_allowed_category_url(&url) {
+            summary_collections.insert(url.to_string());
+        }
+    }
+    let mut categories = BTreeSet::new();
+    for element in parsed.select(&selector) {
+        let Some(href) = element.value().attr("href") else {
+            continue;
+        };
+        let Ok(url) = index_url.join(href) else {
+            continue;
+        };
+        if is_allowed_category_url(&url) && !summary_collections.contains(url.as_str()) {
+            categories.insert(url.to_string());
+            if categories.len() > maximum {
+                bail!("High Court judgments index exceeds its category bound");
+            }
+        }
+    }
+    if categories.is_empty() {
+        bail!("High Court judgments index has no allowlisted category links");
+    }
+    categories
+        .into_iter()
+        .map(|url| Url::parse(&url).map_err(Into::into))
+        .collect()
+}
+
+fn is_allowed_category_url(url: &Url) -> bool {
+    if url.scheme() != "https"
+        || url.host_str() != Some(HOST)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(slug) = url.path().strip_prefix(JUDGMENT_CATEGORY_PATH_PREFIX) else {
+        return false;
+    };
+    !slug.is_empty()
+        && !slug.contains('/')
+        && slug
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn validate_discovery_response_url(requested: &Url, final_url: &Url) -> Result<()> {
+    if final_url.scheme() != "https"
+        || final_url.host_str() != Some(HOST)
+        || !final_url.username().is_empty()
+        || final_url.password().is_some()
+        || final_url.port().is_some()
+        || final_url.path() != requested.path()
+        || final_url.query() != requested.query()
+        || final_url.fragment().is_some()
+    {
+        bail!("High Court discovery escaped its allowlisted host or path");
+    }
+    Ok(())
+}
+
+fn category_page_url(category: &Url, page: usize) -> Url {
+    let mut url = category.clone();
+    url.query_pairs_mut()
+        .clear()
+        .append_pair("page", &page.to_string());
+    url
+}
+
+fn classify_category_page(html: &str, category_url: &Url) -> Result<CategoryPage> {
+    let parsed = Html::parse_document(html);
+    let judgment_view_selector = Selector::parse("main .view.view-judgments")
+        .map_err(|_| anyhow!("invalid High Court judgment-view selector"))?;
+    let resource_view_selector = Selector::parse("main .view.view-resources-publications")
+        .map_err(|_| anyhow!("invalid High Court resource-view selector"))?;
+    let judgment_views = parsed.select(&judgment_view_selector).collect::<Vec<_>>();
+    let resource_views = parsed.select(&resource_view_selector).collect::<Vec<_>>();
+    if judgment_views.len() > 1 || resource_views.len() > 1 {
+        bail!("High Court category {category_url} has multiple official collection views");
+    }
+    if !judgment_views.is_empty() && !resource_views.is_empty() {
+        bail!("High Court category {category_url} mixes judgment and resource collections");
+    }
+
+    if let Some(view) = judgment_views.into_iter().next() {
+        let range = result_range(view, category_url)?;
+        if range.total == 0 {
+            bail!("High Court judgment category {category_url} reports no judgments");
+        }
+        if range.total > 20_000 {
+            bail!("current High Court index exceeds its discovery bound");
+        }
+        let documents = parse_current_page(html, category_url)?;
+        if documents.len() != range.displayed() {
+            bail!(
+                "High Court judgment listing {category_url} displays {} rows but parsed {} judgments",
+                range.displayed(),
+                documents.len()
+            );
+        }
+        let last_page = last_page(view, category_url)?;
+        if (range.total == 0 && last_page != 0) || (range.total > 0 && last_page >= range.total) {
+            bail!("High Court category {category_url} has an implausible pager range");
+        }
+        return Ok(CategoryPage::JudgmentListing {
+            total: range.total,
+            last_page,
+            range,
+            documents,
+        });
+    }
+
+    if let Some(view) = resource_views.into_iter().next() {
+        validate_resource_collection(view, category_url)?;
+        return Ok(CategoryPage::ResourceCollection);
+    }
+
+    bail!("High Court category {category_url} has an unrecognised official collection structure")
+}
+
+fn result_range(root: scraper::ElementRef<'_>, category_url: &Url) -> Result<ResultRange> {
+    let selector = Selector::parse(".view-summary, .view-header")
+        .map_err(|_| anyhow!("invalid High Court result-summary selector"))?;
+    let expression =
+        regex::Regex::new(r"^Displaying\s+([\d,]+)\s*-\s*([\d,]+)\s+of\s+([\d,]+)\s+results$")?;
+    let ranges = root
+        .select(&selector)
+        .filter_map(|element| {
+            let text = element
+                .text()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let captures = expression.captures(&text)?;
+            let parse = |index| {
+                captures
+                    .get(index)
+                    .map(|value| value.as_str().replace(',', ""))?
+                    .parse::<usize>()
+                    .ok()
+            };
+            Some((parse(1)?, parse(2)?, parse(3)?))
+        })
+        .collect::<BTreeSet<_>>();
+    if ranges.len() != 1 {
+        bail!("High Court category {category_url} has no unique result range");
+    }
+    let (first, last, total) = ranges
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("High Court result range disappeared"))?;
+    if (total == 0 && (first != 0 || last != 0))
+        || (total > 0 && (first == 0 || last < first || last > total))
+    {
+        bail!("High Court category {category_url} has an invalid result range");
+    }
+    Ok(ResultRange { first, last, total })
+}
+
+fn last_page(root: scraper::ElementRef<'_>, category_url: &Url) -> Result<usize> {
+    let selector = Selector::parse("a[href*='page=']")
+        .map_err(|_| anyhow!("invalid current High Court pager selector"))?;
+    let last_page = root
+        .select(&selector)
+        .filter_map(|element| element.value().attr("href"))
+        .filter_map(|href| pagination_page(category_url, href))
+        .max()
+        .unwrap_or(0);
+    if last_page > 2_000 {
+        bail!("current High Court index exceeds its discovery bound");
+    }
+    Ok(last_page)
+}
+
+fn validate_resource_collection(view: scraper::ElementRef<'_>, category_url: &Url) -> Result<()> {
+    let range = result_range(view, category_url)?;
+    if range.total > 20_000 {
+        bail!("High Court resource collection exceeds its discovery bound");
+    }
+    let item_selector = Selector::parse(".view-content .views-field-name")
+        .map_err(|_| anyhow!("invalid High Court resource-item selector"))?;
+    let link_selector = Selector::parse(".view-content .media-links a[href]")
+        .map_err(|_| anyhow!("invalid High Court resource-link selector"))?;
+    let empty_selector = Selector::parse(".view-empty")
+        .map_err(|_| anyhow!("invalid High Court empty-resource selector"))?;
+    let items = view.select(&item_selector).count();
+    let links = view.select(&link_selector).count();
+    if (range.total == 0 && view.select(&empty_selector).next().is_none())
+        || (range.total > 0 && (items != range.displayed() || links < items))
+    {
+        bail!("High Court category {category_url} has a malformed resource collection");
+    }
+    Ok(())
+}
+
+fn pagination_page(category_url: &Url, href: &str) -> Option<usize> {
+    let url = category_url.join(href).ok()?;
+    if url.scheme() != "https"
+        || url.host_str() != Some(HOST)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.path() != category_url.path()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let pairs = url.query_pairs().collect::<Vec<_>>();
+    if pairs.len() != 1 || pairs[0].0 != "page" {
+        return None;
+    }
+    pairs[0].1.parse().ok()
+}
+
+fn parse_current_page(html: &str, category_url: &Url) -> Result<Vec<DiscoveredDocument>> {
+    let parsed = Html::parse_document(html);
+    let row_selector = Selector::parse(".views-row-item-judgement")
         .map_err(|_| anyhow!("invalid current High Court row selector"))?;
     let title_selector = Selector::parse(".field--title")
         .map_err(|_| anyhow!("invalid current High Court title selector"))?;
@@ -277,13 +657,16 @@ fn parse_current_page(html: &str) -> Result<Vec<DiscoveredDocument>> {
         .map_err(|_| anyhow!("invalid current High Court date selector"))?;
     let mut documents = Vec::new();
     for row in parsed.select(&row_selector) {
+        if row.value().name() != "a" {
+            bail!("current High Court judgment row is not a link");
+        }
         let href = row
             .value()
             .attr("href")
             .ok_or_else(|| anyhow!("current High Court row has no href"))?;
-        let canonical_url = Url::parse(&format!("https://{HOST}"))?
-            .join(href)?
-            .to_string();
+        let canonical = category_url.join(href)?;
+        validate_judgment_url(category_url, &canonical)?;
+        let canonical_url = canonical.to_string();
         let encoded_title = row
             .select(&title_selector)
             .next()
@@ -352,24 +735,354 @@ fn parse_current_page(html: &str) -> Result<Vec<DiscoveredDocument>> {
     Ok(documents)
 }
 
+fn validate_judgment_url(category_url: &Url, judgment_url: &Url) -> Result<()> {
+    let expected_prefix = format!("{}/", category_url.path());
+    let Some(slug) = judgment_url.path().strip_prefix(&expected_prefix) else {
+        bail!("High Court judgment URL escaped its category path");
+    };
+    if judgment_url.scheme() != "https"
+        || judgment_url.host_str() != Some(HOST)
+        || !judgment_url.username().is_empty()
+        || judgment_url.password().is_some()
+        || judgment_url.port().is_some()
+        || judgment_url.query().is_some()
+        || judgment_url.fragment().is_some()
+        || slug.is_empty()
+        || slug.contains('/')
+        || !slug
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        bail!("High Court judgment URL is outside the allowlisted path shape");
+    }
+    Ok(())
+}
+
+fn validate_judgment_inventory(documents: &[DiscoveredDocument]) -> Result<()> {
+    if documents.is_empty() || documents.len() > MAX_JUDGMENTS {
+        bail!("High Court judgment inventory is empty or exceeds its bound");
+    }
+    let mut identities = BTreeSet::new();
+    for document in documents {
+        if !identities.insert(document.native_id.as_str()) {
+            bail!(
+                "High Court judgment inventory contains duplicate {}",
+                document.native_id
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const INDEX_FIXTURE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/high-court/judgments-index.html"
+    ));
+    const CURRENT_JUDGMENTS_FIXTURE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/high-court/judgments-1998-current.html"
+    ));
+    const SINGLE_JUSTICE_FIXTURE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/high-court/single-justice-judgments.html"
+    ));
+    const CLR_FIXTURE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/high-court/1-clr-100-clr.html"
+    ));
+    const UNREPORTED_FIXTURE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/high-court/unreported-judgments.html"
+    ));
+    const SUMMARIES_FIXTURE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/high-court/judgment-summaries.html"
+    ));
+    const EMPTY_JUDGMENTS_FIXTURE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/high-court/empty-judgment-listing.html"
+    ));
+    const MALFORMED_JUDGMENTS_FIXTURE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/high-court/malformed-judgment-listing.html"
+    ));
+
+    fn category_url(slug: &str) -> Result<Url> {
+        Url::parse(&format!(
+            "https://{HOST}{JUDGMENT_CATEGORY_PATH_PREFIX}{slug}"
+        ))
+        .map_err(Into::into)
+    }
+
+    #[test]
+    fn published_categories_are_dynamic_deduplicated_and_preserve_the_official_coverage_gap(
+    ) -> Result<()> {
+        let categories = parse_judgment_category_urls(INDEX_FIXTURE)?;
+        // The official landing shape has no reported collection for 1960-1997,
+        // and its published unreported category is explicitly incomplete.
+        assert_eq!(
+            categories.iter().map(|url| url.path()).collect::<Vec<_>>(),
+            vec![
+                "/cases-and-judgments/judgments/1-clr-100-clr",
+                "/cases-and-judgments/judgments/judgments-1998-current",
+                "/cases-and-judgments/judgments/single-justice-judgments",
+                "/cases-and-judgments/judgments/unreported-judgments",
+            ]
+        );
+        assert!(categories
+            .iter()
+            .all(|url| !url.path().contains("judgment-summaries")));
+
+        let neutral_title = INDEX_FIXTURE.replace(
+            "</main>",
+            r#"<div class="field--name-field-title"><a href="/cases-and-judgments/judgments/decisions-archive">Decisions archive</a></div></main>"#,
+        );
+        assert!(parse_judgment_category_urls(&neutral_title)?
+            .iter()
+            .any(|url| url.path().ends_with("/decisions-archive")));
+
+        assert!(parse_judgment_category_urls_with_limit(INDEX_FIXTURE, 3).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_discovery_traverses_every_published_judgment_category_once() -> Result<()> {
+        let visits = std::sync::Mutex::new(BTreeMap::<String, usize>::new());
+        let documents = discover_from_index(INDEX_FIXTURE, 2, |url| {
+            *visits
+                .lock()
+                .map_err(|_| anyhow!("fixture visit lock is poisoned"))?
+                .entry(url.path().to_owned())
+                .or_default() += 1;
+            match url.path() {
+                "/cases-and-judgments/judgments/judgments-1998-current" => {
+                    Ok(CURRENT_JUDGMENTS_FIXTURE.to_owned())
+                }
+                "/cases-and-judgments/judgments/single-justice-judgments" => {
+                    Ok(SINGLE_JUSTICE_FIXTURE.to_owned())
+                }
+                "/cases-and-judgments/judgments/1-clr-100-clr" => Ok(CLR_FIXTURE.to_owned()),
+                "/cases-and-judgments/judgments/unreported-judgments" => {
+                    Ok(UNREPORTED_FIXTURE.to_owned())
+                }
+                path => bail!("unexpected fixture category {path}"),
+            }
+        })?;
+        let identities = documents
+            .iter()
+            .map(|document| document.native_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            identities,
+            BTreeSet::from([
+                "[1903] HCA 1",
+                "[2026] HCA 22",
+                "[2026] HCASJ 21",
+                "unreported/robert-clive-fordham-and-state-victoria-v-gareth-evans",
+            ])
+        );
+        assert_eq!(
+            visits.into_inner().expect("fixture visit lock is healthy"),
+            BTreeMap::from([
+                ("/cases-and-judgments/judgments/1-clr-100-clr".to_owned(), 1,),
+                (
+                    "/cases-and-judgments/judgments/judgments-1998-current".to_owned(),
+                    1,
+                ),
+                (
+                    "/cases-and-judgments/judgments/single-justice-judgments".to_owned(),
+                    1,
+                ),
+                (
+                    "/cases-and-judgments/judgments/unreported-judgments".to_owned(),
+                    1,
+                ),
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn category_structure_distinguishes_other_collections_and_fails_closed() -> Result<()> {
+        let category = category_url("judgments-1998-current")?;
+        assert!(matches!(
+            classify_category_page(SUMMARIES_FIXTURE, &category)?,
+            CategoryPage::ResourceCollection
+        ));
+        assert!(classify_category_page(EMPTY_JUDGMENTS_FIXTURE, &category).is_err());
+
+        let index = r#"<main><div class="field--name-field-title"><a href="/cases-and-judgments/judgments/judgments-1998-current">Judgments</a></div></main>"#;
+        let error = discover_from_index(index, 1, |_| Ok(MALFORMED_JUDGMENTS_FIXTURE.to_owned()))
+            .expect_err("a non-empty malformed judgment listing must fail discovery");
+        assert!(error.to_string().contains("displays 1 rows but parsed 0"));
+
+        let changed_row_class =
+            CURRENT_JUDGMENTS_FIXTURE.replace("views-row-item-judgement", "judgment-row");
+        assert!(classify_category_page(&changed_row_class, &category).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_accessible_result_summaries_must_agree() -> Result<()> {
+        let category = category_url("judgments-1998-current")?;
+        let html = r#"
+            <main><div class="view view-judgments">
+              <div class="view-summary">Displaying 1 - 12 of 1,658 results</div>
+              <div class="view-header"><span>Displaying 1 - 12 of 1,658 results</span></div>
+            </div></main>
+        "#;
+        let parsed = Html::parse_document(html);
+        let selector = Selector::parse("main .view.view-judgments")
+            .map_err(|_| anyhow!("invalid test selector"))?;
+        let range = result_range(
+            parsed
+                .select(&selector)
+                .next()
+                .ok_or_else(|| anyhow!("missing test judgment view"))?,
+            &category,
+        )?;
+        assert_eq!((range.first, range.last, range.total), (1, 12, 1_658));
+
+        let conflicting = html.replace(
+            "<span>Displaying 1 - 12 of 1,658 results</span>",
+            "<span>Displaying 1 - 12 of 1,659 results</span>",
+        );
+        let parsed = Html::parse_document(&conflicting);
+        let error = result_range(
+            parsed
+                .select(&selector)
+                .next()
+                .ok_or_else(|| anyhow!("missing conflicting test judgment view"))?,
+            &category,
+        )
+        .expect_err("conflicting result summaries must fail closed");
+        assert!(error.to_string().contains("no unique result range"));
+        Ok(())
+    }
+
+    #[test]
+    fn judgment_inventory_rejects_duplicates_and_inexact_category_totals() -> Result<()> {
+        let mut duplicated = parse_current_page(
+            CURRENT_JUDGMENTS_FIXTURE,
+            &category_url("judgments-1998-current")?,
+        )?;
+        duplicated.extend(parse_current_page(
+            SINGLE_JUSTICE_FIXTURE,
+            &category_url("single-justice-judgments")?,
+        )?);
+        duplicated.push(duplicated[0].clone());
+        let error =
+            validate_judgment_inventory(&duplicated).expect_err("duplicate identity must fail");
+        assert!(error.to_string().contains("duplicate [2026] HCA 22"));
+
+        let index = r#"<main><div class="field--name-field-title"><a href="/cases-and-judgments/judgments/judgments-1998-current">Judgments</a></div></main>"#;
+        let malformed_total = CURRENT_JUDGMENTS_FIXTURE.replace("of 1 results", "of 2 results");
+        let error = discover_from_index(index, 1, |_| Ok(malformed_total.clone()))
+            .expect_err("category inventory total must be exact");
+        assert!(error
+            .to_string()
+            .contains("does not cover its complete result range"));
+
+        let first_page = CURRENT_JUDGMENTS_FIXTURE
+            .replace(
+                "Displaying 1 - 1 of 1 results",
+                "Displaying 1 - 1 of 2 results",
+            )
+            .replace(
+                "      </div>\n    </main>",
+                "        <a href=\"?page=1\">Last page</a>\n      </div>\n    </main>",
+            );
+        let second_page = first_page
+            .replace(
+                "chaplin-v-secretary-department-social-services",
+                "second-v-commonwealth",
+            )
+            .replace(
+                "Chaplin v Secretary, Department of Social Services",
+                "Second v Commonwealth",
+            )
+            .replace("[2026] HCA 22", "[2026] HCA 23");
+        let error = discover_from_index(index, 1, |url| {
+            if url
+                .query_pairs()
+                .any(|(name, value)| name == "page" && value == "1")
+            {
+                Ok(second_page.clone())
+            } else {
+                Ok(first_page.clone())
+            }
+        })
+        .expect_err("overlapping category ranges must fail closed");
+        assert!(error
+            .to_string()
+            .contains("overlapping or incomplete result-range partition"));
+        Ok(())
+    }
+
+    #[test]
+    fn judgment_and_pagination_links_cannot_escape_the_category_path() -> Result<()> {
+        let category = category_url("judgments-1998-current")?;
+        assert_eq!(pagination_page(&category, "?page=7"), Some(7));
+        assert_eq!(
+            pagination_page(
+                &category,
+                "https://www.hcourt.gov.au/cases-and-judgments/judgments/single-justice-judgments?page=7"
+            ),
+            None
+        );
+        assert_eq!(
+            pagination_page(&category, "https://evil.example/?page=7"),
+            None
+        );
+        assert_eq!(pagination_page(&category, "?page=7&sort=title"), None);
+
+        let escaped = CURRENT_JUDGMENTS_FIXTURE.replace(
+            "/cases-and-judgments/judgments/judgments-1998-current/chaplin-v-secretary-department-social-services",
+            "/cases-and-judgments/judgments/single-justice-judgments/chaplin-v-secretary-department-social-services",
+        );
+        assert!(parse_current_page(&escaped, &category).is_err());
+
+        let redirected = Url::parse(
+            "https://www.hcourt.gov.au/cases-and-judgments/judgments/single-justice-judgments",
+        )?;
+        assert!(validate_discovery_response_url(&category, &redirected).is_err());
+        let narrowed = Url::parse(&format!("{category}?year=2026"))?;
+        assert!(validate_discovery_response_url(&category, &narrowed).is_err());
+        assert!(validate_exact_hca_response_url(category.as_str(), &redirected).is_err());
+        Ok(())
+    }
+
     #[test]
     fn current_hca_listing_uses_neutral_citation_identity() -> Result<()> {
         let html = r#"
-            <div class="view-header">Displaying 1 - 1 of 13 results</div>
-            <a class="views-row-item views-row-item-judgement"
-               href="/cases-and-judgments/judgments/judgments-1998-current/example">
-              <div class="field--title">Example v Commonwealth</div>
-              <div class="field--citation"><strong>Citation:</strong> [2026] HCA 1</div>
-              <div class="field--hca-date-issued"><strong>Date:</strong> 1 Jan 2026</div>
-            </a>
-            <a href="?page=1">Last page</a>
+            <main><div class="view view-judgments">
+              <div class="view-summary">Displaying 1 - 1 of 13 results</div>
+              <div class="view-content">
+                <a class="views-row-item views-row-item-judgement"
+                   href="/cases-and-judgments/judgments/judgments-1998-current/example">
+                  <div class="field--title">Example v Commonwealth</div>
+                  <div class="field--citation"><strong>Citation:</strong> [2026] HCA 1</div>
+                  <div class="field--hca-date-issued"><strong>Date:</strong> 1 Jan 2026</div>
+                </a>
+              </div>
+              <a href="?page=1">Last page</a>
+            </div></main>
         "#;
-        assert_eq!(current_page_bounds(html)?, (13, 1));
-        let documents = parse_current_page(html)?;
+        let category = category_url("judgments-1998-current")?;
+        let CategoryPage::JudgmentListing {
+            total,
+            last_page,
+            documents,
+            ..
+        } = classify_category_page(html, &category)?
+        else {
+            bail!("judgment fixture was misclassified as a resource collection")
+        };
+        assert_eq!((total, last_page), (13, 1));
         assert_eq!(documents.len(), 1);
         assert_eq!(documents[0].native_id, "[2026] HCA 1");
         assert_eq!(documents[0].date.as_deref(), Some("2026-01-01"));
@@ -388,7 +1101,7 @@ mod tests {
               <div class="field field--hca-date-issued"><strong>Date:</strong> 11 Nov 1903</div>
             </a>
         "#;
-        let documents = parse_current_page(html)?;
+        let documents = parse_current_page(html, &category_url("1-clr-100-clr")?)?;
         assert_eq!(documents[0].native_id, "[1903] HCA 1");
         assert_eq!(documents[0].citation.as_deref(), Some("[1903] HCA 1"));
         assert_eq!(documents[0].title, "Dalgarno & Hannah [1903] HCA 1");
@@ -406,7 +1119,7 @@ mod tests {
               <div class="field field--hca-date-issued"><strong>Date:</strong> 19 Apr 1993</div>
             </a>
         "#;
-        let documents = parse_current_page(html)?;
+        let documents = parse_current_page(html, &category_url("unreported-judgments")?)?;
         assert_eq!(documents[0].native_id, "unreported/jones-v-cusack");
         assert_eq!(documents[0].citation.as_deref(), Some("1/1923"));
         Ok(())

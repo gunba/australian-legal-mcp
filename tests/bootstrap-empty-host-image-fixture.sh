@@ -17,7 +17,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
   exit 2
 }
 
-version=0.19.11
+version=0.20.0
 revision=1111111111111111111111111111111111111111
 old_revision=2222222222222222222222222222222222222222
 old_digest="ghcr.io/gunba/australian-legal-mcp@sha256:$(printf 'a%.0s' {1..64})"
@@ -75,7 +75,7 @@ case "$1" in
     if [[ -e /tmp/wrong-release-binary ]]; then
       printf '%s\n' 'legal-mcp 9.9.9'
     else
-      printf '%s\n' 'legal-mcp 0.19.11'
+      printf '%s\n' 'legal-mcp 0.20.0'
     fi
     ;;
   verify-runtime)
@@ -532,7 +532,7 @@ case "\$1" in
           if [[ -e /tmp/wrong-oci-description ]]; then printf '%s\n' Wrong; else printf '%s\n' 'Source-grounded Australian legal MCP server'; fi
         elif [[ "\$format" == *'.version'* ]]; then
           if [[ "\$image" = "\$new_image" ]]; then
-            if [[ -e /tmp/wrong-oci-version ]]; then printf '%s\n' 9.9.9; else printf '%s\n' 0.19.11; fi
+            if [[ -e /tmp/wrong-oci-version ]]; then printf '%s\n' 9.9.9; else printf '%s\n' 0.20.0; fi
           else
             printf '%s\n' 0.18.1
           fi
@@ -573,7 +573,7 @@ case "\$1" in
     done
     case "\$command" in
       --version)
-        if [[ -e /tmp/wrong-oci-binary ]]; then printf '%s\n' 'legal-mcp 9.9.9'; else printf '%s\n' 'legal-mcp 0.19.11'; fi
+        if [[ -e /tmp/wrong-oci-binary ]]; then printf '%s\n' 'legal-mcp 9.9.9'; else printf '%s\n' 'legal-mcp 0.20.0'; fi
         ;;
       verify-runtime) printf '%s\n' '{"onnx_runtime_ready":true}' ;;
       '')
@@ -1161,7 +1161,7 @@ if runuser -u legal-mcp-publisher -- \
   echo 'bootstrap image transaction unexpectedly allowed rsync' >&2
   exit 1
 fi
-grep -Fq 'a foreign host transaction must be recovered' /tmp/foreign.stderr
+grep -Fq 'an image transaction must be recovered' /tmp/foreign.stderr
 [[ -z "$(/usr/bin/find.fixture-real /srv/legal-mcp/generations \
   /srv/legal-mcp/uploads /srv/legal-mcp/state -mindepth 1 -maxdepth 1 \
   -printf x -quit)" ]]
@@ -1204,7 +1204,7 @@ fi
 [[ -d "$transaction" && ! -e /tmp/service-active && ! -e /tmp/caddy-active ]]
 
 # A successful cutover pins only software/template state. Corpus, auth, service,
-# Caddy, and ingress remain exactly empty/disabled for the schema-11 upload.
+# Caddy, and ingress remain exactly empty/disabled for the first corpus upload.
 reset_baseline
 output="$(run_update)"
 [[ "$output" = "empty bootstrap host pinned to $new_digest; service and ingress remain off" ]]

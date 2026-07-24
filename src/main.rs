@@ -32,16 +32,16 @@ mod config;
 mod db;
 mod extract;
 mod frl;
-mod generation_projection;
 mod html;
 mod http_auth;
-mod legacy_arroy;
 mod legal_source;
+mod lexical;
 mod official_sources;
 mod pipeline;
 mod retrieval;
 mod rules;
 mod search;
+mod search_timing;
 mod semantic;
 mod source;
 mod source_catalog;
@@ -58,7 +58,8 @@ use retrieval::{
     fetch, get_asset, get_chunks, get_definition, get_doc_anchors, pit_to_date, GetChunksOptions,
     GetDefinitionOptions,
 };
-use search::{search, search_cli, SearchOptions};
+use search::{search_cli, search_with_request_timing, SearchOptions};
+use search_timing::{SearchRequestTiming, SearchTimings};
 #[cfg(test)]
 use semantic::dot_i8_scalar_reference;
 #[cfg(test)]
@@ -67,7 +68,7 @@ use semantic::{SemanticEncodeStats, SemanticModelPaths, SemanticRuntime};
 use source::{
     activate_local_generation, deactivate_generation, link_download, prune_inactive_generations,
     rollback_generation, scrape_diff, snapshot_reduce, stats, tree_crawl, verify_active_generation,
-    verify_active_generation_quick, GenerationId, LinkDownloadArgs, ModelInfo,
+    verify_active_generation_startup, LinkDownloadArgs, ModelInfo,
 };
 use source_update::{run_source_updates, SourceUpdateMode, SourceUpdateRequest};
 
@@ -102,7 +103,7 @@ pub(crate) const ORDINARY_DICTIONARY_PATH_ENV: &str = "LEGAL_MCP_DICTIONARY_PATH
 /// Single corpus version this binary supports. Stamped into both
 /// `meta.schema_version` in SQLite and `schema_version` in generation.json
 /// move together. Bump on any breaking local generation layout change.
-pub(crate) const SUPPORTED_SCHEMA_VERSION: u32 = 11;
+pub(crate) const SUPPORTED_SCHEMA_VERSION: u32 = 12;
 pub(crate) const EMBEDDING_MODEL_ID: &str = "mdbr-leaf-ir-tensorrt-fp16-256d";
 
 /// Compile-time switch: corpus build and runtime semantic search use the
@@ -278,8 +279,8 @@ enum Command {
     },
     /// Print index version, counts, and search-policy status (JSON).
     Stats {},
-    /// Fail unless every source, model file, and ANN sidecar in the active
-    /// generation is ready for production search.
+    /// Fail unless every source, model file, ANN sidecar, and lexical sidecar
+    /// in the active generation is ready for production search.
     Verify {
         /// Emit only the active generation and corpus totals after full verification.
         #[arg(long)]
@@ -326,7 +327,8 @@ enum Command {
     Fetch { uri: String },
     /// In-binary build orchestrator. Reads one committed workspace for every
     /// registered source, normalizes and embeds the authoritative snapshots,
-    /// then writes the unified database, source ANN sidecars, and manifest.
+    /// then writes the unified database, source ANN and lexical sidecars, and
+    /// manifest.
     /// Source refresh and corpus build are separate commands, so a validated
     /// source workspace can feed repeated builds or release dry runs.
     Build {
@@ -343,7 +345,7 @@ enum Command {
         #[arg(long)]
         embedding_cache_db: Option<PathBuf>,
         /// Fresh output directory for generation.json, legal.db, model files,
-        /// and source ANN sidecars.
+        /// and source ANN and lexical sidecars.
         #[arg(long)]
         out_dir: PathBuf,
         #[arg(long, default_value_t = 3)]
@@ -351,34 +353,6 @@ enum Command {
         /// Print cumulative build-stage timings to stderr.
         #[arg(long)]
         profile: bool,
-    },
-    /// Derive a fresh schema-11 candidate from one exact immutable schema-10
-    /// generation without acquisition, chunking, model execution, embedding,
-    /// or ANN reconstruction. The source generation is never modified.
-    DeriveSchema11FromSchema10 {
-        /// Exact installed schema-10 generation directory.
-        #[arg(long)]
-        source_generation_dir: PathBuf,
-        /// Required typed generation ID derived from the source generation.json.
-        #[arg(long)]
-        expected_source_generation: GenerationId,
-        /// Nonexistent same-filesystem directory for the complete candidate.
-        #[arg(long)]
-        out_dir: PathBuf,
-    },
-    /// Derive one fresh flat-int8 schema-11 generation from an exact immutable
-    /// schema-11 Arroy-v20 generation. Sidecars are rebuilt directly from the
-    /// stored SQLite int8 vectors; no model is loaded or executed.
-    DeriveFlatInt8FromSchema11ArroyV20 {
-        /// Exact installed schema-11 Arroy-v20 generation directory.
-        #[arg(long)]
-        source_generation_dir: PathBuf,
-        /// Required typed generation ID derived from the source generation.json.
-        #[arg(long)]
-        expected_source_generation: GenerationId,
-        /// Nonexistent same-filesystem directory for the complete candidate.
-        #[arg(long)]
-        out_dir: PathBuf,
     },
     /// Refresh one or more source workspaces in parallel. Adapters own their
     /// incremental and full discovery strategies, pacing, and concurrency.
@@ -535,7 +509,15 @@ fn main() -> Result<()> {
                 bail!("container network scope requires --require-http-auth");
             }
             let choice = config::resolve_serve_port(port)?;
-            let (cached_instructions, corpus_ready) = server_instructions();
+            let required_generation = if require_ready_corpus {
+                Some(config::active_generation_key()?.ok_or_else(|| {
+                    anyhow!("--require-ready-corpus refuses to start without an active generation")
+                })?)
+            } else {
+                None
+            };
+            let (cached_instructions, corpus_ready) =
+                server_instructions(require_ready_corpus, required_generation.as_deref())?;
             if require_ready_corpus && !corpus_ready {
                 bail!("--require-ready-corpus refuses to start without a ready generation");
             }
@@ -556,10 +538,21 @@ fn main() -> Result<()> {
                 allow_non_loopback_peers: network_scope == HttpNetworkScope::Container,
                 ..Default::default()
             };
+            if require_ready_corpus
+                && state.corpus_generation.as_deref() != required_generation.as_deref()
+            {
+                bail!("active generation changed after strict startup validation");
+            }
             let model_ready = if corpus_ready {
+                if require_ready_corpus {
+                    state.ensure_corpus_generation_unchanged()?;
+                }
                 state
                     .encode_query_embedding("Australian legal service readiness")
                     .context("loading and executing the active semantic model before serving")?;
+                if require_ready_corpus {
+                    state.ensure_corpus_generation_unchanged()?;
+                }
                 true
             } else {
                 false
@@ -628,6 +621,7 @@ fn main() -> Result<()> {
                         "chunk_embeddings": value["chunk_embeddings"],
                         "definitions": value["definitions"],
                         "semantic_search_ready": value["semantic_search_ready"],
+                        "lexical_search_ready": value["lexical_search_ready"],
                     }))?
                 );
             } else {
@@ -780,36 +774,6 @@ fn main() -> Result<()> {
                 profile_enabled: profile,
             })
         }
-        Command::DeriveSchema11FromSchema10 {
-            source_generation_dir,
-            expected_source_generation,
-            out_dir,
-        } => {
-            let report = generation_projection::derive_schema11_from_schema10(
-                generation_projection::DeriveSchema11Args {
-                    source_generation_dir: &source_generation_dir,
-                    expected_source_generation: &expected_source_generation,
-                    out_dir: &out_dir,
-                },
-            )?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
-            Ok(())
-        }
-        Command::DeriveFlatInt8FromSchema11ArroyV20 {
-            source_generation_dir,
-            expected_source_generation,
-            out_dir,
-        } => {
-            let report = generation_projection::derive_flat_int8_from_schema11_arroy_v20(
-                generation_projection::DeriveFlatInt8Args {
-                    source_generation_dir: &source_generation_dir,
-                    expected_source_generation: &expected_source_generation,
-                    out_dir: &out_dir,
-                },
-            )?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
-            Ok(())
-        }
         Command::SourceUpdate {
             workspaces,
             run_dir,
@@ -881,6 +845,7 @@ struct ServerState {
     semantic_tokenizer: OnceLock<BertWordPieceTokenizer>,
     semantic_model_paths: Option<SemanticModelPaths>,
     corpus_generation: Option<String>,
+    live_db_seal: Option<crate::db::LiveDbSeal>,
     // Rendered once at server start so MCP initialize is a cheap field read
     // instead of re-running stats() (~5-10s on a cold 4 GB corpus) per call.
     // The corpus is immutable for the server lifetime. Local activation takes
@@ -899,6 +864,7 @@ impl ServerState {
             semantic_tokenizer: OnceLock::new(),
             semantic_model_paths: None,
             corpus_generation: config::active_generation_key().ok().flatten(),
+            live_db_seal: crate::db::LiveDbSeal::capture().ok(),
             cached_instructions: String::new(),
             ready: AtomicBool::new(false),
             request_sequence: AtomicU64::new(0),
@@ -913,6 +879,7 @@ impl ServerState {
             semantic_tokenizer: OnceLock::new(),
             semantic_model_paths: Some(semantic_model_paths),
             corpus_generation: config::active_generation_key().ok().flatten(),
+            live_db_seal: crate::db::LiveDbSeal::capture().ok(),
             cached_instructions: String::new(),
             ready: AtomicBool::new(false),
             request_sequence: AtomicU64::new(0),
@@ -934,6 +901,12 @@ impl ServerState {
             bail!(
                 "the installed corpus changed after this process started; restart the australian-legal-mcp backend"
             );
+        }
+        if self.corpus_generation.is_some() {
+            self.live_db_seal
+                .as_ref()
+                .ok_or_else(|| anyhow!("the active legal database was not sealed at startup"))?
+                .verify()?;
         }
         Ok(())
     }
@@ -994,7 +967,7 @@ impl ServerState {
         let mut guard = self
             .semantic_runtime
             .lock()
-            .expect("semantic_runtime mutex");
+            .map_err(|_| anyhow!("semantic runtime lock is poisoned"))?;
         if guard.is_none() {
             // ServerState lazily loads SemanticRuntime on the first
             // semantic query and reuses it for the process lifetime.
@@ -1017,7 +990,7 @@ impl ServerState {
         let mut guard = self
             .semantic_runtime
             .lock()
-            .expect("semantic_runtime mutex");
+            .map_err(|_| anyhow!("semantic runtime lock is poisoned"))?;
         if guard.is_none() {
             let model_paths = match &self.semantic_model_paths {
                 Some(paths) => paths.clone(),
@@ -1046,7 +1019,7 @@ impl ServerState {
         let mut guard = self
             .semantic_runtime
             .lock()
-            .expect("semantic_runtime mutex");
+            .map_err(|_| anyhow!("semantic runtime lock is poisoned"))?;
         if guard.is_none() {
             let model_paths = match &self.semantic_model_paths {
                 Some(paths) => paths.clone(),
@@ -1185,13 +1158,22 @@ fn healthcheck(port: u16) -> Result<()> {
     Ok(())
 }
 
-fn execute_http_request(request: tiny_http::Request, state: &ServerState, queued_at: Instant) {
-    let request_id = state.request_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+fn next_request_id(state: &ServerState) -> u64 {
+    state.request_sequence.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+fn execute_http_request(
+    request: tiny_http::Request,
+    state: &ServerState,
+    admitted_at: Instant,
+    request_id: u64,
+) {
+    let worker_started_at = Instant::now();
+    let request_timing = SearchRequestTiming::new(request_id, admitted_at, worker_started_at);
     let method = format!("{:?}", request.method());
     let path = request.url().split('?').next().unwrap_or("/").to_string();
-    let queue_ms = queued_at.elapsed().as_millis();
-    let started = Instant::now();
-    let outcome = handle_http(request, state, request_id);
+    let queue_ms = request_timing.queue_duration().as_millis();
+    let outcome = handle_http(request, state, request_timing);
     eprintln!(
         "{}",
         json!({
@@ -1200,7 +1182,7 @@ fn execute_http_request(request: tiny_http::Request, state: &ServerState, queued
             "method": method,
             "path": path,
             "queue_ms": queue_ms,
-            "duration_ms": started.elapsed().as_millis(),
+            "duration_ms": worker_started_at.elapsed().as_millis(),
             "outcome": if outcome.is_ok() { "ok" } else { "handler-error" },
         })
     );
@@ -1259,7 +1241,8 @@ fn serve(
 
     let workers = configured_http_workers()?;
     let queue_capacity = workers.saturating_mul(HTTP_QUEUE_PER_WORKER);
-    let (sender, receiver) = mpsc::sync_channel::<(tiny_http::Request, Instant)>(queue_capacity);
+    let (sender, receiver) =
+        mpsc::sync_channel::<(tiny_http::Request, Instant, u64)>(queue_capacity);
     let receiver = Arc::new(Mutex::new(receiver));
     let (worker_done_sender, worker_done_receiver) = mpsc::channel();
     for worker in 0..workers {
@@ -1274,10 +1257,10 @@ fn serve(
                         let receiver = receiver.lock().unwrap_or_else(|err| err.into_inner());
                         receiver.recv()
                     };
-                    let Ok((request, queued_at)) = queued else {
+                    let Ok((request, admitted_at, request_id)) = queued else {
                         break;
                     };
-                    execute_http_request(request, &state, queued_at);
+                    execute_http_request(request, &state, admitted_at, request_id);
                 }
                 let _ = worker_done_sender.send(());
             })
@@ -1289,13 +1272,17 @@ fn serve(
         let Some(request) = server.recv_timeout(Duration::from_millis(250))? else {
             continue;
         };
+        let admitted_at = Instant::now();
+        let request_id = next_request_id(&state);
         if matches!(request.url(), "/livez" | "/readyz") {
-            execute_http_request(request, &state, Instant::now());
+            execute_http_request(request, &state, admitted_at, request_id);
             continue;
         }
-        match sender.try_send((request, Instant::now())) {
+        match sender.try_send((request, admitted_at, request_id)) {
             Ok(()) => {}
-            Err(mpsc::TrySendError::Full((request, _))) => {
+            Err(mpsc::TrySendError::Full((request, admitted_at, request_id))) => {
+                let method = format!("{:?}", request.method());
+                let path = request.url().split('?').next().unwrap_or("/").to_string();
                 let response = tiny_http::Response::from_string(
                     r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"server busy"}}"#,
                 )
@@ -1303,6 +1290,18 @@ fn serve(
                 .with_header(json_content_type())
                 .with_header(
                     tiny_http::Header::from_bytes(&b"Retry-After"[..], &b"1"[..]).unwrap(),
+                );
+                eprintln!(
+                    "{}",
+                    json!({
+                        "event": "http-request",
+                        "request_id": request_id,
+                        "method": method,
+                        "path": path,
+                        "queue_ms": admitted_at.elapsed().as_millis(),
+                        "duration_ms": admitted_at.elapsed().as_millis(),
+                        "outcome": "queue-full",
+                    })
                 );
                 let _ = request.respond(response);
             }
@@ -1638,9 +1637,11 @@ fn accepts_streamable_http(request: &tiny_http::Request) -> Result<bool> {
 fn handle_http(
     mut request: tiny_http::Request,
     state: &ServerState,
-    request_id: u64,
+    request_timing: SearchRequestTiming,
 ) -> Result<()> {
     use tiny_http::{Header, Method, Response};
+
+    let request_id = request_timing.request_id();
 
     if !state.allow_non_loopback_peers
         && request
@@ -1856,14 +1857,10 @@ fn handle_http(
             } else if is_json_rpc_response(&message) {
                 None
             } else {
-                handle_rpc(message, state)
+                handle_rpc(message, state, Some(request_timing))
             }
         }
-        Err(err) => Some(json_rpc_error(
-            JsonValue::Null,
-            -32700,
-            &format!("parse error: {err}"),
-        )),
+        Err(_) => Some(json_rpc_error(JsonValue::Null, -32700, "parse error")),
     };
 
     // Streamable HTTP acknowledges accepted notifications with 202.
@@ -1897,7 +1894,11 @@ fn is_json_rpc_response(message: &JsonValue) -> bool {
     valid_id && result != error
 }
 
-fn handle_rpc(message: JsonValue, state: &ServerState) -> Option<JsonValue> {
+fn handle_rpc(
+    message: JsonValue,
+    state: &ServerState,
+    request_timing: Option<SearchRequestTiming>,
+) -> Option<JsonValue> {
     if message.is_array() {
         return Some(json_rpc_error(
             JsonValue::Null,
@@ -1905,10 +1906,14 @@ fn handle_rpc(message: JsonValue, state: &ServerState) -> Option<JsonValue> {
             "JSON-RPC batching is not supported by MCP 2025-06-18",
         ));
     }
-    handle_single_rpc(message, state)
+    handle_single_rpc(message, state, request_timing)
 }
 
-fn handle_single_rpc(message: JsonValue, state: &ServerState) -> Option<JsonValue> {
+fn handle_single_rpc(
+    message: JsonValue,
+    state: &ServerState,
+    request_timing: Option<SearchRequestTiming>,
+) -> Option<JsonValue> {
     let Some(object) = message.as_object() else {
         return Some(json_rpc_error(JsonValue::Null, -32600, "invalid request"));
     };
@@ -1946,13 +1951,29 @@ fn handle_single_rpc(message: JsonValue, state: &ServerState) -> Option<JsonValu
         "tools/call" => {
             let params = object.get("params").cloned().unwrap_or_else(|| json!({}));
             match validate_tool_call(&params) {
-                Ok(()) => Ok(call_tool(params, state).unwrap_or_else(|err| {
-                    json!({
-                        "content": [{ "type": "text", "text": err.to_string() }],
-                        "isError": true
-                    })
-                })),
-                Err(err) => Err((-32602, err.to_string())),
+                Ok(()) => {
+                    let tool = params
+                        .as_object()
+                        .and_then(|params| params.get("name"))
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("unknown")
+                        .to_owned();
+                    Ok(call_tool(params, state, request_timing)
+                        .unwrap_or_else(|error| private_tool_error(&tool, request_timing, &error)))
+                }
+                Err(err) => {
+                    if params
+                        .as_object()
+                        .and_then(|params| params.get("name"))
+                        .and_then(JsonValue::as_str)
+                        == Some("search")
+                    {
+                        if let Some(record) = SearchTimings::rejected_validation(request_timing) {
+                            eprintln!("{record}");
+                        }
+                    }
+                    Err((-32602, err.to_string()))
+                }
             }
         }
         _ => Err((-32601, format!("method not found: {method}"))),
@@ -1963,6 +1984,26 @@ fn handle_single_rpc(message: JsonValue, state: &ServerState) -> Option<JsonValu
     Some(match result {
         Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
         Err((code, message)) => json_rpc_error(id, code, &message),
+    })
+}
+
+fn private_tool_error(
+    tool: &str,
+    request_timing: Option<SearchRequestTiming>,
+    _error: &anyhow::Error,
+) -> JsonValue {
+    eprintln!(
+        "{}",
+        json!({
+            "event": "tool-error",
+            "request_id": request_timing.map(SearchRequestTiming::request_id),
+            "tool": tool,
+            "category": "execution_failed",
+        })
+    );
+    json!({
+        "content": [{ "type": "text", "text": "tool request failed" }],
+        "isError": true
     })
 }
 
@@ -2260,9 +2301,23 @@ fn validate_tool_call(params: &JsonValue) -> Result<()> {
     Ok(())
 }
 
-fn call_tool(params: JsonValue, state: &ServerState) -> Result<JsonValue> {
-    let _corpus_lock = config::corpus_read_lock()?;
-    state.ensure_corpus_generation_unchanged()?;
+fn call_tool(
+    params: JsonValue,
+    state: &ServerState,
+    request_timing: Option<SearchRequestTiming>,
+) -> Result<JsonValue> {
+    let search_mode = search_mode_for_timing(&params);
+    let _corpus_lock = match config::corpus_read_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            emit_failed_search_preflight(request_timing, search_mode);
+            return Err(error);
+        }
+    };
+    if let Err(error) = state.ensure_corpus_generation_unchanged() {
+        emit_failed_search_preflight(request_timing, search_mode);
+        return Err(error);
+    }
     let name = params
         .get("name")
         .and_then(|v| v.as_str())
@@ -2271,6 +2326,13 @@ fn call_tool(params: JsonValue, state: &ServerState) -> Result<JsonValue> {
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    if name == "search" {
+        let text = call_search_tool(&args, state, request_timing)?;
+        return Ok(json!({
+            "content": [{ "type": "text", "text": text }],
+            "isError": false,
+        }));
+    }
     if name == "get_asset" {
         let asset = parse_asset(
             args.get("asset")
@@ -2281,57 +2343,6 @@ fn call_tool(params: JsonValue, state: &ServerState) -> Result<JsonValue> {
         return Ok(json!({ "content": content, "isError": false }));
     }
     let text = match name {
-        "search" => {
-            let query = required_str(&args, "query")?;
-            let types = optional_string_array(&args, "types")?;
-            let resolved_source = parse_source(
-                args.get("source")
-                    .ok_or_else(|| anyhow!("missing required string argument `source`"))?,
-                "source",
-            )?;
-            let similar_to_chunk = args
-                .get("similar_to_chunk")
-                .map(|value| parse_chunk(value, "similar_to_chunk"))
-                .transpose()?;
-            let mode = match args
-                .get("mode")
-                .and_then(|v| v.as_str())
-                .unwrap_or("hybrid")
-            {
-                "hybrid" => SearchMode::Hybrid,
-                "vector" => SearchMode::Vector,
-                "keyword" => SearchMode::Keyword,
-                other => bail!("mode must be one of hybrid, vector, keyword; got `{other}`"),
-            };
-            let sort_by = match args
-                .get("sort_by")
-                .and_then(|v| v.as_str())
-                .unwrap_or("relevance")
-            {
-                "recency" => SortBy::Recency,
-                _ => SortBy::Relevance,
-            };
-            search(
-                query,
-                SearchOptions {
-                    source: resolved_source,
-                    k: optional_usize(&args, "k").unwrap_or(DEFAULT_K),
-                    types: types.as_deref(),
-                    date_from: args.get("date_from").and_then(|v| v.as_str()),
-                    date_to: args.get("date_to").and_then(|v| v.as_str()),
-                    doc_scope: args.get("doc_scope").and_then(|v| v.as_str()),
-                    mode,
-                    sort_by,
-                    include_old: optional_bool(&args, "include_old").unwrap_or(false),
-                    current_only: optional_bool(&args, "current_only").unwrap_or(true),
-                    max_per_doc: DEFAULT_MAX_PER_DOC,
-                    include_snippet: optional_bool(&args, "include_snippet").unwrap_or(true),
-                    similar_to_chunk,
-                    seed_text: args.get("seed_text").and_then(|v| v.as_str()),
-                },
-                Some(state),
-            )?
-        }
         "get_doc_anchors" => {
             let document = parse_document(
                 args.get("document")
@@ -2387,6 +2398,99 @@ fn call_tool(params: JsonValue, state: &ServerState) -> Result<JsonValue> {
     }))
 }
 
+fn search_mode_for_timing(params: &JsonValue) -> Option<SearchMode> {
+    (params.get("name").and_then(JsonValue::as_str) == Some("search")).then(|| {
+        let args = params.get("arguments");
+        let seed_search = args.and_then(|args| args.get("similar_to_chunk")).is_some()
+            || args
+                .and_then(|args| args.get("seed_text"))
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .is_some_and(|seed| !seed.is_empty());
+        if seed_search {
+            SearchMode::Vector
+        } else {
+            match args
+                .and_then(|args| args.get("mode"))
+                .and_then(JsonValue::as_str)
+            {
+                Some("vector") => SearchMode::Vector,
+                Some("keyword") => SearchMode::Keyword,
+                _ => SearchMode::Hybrid,
+            }
+        }
+    })
+}
+
+fn emit_failed_search_preflight(
+    request_timing: Option<SearchRequestTiming>,
+    search_mode: Option<SearchMode>,
+) {
+    let Some(search_mode) = search_mode else {
+        return;
+    };
+    if let Some(record) = SearchTimings::new(request_timing, search_mode).finish(false) {
+        eprintln!("{record}");
+    }
+}
+
+fn call_search_tool(
+    args: &JsonValue,
+    state: &ServerState,
+    request_timing: Option<SearchRequestTiming>,
+) -> Result<String> {
+    let query = required_str(args, "query")?;
+    let types = optional_string_array(args, "types")?;
+    let resolved_source = parse_source(
+        args.get("source")
+            .ok_or_else(|| anyhow!("missing required string argument `source`"))?,
+        "source",
+    )?;
+    let similar_to_chunk = args
+        .get("similar_to_chunk")
+        .map(|value| parse_chunk(value, "similar_to_chunk"))
+        .transpose()?;
+    let mode = match args
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("hybrid")
+    {
+        "hybrid" => SearchMode::Hybrid,
+        "vector" => SearchMode::Vector,
+        "keyword" => SearchMode::Keyword,
+        other => bail!("mode must be one of hybrid, vector, keyword; got `{other}`"),
+    };
+    let sort_by = match args
+        .get("sort_by")
+        .and_then(|v| v.as_str())
+        .unwrap_or("relevance")
+    {
+        "recency" => SortBy::Recency,
+        _ => SortBy::Relevance,
+    };
+    search_with_request_timing(
+        query,
+        SearchOptions {
+            source: resolved_source,
+            k: optional_usize(args, "k").unwrap_or(DEFAULT_K),
+            types: types.as_deref(),
+            date_from: args.get("date_from").and_then(|v| v.as_str()),
+            date_to: args.get("date_to").and_then(|v| v.as_str()),
+            doc_scope: args.get("doc_scope").and_then(|v| v.as_str()),
+            mode,
+            sort_by,
+            include_old: optional_bool(args, "include_old").unwrap_or(false),
+            current_only: optional_bool(args, "current_only").unwrap_or(true),
+            max_per_doc: DEFAULT_MAX_PER_DOC,
+            include_snippet: optional_bool(args, "include_snippet").unwrap_or(true),
+            similar_to_chunk,
+            seed_text: args.get("seed_text").and_then(|v| v.as_str()),
+        },
+        Some(state),
+        request_timing,
+    )
+}
+
 pub(crate) fn required_str<'a>(args: &'a JsonValue, name: &str) -> Result<&'a str> {
     args.get(name)
         .and_then(|v| v.as_str())
@@ -2422,27 +2526,48 @@ pub(crate) fn optional_string_array(args: &JsonValue, name: &str) -> Result<Opti
     Ok(Some(out))
 }
 
-const LEGAL_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first; hits carry typed `document` and generation-bound `chunk` identities accepted directly by follow-up tools. Call `get_chunks` for text and `get_doc_anchors` for navigation. `[doc:X]` and `[asset:X]` markers use canonical source-qualified public references; `[fetch:X]` uses a canonical `legal://` URI. For historical/withdrawn material set `current_only=false` and `include_old=true`."##;
+const LEGAL_MCP_USE_INSTRUCTIONS: &str = r##"Use `search` first; hits carry typed `document` and generation-bound `chunk` identities accepted directly by follow-up tools. Call `get_chunks` for text and `get_doc_anchors` for navigation. `[doc:X]` and `[asset:X]` markers use canonical source-qualified public references; `[fetch:X]` uses a canonical `legal://` URI. For historical, withdrawn, or superseded material set `current_only=false` and `include_old=true`."##;
 
 // Server instructions are built dynamically at start time from corpus
 // stats so the agent sees up-to-date corpus shape without restart-time config.
 // If stats cannot be read, tell the operator to activate a locally built
 // generation; the runtime never downloads corpus artifacts.
-fn server_instructions() -> (String, bool) {
-    match verify_active_generation_quick()
-        .ok()
-        .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
-    {
-        Some(s) if s["semantic_search_ready"].as_bool() == Some(true) => (format!(
-            "Australian legal corpus. Documents: {}, chunks: {}. Index: {}. Searches exclude withdrawn material by default. ATO searches additionally exclude EV edited private advice and pre-{} non-legislation; override with current_only=false and include_old=true.\n\n{}",
-            s["documents"].as_i64().unwrap_or(0),
-            s["chunks"].as_i64().unwrap_or(0),
-            s["index_version"].as_str().unwrap_or("?"),
-            OLD_CONTENT_CUTOFF,
-            LEGAL_MCP_USE_INSTRUCTIONS,
-        ), true),
+fn server_instructions(
+    require_ready_corpus: bool,
+    expected_generation: Option<&str>,
+) -> Result<(String, bool)> {
+    let active = match expected_generation {
+        Some(generation) => Some(generation.to_owned()),
+        None => config::active_generation_key()?,
+    };
+    let report = match active {
+        Some(generation) if require_ready_corpus => Some(
+            verify_active_generation_startup(&generation)
+                .context("--require-ready-corpus strict generation validation failed")?,
+        ),
+        Some(generation) => verify_active_generation_startup(&generation).ok(),
+        None => None,
+    };
+    Ok(render_server_instructions(report.as_deref()))
+}
+
+fn render_server_instructions(report: Option<&str>) -> (String, bool) {
+    match report.and_then(|value| serde_json::from_str::<JsonValue>(value).ok()) {
+        Some(s)
+            if s["semantic_search_ready"].as_bool() == Some(true)
+                && s["lexical_search_ready"].as_bool() == Some(true) =>
+        {
+            (format!(
+                "Australian legal corpus. Documents: {}, chunks: {}. Index: {}. Searches exclude withdrawn and superseded material by default. ATO searches additionally exclude EV edited private advice and pre-{} non-legislation; override with current_only=false and include_old=true.\n\n{}",
+                s["documents"].as_i64().unwrap_or(0),
+                s["chunks"].as_i64().unwrap_or(0),
+                s["index_version"].as_str().unwrap_or("?"),
+                OLD_CONTENT_CUTOFF,
+                LEGAL_MCP_USE_INSTRUCTIONS,
+            ), true)
+        }
         Some(_) => (format!(
-            "The active local corpus generation failed semantic readiness checks. The host operator must run `legal-mcp verify`, repair or roll back the immutable generation, and restart this service.\n\n{}",
+            "The active local corpus generation failed search readiness checks. The host operator must run `legal-mcp verify`, repair or roll back the immutable generation, and restart this service.\n\n{}",
             LEGAL_MCP_USE_INSTRUCTIONS
         ), false),
         None => (format!(
@@ -2628,7 +2753,7 @@ mod tests {
     use chrono::Utc;
     use rusqlite::types::Value;
     use rusqlite::Connection;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeSet, HashMap, HashSet};
     use tempfile::tempdir;
 
     const TEST_SOURCE_ID: &str = "ato";
@@ -2639,8 +2764,48 @@ mod tests {
         TEST_SOURCE_ID.parse().expect("valid test source")
     }
 
+    #[test]
+    fn operational_tool_errors_have_a_fixed_public_response() -> Result<()> {
+        let error = anyhow!(
+            "MODEL_SENTINEL CANDIDATE_SENTINEL SCORE_SENTINEL /private/path CHUNK_ID_SENTINEL"
+        );
+        let response = private_tool_error("search", None, &error);
+        assert_eq!(response["isError"], true);
+        assert_eq!(response["content"][0]["text"], "tool request failed");
+        let response = serde_json::to_string(&response)?;
+        for private in [
+            "MODEL_SENTINEL",
+            "CANDIDATE_SENTINEL",
+            "SCORE_SENTINEL",
+            "/private/path",
+            "CHUNK_ID_SENTINEL",
+        ] {
+            assert!(!response.contains(private));
+        }
+        Ok(())
+    }
+
     fn test_doc_filter(source_id: &SourceId, include_old: bool, current_only: bool) -> SqlFilter {
         build_doc_filter(
+            "d",
+            DocumentFilterSpec {
+                source_id,
+                types: None,
+                date_from: None,
+                date_to: None,
+                doc_scope: None,
+                include_old,
+                current_only,
+            },
+        )
+    }
+
+    fn test_lexical_filter(
+        source_id: &SourceId,
+        include_old: bool,
+        current_only: bool,
+    ) -> SqlFilter {
+        build_lexical_doc_filter(
             "d",
             DocumentFilterSpec {
                 source_id,
@@ -2704,88 +2869,6 @@ mod tests {
         assert!(!full);
         assert!("ato".parse::<SourceWorkspaceArg>().is_err());
         assert!("ato=".parse::<SourceWorkspaceArg>().is_err());
-    }
-
-    #[test]
-    fn schema_projection_cli_requires_a_typed_legacy_generation() {
-        let generation = "a".repeat(64);
-        let cli = Cli::try_parse_from([
-            "legal-mcp",
-            "derive-schema11-from-schema10",
-            "--source-generation-dir",
-            "/data/runtime/generations/legacy",
-            "--expected-source-generation",
-            &generation,
-            "--out-dir",
-            "/data/builds/schema11",
-        ])
-        .expect("valid projection arguments");
-        let Command::DeriveSchema11FromSchema10 {
-            source_generation_dir,
-            expected_source_generation,
-            out_dir,
-        } = cli.command
-        else {
-            panic!("expected schema projection command");
-        };
-        assert_eq!(
-            source_generation_dir,
-            PathBuf::from("/data/runtime/generations/legacy")
-        );
-        assert_eq!(expected_source_generation.as_str(), generation);
-        assert_eq!(out_dir, PathBuf::from("/data/builds/schema11"));
-        assert!(Cli::try_parse_from([
-            "legal-mcp",
-            "derive-schema11-from-schema10",
-            "--source-generation-dir",
-            "/data/runtime/generations/legacy",
-            "--expected-source-generation",
-            "ABC",
-            "--out-dir",
-            "/data/builds/schema11",
-        ])
-        .is_err());
-    }
-
-    #[test]
-    fn flat_derivation_cli_requires_a_typed_arroy_v20_generation() {
-        let generation = "b".repeat(64);
-        let cli = Cli::try_parse_from([
-            "legal-mcp",
-            "derive-flat-int8-from-schema11-arroy-v20",
-            "--source-generation-dir",
-            "/data/runtime/generations/v20",
-            "--expected-source-generation",
-            &generation,
-            "--out-dir",
-            "/data/builds/flat-v21",
-        ])
-        .expect("valid flat derivation arguments");
-        let Command::DeriveFlatInt8FromSchema11ArroyV20 {
-            source_generation_dir,
-            expected_source_generation,
-            out_dir,
-        } = cli.command
-        else {
-            panic!("expected flat derivation command");
-        };
-        assert_eq!(
-            source_generation_dir,
-            PathBuf::from("/data/runtime/generations/v20")
-        );
-        assert_eq!(expected_source_generation.as_str(), generation);
-        assert_eq!(out_dir, PathBuf::from("/data/builds/flat-v21"));
-        assert!(Cli::try_parse_from([
-            "legal-mcp",
-            "derive-flat-int8-from-schema11-arroy-v20",
-            "--source-generation-dir",
-            "/data/runtime/generations/v20",
-            "--expected-source-generation",
-            "v20",
-            "--out-dir",
-            "/data/builds/flat-v21",
-        ])
-        .is_err());
     }
 
     // ----- W1.1 SIMD parity -----
@@ -2873,6 +2956,7 @@ mod tests {
         CandidateMeta {
             document: DocumentId::new(TEST_SOURCE_ID.parse().expect("valid test source"), doc_id)
                 .expect("valid test document"),
+            date: None,
             is_intro,
         }
     }
@@ -3037,8 +3121,80 @@ mod tests {
         Ok(())
     }
 
+    fn install_test_lexical_generation(
+        generation_root: &Path,
+        db: &Path,
+        sources: &[SourceId],
+    ) -> Result<()> {
+        let conn = open_write_at(db)?;
+        for source in sources {
+            let digest = format!("{:x}", sha2::Sha256::digest(source.as_str().as_bytes()));
+            let documents: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM documents WHERE source_id=?1",
+                [source.as_str()],
+                |row| row.get(0),
+            )?;
+            let chunks: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM chunks WHERE source_id=?1",
+                [source.as_str()],
+                |row| row.get(0),
+            )?;
+            set_source_meta(&conn, source.as_str(), "source_index_sha256", &digest)?;
+            set_source_meta(
+                &conn,
+                source.as_str(),
+                "corpus_id",
+                &format!("sha256:{digest}"),
+            )?;
+            set_source_meta(
+                &conn,
+                source.as_str(),
+                "documents_count",
+                &documents.to_string(),
+            )?;
+            set_source_meta(&conn, source.as_str(), "chunks_count", &chunks.to_string())?;
+        }
+        drop(conn);
+
+        let db_sha256 = crate::build::sha256_file(db)?;
+        let legal = Connection::open_with_flags(
+            db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let mut built = std::collections::BTreeMap::new();
+        for source in sources {
+            built.insert(
+                source.clone(),
+                crate::lexical::build_sidecar(&legal, source, generation_root, &db_sha256)?,
+            );
+        }
+        drop(legal);
+
+        let mut manifest = sample_manifest(SUPPORTED_SCHEMA_VERSION, env!("CARGO_PKG_VERSION"));
+        manifest.db.sha256 = db_sha256;
+        manifest.db.size = fs::metadata(db)?.len();
+        for (source, lexical) in built {
+            let ann = manifest
+                .ann
+                .get_mut(&source)
+                .expect("sample manifest contains every source");
+            ann.corpus_id = lexical.corpus_id.clone();
+            ann.vector_count = lexical.chunk_count;
+            ann.first_chunk_id = lexical.first_chunk_id;
+            ann.last_chunk_id = lexical.last_chunk_id;
+            ann.size = crate::ann::expected_sidecar_size(ann.vector_count)?;
+            manifest.lexical.insert(source, lexical);
+        }
+        validate_manifest(&manifest)?;
+        fs::write(
+            generation_root.join(config::GENERATION_MANIFEST_FILENAME),
+            serde_json::to_vec_pretty(&manifest)?,
+        )?;
+        Ok(())
+    }
+
     #[test]
-    fn stats_omits_flat_prefix_breakdowns_and_exposes_types_and_policy() -> Result<()> {
+    fn public_stats_contract_is_compact_and_preserves_types_and_policy() -> Result<()> {
         let _lock = lock_test_db();
         let (dir, db) = make_test_db()?;
         let conn = open_write_at(&db)?;
@@ -3091,6 +3247,69 @@ mod tests {
 
         with_data_dir(dir.path(), || -> Result<()> {
             let payload: JsonValue = serde_json::from_str(&stats()?)?;
+            let top_level_keys = payload
+                .as_object()
+                .expect("stats payload is an object")
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                top_level_keys,
+                BTreeSet::from([
+                    "active_generation",
+                    "chunk_embeddings",
+                    "chunks",
+                    "default_search_mode",
+                    "default_search_policy",
+                    "definitions",
+                    "documents",
+                    "index_version",
+                    "lexical_search_ready",
+                    "search_modes",
+                    "semantic_search_ready",
+                    "source_stats",
+                    "sources",
+                ])
+            );
+            let ato_keys = payload["source_stats"]["ato"]
+                .as_object()
+                .expect("ATO source stats are an object")
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                ato_keys,
+                BTreeSet::from([
+                    "chunk_embeddings",
+                    "chunks",
+                    "definitions",
+                    "display_name",
+                    "documents",
+                    "lexical_search_ready",
+                    "prefix_breakdown",
+                    "semantic_search_ready",
+                    "source_id",
+                    "types",
+                ])
+            );
+            let public_wire = serde_json::to_string(&payload)?;
+            for forbidden_key in [
+                "ann",
+                "corpus_id",
+                "data_dir",
+                "embedding_model_id",
+                "last_update_at",
+                "lexical",
+                "metric",
+                "path",
+                "sha256",
+                "tokenizer",
+            ] {
+                assert!(
+                    !public_wire.contains(&format!("\"{forbidden_key}\"")),
+                    "public stats exposed internal key `{forbidden_key}`: {public_wire}"
+                );
+            }
             assert_eq!(
                 payload["source_stats"]["ato"]["types"],
                 json!({"EV": 1, "PAC": 3})
@@ -3147,7 +3366,7 @@ mod tests {
             Some("PAC/19970038/203-55")
         );
 
-        let chunks = chunk_html(&rewritten, Some("Example"), EMBED_MAX_TOKENS);
+        let chunks = chunk_html(&rewritten, Some("Example"), EMBED_MAX_TOKENS).unwrap();
         assert!(chunks
             .iter()
             .any(|chunk| chunk.text.contains("[doc:ato:PAC/19970038/203-55]")));
@@ -3189,10 +3408,29 @@ mod tests {
             format!("{:x}", Sha256::digest(final_html.as_bytes())),
             "d35a6cb8d7df1f4cb8bed9a700dc4cdf7ccc78cf9763dc240b6404443faba0cf"
         );
-        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.len(), 4);
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.anchor.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("H1"), Some("H6"), Some("H8"), None]
+        );
+        assert!(chunks[0].text.starts_with(
+            "# Class Ruling\n\n## CR 2025/13\n\n### Just Eggs Pty Limited - employee share scheme - reducing the minimum holding period\n\n- Please note"
+        ));
+        assert!(chunks[1]
+            .text
+            .starts_with("### Ruling\n\n6. The Commissioner"));
+        assert!(chunks[2]
+            .text
+            .starts_with("### Scheme\n\n8. The following description"));
+        assert!(chunks[3]
+            .text
+            .starts_with("### References\n\n**ATO references:**"));
         assert_eq!(
             format!("{:x}", Sha256::digest(chunk_projection.as_bytes())),
-            "d1332bde3d401fabb500ff799409e1054a854dbcf3957d63ae41ae4e0990152b"
+            "57f8267b55886a150952fd737394927f1776b122abe91c7af15cceb8a40908e1"
         );
         assert_eq!(anchors.len(), 9);
         assert_eq!(
@@ -3374,7 +3612,7 @@ mod tests {
     #[test]
     fn json_rpc_empty_batch_and_strict_tool_arguments() {
         let state = ServerState::new();
-        let empty = handle_rpc(json!([]), &state).expect("empty batch response");
+        let empty = handle_rpc(json!([]), &state, None).expect("empty batch response");
         assert_eq!(empty["error"]["code"], -32600);
 
         let malformed = handle_rpc(
@@ -3388,6 +3626,7 @@ mod tests {
                 }
             }),
             &state,
+            None,
         )
         .expect("invalid params response");
         assert_eq!(malformed["error"]["code"], -32602);
@@ -3403,6 +3642,7 @@ mod tests {
                 }
             }),
             &state,
+            None,
         )
         .expect("invalid cursor response");
         assert_eq!(malformed_cursor["error"]["code"], -32602);
@@ -3418,6 +3658,7 @@ mod tests {
                 }
             }),
             &state,
+            None,
         )
         .expect("unknown argument response");
         assert_eq!(unknown_argument["error"]["code"], -32602);
@@ -3434,6 +3675,7 @@ mod tests {
                 }
             }),
             &state,
+            None,
         )
         .expect("unknown tools/call parameter response");
         assert_eq!(unknown_param["error"]["code"], -32602);
@@ -3449,6 +3691,7 @@ mod tests {
                 }
             }),
             &state,
+            None,
         )
         .expect("unknown source response");
         assert_eq!(unknown_source["error"]["code"], -32602);
@@ -3570,6 +3813,7 @@ mod tests {
                         "params": {"name": "get_chunks", "arguments": arguments}
                     }),
                     &state,
+                    None,
                 )
                 .expect("get_chunks response");
                 assert!(response.get("error").is_none(), "response: {response}");
@@ -3786,13 +4030,40 @@ mod tests {
     }
 
     fn sample_manifest(schema_version: u32, min_client_version: &str) -> Manifest {
-        let ann = source_registry()
+        let ann: std::collections::BTreeMap<SourceId, ManifestAnn> = source_registry()
             .source_ids()
             .into_iter()
             .map(|source| {
                 (
                     source.parse().expect("valid registered source id"),
                     sample_ann(source, "3"),
+                )
+            })
+            .collect();
+        let lexical = ann
+            .iter()
+            .map(|(source_id, ann)| {
+                (
+                    source_id.clone(),
+                    crate::lexical::ManifestLexical {
+                        source_id: source_id.clone(),
+                        format: crate::lexical::LEXICAL_FORMAT.to_string(),
+                        format_version: crate::lexical::LEXICAL_FORMAT_VERSION,
+                        path: crate::lexical::sidecar_manifest_path(source_id),
+                        sha256: ann.embedding_set_sha256.clone(),
+                        size: 4096,
+                        corpus_id: ann.corpus_id.clone(),
+                        source_index_sha256: ann.embedding_set_sha256.clone(),
+                        tokenizer: crate::lexical::LEXICAL_TOKENIZER.to_string(),
+                        document_count: 1,
+                        chunk_count: 1,
+                        first_chunk_id: 1,
+                        last_chunk_id: 1,
+                        chunk_text_sha256: ann.embedding_set_sha256.clone(),
+                        title_text_sha256: ann.embedding_set_sha256.clone(),
+                        chunk_fts_index_sha256: ann.embedding_set_sha256.clone(),
+                        title_fts_index_sha256: ann.embedding_set_sha256.clone(),
+                    },
                 )
             })
             .collect();
@@ -3825,6 +4096,7 @@ mod tests {
                 size: 1,
             },
             ann,
+            lexical,
         }
     }
 
@@ -3853,11 +4125,74 @@ mod tests {
     // ----- serve startup instructions -----
 
     #[test]
+    fn require_ready_corpus_rejects_non_schema_payload_mutation() -> Result<()> {
+        let _lock = lock_test_db();
+        let (data, db) = make_test_db()?;
+        let conn = open_write_at(&db)?;
+        insert_doc(&conn, "DOC_PAYLOAD")?;
+        drop(conn);
+
+        let generation = db.parent().expect("test database has a generation parent");
+        fs::create_dir(generation.join(crate::ann::ANN_DIRECTORY))?;
+        fs::create_dir(generation.join(crate::lexical::LEXICAL_DIRECTORY))?;
+        fs::write(generation.join("model.onnx"), b"placeholder")?;
+        fs::write(generation.join("tokenizer.json"), b"placeholder")?;
+
+        let mut manifest = sample_manifest(SUPPORTED_SCHEMA_VERSION, env!("CARGO_PKG_VERSION"));
+        manifest.db.size = fs::metadata(&db)?.len();
+        manifest.db.sha256 = crate::build::sha256_file(&db)?;
+        let original_modified = fs::metadata(&db)?.modified()?;
+        validate_manifest(&manifest)?;
+        fs::write(
+            generation.join(config::GENERATION_MANIFEST_FILENAME),
+            serde_json::to_vec_pretty(&manifest)?,
+        )?;
+
+        // Change a stored title without changing the schema or file length.
+        let conn = open_write_at(&db)?;
+        let original: String = conn.query_row(
+            "SELECT title FROM documents WHERE source_id=?1 AND native_id='DOC_PAYLOAD'",
+            [TEST_SOURCE_ID],
+            |row| row.get(0),
+        )?;
+        let mutated = format!("X{}", &original[1..]);
+        assert_eq!(mutated.len(), original.len());
+        conn.execute(
+            "UPDATE documents SET title=?1 WHERE source_id=?2 AND native_id='DOC_PAYLOAD'",
+            params![mutated, TEST_SOURCE_ID],
+        )?;
+        drop(conn);
+        let journal = PathBuf::from(format!("{}-journal", db.display()));
+        if journal.exists() {
+            fs::remove_file(journal)?;
+        }
+        let file = OpenOptions::new().write(true).open(&db)?;
+        file.set_times(std::fs::FileTimes::new().set_modified(original_modified))?;
+        drop(file);
+        assert_eq!(fs::metadata(&db)?.len(), manifest.db.size);
+        assert_eq!(fs::metadata(&db)?.modified()?, original_modified);
+        assert_ne!(crate::build::sha256_file(&db)?, manifest.db.sha256);
+
+        with_data_dir(data.path(), || {
+            let error = server_instructions(true, Some(TEST_GENERATION))
+                .expect_err("--require-ready-corpus must reject changed payload bytes");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("generation file SHA-256 mismatch")
+                    && message.contains(LEGAL_DB_FILENAME),
+                "strict startup rejected for the wrong reason: {message}"
+            );
+        });
+        Ok(())
+    }
+
+    #[test]
     fn server_instructions_no_db_requires_local_activation() -> Result<()> {
         let _lock = lock_test_db();
         let data = tempdir()?;
         with_data_dir(data.path(), || {
-            let (text, ready) = server_instructions();
+            let (text, ready) =
+                server_instructions(false, None).expect("best-effort startup guidance");
             assert!(!ready);
             assert!(
                 text.contains("No local corpus generation is active"),
@@ -3891,7 +4226,8 @@ mod tests {
                 "static MCP use instructions are too large: {static_words} words"
             );
 
-            let (text, ready) = server_instructions();
+            let (text, ready) =
+                server_instructions(false, None).expect("best-effort startup guidance");
             assert!(!ready);
             let boot_chars = text.chars().count();
             assert!(
@@ -3941,17 +4277,17 @@ mod tests {
 
     // ===== Wave 2 ===========================================================
 
-    // ----- Schema v11 -----
+    // ----- Schema v12 -----
 
     #[test]
-    fn schema_init_writes_v11_metadata() -> Result<()> {
+    fn schema_init_writes_v12_metadata() -> Result<()> {
         let _lock = lock_test_db();
         let (_dir, db) = make_test_db()?;
         let conn = open_write_at(&db)?;
         let value = get_corpus_meta(&conn, "schema_version")?
             .expect("init_db should have written schema_version");
         assert_eq!(value, SUPPORTED_SCHEMA_VERSION.to_string());
-        assert_eq!(SUPPORTED_SCHEMA_VERSION, 11);
+        assert_eq!(SUPPORTED_SCHEMA_VERSION, 12);
         Ok(())
     }
 
@@ -4063,10 +4399,10 @@ mod tests {
     }
 
     #[test]
-    fn fts_query_uses_or_term_semantics() {
+    fn fts_query_uses_strict_all_term_semantics() {
         assert_eq!(
             fts_query("a Body research-development evidence"),
-            "\"Body\" OR \"research-development\" OR \"evidence\""
+            "\"Body\" \"research-development\" \"evidence\""
         );
     }
 
@@ -4245,27 +4581,7 @@ mod tests {
             Some("TR 2024/1"),
             None,
         )?;
-        // title_fts must be populated for the bm25 path.
-        conn.execute(
-            "INSERT INTO title_fts(source_id, native_id, title, headings)
-             VALUES (?1, ?2, ?3, '')",
-            params![
-                TEST_SOURCE_ID,
-                "DOC_CURRENT",
-                "depreciation effective life rulings"
-            ],
-        )?;
-        conn.execute(
-            "INSERT INTO title_fts(source_id, native_id, title, headings)
-             VALUES (?1, ?2, ?3, '')",
-            params![
-                TEST_SOURCE_ID,
-                "DOC_WITHDRAWN",
-                "depreciation effective life rulings"
-            ],
-        )?;
-        // Update documents.title to match what title_fts holds (collect_title_hits
-        // joins documents to fetch the displayed title back).
+        // The lexical sidecar is built from these authoritative titles below.
         conn.execute(
             "UPDATE documents SET title = ?1 WHERE source_id = ?2 AND native_id = ?3",
             params![
@@ -4287,9 +4603,19 @@ mod tests {
         with_data_dir(dir.path(), || -> Result<()> {
             let conn = open_read()?;
             let source = test_source();
+            let lexical = crate::lexical::test_sidecar_connection(&conn, &source)?;
             // Default: current_only=true → withdrawn doc filtered out.
             let filter = test_doc_filter(&source, true, true);
-            let hits = collect_title_hits(&conn, &source, "depreciation", 10, &filter)?;
+            let lexical_filter = test_lexical_filter(&source, true, true);
+            let hits = collect_title_hits(
+                &conn,
+                &lexical,
+                &source,
+                "depreciation",
+                10,
+                &filter,
+                &lexical_filter,
+            )?;
             let doc_ids: Vec<String> = hits.iter().map(|h| h.document.public_ref()).collect();
             assert!(
                 doc_ids.contains(&"ato:DOC_CURRENT".to_string()),
@@ -4302,7 +4628,16 @@ mod tests {
 
             // current_only=false → withdrawn doc returned with marker visible.
             let filter = test_doc_filter(&source, true, false);
-            let hits = collect_title_hits(&conn, &source, "depreciation", 10, &filter)?;
+            let lexical_filter = test_lexical_filter(&source, true, false);
+            let hits = collect_title_hits(
+                &conn,
+                &lexical,
+                &source,
+                "depreciation",
+                10,
+                &filter,
+                &lexical_filter,
+            )?;
             let withdrawn_hit = hits
                 .iter()
                 .find(|h| h.document.native_id == "DOC_WITHDRAWN")
@@ -4342,15 +4677,6 @@ mod tests {
                 "PAC/19970038/203-50"
             ],
         )?;
-        conn.execute(
-            "INSERT INTO title_fts(source_id, native_id, title, headings)
-             VALUES (?1, ?2, ?3, '')",
-            params![
-                TEST_SOURCE_ID,
-                "PAC/19970038/203-50",
-                "Completely unrelated provision heading"
-            ],
-        )?;
         insert_doc_full(
             &conn,
             "PAC/19970038/8-1",
@@ -4368,29 +4694,32 @@ mod tests {
                 "PAC/19970038/8-1"
             ],
         )?;
-        conn.execute(
-            "INSERT INTO title_fts(source_id, native_id, title, headings)
-             VALUES (?1, ?2, ?3, '')",
-            params![
-                TEST_SOURCE_ID,
-                "PAC/19970038/8-1",
-                "Income Tax Assessment Act 1997 s 8-1"
-            ],
-        )?;
         drop(conn);
 
         with_data_dir(dir.path(), || -> Result<()> {
             let conn = open_read()?;
             let source = test_source();
             let filter = test_doc_filter(&source, false, true);
-            let hits = collect_title_hits(&conn, &source, "PAC/19970038/203-50", 5, &filter)?;
+            let lexical_filter = test_lexical_filter(&source, false, true);
+            let lexical = crate::lexical::test_sidecar_connection(&conn, &source)?;
+            let hits = collect_title_hits(
+                &conn,
+                &lexical,
+                &source,
+                "PAC/19970038/203-50",
+                5,
+                &filter,
+                &lexical_filter,
+            )?;
             assert_eq!(hits[0].document.public_ref(), "ato:PAC/19970038/203-50");
             let hits = collect_title_hits(
                 &conn,
+                &lexical,
                 &source,
                 "Income Tax Assessment Act 1997 s 8-1",
                 5,
                 &filter,
+                &lexical_filter,
             )?;
             assert_eq!(hits[0].document.public_ref(), "ato:PAC/19970038/8-1");
             Ok(())
@@ -4608,15 +4937,12 @@ mod tests {
         ] {
             insert_doc(&conn, doc_id)?;
             insert_chunk(&conn, chunk_id, doc_id, 0, text)?;
-            conn.execute(
-                "INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)",
-                params![chunk_id, text],
-            )?;
         }
 
         let source = test_source();
-        let filter = test_doc_filter(&source, false, true);
-        let hits = lexical_search(&conn, &source, "common distinctive", &filter, 10)?;
+        let lexical = crate::lexical::test_sidecar_connection(&conn, &source)?;
+        let filter = test_lexical_filter(&source, false, true);
+        let hits = lexical_search(&lexical, &source, "common distinctive", &filter, 10)?;
         assert_eq!(hits.len(), 1, "two-term searches remain strict");
         assert_eq!(hits[0].chunk_id, 1);
         Ok(())
@@ -4635,11 +4961,6 @@ mod tests {
              WHERE source_id = ?2 AND native_id = ?3",
             params![title, TEST_SOURCE_ID, doc_id],
         )?;
-        conn.execute(
-            "INSERT INTO title_fts(source_id, native_id, title, headings)
-             VALUES (?1, ?2, ?3, '')",
-            params![TEST_SOURCE_ID, doc_id, title],
-        )?;
         let citation_chunk =
             "Body by Michael Pty Ltd v Industry Innovation and Science Australia [2025] ARTA 44";
         let evidence_chunk = "The absence of documentary evidence may create evidentiary difficulty, but any such absence is not of itself determinative.";
@@ -4648,10 +4969,6 @@ mod tests {
             (11_i64, 1_i64, evidence_chunk),
         ] {
             insert_chunk(&conn, chunk_id, doc_id, ord, text)?;
-            conn.execute(
-                "INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)",
-                params![chunk_id, text],
-            )?;
         }
 
         insert_doc_full(
@@ -4674,17 +4991,20 @@ mod tests {
             0,
             "Body Michael Industry Innovation Science Australia 2025 ARTA 44 absence documentary evidence not determinative",
         )?;
-        conn.execute(
-            "INSERT INTO chunks_fts(rowid, text) VALUES (12, ?)",
-            params!["Body Michael Industry Innovation Science Australia 2025 ARTA 44 absence documentary evidence not determinative"],
-        )?;
         drop(conn);
+        install_test_lexical_generation(
+            db.parent().expect("test database has a generation parent"),
+            &db,
+            &[test_source()],
+        )?;
 
         with_data_dir(dir.path(), || -> Result<()> {
             let types = vec!["JUD".to_string()];
             let source = test_source();
-            let json_str = search(
-                "Body by Michael Industry Innovation Science Australia 2025 ARTA 44 absence documentary evidence not determinative",
+            let admitted_at = Instant::now();
+            let request_timing = SearchRequestTiming::new(811, admitted_at, admitted_at);
+            let (search_result, timing_record) = search_with_timing_record(
+                "Body Michael Industry Innovation Science Australia",
                 SearchOptions {
                     source: source.clone(),
                     k: 10,
@@ -4702,7 +5022,27 @@ mod tests {
                     seed_text: None,
                 },
                 None,
-            )?;
+                request_timing,
+            );
+            let json_str = search_result?;
+            assert_eq!(timing_record["request_id"], 811);
+            assert_eq!(timing_record["mode"], "keyword");
+            assert_eq!(timing_record["status"], "ok");
+            assert_eq!(timing_record["phase_status"]["lexical_index"], "completed");
+            assert_eq!(
+                timing_record["phase_status"]["payload_hydration"],
+                "completed"
+            );
+            for phase in ["embedding", "vector_scan", "fusion"] {
+                assert_eq!(timing_record["phase_status"][phase], "not_run");
+                assert_eq!(timing_record["duration_us"][phase], 0);
+            }
+            for internal_field in ["search-timing", "phase_status", "duration_us"] {
+                assert!(
+                    !json_str.contains(internal_field),
+                    "search response leaked internal timing field `{internal_field}`"
+                );
+            }
             let parsed: JsonValue = serde_json::from_str(&json_str)?;
             let hits = parsed["hits"].as_array().expect("hits array");
             assert!(hits.iter().any(|hit| hit["document"]
@@ -4717,6 +5057,36 @@ mod tests {
                     "source": TEST_SOURCE_ID,
                     "native_id": doc_id,
                 })));
+
+            let state = ServerState::new();
+            let admitted_at = Instant::now();
+            let rpc_response = handle_rpc(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "successful-search-contract",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "search",
+                        "arguments": {
+                            "query": "Body Michael Industry Innovation Science Australia",
+                            "source": TEST_SOURCE_ID,
+                            "types": ["JUD"],
+                            "mode": "keyword"
+                        }
+                    }
+                }),
+                &state,
+                Some(SearchRequestTiming::new(812, admitted_at, admitted_at)),
+            )
+            .expect("successful search response");
+            assert_eq!(rpc_response["result"]["isError"], false);
+            let rpc_wire = serde_json::to_string(&rpc_response)?;
+            for internal_field in ["search-timing", "phase_status", "duration_us"] {
+                assert!(
+                    !rpc_wire.contains(internal_field),
+                    "MCP response leaked internal timing field `{internal_field}`"
+                );
+            }
             Ok(())
         })?;
         Ok(())
@@ -4729,10 +5099,6 @@ mod tests {
         let conn = open_write_at(&db)?;
         insert_doc(&conn, "SHARED")?;
         insert_chunk(&conn, 201, "SHARED", 0, "shared needle ATO material")?;
-        conn.execute(
-            "INSERT INTO chunks_fts(rowid, text) VALUES (201, 'shared needle ATO material')",
-            [],
-        )?;
         conn.execute(
             "INSERT INTO sources(source_id, display_name) VALUES ('frl', 'Federal Register of Legislation')",
             [],
@@ -4749,11 +5115,13 @@ mod tests {
              VALUES (202, 'frl', 'SHARED', 0, ?1)",
             [compress_text("shared needle Federal Register material")?],
         )?;
-        conn.execute(
-            "INSERT INTO chunks_fts(rowid, text) VALUES (202, 'shared needle Federal Register material')",
-            [],
-        )?;
         drop(conn);
+        let frl: SourceId = "frl".parse()?;
+        install_test_lexical_generation(
+            db.parent().expect("test database has a generation parent"),
+            &db,
+            &[frl],
+        )?;
 
         with_data_dir(dir.path(), || -> Result<()> {
             let response = search(
@@ -4838,11 +5206,12 @@ mod tests {
         insert_doc_with_nav_flags(&conn, "DOC_NAV", 1, 0, 0)?;
         let text = "Research and development tax incentive paragraph navigation flag canary text.";
         insert_chunk(&conn, 1, "DOC_NAV", 0, text)?;
-        conn.execute(
-            "INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)",
-            params![1_i64, text],
-        )?;
         drop(conn);
+        install_test_lexical_generation(
+            db.parent().expect("test database has a generation parent"),
+            &db,
+            &[test_source()],
+        )?;
 
         with_data_dir(dir.path(), || -> Result<()> {
             let source = test_source();
@@ -5170,6 +5539,7 @@ mod tests {
                         format!("DOC_H{i}"),
                     )
                     .expect("valid test document"),
+                    date: None,
                     is_intro: false,
                 },
             );
@@ -5183,6 +5553,7 @@ mod tests {
                         "DOC_TAIL_ONLY",
                     )
                     .expect("valid test document"),
+                    date: None,
                     is_intro: false,
                 },
             );

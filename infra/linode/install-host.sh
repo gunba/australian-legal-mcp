@@ -60,8 +60,8 @@ HOST_TOOL_IMPLEMENTATION_DIR=/usr/local/libexec/legal-mcp/host-tools
 AUTH_READY_MARKER=/etc/legal-mcp/auth-ready
 HOST_TOOL_DISPATCH=/run/legal-mcp/host-tool-launcher-dispatch
 AUTH_CONFIGURING_PERMIT=/run/legal-mcp/auth-configuring
-CUTOVER_STARTING_PERMIT=/run/legal-mcp/flat-int8-cutover-starting
-CUTOVER_START_ARM=/run/legal-mcp/flat-int8-cutover-start-armed
+PAIR_STARTING_PERMIT=/run/legal-mcp/pair-cutover-starting
+PAIR_START_ARM=/run/legal-mcp/pair-cutover-start-armed
 PUBLISHER_SUDOERS=/etc/sudoers.d/legal-mcp-publisher
 HOST_TRANSACTION_LOCK=/run/lock/legal-mcp-host-transaction.lock
 HOST_TOOLS_RETIREMENT_WAS_PENDING=false
@@ -220,8 +220,8 @@ QUADLET=/etc/containers/systemd/legal-mcp.container
 IMAGE=/etc/legal-mcp/image
 AUTH_READY=/etc/legal-mcp/auth-ready
 AUTH_PERMIT=/run/legal-mcp/auth-configuring
-CUTOVER_PERMIT=/run/legal-mcp/flat-int8-cutover-starting
-CUTOVER_ARM=/run/legal-mcp/flat-int8-cutover-start-armed
+PAIR_PERMIT=/run/legal-mcp/pair-cutover-starting
+PAIR_ARM=/run/legal-mcp/pair-cutover-start-armed
 DISPATCH=/run/legal-mcp/host-tool-launcher-dispatch
 DISPATCH_RETIRING=${DISPATCH}.retiring
 DISPATCH_RETIRED=${DISPATCH}.retired
@@ -266,11 +266,29 @@ strict_dispatch_permit() {
       || grep -Fxq -- "$required_argument" <<< "$cmdline"; }
 }
 
+image_transaction_names_are_known() {
+  local path
+  while IFS= read -r -d '' path; do
+    case "$path" in
+      /etc/legal-mcp/.image-transaction|\
+      /etc/legal-mcp/.image-transaction.preparing|\
+      /etc/legal-mcp/.image-transaction.preparing-retired|\
+      /etc/legal-mcp/.image-transaction.preparing-deletion|\
+      /etc/legal-mcp/.image-transaction.retiring|\
+      /etc/legal-mcp/.image-transaction.retired|\
+      /etc/legal-mcp/.image-transaction.deletion) ;;
+      *) return 1 ;;
+    esac
+  done < <(find /etc/legal-mcp -mindepth 1 -maxdepth 1 \
+    -name '.image-transaction*' -print0)
+}
+
 committed_auth_ready() {
+  image_transaction_names_are_known || return 1
   require_file "$AUTH_READY" root root 444 0 \
     && [[ "$(getfacl --absolute-names --numeric --omit-header "$AUTH_READY")" \
       = $'user::r--\ngroup::r--\nother::r--' ]] || return 1
-  local path transaction='' count=0 kind outcome
+  local path transaction='' count=0
   for path in /etc/legal-mcp/.image-transaction \
     /etc/legal-mcp/.image-transaction.retiring \
     /etc/legal-mcp/.image-transaction.retired; do
@@ -284,31 +302,24 @@ committed_auth_ready() {
   [[ -d "$transaction" && ! -L "$transaction" \
     && "$(stat -c '%U:%G:%a' "$transaction")" = root:root:700 ]] || return 1
   require_file "$transaction/kind" root root 600 || return 1
-  kind="$(<"$transaction/kind")"
-  case "$kind" in
-    LEGAL_MCP_IMAGE_TRANSACTION_V2)
-      return 0
-      ;;
-    LEGAL_MCP_FLAT_INT8_CUTOVER_TRANSACTION_V1)
-      require_file "$transaction/retirement-outcome" root root 600 || return 1
-      outcome="$(<"$transaction/retirement-outcome")"
-      [[ "$outcome" = saved || "$outcome" = target ]]
-      ;;
-    *) return 1 ;;
-  esac
+  [[ "$(<"$transaction/kind")" = LEGAL_MCP_IMAGE_TRANSACTION_V2 ]]
 }
 
 strict_auth_ready() {
   committed_auth_ready && return 0
-  strict_dispatch_permit "$AUTH_PERMIT" configure-auth '' \
-    || { strict_dispatch_permit "$CUTOVER_PERMIT" update-image --flat-int8-cutover \
-      && require_file "$CUTOVER_ARM" root root 400 \
-      && cmp --silent "$CUTOVER_PERMIT" "$CUTOVER_ARM"; }
+  strict_dispatch_permit "$AUTH_PERMIT" configure-auth ''
+  return
+}
+
+pair_private_start_ready() {
+  strict_dispatch_permit "$PAIR_PERMIT" update-image '' \
+    && require_file "$PAIR_ARM" root root 400 \
+    && cmp --silent "$PAIR_PERMIT" "$PAIR_ARM"
 }
 
 if [[ "${1:-}" = --check-auth-ready ]]; then
   [[ $# -eq 1 && $EUID -eq 0 ]] || exit 1
-  strict_auth_ready
+  strict_auth_ready || pair_private_start_ready
   exit
 fi
 
@@ -340,9 +351,9 @@ read_implementation() {
   printf '%s\n' "$value"
 }
 
-cutover_release_binding_recoverable() {
+pair_release_binding_recoverable() {
   local template_sha="$1" path transaction='' count=0 rendered
-  [[ "${cutover_dispatch:-false}" = true ]] || return 1
+  image_transaction_names_are_known || return 1
   for path in /etc/legal-mcp/.image-transaction \
     /etc/legal-mcp/.image-transaction.retiring \
     /etc/legal-mcp/.image-transaction.retired; do
@@ -357,7 +368,7 @@ cutover_release_binding_recoverable() {
     target-image target-quadlet target-template; do
     require_file "$transaction/$path" root root 600 || return 1
   done
-  [[ "$(<"$transaction/kind")" = LEGAL_MCP_FLAT_INT8_CUTOVER_TRANSACTION_V1 \
+  [[ "$(<"$transaction/kind")" = LEGAL_MCP_IMAGE_GENERATION_PAIR_TRANSACTION_V1 \
     && "$(sha256sum "$transaction/saved-template" | awk '{print $1}')" = "$template_sha" \
     && "$(sha256sum "$transaction/target-template" | awk '{print $1}')" = "$template_sha" ]] \
     || return 1
@@ -367,43 +378,21 @@ cutover_release_binding_recoverable() {
       || cmp --silent "$TEMPLATE" "$transaction/target-template"; } \
     && { cmp --silent "$QUADLET" "$transaction/saved-quadlet" \
       || cmp --silent "$QUADLET" "$transaction/target-quadlet"; } || return 1
-  rendered="$(mktemp /run/legal-mcp-launcher-cutover.XXXXXX)"
+  rendered="$(mktemp /run/legal-mcp-launcher-pair.XXXXXX)"
   sed "s|__IMAGE_DIGEST__|$(<"$transaction/saved-image")|g" \
     "$transaction/saved-template" > "$rendered"
-  if ! cmp --silent "$rendered" "$transaction/saved-quadlet"; then
-    rm -f "$rendered"
-    return 1
-  fi
+  cmp --silent "$rendered" "$transaction/saved-quadlet" || { rm -f "$rendered"; return 1; }
   sed "s|__IMAGE_DIGEST__|$(<"$transaction/target-image")|g" \
     "$transaction/target-template" > "$rendered"
-  if ! cmp --silent "$rendered" "$transaction/target-quadlet"; then
-    rm -f "$rendered"
-    return 1
-  fi
+  cmp --silent "$rendered" "$transaction/target-quadlet" || { rm -f "$rendered"; return 1; }
   rm -f "$rendered"
-}
-
-cutover_transaction_present() {
-  local path
-  for path in /etc/legal-mcp/.image-transaction \
-    /etc/legal-mcp/.image-transaction.retiring \
-    /etc/legal-mcp/.image-transaction.retired; do
-    if ! absent "$path"; then
-      [[ -d "$path" && ! -L "$path" \
-        && "$(stat -c '%U:%G:%a' "$path")" = root:root:700 ]] || continue
-      require_file "$path/kind" root root 600 || continue
-      require_file "$path/retirement-outcome" root root 600 || continue
-      [[ "$(<"$path/kind")" = LEGAL_MCP_FLAT_INT8_CUTOVER_TRANSACTION_V1 \
-        && "$(<"$path/retirement-outcome")" = pending ]] && return 0
-    fi
-  done
-  return 1
 }
 
 require_v2_release_binding() {
   local configure_digest="$1" update_digest="$2" rendered
   local deploy_sha publisher_sha template_sha sudoers_sha image
   local -a values image_values
+  image_transaction_names_are_known || return 1
   require_file "$HOST_TOOLS_MARKER" root root 444 || return 1
   mapfile -t values < "$HOST_TOOLS_MARKER"
   [[ ${#values[@]} -eq 9 \
@@ -441,7 +430,7 @@ require_v2_release_binding() {
   sed "s|__IMAGE_DIGEST__|$image|g" "$TEMPLATE" > "$rendered"
   if ! cmp --silent "$rendered" "$QUADLET"; then
     rm -f "$rendered"
-    cutover_release_binding_recoverable "$template_sha" || return 1
+    pair_release_binding_recoverable "$template_sha" || return 1
     return 0
   fi
   rm -f "$rendered"
@@ -481,7 +470,7 @@ reconcile_dispatch() {
   fi
   delete_dispatch_retirement "$DISPATCH_RETIRED"
   if absent "$DISPATCH"; then
-    rm -f -- "$AUTH_PERMIT" "$CUTOVER_PERMIT" "$CUTOVER_ARM"
+    rm -f -- "$AUTH_PERMIT" "$PAIR_PERMIT" "$PAIR_ARM"
     sync -f /run/legal-mcp
     return 0
   fi
@@ -498,7 +487,7 @@ reconcile_dispatch() {
     echo 'another immutable host-tool dispatch is active' >&2
     return 1
   }
-  rm -f -- "$AUTH_PERMIT" "$CUTOVER_PERMIT" "$CUTOVER_ARM"
+  rm -f -- "$AUTH_PERMIT" "$PAIR_PERMIT" "$PAIR_ARM"
   sync -f /run/legal-mcp
   absent "$DISPATCH_RETIRING" && absent "$DISPATCH_RETIRED" || return 1
   mv -T "$DISPATCH" "$DISPATCH_RETIRING"
@@ -737,21 +726,10 @@ remove_auth_permit() {
   absent "$AUTH_PERMIT"
 }
 
-remove_cutover_permit() {
-  rm -f -- "$CUTOVER_PERMIT" "$CUTOVER_ARM"
+remove_pair_permit() {
+  rm -f -- "$PAIR_PERMIT" "$PAIR_ARM"
   sync -f /run/legal-mcp
-  absent "$CUTOVER_PERMIT" && absent "$CUTOVER_ARM"
-}
-
-write_cutover_permit() {
-  local pid="$1" process_start="$2" temporary
-  temporary="$(mktemp /run/legal-mcp/.flat-int8-cutover-starting.XXXXXX)"
-  printf '%s %s\n' "$pid" "$process_start" > "$temporary"
-  chown root:root "$temporary"
-  chmod 400 "$temporary"
-  sync -f "$temporary"
-  mv -fT "$temporary" "$CUTOVER_PERMIT"
-  sync -f /run/legal-mcp
+  absent "$PAIR_PERMIT" && absent "$PAIR_ARM"
 }
 
 force_auth_closed() {
@@ -789,6 +767,40 @@ write_auth_permit() {
   sync -f /run/legal-mcp
 }
 
+write_pair_permit() {
+  local pid="$1" process_start="$2" temporary
+  temporary="$(mktemp /run/legal-mcp/.pair-cutover-starting.XXXXXX)"
+  printf '%s %s\n' "$pid" "$process_start" > "$temporary"
+  chown root:root "$temporary"
+  chmod 400 "$temporary"
+  sync -f "$temporary"
+  mv -fT "$temporary" "$PAIR_PERMIT"
+  sync -f /run/legal-mcp
+}
+
+pair_transaction_state_present() {
+  local path kind=LEGAL_MCP_IMAGE_GENERATION_PAIR_TRANSACTION_V1
+  for path in /etc/legal-mcp/.pair-transaction-build \
+    /etc/legal-mcp/.image-transaction.preparing \
+    /etc/legal-mcp/.image-transaction.preparing-retired \
+    /etc/legal-mcp/.image-transaction \
+    /etc/legal-mcp/.image-transaction.retiring \
+    /etc/legal-mcp/.image-transaction.retired; do
+    if [[ -d "$path" && ! -L "$path" \
+      && -f "$path/kind" && ! -L "$path/kind" \
+      && "$(<"$path/kind")" = "$kind" ]]; then
+      return 0
+    fi
+  done
+  for path in /etc/legal-mcp/.image-transaction.preparing-deletion \
+    /etc/legal-mcp/.image-transaction.deletion; do
+    if [[ -f "$path" && ! -L "$path" && "$(<"$path")" = "$kind" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 if [[ "${1:-}" = --legal-mcp-launcher-internal ]]; then
   [[ $EUID -eq 0 && $# -ge 4 && "$(readlink -f "$0")" = "$CANONICAL" ]] || exit 1
   role="$2"
@@ -800,6 +812,13 @@ if [[ "${1:-}" = --legal-mcp-launcher-internal ]]; then
     && "$update_digest" =~ ^[0-9a-f]{64}$ ]] || exit 1
   current_start="$(start_time "$$")"
   configure_recover_only=false
+  pair_request=false
+  if [[ "$role" = update-image ]]; then
+    for argument in "$@"; do
+      [[ "$argument" = --pair-cutover || "$argument" = --pair-rollback ]] \
+        && pair_request=true
+    done
+  fi
   if [[ "$role" = configure-auth && $# -eq 1 && "$1" = --recover ]]; then
     configure_recover_only=true
   fi
@@ -874,16 +893,12 @@ if [[ "${1:-}" = --legal-mcp-launcher-internal ]]; then
       force_auth_closed || status=1
     fi
   else
-    cutover_request=false
-    for argument in "$@"; do
-      [[ "$argument" = --flat-int8-cutover ]] && cutover_request=true
-    done
     "$UPDATE" "$@" || status=$?
-    if [[ $status -ne 0 && "$cutover_request" = true ]] \
-      && cutover_transaction_present; then
+    if [[ $status -ne 0 && "$pair_request" = true ]] \
+      && pair_transaction_state_present; then
       force_auth_closed || status=1
     fi
-    remove_cutover_permit || status=1
+    remove_pair_permit || status=1
   fi
   retire_dispatch || status=1
   exit "$status"
@@ -895,7 +910,6 @@ case "$(basename "$0")" in
   legal-mcp-update-image) role=update-image ;;
   *) echo 'invoke the installed authentication or image launcher' >&2; exit 2 ;;
 esac
-cutover_dispatch=false
 if [[ "$role" = configure-auth ]]; then
   for argument in "$@"; do
     case "$argument" in
@@ -906,23 +920,22 @@ if [[ "$role" = configure-auth ]]; then
     esac
   done
 else
-  cutover_arguments=0
+  pair_arguments=0
   for argument in "$@"; do
     case "$argument" in
       --legal-mcp-launcher-internal)
         echo 'internal image handoff command is not a public launcher argument' >&2
         exit 2
         ;;
-      --flat-int8-cutover)
-        cutover_arguments=$((cutover_arguments + 1))
+      --pair-cutover|--pair-rollback)
+        pair_arguments=$((pair_arguments + 1))
         ;;
     esac
   done
-  [[ $cutover_arguments -le 1 ]] || {
-    echo 'flat-int8 cutover mode may be selected only once' >&2
+  [[ $pair_arguments -le 1 ]] || {
+    echo 'select exactly one pair operation' >&2
     exit 2
   }
-  [[ $cutover_arguments -eq 1 ]] && cutover_dispatch=true
 fi
 require_file "$LOCK_FILE" root legal-mcp-publisher 640 || {
   echo 'host transaction lock is missing or unsafe' >&2
@@ -972,8 +985,8 @@ mv -T "$preparing" "$DISPATCH"
 sync -f /run/legal-mcp
 if [[ "$role" = configure-auth ]]; then
   write_auth_permit "$$" "$process_start"
-elif [[ "$cutover_dispatch" = true ]]; then
-  write_cutover_permit "$$" "$process_start"
+elif [[ $pair_arguments -eq 1 ]]; then
+  write_pair_permit "$$" "$process_start"
 fi
 export LEGAL_MCP_HOST_TRANSACTION_LOCK_FD=9
 exec /usr/bin/unshare --mount --propagation private -- \
@@ -1499,16 +1512,13 @@ host_tool_foreign_transactions_are_absent() {
     /etc/legal-mcp/.auth-transaction.retiring \
     /etc/legal-mcp/.auth-transaction.retired \
     /etc/legal-mcp/.auth-transaction.legacy-v0192-preparing-retiring \
-    /etc/legal-mcp/.auth-transaction.legacy-v0192-preparing-retired \
-    /etc/legal-mcp/.image-transaction.preparing \
-    /etc/legal-mcp/.image-transaction.preparing-retired \
-    /etc/legal-mcp/.image-transaction.flat-int8-preparing \
-    /etc/legal-mcp/.image-transaction.flat-int8-preparing-retired \
-    /etc/legal-mcp/.image-transaction \
-    /etc/legal-mcp/.image-transaction.retiring \
-    /etc/legal-mcp/.image-transaction.retired; do
+    /etc/legal-mcp/.auth-transaction.legacy-v0192-preparing-retired; do
     path_is_absent "$path" || return 1
   done
+  path_is_absent /etc/legal-mcp/.pair-transaction-build || return 1
+  found="$(find /etc/legal-mcp -mindepth 1 -maxdepth 1 \
+    -name '.image-transaction*' -print -quit)" || return 1
+  [[ -z "$found" ]] || return 1
   found="$(find /etc/legal-mcp -mindepth 1 -maxdepth 1 \
     -name '.auth-transaction.preparing.*' -print -quit)" || return 1
   [[ -z "$found" ]]
@@ -1805,8 +1815,7 @@ PY
   fi
   for path in "$AUTH_READY_MARKER" "$HOST_TOOL_DISPATCH" \
     "${HOST_TOOL_DISPATCH}.retiring" "${HOST_TOOL_DISPATCH}.retired" \
-    "$AUTH_CONFIGURING_PERMIT" "$CUTOVER_STARTING_PERMIT" \
-    "$CUTOVER_START_ARM"; do
+    "$AUTH_CONFIGURING_PERMIT" "$PAIR_STARTING_PERMIT" "$PAIR_START_ARM"; do
     path_is_absent "$path" || {
       echo 'host-tool upgrade requires no authentication-ready or launcher-dispatch state' >&2
       return 1
@@ -3124,7 +3133,7 @@ atomic_install_file "$HOST_TOOL_CONFIGURE_POINTER_SOURCE" "$CONFIGURE_AUTH_POINT
 atomic_install_file "$HOST_TOOL_UPDATE_POINTER_SOURCE" "$UPDATE_IMAGE_POINTER" root root 644
 atomic_install_file "$HOST_TOOL_LAUNCHER_MARKER_SOURCE" "$HOST_TOOL_LAUNCHER_MARKER" root root 444
 rm -f -- "$AUTH_READY_MARKER" "$AUTH_CONFIGURING_PERMIT" \
-  "$CUTOVER_STARTING_PERMIT" "$CUTOVER_START_ARM"
+  "$PAIR_STARTING_PERMIT" "$PAIR_START_ARM"
 cleanup_host_tool_sources
 printf '%s\n' "$ADMIN_SOURCE_IP" > /etc/legal-mcp/admin-source-ip
 chown root:root /etc/legal-mcp/admin-source-ip

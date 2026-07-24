@@ -150,6 +150,7 @@ fn sidecar_layout(vector_count: u64) -> Result<SidecarLayout> {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn expected_sidecar_size(vector_count: u64) -> Result<u64> {
     Ok(sidecar_layout(vector_count)?.file_size)
 }
@@ -704,6 +705,9 @@ pub(crate) fn validate_manifest_ann(source_id: &SourceId, info: &ManifestAnn) ->
     {
         bail!("ANN sidecar integrity metadata is malformed");
     }
+    if u64::from(info.last_chunk_id - info.first_chunk_id) + 1 != info.vector_count {
+        bail!("ANN sidecar chunk range is not contiguous for source `{source_id}`");
+    }
     let layout = sidecar_layout(info.vector_count)?;
     if info.size != layout.file_size {
         bail!("ANN sidecar manifest size does not match its canonical plane layout");
@@ -774,11 +778,11 @@ fn open_regular_file(path: &Path, expected_size: u64) -> Result<File> {
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct WindowsFileIdentity {
-    file_attributes: u32,
-    volume_serial_number: u32,
-    file_index: u64,
-    number_of_links: u32,
+pub(crate) struct WindowsFileIdentity {
+    pub(crate) file_attributes: u32,
+    pub(crate) volume_serial_number: u32,
+    pub(crate) file_index: u64,
+    pub(crate) number_of_links: u32,
 }
 
 #[cfg(windows)]
@@ -800,7 +804,7 @@ fn open_windows_sidecar_handle(path: &Path) -> Result<File> {
 }
 
 #[cfg(windows)]
-fn windows_file_identity(file: &File) -> Result<WindowsFileIdentity> {
+pub(crate) fn windows_file_identity(file: &File) -> Result<WindowsFileIdentity> {
     use std::mem::MaybeUninit;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{

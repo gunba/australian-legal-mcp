@@ -2,7 +2,7 @@
 //! `<a href>` rewriting to `data-doc-id`, attribute stripping, named-anchor
 //! normalisation, and ATO doc-link parsing.
 
-use legal_model::{DocumentId, SourceId};
+use legal_model::{encode_public_component, DocumentId, SourceId};
 use regex::Regex;
 use std::collections::HashSet;
 
@@ -39,6 +39,12 @@ pub(crate) fn canonical_source_character(character: char) -> Option<char> {
         _ if character.is_control() => return None,
         _ => character,
     })
+}
+
+pub(crate) fn push_anchor_marker(output: &mut String, anchor: &str) {
+    output.push_str("[anchor:");
+    output.push_str(&encode_public_component(anchor));
+    output.push(']');
 }
 
 // Containers ATO has used over the years. First selector match wins;
@@ -381,9 +387,7 @@ pub(crate) fn render_node(
                             buf.push_str(&inner);
                             buf.push(' ');
                         }
-                        buf.push_str("[anchor:");
-                        buf.push_str(name);
-                        buf.push(']');
+                        push_anchor_marker(buf, name);
                         return;
                     }
                 }
@@ -407,9 +411,8 @@ pub(crate) fn render_node(
                 }
                 if let Some(id) = el.attr("id") {
                     if referenced.contains(id) {
-                        buf.push_str(" [anchor:");
-                        buf.push_str(id);
-                        buf.push(']');
+                        buf.push(' ');
+                        push_anchor_marker(buf, id);
                     }
                 }
                 return;
@@ -425,9 +428,8 @@ pub(crate) fn render_node(
                     }
                     if let Some(id) = el.attr("id") {
                         if referenced.contains(id) {
-                            buf.push_str(" [anchor:");
-                            buf.push_str(id);
-                            buf.push(']');
+                            buf.push(' ');
+                            push_anchor_marker(buf, id);
                         }
                     }
                     return;
@@ -441,9 +443,8 @@ pub(crate) fn render_node(
                     }
                     if let Some(id) = el.attr("id") {
                         if referenced.contains(id) {
-                            buf.push_str(" [anchor:");
-                            buf.push_str(id);
-                            buf.push(']');
+                            buf.push(' ');
+                            push_anchor_marker(buf, id);
                         }
                     }
                     return;
@@ -462,9 +463,8 @@ pub(crate) fn render_node(
                         buf.push_str(&inner);
                         if let Some(id) = el.attr("id") {
                             if referenced.contains(id) {
-                                buf.push_str(" [anchor:");
-                                buf.push_str(id);
-                                buf.push(']');
+                                buf.push(' ');
+                                push_anchor_marker(buf, id);
                             }
                         }
                         buf.push('\n');
@@ -483,9 +483,8 @@ pub(crate) fn render_node(
                             if buf.ends_with('\n') {
                                 buf.pop();
                             }
-                            buf.push_str(" [anchor:");
-                            buf.push_str(id);
-                            buf.push(']');
+                            buf.push(' ');
+                            push_anchor_marker(buf, id);
                             buf.push('\n');
                         } else if !buf.ends_with('\n') {
                             buf.push('\n');
@@ -505,9 +504,7 @@ pub(crate) fn render_node(
                         buf.push_str(&inner);
                         buf.push(' ');
                     }
-                    buf.push_str("[anchor:");
-                    buf.push_str(id);
-                    buf.push(']');
+                    push_anchor_marker(buf, id);
                     return;
                 }
             }
@@ -855,6 +852,17 @@ mod security_tests {
         assert_eq!(
             subtree_text(&html, &HashSet::new()),
             "Formula [image: x + y] [asset:frl:C2024A00001/sha256-one] and [asset:frl:C2024A00001/sha256-two] end."
+        );
+    }
+
+    #[test]
+    fn rendered_anchor_markers_encode_reserved_characters() {
+        let html = scraper::Html::parse_fragment(
+            r##"<p><a href="#JM:James">jump</a> <span id="JM:James">target</span></p>"##,
+        );
+        assert_eq!(
+            subtree_text(&html, &HashSet::from(["JM:James".to_string()])),
+            "jump target [anchor:JM%3AJames]"
         );
     }
 

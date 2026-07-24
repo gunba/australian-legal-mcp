@@ -12,16 +12,16 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 }
 ACTION="$1"
 GENERATION="$2"
-[[ "$ACTION" = prepare || "$ACTION" = activate || "$ACTION" = abort \
-  || "$ACTION" = cutover-activate || "$ACTION" = cutover-rollback \
-  || "$ACTION" = cutover-commit ]] || {
-  echo 'invalid deployment action' >&2
-  exit 2
+[[ "$ACTION" = prepare || "$ACTION" = activate || "$ACTION" = abort ]] || {
+  [[ "$ACTION" = pair-seal || "$ACTION" = pair-activate \
+    || "$ACTION" = pair-restore || "$ACTION" = pair-commit ]] || {
+    echo 'invalid deployment action' >&2
+    exit 2
+  }
 }
 [[ "$GENERATION" =~ ^[0-9a-f]{64}$ ]] || { echo 'generation ID is malformed' >&2; exit 2; }
-CUTOVER_ACTION=false
-[[ "$ACTION" == cutover-* ]] && CUTOVER_ACTION=true
-
+PAIR_ACTION=false
+[[ "$ACTION" == pair-* ]] && PAIR_ACTION=true
 DATA_ROOT=/srv/legal-mcp
 GENERATIONS="$DATA_ROOT/generations"
 LIFECYCLE="$DATA_ROOT/lifecycle"
@@ -32,7 +32,7 @@ JOURNAL="$LIFECYCLE/.deployment-transaction"
 JOURNAL_PREPARING="$LIFECYCLE/.deployment-transaction.preparing"
 IMAGE_FILE=/etc/legal-mcp/image
 AUTH_READY=/etc/legal-mcp/auth-ready
-CUTOVER_TRANSACTION=/etc/legal-mcp/.image-transaction
+PAIR_TRANSACTION=/etc/legal-mcp/.image-transaction
 SERVICE=legal-mcp.service
 LOCK_FILE=/run/lock/legal-mcp-host-transaction.lock
 RUNTIME_CONTROL=/run/legal-mcp
@@ -58,7 +58,7 @@ require_commands flock getfacl rm stat sync
   exit 1
 }
 INHERITED_LOCK_FD="${LEGAL_MCP_HOST_TRANSACTION_LOCK_FD:-9}"
-if [[ "$CUTOVER_ACTION" = true \
+if [[ "$PAIR_ACTION" = true \
   && "$INHERITED_LOCK_FD" =~ ^[0-9]+$ \
   && -e "/proc/$$/fd/$INHERITED_LOCK_FD" \
   && "$(stat -Lc '%d:%i' "/proc/$$/fd/$INHERITED_LOCK_FD" 2>/dev/null || true)" \
@@ -119,56 +119,6 @@ read_systemctl_enablement() {
   esac
 }
 
-require_cutover_dark_surface() {
-  local listeners report admin_source
-  [[ -f "$CUTOVER_TRANSACTION/state" && ! -L "$CUTOVER_TRANSACTION/state" \
-    && "$(stat -c '%U:%G:%a:%h' "$CUTOVER_TRANSACTION/state")" = root:root:600:1 ]] \
-    || return 1
-  grep -Fxq 'PUBLICATION_STATE=configured-dark' "$CUTOVER_TRANSACTION/state" \
-    || return 1
-  path_is_absent "$AUTH_READY" || {
-    echo 'cutover lifecycle action requires authentication-ready to be absent' >&2
-    return 1
-  }
-  [[ "$(read_systemctl_enablement "$SERVICE")" = generated \
-    && "$(read_systemctl_activity "$SERVICE")" = inactive \
-    && "$(read_systemctl_enablement caddy.service)" = disabled \
-    && "$(read_systemctl_activity caddy.service)" = inactive ]] || {
-      echo 'cutover lifecycle action requires the exact configured-dark service matrix' >&2
-      return 1
-    }
-  [[ -f /etc/legal-mcp/admin-source-ip && ! -L /etc/legal-mcp/admin-source-ip \
-    && "$(stat -c '%U:%G:%a:%h' /etc/legal-mcp/admin-source-ip)" = root:root:600:1 ]] \
-    || return 1
-  admin_source="$(</etc/legal-mcp/admin-source-ip)"
-  [[ "$admin_source" =~ ^[0-9A-Fa-f:.]{2,45}$ ]] || return 1
-  report="$(ufw status verbose)" || return 1
-  printf '%s\n' "$report" | python3 /dev/fd/3 "$admin_source" 3<<'PY'
-import re, sys
-admin = sys.argv[1]
-report = sys.stdin.read().splitlines()
-if "Status: active" not in report:
-    raise SystemExit(1)
-if not any(re.fullmatch(r"Default: deny \(incoming\), allow \(outgoing\), (?:disabled|deny) \(routed\)", line) for line in report):
-    raise SystemExit(1)
-rules = []
-for line in report:
-    for action in ("ALLOW IN", "DENY IN", "REJECT IN", "LIMIT IN"):
-        if action in line:
-            left, right = line.split(action, 1)
-            rules.append((left.strip(), action, right.split("#", 1)[0].strip()))
-            break
-if rules != [("22/tcp", "ALLOW IN", admin)]:
-    raise SystemExit(1)
-PY
-  listeners="$(ss --listening --tcp --numeric --no-header)" || return 1
-  ! awk '$4 ~ /:(80|443|51235)$/ { found=1 } END { exit found ? 0 : 1 }' \
-    <<< "$listeners" || {
-      echo 'cutover lifecycle action found a listener on 80, 443, or 51235' >&2
-      return 1
-    }
-}
-
 podman_image_state() {
   local image="$1" status
   if podman image exists "$image"; then
@@ -185,9 +135,37 @@ podman_image_state() {
   return 1
 }
 
+require_fixed_host_identities() {
+  publisher_uid="$(id -u "$PUBLISHER")"
+  publisher_gid="$(id -g "$PUBLISHER")"
+  [[ "$publisher_uid" = 973 && "$publisher_gid" = 973 \
+    && "$(id -G "$PUBLISHER")" = 973 ]] || {
+    echo 'publisher identity does not match the fixed host contract' >&2
+    return 1
+  }
+  [[ "$(id -u "$SERVICE_USER")" = 971 && "$(id -g "$SERVICE_USER")" = 971 \
+    && "$(id -G "$SERVICE_USER")" = 971 ]] || {
+    echo 'service identity does not match the fixed host contract' >&2
+    return 1
+  }
+}
+
 validate_host_state() {
-  local target source fstype options marker_uuid actual_uuid xfs_details expected_acl directory
-  local -a marker
+  local target source fstype options marker_uuid host_uuid actual_uuid xfs_details expected_acl directory
+  local -a marker host_marker
+  [[ -f /etc/legal-mcp/host-installed && ! -L /etc/legal-mcp/host-installed \
+    && "$(stat -c '%U:%G:%a:%h' /etc/legal-mcp/host-installed)" = root:root:444:1 ]] || {
+    echo 'installed host identity marker is missing' >&2
+    exit 1
+  }
+  require_acl /etc/legal-mcp/host-installed $'user::r--\ngroup::r--\nother::r--'
+  mapfile -t host_marker < /etc/legal-mcp/host-installed
+  [[ ${#host_marker[@]} -eq 2 && "${host_marker[0]}" = LEGAL_MCP_HOST_V1 \
+    && "${host_marker[1]}" =~ ^VOLUME_UUID=([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$ ]] || {
+    echo 'installed host identity marker is malformed' >&2
+    exit 1
+  }
+  host_uuid="${BASH_REMATCH[1],,}"
   read -r target source fstype options < <(findmnt --noheadings --raw --output TARGET,SOURCE,FSTYPE,OPTIONS --target "$DATA_ROOT")
   [[ "$target" = "$DATA_ROOT" && "$fstype" = xfs \
     && ",$options," = *,noatime,* && ",$options," = *,nodev,* \
@@ -215,8 +193,8 @@ validate_host_state() {
   }
   marker_uuid="${BASH_REMATCH[1],,}"
   actual_uuid="$(blkid -s UUID -o value "$source")"
-  [[ "${actual_uuid,,}" = "$marker_uuid" ]] || {
-    echo 'mounted corpus volume UUID does not match its marker' >&2
+  [[ "$host_uuid" = "$marker_uuid" && "${actual_uuid,,}" = "$marker_uuid" ]] || {
+    echo 'host and mounted corpus volume identities do not match' >&2
     exit 1
   }
 
@@ -337,20 +315,14 @@ active_generation() {
 }
 
 write_journal() {
-  local phase="$1" previous="$2" kind="${3:-ordinary}"
+  local phase="$1" previous="$2"
   [[ "$phase" =~ ^(preparing|prepared|aborting|activating|activated|rolling-back|rolled-back)$ ]] || exit 1
   [[ "$previous" = - || "$previous" =~ ^[0-9a-f]{64}$ ]] || exit 1
-  [[ "$kind" = ordinary || "$kind" = flat-int8-cutover ]] || exit 1
   path_is_absent "$JOURNAL_PREPARING" || {
     echo 'deployment journal preparation was not reconciled' >&2
     exit 1
   }
-  if [[ "$kind" = flat-int8-cutover ]]; then
-    printf '%s\n%s\n%s\n%s\n' "$GENERATION" "$previous" "$phase" \
-      flat-int8-cutover > "$JOURNAL_PREPARING"
-  else
-    printf '%s\n%s\n%s\n' "$GENERATION" "$previous" "$phase" > "$JOURNAL_PREPARING"
-  fi
+  printf '%s\n%s\n%s\n' "$GENERATION" "$previous" "$phase" > "$JOURNAL_PREPARING"
   chown root:root "$JOURNAL_PREPARING"
   chmod 600 "$JOURNAL_PREPARING"
   sync -f "$JOURNAL_PREPARING"
@@ -364,8 +336,7 @@ read_journal() {
     exit 1
   }
   mapfile -t transaction < "$JOURNAL"
-  [[ ( ${#transaction[@]} -eq 3 \
-      || ( ${#transaction[@]} -eq 4 && "${transaction[3]}" = flat-int8-cutover ) ) \
+  [[ ${#transaction[@]} -eq 3 \
     && "${transaction[0]}" =~ ^[0-9a-f]{64}$ \
     && ( "${transaction[1]}" = - || "${transaction[1]}" =~ ^[0-9a-f]{64}$ ) \
     && "${transaction[2]}" =~ ^(preparing|prepared|aborting|activating|activated|rolling-back|rolled-back)$ ]] || {
@@ -375,11 +346,6 @@ read_journal() {
   TX_GENERATION="${transaction[0]}"
   TX_PREVIOUS="${transaction[1]}"
   TX_PHASE="${transaction[2]}"
-  if [[ ${#transaction[@]} -eq 4 ]]; then
-    TX_KIND=flat-int8-cutover
-  else
-    TX_KIND=ordinary
-  fi
 }
 
 normalize_upload_for_activation() {
@@ -392,6 +358,16 @@ normalize_upload_for_activation() {
   sync -f "$upload"
 }
 
+seal_upload_for_pair() {
+  local upload="$UPLOADS/$GENERATION"
+  [[ -d "$upload" && ! -L "$upload" ]] || { echo 'pair candidate upload is missing' >&2; exit 1; }
+  setfacl --recursive --remove-all "$upload"
+  chown -R root:legal-mcp "$upload"
+  find "$upload" -xdev -type d -exec chmod 550 {} +
+  find "$upload" -xdev -type f -exec chmod 440 {} +
+  sync -f "$upload"
+}
+
 restore_upload_to_publisher() {
   local upload="$UPLOADS/$GENERATION"
   [[ -d "$upload" && ! -L "$upload" ]] || return 0
@@ -399,6 +375,7 @@ restore_upload_to_publisher() {
   chown -R "$PUBLISHER:$PUBLISHER" "$upload"
   find "$upload" -xdev -type d -exec chmod 700 {} +
   find "$upload" -xdev -type f -exec chmod 600 {} +
+  sync -f "$upload"
 }
 
 clear_upload_authorization() {
@@ -453,6 +430,25 @@ reconcile_journal_preparation() {
   sync -f "$LIFECYCLE"
 }
 
+reject_unknown_image_transaction_states() {
+  local path
+  while IFS= read -r -d '' path; do
+    case "$path" in
+      /etc/legal-mcp/.image-transaction|\
+      /etc/legal-mcp/.image-transaction.preparing|\
+      /etc/legal-mcp/.image-transaction.preparing-retired|\
+      /etc/legal-mcp/.image-transaction.retiring|\
+      /etc/legal-mcp/.image-transaction.retired|\
+      /etc/legal-mcp/.image-transaction.deletion) ;;
+      *)
+        echo "unknown image transaction state must be reviewed before corpus deployment: $path" >&2
+        exit 1
+        ;;
+    esac
+  done < <(find /etc/legal-mcp -mindepth 1 -maxdepth 1 \
+    -name '.image-transaction*' -print0)
+}
+
 reject_foreign_host_transactions() {
   local transaction
   [[ -d /etc/legal-mcp && ! -L /etc/legal-mcp \
@@ -461,6 +457,7 @@ reject_foreign_host_transactions() {
     exit 1
   }
   require_acl /etc/legal-mcp $'user::rwx\ngroup::r-x\nother::r-x'
+  reject_unknown_image_transaction_states
   for transaction in \
     /etc/legal-mcp/.auth-transaction.preparing \
     /etc/legal-mcp/.auth-transaction.preparing-retired \
@@ -471,11 +468,10 @@ reject_foreign_host_transactions() {
     /etc/legal-mcp/.auth-transaction.legacy-v0192-preparing-retired \
     /etc/legal-mcp/.image-transaction.preparing \
     /etc/legal-mcp/.image-transaction.preparing-retired \
-    /etc/legal-mcp/.image-transaction.flat-int8-preparing \
-    /etc/legal-mcp/.image-transaction.flat-int8-preparing-retired \
     /etc/legal-mcp/.image-transaction \
     /etc/legal-mcp/.image-transaction.retiring \
     /etc/legal-mcp/.image-transaction.retired \
+    /etc/legal-mcp/.image-transaction.deletion \
     /etc/legal-mcp/.host-tools-transaction.building \
     /etc/legal-mcp/.host-tools-transaction.building-retired \
     /etc/legal-mcp/.host-tools-transaction.preparing \
@@ -487,7 +483,7 @@ reject_foreign_host_transactions() {
     /etc/legal-mcp/.host-tools-transaction.rollback-retired \
     /etc/legal-mcp/.host-tools-transaction.publisher-restore \
     /etc/legal-mcp/.host-tools-transaction.publisher-restore-retired; do
-    if [[ "$CUTOVER_ACTION" = true && "$transaction" = "$CUTOVER_TRANSACTION" ]]; then
+    if [[ "$PAIR_ACTION" = true && "$transaction" = "$PAIR_TRANSACTION" ]]; then
       continue
     fi
     path_is_absent "$transaction" || {
@@ -506,28 +502,90 @@ reject_foreign_host_transactions() {
   }
 }
 
-require_cutover_coordinator() {
-  [[ "$CUTOVER_ACTION" = true \
-    && "${LEGAL_MCP_FLAT_INT8_CUTOVER:-}" = 1 \
+require_pair_dark_surface() {
+  local listeners report admin_source
+  path_is_absent "$AUTH_READY" || {
+    echo 'pair lifecycle action requires authentication-ready to be absent' >&2
+    exit 1
+  }
+  [[ "$(read_systemctl_enablement "$SERVICE")" = generated \
+    && "$(read_systemctl_activity "$SERVICE")" = inactive \
+    && "$(read_systemctl_enablement caddy.service)" = disabled \
+    && "$(read_systemctl_activity caddy.service)" = inactive ]] || {
+      echo 'pair lifecycle action requires the exact configured-dark service matrix' >&2
+      exit 1
+    }
+  [[ -f /etc/legal-mcp/admin-source-ip && ! -L /etc/legal-mcp/admin-source-ip \
+    && "$(stat -c '%U:%G:%a:%h' /etc/legal-mcp/admin-source-ip)" = root:root:600:1 ]] \
+    || exit 1
+  admin_source="$(</etc/legal-mcp/admin-source-ip)"
+  [[ "$admin_source" =~ ^[0-9A-Fa-f:.]{2,45}$ ]] || exit 1
+  report="$(ufw status verbose)" || exit 1
+  printf '%s\n' "$report" | python3 /dev/fd/3 "$admin_source" 3<<'PY'
+import re, sys
+admin = sys.argv[1]
+report = sys.stdin.read().splitlines()
+if "Status: active" not in report:
+    raise SystemExit(1)
+if not any(re.fullmatch(r"Default: deny \(incoming\), allow \(outgoing\), (?:disabled|deny) \(routed\)", line) for line in report):
+    raise SystemExit(1)
+rules = []
+for line in report:
+    for action in ("ALLOW IN", "DENY IN", "REJECT IN", "LIMIT IN"):
+        if action in line:
+            left, right = line.split(action, 1)
+            rules.append((left.strip(), action, right.split("#", 1)[0].strip()))
+            break
+if rules != [("22/tcp", "ALLOW IN", admin)]:
+    raise SystemExit(1)
+PY
+  listeners="$(ss --listening --tcp --numeric --no-header)" || exit 1
+  ! awk '$4 ~ /:(80|443|51235)$/ { found=1 } END { exit found ? 0 : 1 }' \
+    <<< "$listeners" || {
+      echo 'pair lifecycle action found a listener on 80, 443, or 51235' >&2
+      exit 1
+    }
+}
+
+read_pair_contract() {
+  local name
+  [[ "$PAIR_ACTION" = true \
+    && "${LEGAL_MCP_PAIR_COORDINATOR:-}" = 1 \
     && "$INHERITED_LOCK_FD" =~ ^[0-9]+$ \
     && -e "/proc/$$/fd/$INHERITED_LOCK_FD" \
     && "$(stat -Lc '%d:%i' "/proc/$$/fd/$INHERITED_LOCK_FD" 2>/dev/null || true)" \
       = "$(stat -Lc '%d:%i' "$LOCK_FILE")" \
-    && -d "$CUTOVER_TRANSACTION" && ! -L "$CUTOVER_TRANSACTION" \
-    && "$(stat -c '%U:%G:%a' "$CUTOVER_TRANSACTION")" = root:root:700 \
-    && -f "$CUTOVER_TRANSACTION/kind" && ! -L "$CUTOVER_TRANSACTION/kind" \
-    && "$(stat -c '%U:%G:%a:%h' "$CUTOVER_TRANSACTION/kind")" = root:root:600:1 \
-    && "$(<"$CUTOVER_TRANSACTION/kind")" = LEGAL_MCP_FLAT_INT8_CUTOVER_TRANSACTION_V1 ]] || {
-      echo 'cutover lifecycle action requires the live root coordinator transaction' >&2
+    && -d "$PAIR_TRANSACTION" && ! -L "$PAIR_TRANSACTION" \
+    && "$(stat -c '%U:%G:%a' "$PAIR_TRANSACTION")" = root:root:700 ]] || {
+      echo 'pair lifecycle action requires the live privileged coordinator transaction' >&2
       exit 1
     }
-  local name
-  for name in state saved-image target-image retirement-outcome; do
-    [[ -f "$CUTOVER_TRANSACTION/$name" && ! -L "$CUTOVER_TRANSACTION/$name" \
-      && "$(stat -c '%U:%G:%a:%h' "$CUTOVER_TRANSACTION/$name")" = root:root:600:1 ]] \
-      || { echo "cutover coordinator file is unsafe: $name" >&2; exit 1; }
+  for name in kind operation prior-generation target-generation retirement-outcome \
+    saved-image target-image; do
+    [[ -f "$PAIR_TRANSACTION/$name" && ! -L "$PAIR_TRANSACTION/$name" \
+      && "$(stat -c '%U:%G:%a:%h' "$PAIR_TRANSACTION/$name")" = root:root:600:1 ]] || {
+        echo "pair coordinator file is unsafe: $name" >&2
+        exit 1
+      }
   done
-  require_cutover_dark_surface || exit 1
+  [[ "$(<"$PAIR_TRANSACTION/kind")" = LEGAL_MCP_IMAGE_GENERATION_PAIR_TRANSACTION_V1 ]] || {
+    echo 'pair coordinator transaction kind is not supported' >&2
+    exit 1
+  }
+  PAIR_OPERATION="$(<"$PAIR_TRANSACTION/operation")"
+  PAIR_PRIOR_GENERATION="$(<"$PAIR_TRANSACTION/prior-generation")"
+  PAIR_TARGET_GENERATION="$(<"$PAIR_TRANSACTION/target-generation")"
+  PAIR_OUTCOME="$(<"$PAIR_TRANSACTION/retirement-outcome")"
+  [[ ( "$PAIR_OPERATION" = prepared || "$PAIR_OPERATION" = installed ) \
+    && "$PAIR_PRIOR_GENERATION" =~ ^[0-9a-f]{64}$ \
+    && "$PAIR_TARGET_GENERATION" =~ ^[0-9a-f]{64}$ \
+    && "$PAIR_PRIOR_GENERATION" != "$PAIR_TARGET_GENERATION" \
+    && "$PAIR_TARGET_GENERATION" = "$GENERATION" \
+    && "$PAIR_OUTCOME" =~ ^(pending|saved|target)$ ]] || {
+      echo 'pair coordinator transaction identity is malformed or mismatched' >&2
+      exit 1
+    }
+  require_pair_dark_surface
 }
 
 require_abort_upload() {
@@ -640,7 +698,7 @@ probe_exact_generation() {
 }
 
 wait_for_exact_generation() {
-  local expected="$1" deadline=$((SECONDS + 180)) activity
+  local expected="$1" deadline=$((SECONDS + 600)) activity
   while (( SECONDS < deadline )); do
     probe_exact_generation "$expected" && return 0
     activity="$(read_systemctl_activity "$SERVICE")" || return 1
@@ -666,220 +724,234 @@ rollback_pointer() {
   fi
 }
 
-cutover_activate_generation() {
-  local activation_ok=false current
-  read_journal
-  [[ "$TX_GENERATION" = "$GENERATION" && "$TX_PREVIOUS" != - ]] || {
-    echo 'cutover generation does not match its prepared replacement transaction' >&2
+require_pair_image() {
+  local choice="$1" expected
+  case "$choice" in
+    saved) expected="$PAIR_TRANSACTION/saved-image" ;;
+    target) expected="$PAIR_TRANSACTION/target-image" ;;
+    *) exit 1 ;;
+  esac
+  cmp --silent "$IMAGE_FILE" "$expected" || {
+    echo "pair lifecycle action does not use the recorded $choice image" >&2
     exit 1
   }
-  if [[ "$TX_KIND" = ordinary ]]; then
-    [[ "$TX_PHASE" = prepared \
-      && "$(active_generation)" = "$TX_PREVIOUS" \
-      && -d "$UPLOADS/$GENERATION" && ! -L "$UPLOADS/$GENERATION" ]] || {
-        echo 'cutover can bind only the exact prepared ordinary deployment transaction' >&2
-        exit 1
-      }
-    write_journal prepared "$TX_PREVIOUS" flat-int8-cutover
-    read_journal
-  fi
-  [[ "$TX_KIND" = flat-int8-cutover ]] || exit 1
+}
 
-  case "$TX_PHASE" in
+require_sealed_pair_upload() {
+  local upload="$UPLOADS/$GENERATION"
+  [[ -d "$upload" && ! -L "$upload" \
+    && "$(stat -c '%U:%G:%a' "$upload")" = root:legal-mcp:550 ]] || {
+      echo 'pair candidate is not an exact sealed upload' >&2
+      exit 1
+    }
+  [[ -f "$upload/generation.json" && ! -L "$upload/generation.json" \
+    && "$(stat -c '%U:%G:%a:%h' "$upload/generation.json")" \
+      = root:legal-mcp:440:1 ]] || {
+      echo 'sealed pair candidate manifest is unsafe' >&2
+      exit 1
+    }
+}
+
+pair_seal_generation() {
+  local current
+  read_pair_contract
+  require_pair_image saved
+  current="$(active_generation)"
+  [[ "$current" = "$PAIR_PRIOR_GENERATION" ]] || {
+    echo 'pair preparation does not match the prior active generation' >&2
+    exit 1
+  }
+  case "$PAIR_OPERATION" in
     prepared)
-      [[ "$(active_generation)" = "$TX_PREVIOUS" ]] || {
-        echo 'prepared cutover does not match the prior active pointer' >&2
+      read_journal
+      [[ "$TX_GENERATION" = "$GENERATION" \
+        && "$TX_PREVIOUS" = "$PAIR_PRIOR_GENERATION" \
+        && "$TX_PHASE" = prepared \
+        && -d "$UPLOADS/$GENERATION" && ! -L "$UPLOADS/$GENERATION" \
+        && ! -e "$GENERATIONS/$GENERATION" && ! -L "$GENERATIONS/$GENERATION" ]] || {
+          echo 'pair preparation requires the exact ordinary prepared upload' >&2
+          exit 1
+        }
+      seal_upload_for_pair
+      require_sealed_pair_upload
+      ;;
+    installed)
+      path_is_absent "$JOURNAL" || {
+        echo 'installed pair rollback refuses a corpus deployment transaction' >&2
         exit 1
       }
-      write_journal activating "$TX_PREVIOUS" flat-int8-cutover
-      normalize_upload_for_activation
-      activate_prepared_upload >/dev/null && activation_ok=true
+      [[ -d "$GENERATIONS/$GENERATION" && ! -L "$GENERATIONS/$GENERATION" \
+        && ! -e "$UPLOADS/$GENERATION" && ! -L "$UPLOADS/$GENERATION" ]] || {
+          echo 'installed pair rollback target is not one unambiguous generation' >&2
+          exit 1
+        }
       ;;
-    activating)
-      current="$(active_generation)"
-      if [[ "$current" = "$GENERATION" ]]; then
-        activation_ok=true
-      elif [[ "$current" = "$TX_PREVIOUS" \
-        && -d "$UPLOADS/$GENERATION" && ! -L "$UPLOADS/$GENERATION" ]]; then
-        normalize_upload_for_activation
-        activate_prepared_upload >/dev/null && activation_ok=true
-      elif [[ "$current" = "$TX_PREVIOUS" \
-        && -d "$GENERATIONS/$GENERATION" && ! -L "$GENERATIONS/$GENERATION" ]]; then
-        run_legal rollback --generation "$GENERATION" >/dev/null && activation_ok=true
-      else
-        echo 'cutover activation cannot locate one unambiguous candidate' >&2
+  esac
+  echo pair-prepared
+}
+
+pair_activate_generation() {
+  local activation_ok=false current
+  read_pair_contract
+  require_pair_image target
+  current="$(active_generation)"
+  case "$PAIR_OPERATION" in
+    prepared)
+      read_journal
+      [[ "$TX_GENERATION" = "$GENERATION" \
+        && "$TX_PREVIOUS" = "$PAIR_PRIOR_GENERATION" ]] || {
+          echo 'pair activation does not match its prepared corpus transaction' >&2
+          exit 1
+        }
+      case "$TX_PHASE" in
+        prepared)
+          [[ "$current" = "$PAIR_PRIOR_GENERATION" ]] || exit 1
+          require_sealed_pair_upload
+          write_journal activating "$PAIR_PRIOR_GENERATION"
+          if activate_prepared_upload >/dev/null; then activation_ok=true; fi
+          ;;
+        activating)
+          if [[ "$current" = "$GENERATION" ]]; then
+            activation_ok=true
+          elif [[ "$current" = "$PAIR_PRIOR_GENERATION" \
+            && -d "$UPLOADS/$GENERATION" && ! -L "$UPLOADS/$GENERATION" \
+            && ! -e "$GENERATIONS/$GENERATION" && ! -L "$GENERATIONS/$GENERATION" ]]; then
+            require_sealed_pair_upload
+            if activate_prepared_upload >/dev/null; then activation_ok=true; fi
+          elif [[ "$current" = "$PAIR_PRIOR_GENERATION" \
+            && -d "$GENERATIONS/$GENERATION" && ! -L "$GENERATIONS/$GENERATION" \
+            && ! -e "$UPLOADS/$GENERATION" && ! -L "$UPLOADS/$GENERATION" ]]; then
+            if run_legal rollback --generation "$GENERATION" >/dev/null; then activation_ok=true; fi
+          else
+            echo 'pair activation cannot locate one unambiguous candidate' >&2
+            exit 1
+          fi
+          ;;
+        activated)
+          [[ "$current" = "$GENERATION" ]] && activation_ok=true
+          ;;
+        *)
+          echo 'pair corpus transaction is not activatable' >&2
+          exit 1
+          ;;
+      esac
+      [[ "$activation_ok" = true && "$(active_generation)" = "$GENERATION" ]] || {
+        echo 'pair target generation validation or activation failed' >&2
+        exit 1
+      }
+      write_journal activated "$PAIR_PRIOR_GENERATION"
+      ;;
+    installed)
+      path_is_absent "$JOURNAL" || exit 1
+      if [[ "$current" = "$PAIR_PRIOR_GENERATION" ]]; then
+        run_legal rollback --generation "$GENERATION" >/dev/null
+      elif [[ "$current" != "$GENERATION" ]]; then
+        echo 'installed pair activation found a pointer outside the recorded pair' >&2
         exit 1
       fi
       ;;
-    rolled-back|rolling-back)
-      [[ "$(active_generation)" = "$TX_PREVIOUS" \
-        && -d "$GENERATIONS/$GENERATION" && ! -L "$GENERATIONS/$GENERATION" ]] || {
-          echo 'rolled-back cutover candidate is not exact' >&2
-          exit 1
-        }
-      run_legal rollback --generation "$GENERATION" >/dev/null && activation_ok=true
-      ;;
-    activated)
-      [[ "$(active_generation)" = "$GENERATION" ]] || {
-        echo 'activated cutover journal does not match the pointer' >&2
-        exit 1
-      }
-      activation_ok=true
-      ;;
-    *)
-      echo 'cutover deployment journal is not activatable' >&2
-      exit 1
-      ;;
   esac
-
-  if [[ "$activation_ok" != true ]]; then
-    current="$(active_generation)"
-    if [[ "$current" = "$GENERATION" ]]; then
-      write_journal activated "$TX_PREVIOUS" flat-int8-cutover
-    elif [[ "$current" = "$TX_PREVIOUS" \
-      && -d "$UPLOADS/$GENERATION" && ! -L "$UPLOADS/$GENERATION" ]]; then
-      restore_upload_to_publisher
-      write_journal prepared "$TX_PREVIOUS" flat-int8-cutover
-    elif [[ "$current" = "$TX_PREVIOUS" \
-      && -d "$GENERATIONS/$GENERATION" && ! -L "$GENERATIONS/$GENERATION" ]]; then
-      write_journal activating "$TX_PREVIOUS" flat-int8-cutover
-    else
-      echo 'failed cutover activation has an unexplained pointer or candidate location' >&2
-      exit 1
-    fi
-    echo 'flat-int8 generation validation or activation failed' >&2
-    exit 1
-  fi
-
-  [[ "$(active_generation)" = "$GENERATION" ]] || exit 1
-  write_journal activated "$TX_PREVIOUS" flat-int8-cutover
+  [[ "$(active_generation)" = "$GENERATION" ]]
   run_legal verify --quiet >/dev/null
-  echo cutover-activated-dark
+  echo pair-activated-dark
 }
 
-cutover_rollback_generation() {
-  local current
-  read_journal
-  [[ "$TX_GENERATION" = "$GENERATION" && "$TX_PREVIOUS" != - ]] || {
-    echo 'cutover rollback does not match the coordinated generation' >&2
-    exit 1
-  }
+pair_restore_generation() {
+  local current installed="$GENERATIONS/$GENERATION" upload="$UPLOADS/$GENERATION"
+  read_pair_contract
+  require_pair_image saved
   current="$(active_generation)"
-  if [[ "$TX_KIND" = ordinary ]]; then
-    [[ "$TX_PHASE" = prepared && "$current" = "$TX_PREVIOUS" \
-      && -d "$UPLOADS/$GENERATION" && ! -L "$UPLOADS/$GENERATION" ]] || {
-        echo 'ordinary deployment state cannot be the coordinated rollback target' >&2
-        exit 1
-      }
-    restore_upload_to_publisher
-    run_legal verify --quiet >/dev/null
-    echo cutover-rolled-back-dark
-    return
-  fi
-  [[ "$TX_KIND" = flat-int8-cutover ]] || exit 1
-
   if [[ "$current" = "$GENERATION" ]]; then
-    write_journal rolling-back "$TX_PREVIOUS" flat-int8-cutover
-    rollback_pointer "$TX_PREVIOUS"
+    if [[ "$PAIR_OPERATION" = prepared ]]; then
+      write_journal rolling-back "$PAIR_PRIOR_GENERATION"
+    fi
+    run_legal rollback --generation "$PAIR_PRIOR_GENERATION" >/dev/null
     current="$(active_generation)"
   fi
-  [[ "$current" = "$TX_PREVIOUS" ]] || {
-    echo 'cutover rollback found a pointer outside the prior/target pair' >&2
+  [[ "$current" = "$PAIR_PRIOR_GENERATION" ]] || {
+    echo 'pair restore found a pointer outside the recorded pair' >&2
     exit 1
   }
-
-  if [[ -d "$UPLOADS/$GENERATION" && ! -L "$UPLOADS/$GENERATION" ]]; then
-    [[ ! -e "$GENERATIONS/$GENERATION" && ! -L "$GENERATIONS/$GENERATION" ]] || {
-      echo 'cutover rollback found the candidate in both locations' >&2
-      exit 1
-    }
-    restore_upload_to_publisher
-    # No install occurred, so restore the exact ordinary prepared transaction
-    # that the coordinator took over.
-    write_journal prepared "$TX_PREVIOUS" ordinary
-  elif [[ -d "$GENERATIONS/$GENERATION" && ! -L "$GENERATIONS/$GENERATION" ]]; then
-    write_journal rolled-back "$TX_PREVIOUS" flat-int8-cutover
-  else
-    echo 'cutover rollback cannot locate its preserved candidate' >&2
-    exit 1
-  fi
-  run_legal verify --quiet >/dev/null
-  echo cutover-rolled-back-dark
-}
-
-cutover_commit_generation() {
-  local current outcome
-  read_journal
-  [[ "$TX_GENERATION" = "$GENERATION" && "$TX_PREVIOUS" != - ]] || {
-    echo 'cutover commit does not match the coordinated generation' >&2
-    exit 1
-  }
-  require_cutover_dark_surface
-  [[ -f "$CUTOVER_TRANSACTION/retirement-outcome" \
-    && ! -L "$CUTOVER_TRANSACTION/retirement-outcome" \
-    && "$(stat -c '%U:%G:%a:%h' "$CUTOVER_TRANSACTION/retirement-outcome")" \
-      = root:root:600:1 ]] || exit 1
-  outcome="$(<"$CUTOVER_TRANSACTION/retirement-outcome")"
-  current="$(active_generation)"
-  case "$TX_KIND:$TX_PHASE" in
-    flat-int8-cutover:activated)
-      [[ "$current" = "$GENERATION" \
-        && "$outcome" = target \
-        && -d "$GENERATIONS/$GENERATION" && ! -L "$GENERATIONS/$GENERATION" \
-        && "$(<"$IMAGE_FILE")" = "$(<"$CUTOVER_TRANSACTION/target-image")" ]] \
-        || { echo 'cutover target commit is not exact' >&2; exit 1; }
-      run_legal verify --quiet >/dev/null
-      run_legal prune-generations --keep-inactive 1 >/dev/null
-      rm -f -- "$JOURNAL"
-      path_is_absent "$JOURNAL" || exit 1
-      sync -f "$LIFECYCLE"
-      echo cutover-committed
-      ;;
-    flat-int8-cutover:rolled-back)
-      [[ "$current" = "$TX_PREVIOUS" && "$outcome" = saved \
-        && "$(<"$IMAGE_FILE")" = "$(<"$CUTOVER_TRANSACTION/saved-image")" ]] \
-        || { echo 'cutover rollback commit is not on the prior generation' >&2; exit 1; }
-      run_legal verify --quiet >/dev/null
-      if [[ -d "$GENERATIONS/$GENERATION" && ! -L "$GENERATIONS/$GENERATION" ]]; then
-        path_is_absent "$UPLOADS/$GENERATION" || {
-          echo 'cutover rollback candidate exists in both locations' >&2
+  case "$PAIR_OPERATION" in
+    prepared)
+      [[ -f "$JOURNAL" && ! -L "$JOURNAL" ]] || exit 1
+      if [[ -d "$installed" && ! -L "$installed" ]]; then
+        path_is_absent "$upload" || {
+          echo 'pair restore found the candidate in both installed and upload locations' >&2
           exit 1
         }
-        mv -T "$GENERATIONS/$GENERATION" "$UPLOADS/$GENERATION"
+        mv -T "$installed" "$upload"
         sync -f "$GENERATIONS"
         sync -f "$UPLOADS"
       fi
-      [[ -d "$UPLOADS/$GENERATION" && ! -L "$UPLOADS/$GENERATION" \
-        && ! -e "$GENERATIONS/$GENERATION" && ! -L "$GENERATIONS/$GENERATION" ]] || {
-          echo 'cutover rollback candidate cannot be restored to its upload' >&2
+      [[ -d "$upload" && ! -L "$upload" \
+        && ! -e "$installed" && ! -L "$installed" ]] || {
+          echo 'pair restore cannot locate its preserved prepared candidate' >&2
           exit 1
         }
       restore_upload_to_publisher
-      sync -f "$UPLOADS/$GENERATION"
-      write_journal prepared "$TX_PREVIOUS" ordinary
-      run_legal verify --quiet >/dev/null
-      echo cutover-rollback-committed
+      write_journal prepared "$PAIR_PRIOR_GENERATION"
       ;;
-    ordinary:prepared)
-      [[ "$current" = "$TX_PREVIOUS" \
-        && "$outcome" = saved \
-        && "$(<"$IMAGE_FILE")" = "$(<"$CUTOVER_TRANSACTION/saved-image")" \
-        && -d "$UPLOADS/$GENERATION" && ! -L "$UPLOADS/$GENERATION" \
-        && ! -e "$GENERATIONS/$GENERATION" && ! -L "$GENERATIONS/$GENERATION" ]] || {
-          echo 'ordinary prepared rollback state is not exact' >&2
+    installed)
+      path_is_absent "$JOURNAL" || exit 1
+      [[ -d "$installed" && ! -L "$installed" \
+        && -d "$GENERATIONS/$PAIR_PRIOR_GENERATION" \
+        && ! -L "$GENERATIONS/$PAIR_PRIOR_GENERATION" \
+        && ! -e "$upload" && ! -L "$upload" ]] || {
+          echo 'installed pair restore lost one member of the retained pair' >&2
           exit 1
         }
-      run_legal verify --quiet >/dev/null
-      restore_upload_to_publisher
-      sync -f "$UPLOADS/$GENERATION"
-      run_legal verify --quiet >/dev/null
-      echo cutover-rollback-committed
-      ;;
-    *)
-      echo 'cutover commit has no valid target or rollback state' >&2
-      exit 1
       ;;
   esac
+  run_legal verify --quiet >/dev/null
+  echo pair-restored-dark
+}
+
+pair_commit_generation() {
+  local current
+  read_pair_contract
+  [[ "$PAIR_OUTCOME" = saved || "$PAIR_OUTCOME" = target ]] || {
+    echo 'pair commit decision is not durable' >&2
+    exit 1
+  }
+  require_pair_image "$PAIR_OUTCOME"
+  current="$(active_generation)"
+  case "$PAIR_OPERATION:$PAIR_OUTCOME" in
+    prepared:target)
+      read_journal
+      [[ "$TX_GENERATION" = "$GENERATION" \
+        && "$TX_PREVIOUS" = "$PAIR_PRIOR_GENERATION" \
+        && "$TX_PHASE" = activated && "$current" = "$GENERATION" \
+        && -d "$GENERATIONS/$GENERATION" && ! -L "$GENERATIONS/$GENERATION" \
+        && ! -e "$UPLOADS/$GENERATION" && ! -L "$UPLOADS/$GENERATION" ]] || exit 1
+      rm -f -- "$JOURNAL"
+      path_is_absent "$JOURNAL" || exit 1
+      sync -f "$LIFECYCLE"
+      ;;
+    prepared:saved)
+      read_journal
+      [[ "$TX_GENERATION" = "$GENERATION" \
+        && "$TX_PREVIOUS" = "$PAIR_PRIOR_GENERATION" \
+        && "$TX_PHASE" = prepared && "$current" = "$PAIR_PRIOR_GENERATION" \
+        && -d "$UPLOADS/$GENERATION" && ! -L "$UPLOADS/$GENERATION" \
+        && "$(stat -c '%U:%G:%a' "$UPLOADS/$GENERATION")" \
+          = legal-mcp-publisher:legal-mcp-publisher:700 \
+        && ! -e "$GENERATIONS/$GENERATION" && ! -L "$GENERATIONS/$GENERATION" ]] || exit 1
+      ;;
+    installed:target)
+      [[ "$current" = "$GENERATION" && -d "$GENERATIONS/$PAIR_PRIOR_GENERATION" \
+        && ! -L "$GENERATIONS/$PAIR_PRIOR_GENERATION" ]] || exit 1
+      path_is_absent "$JOURNAL" || exit 1
+      ;;
+    installed:saved)
+      [[ "$current" = "$PAIR_PRIOR_GENERATION" && -d "$GENERATIONS/$GENERATION" \
+        && ! -L "$GENERATIONS/$GENERATION" ]] || exit 1
+      path_is_absent "$JOURNAL" || exit 1
+      ;;
+    *) exit 1 ;;
+  esac
+  run_legal verify --quiet >/dev/null
+  echo pair-committed-dark
 }
 
 # The fixed journal preparation is non-authoritative until its atomic rename.
@@ -888,13 +960,20 @@ cutover_commit_generation() {
 reconcile_journal_preparation
 reject_foreign_host_transactions
 
-if [[ "$CUTOVER_ACTION" = false && -f "$JOURNAL" && ! -L "$JOURNAL" ]]; then
-  mapfile -t journal_preview < "$JOURNAL"
-  if [[ ${#journal_preview[@]} -eq 4 \
-    && "${journal_preview[3]}" = flat-int8-cutover ]]; then
-    echo 'flat-int8 cutover-bound generation requires the explicit root coordinator' >&2
-    exit 1
-  fi
+if [[ "$PAIR_ACTION" = true ]]; then
+  require_commands awk blkid chmod chown find findmnt getfacl grep id mv podman \
+    python3 setfacl ss systemctl ufw xfs_info
+  validate_host_state
+  require_fixed_host_identities
+  read_image
+  clear_upload_authorization
+  case "$ACTION" in
+    pair-seal) pair_seal_generation ;;
+    pair-activate) pair_activate_generation ;;
+    pair-restore) pair_restore_generation ;;
+    pair-commit) pair_commit_generation ;;
+  esac
+  exit 0
 fi
 
 if [[ "$ACTION" = abort ]]; then
@@ -903,49 +982,15 @@ if [[ "$ACTION" = abort ]]; then
   clear_upload_authorization
   require_commands blkid chmod chown findmnt getfacl grep id mv xfs_info
   validate_host_state
-  publisher_uid="$(id -u "$PUBLISHER")"
-  publisher_gid="$(id -g "$PUBLISHER")"
-  [[ "$publisher_uid" = 973 && "$publisher_gid" = 973 \
-    && "$(id -G "$PUBLISHER")" = 973 ]] || {
-    echo 'publisher identity does not match the fixed host contract' >&2
-    exit 1
-  }
+  require_fixed_host_identities
   abort_generation
 fi
 
 require_commands blkid cp curl df find findmnt getfacl getent grep id mv podman python3 \
   setfacl systemctl xfs_info
-if [[ "$CUTOVER_ACTION" = true ]]; then
-  require_commands ss ufw
-fi
 validate_host_state
+require_fixed_host_identities
 read_image
-publisher_uid="$(id -u "$PUBLISHER")"
-publisher_gid="$(id -g "$PUBLISHER")"
-[[ "$publisher_uid" = 973 && "$publisher_gid" = 973 ]] || {
-  echo 'publisher identity does not match the fixed host contract' >&2
-  exit 1
-}
-[[ "$(id -G "$PUBLISHER")" = 973 ]] || {
-  echo 'publisher must not have supplementary host groups' >&2
-  exit 1
-}
-[[ "$(id -u "$SERVICE_USER")" = 971 && "$(id -g "$SERVICE_USER")" = 971 \
-  && "$(id -G "$SERVICE_USER")" = 971 ]] || {
-  echo 'service identity does not match the fixed host contract' >&2
-  exit 1
-}
-
-if [[ "$CUTOVER_ACTION" = true ]]; then
-  require_cutover_coordinator
-  clear_upload_authorization
-  case "$ACTION" in
-    cutover-activate) cutover_activate_generation ;;
-    cutover-rollback) cutover_rollback_generation ;;
-    cutover-commit) cutover_commit_generation ;;
-  esac
-  exit 0
-fi
 
 if [[ "$ACTION" = prepare ]]; then
   service_activity=''
@@ -1183,7 +1228,8 @@ if systemctl start "$SERVICE" \
   && wait_for_exact_generation "$GENERATION" \
   && running_image_is_pinned; then
   run_legal verify --quiet >/dev/null
-  run_legal prune-generations --keep-inactive 1 >/dev/null
+  # Hosted generations are retained for explicit pair rollback. Pruning is a
+  # separate, reviewed maintenance action and must never follow activation.
   rm -f "$JOURNAL"
   sync -f "$LIFECYCLE"
   echo activated

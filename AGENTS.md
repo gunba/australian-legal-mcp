@@ -19,6 +19,7 @@ MCP. Read [README.md](README.md), [MAINTENANCE.md](MAINTENANCE.md),
 | Corpus DB | `legal.db` |
 | Generation contract | `generation.json` |
 | ANN sidecars | `ann/<source>.ann` |
+| Lexical sidecars | `lexical/<source>.db` |
 | Sources | `ato`, `frl`, `federal-court`, `high-court`, `nsw-caselaw`, `nsw-legislation`, `qld-legislation`, `wa-legislation`, `sa-legislation`, `tas-legislation` |
 | Live URI | `legal://<source>/<encoded-native-id>` |
 
@@ -31,7 +32,7 @@ publishes corpus/model artifacts, and the image contains no corpus. GitHub
 Releases are binary-only; GHCR images are digest-pinned and attested. Flat-int8
 v22 is active on the Linode with the exact v0.19.11 runtime image and host tools. The
 service is public only through exact authenticated Caddy routes; host port
-51235 remains loopback-only. Recovery and cutover journals are retired, Arroy
+51235 remains loopback-only. Deployment journals are retired, and Arroy
 v20 is the sole hosted rollback generation. Current API-key IDs are `local-pi`
 and `work-laptop`; the prior `enterprise-laptop` key is revoked. Private/public
 HarbourGrid, all-seven-tool/all-ten-source,
@@ -96,8 +97,9 @@ exchange after build/activation validation. Never overwrite committed stores in
 place. Embedding reuse is disposable acceleration keyed only by exact
 `(model_id, chunk_text_sha256)`.
 
-Every generation contains exact DB, model, tokenizer, and ten ANN bindings.
-Validation checks hashes, schema, source set, relational integrity, FTS, model,
+Every generation contains exact DB, model, tokenizer, ten ANN bindings, and ten
+lexical bindings. Validation checks hashes, schema, exact sidecar file sets,
+source/filter mappings, contentless FTS integrity, source-text digests, model,
 and ANN metadata before making the directory read-only. `active-generation` is
 the sole atomic switch. Installed generations are immutable and rollback-capable.
 Never delete the active or last known-good generation before strict verification.
@@ -136,17 +138,15 @@ at 512 tokens; store normalized int8 first-256-dimension vectors.
 Each source has one deterministic exact flat int8 sidecar with a fixed 4 KiB
 header, sorted u32 chunk IDs, and contiguous 256-byte vectors. A bounded global
 four-thread scan pool proposes exact top candidates; SQLite vectors remain
-authoritative for reranking. Keep source-qualified schema 11. Schema 11 makes
-`chunks_fts` a contentless-delete FTS5 table while preserving the
-authoritative chunk text in `chunks` and binding FTS postings/BM25 metadata by
-digest.
+authoritative for reranking.
 
-`derive-schema11-from-schema10` is the sole schema-10 projection path. It
-strictly validates one immutable schema-10 generation, uses SQLite FTS
-tokenization to rebuild only `chunks_fts`, removes the disposable embedding
-cache, and creates a fresh complete generation. It performs no acquisition,
-OCR, rechunking, model tokenization, model execution, re-embedding, or ANN
-rebuild; model, tokenizer, and ANN artifacts remain byte-identical.
+Keep source-qualified schema 12. `legal.db` contains no runtime FTS table. Each
+registered source has one deterministic `lexical/<source>.db` containing only
+compact filter/mapping metadata and contentless-delete chunk/title FTS5 tables.
+Keyword and title FTS are strict-only. Query the sidecar first and hydrate only
+winners from `legal.db`. Bind every sidecar to its source, source corpus,
+source-text digests, tokenizer, legal DB hash, file hash, and generation
+identity. There is no schema projection or compatibility route.
 
 Maintainer dependencies are `unrtf`, `antiword`, `soffice`, `pdftotext`,
 `pdftoppm`, `tesseract`, and Chrome/Chromium for Federal Court. Serving is
@@ -164,25 +164,21 @@ scripts/deploy-generation.sh \
   --host legal-mcp-publisher@HOST
 ```
 
-Software is 0.19.11. Exact document-scoped FTS narrowing preserves wildcard
-and case-insensitive scope semantics. Chunker-format-6 flat-int8 v22
-`937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939` is active
-and strictly verified locally and on the Linode. Arroy v20
+Unreleased version 0.20.0 accepts schema 12 only. Build a fresh complete
+generation before activation; the released v0.19.11 schema-11 v22 generation
+requires its matching binary. Exact document-scoped FTS narrowing preserves
+wildcard and case-insensitive scope semantics. Chunker-format-6 flat-int8 v22
+`937683b86190ea9bc51f1607c8d517d4848a6f4db413fcc41d8116995e61d939` remains
+the currently hosted released generation. Arroy v20
 `a6e7da47edf2c332dbe616b2014a8b63dbdd9e793065c85da959cf56a2791aa3` is the
 sole hosted rollback generation. Retain the local v19 parent with its matching
 v0.18.1 binary/image as the schema-10 disaster-recovery fallback; the schema-11
 binary must not attempt to roll back to schema 10.
 
 Immutable v0.19.11 release assets and OCI attestations were independently
-verified. Its exact host tools and digest-pinned image are live. The retained
-v0.19.10 bundle's one-time v0.19.8 recovery bridge retired the old transaction
-without changing v0.19.8 bytes, and the corrected cutover retired its own
-journal. Live bounding,
+verified. Its exact host tools and digest-pinned image are live. Live bounding,
 effective, inheritable, and permitted capability sets are all empty. The prior
 `second-client` and `enterprise-laptop` keys are revoked; never restore them.
-The completed v0.19.8 bridge
-surface was removed in v0.19.11; historical recovery remains owned only by the
-retained immutable v0.19.10 bundle.
 
 Manual recovery uses `activate`, `verify`, `rollback`, and
 `prune-generations`. There is no runtime `update`, corpus download, corpus/model

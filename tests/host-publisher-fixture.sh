@@ -68,9 +68,9 @@ expect_rejected 'abort 1'
 for transaction in \
   /etc/legal-mcp/.auth-transaction \
   /etc/legal-mcp/.image-transaction.preparing \
-  /etc/legal-mcp/.image-transaction.flat-int8-preparing \
-  /etc/legal-mcp/.image-transaction.flat-int8-preparing-retired \
   /etc/legal-mcp/.image-transaction \
+  /etc/legal-mcp/.image-transaction.unrecognised \
+  /etc/legal-mcp/.image-transaction.deletion \
   /etc/legal-mcp/.image-transaction.retiring \
   /etc/legal-mcp/.host-tools-transaction.preparing \
   /etc/legal-mcp/.host-tools-transaction \

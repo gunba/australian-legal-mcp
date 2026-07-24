@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import json
+import os
 import pathlib
 import sys
 import tempfile
@@ -22,6 +23,7 @@ class AzureGenerationTransportTests(unittest.TestCase):
     ) -> pathlib.Path:
         generation = root / generation_id
         (generation / "ann").mkdir(parents=True)
+        (generation / "lexical").mkdir()
         files = {
             "legal.db": bytearray((b"database-page-contents\0" * 12_000)[:230_000]),
             "model.onnx": bytearray((b"model" * 30_000)[:110_000]),
@@ -30,6 +32,9 @@ class AzureGenerationTransportTests(unittest.TestCase):
         for index, source in enumerate(transport.SOURCE_IDS):
             files[f"ann/{source}.ann"] = bytearray(
                 (f"ann-{index}-{source}\n".encode() * 4_000)[:45_000]
+            )
+            files[f"lexical/{source}.db"] = bytearray(
+                (f"lexical-{index}-{source}\n".encode() * 4_000)[:48_000]
             )
         if changed:
             files["legal.db"][70_000:70_100] = b"changed-pages".ljust(100, b"!")
@@ -43,7 +48,7 @@ class AzureGenerationTransportTests(unittest.TestCase):
                 "sha256": hashlib.sha256(contents).hexdigest(),
             }
         manifest = {
-            "schema_version": 10,
+            "schema_version": 12,
             "index_version": "test",
             "created_at": "2026-01-01T00:00:00Z",
             "min_client_version": "0.17.0",
@@ -58,6 +63,13 @@ class AzureGenerationTransportTests(unittest.TestCase):
                 source: {
                     "source_id": source,
                     **metadata[f"ann/{source}.ann"],
+                }
+                for source in transport.SOURCE_IDS
+            },
+            "lexical": {
+                source: {
+                    "source_id": source,
+                    **metadata[f"lexical/{source}.db"],
                 }
                 for source in transport.SOURCE_IDS
             },
@@ -167,6 +179,39 @@ class AzureGenerationTransportTests(unittest.TestCase):
             self.assertGreaterEqual(resumed["restored_unique_chunks"], 1)
             self.assert_generation_equal(second, restored_second)
 
+    def test_cached_upload_rehashes_same_size_source_bytes_before_skipping(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            generation_id = "9" * 64
+            generation = self.create_generation(root / "source", generation_id)
+            blob_url = (root / "blob").as_uri()
+            cache_dir = root / "cache"
+            transport.upload_generation(
+                generation,
+                blob_url,
+                token_mode="azure-cli",
+                tier="Cool",
+                workers=2,
+                cache_dir=cache_dir,
+            )
+
+            database = generation / "legal.db"
+            original_size = database.stat().st_size
+            with database.open("r+b") as handle:
+                handle.seek(80_000)
+                handle.write(b"same-size-mutation")
+            self.assertEqual(database.stat().st_size, original_size)
+
+            with self.assertRaises(transport.TransportError):
+                transport.upload_generation(
+                    generation,
+                    blob_url,
+                    token_mode="azure-cli",
+                    tier="Cool",
+                    workers=2,
+                    cache_dir=cache_dir,
+                )
+
     def test_manifest_parser_rejects_paths_and_incomplete_layouts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -182,6 +227,71 @@ class AzureGenerationTransportTests(unittest.TestCase):
             raw["files"].pop()
             with self.assertRaises(transport.TransportError):
                 transport.parse_manifest(json.dumps(raw).encode(), generation_id)
+
+    def test_generation_manifest_rejects_wrong_source_sidecar_bindings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            generation = self.create_generation(
+                pathlib.Path(temporary), "c" * 64
+            )
+            manifest_path = generation / "generation.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["lexical"]["ato"]["source_id"] = "frl"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaises(transport.TransportError):
+                transport.expected_generation_files(generation)
+
+    def test_upload_rejects_extra_source_file_even_with_cached_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            generation_id = "d" * 64
+            generation = self.create_generation(root / "source", generation_id)
+            manifest, _ = transport.build_manifest(generation)
+            cache = root / "cache"
+            cache.mkdir()
+            (cache / f"{generation_id}.json").write_bytes(manifest.bytes())
+            (generation / "unexpected.secret").write_text("not transportable")
+
+            with self.assertRaises(transport.TransportError):
+                transport.upload_generation(
+                    generation,
+                    (root / "blob").as_uri(),
+                    token_mode="azure-cli",
+                    tier="Cool",
+                    workers=1,
+                    cache_dir=cache,
+                )
+
+    def test_source_generation_rejects_extra_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            generation = self.create_generation(
+                pathlib.Path(temporary), "e" * 64
+            )
+            (generation / "unexpected").mkdir()
+            with self.assertRaises(transport.TransportError):
+                transport.build_manifest(generation)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO creation is unavailable")
+    def test_source_generation_rejects_special_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            generation = self.create_generation(
+                pathlib.Path(temporary), "f" * 64
+            )
+            os.mkfifo(generation / "unexpected.fifo")
+            with self.assertRaises(transport.TransportError):
+                transport.build_manifest(generation)
+
+    @unittest.skipIf(sys.platform == "win32", "symlink creation requires extra privileges")
+    def test_source_generation_rejects_symlinked_root_before_resolving(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            generation_id = "1" * 64
+            generation = self.create_generation(root / "real", generation_id)
+            linked_parent = root / "linked"
+            linked_parent.mkdir()
+            linked = linked_parent / generation_id
+            linked.symlink_to(generation, target_is_directory=True)
+            with self.assertRaises(transport.TransportError):
+                transport.build_manifest(linked)
 
     def test_decompression_and_manifest_resource_limits_are_enforced(self) -> None:
         encoded = transport.compress_chunk(b"x" * (1024 * 1024))

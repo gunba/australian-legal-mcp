@@ -168,6 +168,8 @@ impl OfficialAdapter for NswCaselaw {
                 drop_ids: &[],
                 drop_classes: &["decision-actions"],
                 heading_classes: &[],
+                preserve_same_document_fragments: false,
+                repair_broken_links: false,
             },
         )?;
         Ok(Some(make_acquired_html(

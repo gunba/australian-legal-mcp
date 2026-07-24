@@ -32,13 +32,6 @@ reject_foreign_host_transactions() {
     /etc/legal-mcp/.auth-transaction.retired \
     /etc/legal-mcp/.auth-transaction.legacy-v0192-preparing-retiring \
     /etc/legal-mcp/.auth-transaction.legacy-v0192-preparing-retired \
-    /etc/legal-mcp/.image-transaction.preparing \
-    /etc/legal-mcp/.image-transaction.preparing-retired \
-    /etc/legal-mcp/.image-transaction.flat-int8-preparing \
-    /etc/legal-mcp/.image-transaction.flat-int8-preparing-retired \
-    /etc/legal-mcp/.image-transaction \
-    /etc/legal-mcp/.image-transaction.retiring \
-    /etc/legal-mcp/.image-transaction.retired \
     /etc/legal-mcp/.host-tools-transaction.building \
     /etc/legal-mcp/.host-tools-transaction.building-retired \
     /etc/legal-mcp/.host-tools-transaction.preparing \
@@ -55,6 +48,15 @@ reject_foreign_host_transactions() {
       exit 1
     }
   done
+  transaction="$(find /etc/legal-mcp -mindepth 1 -maxdepth 1 \
+    -name '.image-transaction*' -print -quit)" || {
+    echo 'could not inspect image transaction states' >&2
+    exit 1
+  }
+  [[ -z "$transaction" ]] || {
+    echo 'an image transaction must be recovered before publisher mutation' >&2
+    exit 1
+  }
   transaction="$(find /etc/legal-mcp -mindepth 1 -maxdepth 1 \
     -name '.auth-transaction.preparing.*' -print -quit)" || {
     echo 'could not inspect authentication transaction preparations' >&2

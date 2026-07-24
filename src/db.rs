@@ -5,16 +5,139 @@ use crate::SUPPORTED_SCHEMA_VERSION;
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OpenFlags};
 use sha2::{Digest, Sha256};
-use std::fs;
+#[cfg(windows)]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::Cursor;
 use std::path::Path;
 
-pub(crate) const CHUNKS_FTS_V11_SQL: &str = r#"CREATE VIRTUAL TABLE chunks_fts USING fts5(
-    text,
-    content = '',
-    contentless_delete = 1,
-    tokenize = "porter unicode61 remove_diacritics 2"
-)"#;
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LiveDbStamp {
+    len: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    change_seconds: i64,
+    #[cfg(unix)]
+    change_nanoseconds: i64,
+    #[cfg(windows)]
+    volume_serial_number: u32,
+    #[cfg(windows)]
+    file_index: u64,
+    #[cfg(windows)]
+    last_write_time: u64,
+}
+
+pub(crate) struct LiveDbSeal {
+    path: std::path::PathBuf,
+    file: File,
+    stamp: LiveDbStamp,
+}
+
+impl LiveDbSeal {
+    pub(crate) fn capture() -> Result<Self> {
+        Self::capture_path(db_path()?)
+    }
+
+    fn capture_path(path: std::path::PathBuf) -> Result<Self> {
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!(
+                "live DB must be a regular non-symlink file: {}",
+                path.display()
+            );
+        }
+        let file = open_immutable_db_handle(&path)?;
+        let stamp = live_db_file_stamp(&file)?;
+        Ok(Self { path, file, stamp })
+    }
+
+    pub(crate) fn verify(&self) -> Result<()> {
+        let metadata = fs::symlink_metadata(&self.path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("live DB changed after runtime validation");
+        }
+        let current = open_immutable_db_handle(&self.path)?;
+        if live_db_file_stamp(&current)? != self.stamp
+            || live_db_file_stamp(&self.file)? != self.stamp
+        {
+            bail!("live DB changed after runtime validation");
+        }
+        Ok(())
+    }
+}
+
+fn live_db_file_stamp(file: &File) -> Result<LiveDbStamp> {
+    #[allow(unused_mut)]
+    let mut stamp = live_db_stamp(&file.metadata()?)?;
+    #[cfg(windows)]
+    {
+        let identity = crate::ann::windows_file_identity(file)?;
+        stamp.volume_serial_number = identity.volume_serial_number;
+        stamp.file_index = identity.file_index;
+    }
+    Ok(stamp)
+}
+
+fn live_db_stamp(metadata: &fs::Metadata) -> Result<LiveDbStamp> {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::MetadataExt;
+    Ok(LiveDbStamp {
+        len: metadata.len(),
+        modified: metadata.modified()?,
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        #[cfg(unix)]
+        change_seconds: metadata.ctime(),
+        #[cfg(unix)]
+        change_nanoseconds: metadata.ctime_nsec(),
+        #[cfg(windows)]
+        volume_serial_number: 0,
+        #[cfg(windows)]
+        file_index: 0,
+        #[cfg(windows)]
+        last_write_time: metadata.last_write_time(),
+    })
+}
+
+#[cfg(unix)]
+fn open_immutable_db_handle(path: &Path) -> Result<File> {
+    Ok(File::open(path)?)
+}
+
+#[cfg(windows)]
+fn open_immutable_db_handle(path: &Path) -> Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let identity = crate::ann::windows_file_identity(&file)?;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    if identity.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 || identity.number_of_links != 1
+    {
+        bail!(
+            "live DB must not be a reparse point or hard link: {}",
+            path.display()
+        );
+    }
+    Ok(file)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn open_immutable_db_handle(path: &Path) -> Result<File> {
+    Ok(File::open(path)?)
+}
 
 pub(crate) fn open_read() -> Result<Connection> {
     let path = db_path()?;
@@ -41,6 +164,20 @@ pub(crate) fn open_read() -> Result<Connection> {
             bail!("live DB must not be hard-linked: {}", path.display());
         }
     }
+    #[cfg(windows)]
+    {
+        let file = fs::File::open(&path)?;
+        let identity = crate::ann::windows_file_identity(&file)?;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if identity.number_of_links != 1
+            || identity.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            bail!(
+                "live DB must not be a reparse point or hard link: {}",
+                path.display()
+            );
+        }
+    }
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .context("opening local corpus database")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -48,6 +185,7 @@ pub(crate) fn open_read() -> Result<Connection> {
     // still use in-memory temp storage for query work.
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     enforce_db_schema_version(&conn)?;
+    validate_canonical_schema(&conn)?;
     Ok(conn)
 }
 
@@ -112,6 +250,28 @@ pub(crate) fn enforce_db_schema_version(conn: &Connection) -> Result<()> {
                 );
             }
         }
+    }
+    Ok(())
+}
+
+fn schema_objects(conn: &Connection) -> Result<Vec<(String, String, String, String)>> {
+    let mut statement = conn.prepare(
+        "SELECT type, name, tbl_name, COALESCE(sql, '')
+         FROM sqlite_schema
+         WHERE name NOT LIKE 'sqlite_%'
+         ORDER BY type, name, tbl_name",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub(crate) fn validate_canonical_schema(conn: &Connection) -> Result<()> {
+    let expected = Connection::open_in_memory()?;
+    init_db(&expected)?;
+    if schema_objects(conn)? != schema_objects(&expected)? {
+        bail!("schema-{SUPPORTED_SCHEMA_VERSION} legal.db does not match the canonical schema");
     }
     Ok(())
 }
@@ -276,144 +436,31 @@ pub(crate) fn init_db(conn: &Connection) -> Result<()> {
             embedding BLOB NOT NULL CHECK(length(embedding) = 256)
         );
 
-        CREATE VIRTUAL TABLE IF NOT EXISTS title_fts USING fts5(
-            source_id UNINDEXED,
-            native_id UNINDEXED,
-            title,
-            headings,
-            tokenize = "porter unicode61 remove_diacritics 2"
-        );
-
         "#,
     )?;
-    if !table_exists(&tx, "chunks_fts")? {
-        tx.execute_batch(CHUNKS_FTS_V11_SQL)?;
-    }
     set_corpus_meta(&tx, "schema_version", &SUPPORTED_SCHEMA_VERSION.to_string())?;
     tx.commit()?;
     Ok(())
 }
 
-pub(crate) fn validate_chunks_fts_schema(conn: &Connection) -> Result<()> {
-    let actual = conn
-        .query_row(
-            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'chunks_fts'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .context("reading chunks_fts schema")?;
-    if normalized_sql(&actual) != normalized_sql(CHUNKS_FTS_V11_SQL) {
+/// Schema 12 keeps every lexical index outside the authoritative payload DB.
+pub(crate) fn validate_no_embedded_lexical_index(conn: &Connection) -> Result<()> {
+    let lexical_objects: i64 = conn.query_row(
+        "SELECT
+             (SELECT COUNT(*) FROM sqlite_schema
+              WHERE name LIKE 'chunks_fts%' OR name LIKE 'title_fts%')
+             +
+             (SELECT COUNT(*) FROM pragma_table_list
+              WHERE schema = 'main' AND type IN ('virtual', 'shadow'))",
+        [],
+        |row| row.get(0),
+    )?;
+    if lexical_objects != 0 {
         bail!(
-            "chunks_fts does not match the schema-{SUPPORTED_SCHEMA_VERSION} contentless-delete contract"
+            "schema-{SUPPORTED_SCHEMA_VERSION} legal.db must not contain runtime lexical indexes"
         );
     }
     Ok(())
-}
-
-pub(crate) fn verify_fts_relational_bindings(conn: &Connection) -> Result<()> {
-    for (table, expected) in [("chunks_fts", "chunks"), ("title_fts", "documents")] {
-        let indexed: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-            row.get(0)
-        })?;
-        let source: i64 =
-            conn.query_row(&format!("SELECT COUNT(*) FROM {expected}"), [], |row| {
-                row.get(0)
-            })?;
-        if indexed != source {
-            bail!("generation FTS table `{table}` has {indexed} rows; expected {source}");
-        }
-    }
-
-    if !ordered_i64_queries_match(
-        conn,
-        "SELECT chunk_id FROM chunks ORDER BY chunk_id",
-        "SELECT rowid FROM chunks_fts ORDER BY rowid",
-    )? {
-        bail!("chunks_fts rowids do not exactly match chunks.chunk_id");
-    }
-
-    if !ordered_text_pair_queries_match(
-        conn,
-        "SELECT source_id, native_id FROM documents ORDER BY source_id, native_id",
-        "SELECT source_id, native_id FROM title_fts ORDER BY source_id, native_id",
-    )? {
-        bail!("title_fts identities do not exactly match documents");
-    }
-    verify_source_rowid_partitions(conn)?;
-    Ok(())
-}
-
-pub(crate) fn verify_fts_integrity(conn: &Connection) -> Result<()> {
-    let transaction = conn.unchecked_transaction()?;
-    transaction.execute(
-        "INSERT INTO title_fts(title_fts) VALUES('integrity-check')",
-        [],
-    )?;
-    transaction.execute(
-        "INSERT INTO chunks_fts(chunks_fts) VALUES('integrity-check')",
-        [],
-    )?;
-    transaction.rollback()?;
-    Ok(())
-}
-
-fn verify_source_rowid_partitions(conn: &Connection) -> Result<()> {
-    for (table, rowid) in [("chunks", "chunk_id"), ("title_fts", "rowid")] {
-        let sql = format!(
-            "SELECT source_id, MIN({rowid}), MAX({rowid}), COUNT(*) \
-             FROM {table} GROUP BY source_id ORDER BY MIN({rowid}), source_id"
-        );
-        let mut statement = conn.prepare(&sql)?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        })?;
-        let ranges = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        for pair in ranges.windows(2) {
-            let (source_id, first, last, _count) = &pair[0];
-            let (next_source_id, next_first, next_last, _next_count) = &pair[1];
-            if first <= next_last && next_first <= last {
-                bail!(
-                    "generation FTS sources `{source_id}` and `{next_source_id}` overlap rowid ranges in `{table}`: {first}-{last} and {next_first}-{next_last}"
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-fn ordered_i64_queries_match(conn: &Connection, left: &str, right: &str) -> Result<bool> {
-    let mut left_statement = conn.prepare(left)?;
-    let mut right_statement = conn.prepare(right)?;
-    let mut left_rows = left_statement.query([])?;
-    let mut right_rows = right_statement.query([])?;
-    loop {
-        match (left_rows.next()?, right_rows.next()?) {
-            (Some(left), Some(right)) if left.get::<_, i64>(0)? == right.get::<_, i64>(0)? => {}
-            (None, None) => return Ok(true),
-            _ => return Ok(false),
-        }
-    }
-}
-
-fn ordered_text_pair_queries_match(conn: &Connection, left: &str, right: &str) -> Result<bool> {
-    let mut left_statement = conn.prepare(left)?;
-    let mut right_statement = conn.prepare(right)?;
-    let mut left_rows = left_statement.query([])?;
-    let mut right_rows = right_statement.query([])?;
-    loop {
-        match (left_rows.next()?, right_rows.next()?) {
-            (Some(left), Some(right))
-                if left.get::<_, String>(0)? == right.get::<_, String>(0)?
-                    && left.get::<_, String>(1)? == right.get::<_, String>(1)? => {}
-            (None, None) => return Ok(true),
-            _ => return Ok(false),
-        }
-    }
 }
 
 fn validate_fts_digest_table(conn: &Connection, table: &str) -> Result<()> {
@@ -438,86 +485,7 @@ fn validate_fts_digest_table(conn: &Connection, table: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn chunks_fts_logical_sha256(conn: &Connection, table: &str) -> Result<String> {
-    validate_fts_digest_table(conn, table)?;
-
-    let original_query_only: i64 = conn.pragma_query_value(None, "query_only", |row| row.get(0))?;
-    conn.pragma_update(None, "query_only", "OFF")?;
-    let result = (|| -> Result<String> {
-        conn.execute_batch("DROP TABLE IF EXISTS temp.chunks_fts_digest_vocab;")?;
-        conn.execute_batch(&format!(
-            "CREATE VIRTUAL TABLE temp.chunks_fts_digest_vocab
-             USING fts5vocab(main, {table}, instance);"
-        ))?;
-        let digest = (|| -> Result<String> {
-            // FTS5 vocab consumes ORDER BY term and emits each term's
-            // instances in doc/column/offset order. The monotonic assertion
-            // makes that streaming contract fail closed without a temp sort.
-            let mut statement = conn.prepare(
-                "SELECT term, doc, col, offset
-                 FROM temp.chunks_fts_digest_vocab
-                 ORDER BY term",
-            )?;
-            let mut rows = statement.query([])?;
-            let mut previous_term = String::new();
-            let mut previous_doc = 0_i64;
-            let mut previous_column = String::new();
-            let mut previous_offset = 0_i64;
-            let mut have_previous = false;
-            let mut count = 0_u64;
-            let mut hasher = Sha256::new();
-            hasher.update(b"australian-legal-mcp-chunks-fts-instance-v1\0");
-            while let Some(row) = rows.next()? {
-                let term = row.get_ref(0)?.as_str()?;
-                let doc = row.get::<_, i64>(1)?;
-                let column = row.get_ref(2)?.as_str()?;
-                let offset = row.get::<_, i64>(3)?;
-                if have_previous
-                    && (previous_term.as_str() > term
-                        || (previous_term == term
-                            && (previous_doc, previous_column.as_str(), previous_offset)
-                                >= (doc, column, offset)))
-                {
-                    bail!("FTS vocabulary instances are not strictly ordered");
-                }
-                hash_digest_field(&mut hasher, term.as_bytes());
-                hasher.update(doc.to_le_bytes());
-                hash_digest_field(&mut hasher, column.as_bytes());
-                hasher.update(offset.to_le_bytes());
-                if previous_term != term {
-                    previous_term.clear();
-                    previous_term.push_str(term);
-                }
-                previous_doc = doc;
-                previous_column.clear();
-                previous_column.push_str(column);
-                previous_offset = offset;
-                have_previous = true;
-                count = count
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("FTS vocabulary count overflow"))?;
-            }
-            hasher.update(count.to_le_bytes());
-            hash_fts_bm25_metadata(&mut hasher, conn, table)?;
-            Ok(format!("{:x}", hasher.finalize()))
-        })();
-        let cleanup = conn.execute_batch("DROP TABLE temp.chunks_fts_digest_vocab;");
-        let digest = digest?;
-        cleanup?;
-        Ok(digest)
-    })();
-    let restore = conn.pragma_update(None, "query_only", original_query_only);
-    match (result, restore) {
-        (Ok(digest), Ok(())) => Ok(digest),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(error.into()),
-        (Err(error), Err(restore_error)) => Err(error).context(format!(
-            "restoring SQLite query_only after FTS digest also failed: {restore_error}"
-        )),
-    }
-}
-
-pub(crate) fn chunks_fts_index_sha256(conn: &Connection, table: &str) -> Result<String> {
+pub(crate) fn fts_index_sha256(conn: &Connection, table: &str) -> Result<String> {
     validate_fts_digest_table(conn, table)?;
     let mut hasher = Sha256::new();
     hasher.update(b"australian-legal-mcp-chunks-fts-storage-v1\0");
@@ -575,51 +543,23 @@ pub(crate) fn chunks_fts_index_sha256(conn: &Connection, table: &str) -> Result<
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn hash_fts_bm25_metadata(hasher: &mut Sha256, conn: &Connection, table: &str) -> Result<()> {
-    hash_fts_docsize(hasher, conn, table)?;
-    let averages = conn
-        .query_row(
-            &format!("SELECT block FROM {table}_data WHERE id = 1"),
-            [],
-            |row| row.get::<_, Vec<u8>>(0),
-        )
-        .context("reading FTS averages record")?;
-    hasher.update(b"averages\0");
-    hash_digest_field(hasher, &averages);
-    Ok(())
-}
-
 fn hash_fts_docsize(hasher: &mut Sha256, conn: &Connection, table: &str) -> Result<()> {
     hasher.update(b"docsize\0");
     let mut count = 0_u64;
-    let mut statement = conn.prepare(&format!("SELECT id, sz FROM {table}_docsize ORDER BY id"))?;
+    let mut statement = conn.prepare(&format!(
+        "SELECT id, sz, typeof(origin), quote(origin) FROM {table}_docsize ORDER BY id"
+    ))?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
         hasher.update(row.get::<_, i64>(0)?.to_le_bytes());
         hash_digest_field(hasher, row.get_ref(1)?.as_blob()?);
+        hash_digest_field(hasher, row.get::<_, String>(2)?.as_bytes());
+        hash_digest_field(hasher, row.get::<_, String>(3)?.as_bytes());
         count = count
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("FTS docsize row count overflow"))?;
     }
     hasher.update(count.to_le_bytes());
-    Ok(())
-}
-
-pub(crate) fn verify_chunks_fts_index_digest(conn: &Connection) -> Result<()> {
-    let expected = get_corpus_meta(conn, "chunks_fts_index_sha256")?.ok_or_else(|| {
-        anyhow::anyhow!("database is missing corpus_meta.chunks_fts_index_sha256")
-    })?;
-    if expected.len() != 64
-        || !expected
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        bail!("corpus_meta.chunks_fts_index_sha256 is malformed");
-    }
-    let actual = chunks_fts_index_sha256(conn, "chunks_fts")?;
-    if actual != expected {
-        bail!("chunks_fts index storage or BM25 metadata does not match its schema-11 digest");
-    }
     Ok(())
 }
 
@@ -864,18 +804,8 @@ mod tests {
                 "headings",
             ])
         );
-        assert_eq!(
-            table_columns(&conn, "title_fts")?,
-            names(&["source_id", "native_id", "title", "headings"])
-        );
-        let title_fts_sql: String = conn.query_row(
-            "SELECT sql FROM sqlite_master WHERE name = 'title_fts'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert!(title_fts_sql.contains("source_id UNINDEXED"));
-        assert!(title_fts_sql.contains("native_id UNINDEXED"));
-        validate_chunks_fts_schema(&conn)?;
+        assert!(!table_exists(&conn, "chunks_fts")?);
+        assert!(!table_exists(&conn, "title_fts")?);
 
         conn.execute(
             "INSERT INTO sources(source_id, display_name) VALUES ('ato', 'Australian Taxation Office')",
@@ -892,225 +822,32 @@ mod tests {
             Some("42".to_string())
         );
 
-        conn.execute(
-            "INSERT INTO title_fts(source_id, native_id, title, headings) \
-             VALUES ('ato', 'TR/1', 'Deductions', 'Business deductions')",
-            [],
-        )?;
-        conn.execute(
-            "INSERT INTO chunks_fts(rowid, text) VALUES (41, 'business deductions')",
-            [],
-        )?;
-        let fts_identity: (String, String) = conn.query_row(
-            "SELECT source_id, native_id FROM title_fts WHERE title_fts MATCH 'deductions'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        assert_eq!(fts_identity, ("ato".to_string(), "TR/1".to_string()));
-        let chunk_rowid: i64 = conn.query_row(
-            "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH 'business'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(chunk_rowid, 41);
-        let stored_text: Option<String> =
-            conn.query_row("SELECT text FROM chunks_fts WHERE rowid = 41", [], |row| {
-                row.get(0)
-            })?;
-        assert_eq!(stored_text, None, "chunks_fts must be contentless");
-        conn.execute("DELETE FROM chunks_fts WHERE rowid = 41", [])?;
-        let remaining: i64 =
-            conn.query_row("SELECT COUNT(*) FROM chunks_fts", [], |row| row.get(0))?;
-        assert_eq!(
-            remaining, 0,
-            "contentless-delete must support normal DELETE"
-        );
         Ok(())
     }
 
     #[test]
-    fn chunks_fts_schema_rejects_contentful_or_incompatible_tables() -> Result<()> {
-        for ddl in [
-            r#"CREATE VIRTUAL TABLE chunks_fts USING fts5(
-                text,
-                tokenize = "porter unicode61 remove_diacritics 2"
-            )"#,
-            r#"CREATE VIRTUAL TABLE chunks_fts USING fts5(
-                text,
-                content = '',
-                tokenize = "porter unicode61 remove_diacritics 2"
-            )"#,
-            r#"CREATE VIRTUAL TABLE chunks_fts USING fts5(
-                text,
-                content = '',
-                contentless_delete = 1,
-                tokenize = "unicode61"
-            )"#,
-        ] {
-            let conn = Connection::open_in_memory()?;
-            conn.execute_batch(ddl)?;
-            assert!(validate_chunks_fts_schema(&conn).is_err(), "accepted {ddl}");
-        }
-        Ok(())
-    }
+    fn canonical_schema_rejects_missing_changed_and_extra_objects() -> Result<()> {
+        let canonical = Connection::open_in_memory()?;
+        init_db(&canonical)?;
+        validate_canonical_schema(&canonical)?;
 
-    #[test]
-    fn fts_relational_bindings_require_exact_chunk_rowids() -> Result<()> {
-        let conn = Connection::open_in_memory()?;
-        init_db(&conn)?;
-        conn.execute_batch(
-            "INSERT INTO sources(source_id, display_name) VALUES ('ato', 'ATO');
-             INSERT INTO documents(
-                 source_id, native_id, type, title, canonical_url, downloaded_at,
-                 content_hash, html
-             ) VALUES (
-                 'ato', 'doc', 'ruling', 'Document', 'https://example.invalid/doc',
-                 '2026-01-01T00:00:00Z', 'hash', X'00'
-             );
-             INSERT INTO chunks(chunk_id, source_id, native_id, ord, text)
-             VALUES (1, 'ato', 'doc', 0, X'00');
-             INSERT INTO title_fts(rowid, source_id, native_id, title, headings)
-             VALUES (1, 'ato', 'doc', 'Document', '');
-             INSERT INTO chunks_fts(rowid, text) VALUES (2, 'wrong identity');",
-        )?;
-        let error = verify_fts_relational_bindings(&conn).unwrap_err();
-        assert!(error.to_string().contains("rowids"));
-        Ok(())
-    }
+        let missing = Connection::open_in_memory()?;
+        init_db(&missing)?;
+        missing.execute_batch("DROP TABLE definitions")?;
+        assert!(validate_canonical_schema(&missing).is_err());
 
-    #[test]
-    fn fts_relational_bindings_require_isolated_source_partitions() -> Result<()> {
-        let conn = Connection::open_in_memory()?;
-        init_db(&conn)?;
-        conn.execute_batch(
-            "INSERT INTO sources(source_id, display_name) VALUES ('ato', 'ATO'), ('frl', 'FRL');
-             INSERT INTO documents(
-                 source_id, native_id, type, title, canonical_url, downloaded_at,
-                 content_hash, html
-             ) VALUES
-                 ('ato', 'a', 'ruling', 'A', 'https://example.invalid/a', '2026-01-01T00:00:00Z', 'a', X'00'),
-                 ('frl', 'b', 'Act', 'B', 'https://example.invalid/b', '2026-01-01T00:00:00Z', 'b', X'00'),
-                 ('ato', 'c', 'ruling', 'C', 'https://example.invalid/c', '2026-01-01T00:00:00Z', 'c', X'00');
-             INSERT INTO chunks(chunk_id, source_id, native_id, ord, text) VALUES
-                 (1, 'ato', 'a', 0, X'00'),
-                 (2, 'frl', 'b', 0, X'00'),
-                 (3, 'ato', 'c', 0, X'00');
-             INSERT INTO chunks_fts(rowid, text) VALUES (1, 'a'), (2, 'b'), (3, 'c');
-             INSERT INTO title_fts(rowid, source_id, native_id, title, headings) VALUES
-                 (1, 'ato', 'a', 'A', ''),
-                 (2, 'frl', 'b', 'B', ''),
-                 (3, 'ato', 'c', 'C', '');",
+        let changed = Connection::open_in_memory()?;
+        init_db(&changed)?;
+        changed.execute_batch(
+            "DROP INDEX idx_documents_source_type;
+             CREATE INDEX idx_documents_source_type ON documents(source_id, title)",
         )?;
-        let error = verify_fts_relational_bindings(&conn).unwrap_err();
-        assert!(error.to_string().contains("overlap rowid ranges"));
-        Ok(())
-    }
+        assert!(validate_canonical_schema(&changed).is_err());
 
-    #[test]
-    fn chunks_fts_integrity_digest_binds_postings_and_bm25_metadata() -> Result<()> {
-        let conn = Connection::open_in_memory()?;
-        init_db(&conn)?;
-        conn.execute_batch(
-            "INSERT INTO chunks_fts(rowid, text) VALUES
-                 (1, 'research development incentive'),
-                 (2, 'documentary evidence');",
-        )?;
-        let digest = chunks_fts_index_sha256(&conn, "chunks_fts")?;
-        set_corpus_meta(&conn, "chunks_fts_index_sha256", &digest)?;
-        verify_chunks_fts_index_digest(&conn)?;
-
-        conn.execute("DELETE FROM chunks_fts WHERE rowid = 2", [])?;
-        conn.execute(
-            "INSERT INTO chunks_fts(rowid, text) VALUES (2, 'unrelated garbage')",
-            [],
-        )?;
-        let error = verify_chunks_fts_index_digest(&conn).unwrap_err();
-        assert!(error.to_string().contains("index storage"));
-
-        conn.execute("DELETE FROM chunks_fts WHERE rowid = 2", [])?;
-        conn.execute(
-            "INSERT INTO chunks_fts(rowid, text) VALUES (2, 'documentary evidence')",
-            [],
-        )?;
-        let repaired_digest = chunks_fts_index_sha256(&conn, "chunks_fts")?;
-        set_corpus_meta(&conn, "chunks_fts_index_sha256", &repaired_digest)?;
-        verify_chunks_fts_index_digest(&conn)?;
-        let logical_digest = chunks_fts_logical_sha256(&conn, "chunks_fts")?;
-        let baseline_score: f64 = conn.query_row(
-            "SELECT bm25(chunks_fts) FROM chunks_fts
-             WHERE rowid = 1 AND chunks_fts MATCH 'research'",
-            [],
-            |row| row.get(0),
-        )?;
-        let original_docsize: Vec<u8> = conn.query_row(
-            "SELECT sz FROM chunks_fts_docsize WHERE id = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        conn.execute("UPDATE chunks_fts_docsize SET sz = X'64' WHERE id = 1", [])?;
-        let changed_docsize_score: f64 = conn.query_row(
-            "SELECT bm25(chunks_fts) FROM chunks_fts
-             WHERE rowid = 1 AND chunks_fts MATCH 'research'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_ne!(changed_docsize_score, baseline_score);
-        assert_ne!(
-            chunks_fts_logical_sha256(&conn, "chunks_fts")?,
-            logical_digest
-        );
-        assert!(verify_chunks_fts_index_digest(&conn).is_err());
-        conn.execute(
-            "UPDATE chunks_fts_docsize SET sz = ?1 WHERE id = 1",
-            [original_docsize],
-        )?;
-        assert_eq!(
-            chunks_fts_logical_sha256(&conn, "chunks_fts")?,
-            logical_digest
-        );
-        verify_chunks_fts_index_digest(&conn)?;
-
-        let original_averages: Vec<u8> = conn.query_row(
-            "SELECT block FROM chunks_fts_data WHERE id = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        conn.execute(
-            "UPDATE chunks_fts_data SET block = X'0264' WHERE id = 1",
-            [],
-        )?;
-        let changed_average_score: f64 = conn.query_row(
-            "SELECT bm25(chunks_fts) FROM chunks_fts
-             WHERE rowid = 1 AND chunks_fts MATCH 'research'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_ne!(changed_average_score, baseline_score);
-        assert_ne!(
-            chunks_fts_logical_sha256(&conn, "chunks_fts")?,
-            logical_digest
-        );
-        conn.execute(
-            "INSERT INTO chunks_fts(chunks_fts) VALUES('integrity-check')",
-            [],
-        )?;
-        assert!(verify_chunks_fts_index_digest(&conn).is_err());
-        conn.execute(
-            "UPDATE chunks_fts_data SET block = ?1 WHERE id = 1",
-            [original_averages],
-        )?;
-        assert_eq!(
-            chunks_fts_logical_sha256(&conn, "chunks_fts")?,
-            logical_digest
-        );
-        verify_chunks_fts_index_digest(&conn)?;
-        let storage_before_vacuum = chunks_fts_index_sha256(&conn, "chunks_fts")?;
-        conn.execute_batch("VACUUM")?;
-        assert_eq!(
-            chunks_fts_index_sha256(&conn, "chunks_fts")?,
-            storage_before_vacuum
-        );
-        verify_chunks_fts_index_digest(&conn)?;
+        let extra = Connection::open_in_memory()?;
+        init_db(&extra)?;
+        extra.execute_batch("CREATE TABLE unexpected(value TEXT)")?;
+        assert!(validate_canonical_schema(&extra).is_err());
         Ok(())
     }
 
@@ -1360,6 +1097,17 @@ mod tests {
     fn decompress_text_reuses_valid_utf8_buffer() -> Result<()> {
         let text = "Tax guidance — valid UTF-8";
         assert_eq!(decompress_text(compress_text(text)?)?, text);
+        Ok(())
+    }
+
+    #[test]
+    fn live_database_seal_detects_same_length_payload_mutation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("legal.db");
+        fs::write(&path, b"authoritative")?;
+        let seal = LiveDbSeal::capture_path(path.clone())?;
+        fs::write(&path, b"counterfeited!")?;
+        assert!(seal.verify().is_err());
         Ok(())
     }
 

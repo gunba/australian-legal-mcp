@@ -328,7 +328,7 @@ pub(crate) fn fetch_ato_doc(doc_id: &str, pit: Option<&str>, view: Option<&str>)
     // corpus doc: a list of {ord, anchor, text} chunks. Stateless — the
     // chunks aren't persisted and carry no chunk_id; all of them come
     // back inline in this one response.
-    let chunks = chunk_html(&cleaned.html, cleaned.title.as_deref(), EMBED_MAX_TOKENS);
+    let chunks = chunk_html(&cleaned.html, cleaned.title.as_deref(), EMBED_MAX_TOKENS)?;
     let chunk_json: Vec<JsonValue> = chunks
         .iter()
         .map(|c| -> Result<JsonValue> {
